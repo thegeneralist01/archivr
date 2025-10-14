@@ -1,0 +1,12 @@
+*
+
+!.gitignore
+
+!src
+!src/**
+
+!flake.nix
+!flake.lock
+
+!Cargo.toml
+!Cargo.lock
