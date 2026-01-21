@@ -1,7 +1,9 @@
 *
 
 !.gitignore
-!*.md
+
+LICENSE.md
+README.md
 
 !src
 !src/**
