@@ -2,8 +2,8 @@
 
 !.gitignore
 
-LICENSE.md
-README.md
+!docs
+!docs/**
 
 !src
 !src/**
