@@ -82,13 +82,10 @@ fn determine_source(path: &str) -> Source {
     // TEST: X posts can have multiple videos.
 
     // Shorthand schemes: yt: or youtube:
-    if path.starts_with("yt:") || path.starts_with("youtube:") {
-        let after_scheme = if path.starts_with("yt:") {
-            &path[3..]
-        } else {
-            &path[8..]
-        };
-
+    if let Some(after_scheme) = path
+        .strip_prefix("yt:")
+        .or_else(|| path.strip_prefix("youtube:"))
+    {
         // video/ID, short/ID, shorts/ID
         if after_scheme.starts_with("video/")
             || after_scheme.starts_with("short/")
@@ -110,6 +107,11 @@ fn determine_source(path: &str) -> Source {
         {
             return Source::YouTubeChannel;
         }
+    }
+
+    // Shorthand schemes: x: or twitter:
+    if path.starts_with("x:") || path.starts_with("twitter:") {
+        return Source::X;
     }
 
     if path.starts_with("file://") {
@@ -499,15 +501,38 @@ mod tests {
     }
 
     #[test]
+    fn test_x_sources() {
+        let x_cases = [
+            TestCase {
+                url: "https://x.com/some_post",
+                expected: Source::X,
+            },
+            TestCase {
+                url: "x:1234567890",
+                expected: Source::X,
+            },
+            TestCase {
+                url: "twitter:1234567890",
+                expected: Source::X,
+            },
+        ];
+
+        for case in &x_cases {
+            assert_eq!(
+                determine_source(case.url),
+                case.expected,
+                "Failed for URL: {}",
+                case.url
+            );
+        }
+    }
+
+    #[test]
     fn test_non_youtube_sources() {
         let other_cases = [
             TestCase {
                 url: "file:///local/path/file.mp4",
                 expected: Source::Local,
-            },
-            TestCase {
-                url: "https://x.com/some_post",
-                expected: Source::X,
             },
             TestCase {
                 url: "https://example.com/",
