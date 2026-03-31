@@ -10,6 +10,12 @@ use std::{
 mod downloader;
 mod hash;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExplicitArchiveRequest {
+    Tweet(downloader::tweets::TweetArchiveRequest),
+    TweetMedia { tweet_id: String },
+}
+
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
@@ -77,6 +83,49 @@ enum Source {
     Snapchat,
     Local,
     Other,
+}
+
+fn parse_tweet_id(id: &str) -> Option<String> {
+    if !id.is_empty() && id.chars().all(|char| char.is_ascii_digit()) {
+        Some(id.to_string())
+    } else {
+        None
+    }
+}
+
+fn parse_explicit_archive_request(path: &str) -> Option<ExplicitArchiveRequest> {
+    let parts: Vec<&str> = path.split(':').collect();
+
+    match parts.as_slice() {
+        ["tweet", id] => parse_tweet_id(id).map(|tweet_id| {
+            ExplicitArchiveRequest::Tweet(downloader::tweets::TweetArchiveRequest {
+                tweet_id,
+                mode: downloader::tweets::TweetArchiveMode::Tweet,
+            })
+        }),
+        ["tweet", "media", id] => {
+            parse_tweet_id(id).map(|tweet_id| ExplicitArchiveRequest::TweetMedia { tweet_id })
+        }
+        ["x", "tweet", id] | ["x", "x", id] | ["twitter", "x", id] | ["twitter", "tweet", id] => {
+            parse_tweet_id(id).map(|tweet_id| {
+                ExplicitArchiveRequest::Tweet(downloader::tweets::TweetArchiveRequest {
+                    tweet_id,
+                    mode: downloader::tweets::TweetArchiveMode::Tweet,
+                })
+            })
+        }
+        ["x", "thread", id] | ["twitter", "thread", id] => parse_tweet_id(id).map(|tweet_id| {
+            ExplicitArchiveRequest::Tweet(downloader::tweets::TweetArchiveRequest {
+                tweet_id,
+                mode: downloader::tweets::TweetArchiveMode::Thread,
+            })
+        }),
+        _ => None,
+    }
+}
+
+fn tweet_media_path(tweet_id: &str) -> String {
+    format!("https://x.com/i/status/{tweet_id}")
 }
 
 // INFO: yt-dlp supports a lot of sites; so, when archiving (for example) a website, the user
@@ -260,33 +309,67 @@ fn move_temp_to_raw(file: &Path, hash: &String, store_path: &Path) -> Result<()>
     Ok(())
 }
 
+fn initialize_store_directories(store_path: &Path) -> Result<()> {
+    fs::create_dir_all(store_path.join("raw"))?;
+    fs::create_dir_all(store_path.join("raw_tweets"))?;
+    fs::create_dir_all(store_path.join("structured"))?;
+    fs::create_dir_all(store_path.join("temp"))?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
         Command::Archive { ref path } => {
-            let archive_path = get_archive_path();
-            if get_archive_path().is_none() {
-                eprintln!("Not in an archive. Use 'archivr init' to create one.");
-                process::exit(1);
-            }
+            let archive_path = match get_archive_path() {
+                Some(path) => path,
+                None => {
+                    eprintln!("Not in an archive. Use 'archivr init' to create one.");
+                    process::exit(1);
+                }
+            };
 
             // let download_id = uuid::Uuid::new_v4();
             let timestamp = Local::now().format("%Y-%m-%dT%H-%M-%S%.3f").to_string();
 
-            let source = determine_source(path);
-            if let Source::Other = source {
-                eprintln!("Archiving from this source is not yet implemented.");
-                process::exit(1);
-            }
-
-            let store_path_string_file = archive_path.unwrap().join("store_path");
+            let store_path_string_file = archive_path.join("store_path");
             let store_path = match fs::read_to_string(store_path_string_file) {
                 Ok(p) => PathBuf::from(p.trim()),
                 Err(e) => {
                     eprintln!("Failed to read store path: {e}");
                     process::exit(1);
                 }
+            };
+
+            if let Some(ExplicitArchiveRequest::Tweet(request)) =
+                parse_explicit_archive_request(path)
+            {
+                match downloader::tweets::archive(&request, &store_path, &timestamp) {
+                    Ok(output_dir) => {
+                        println!("Tweet archived successfully to {}", output_dir.display());
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to archive tweet: {e}");
+                        process::exit(1);
+                    }
+                }
+            }
+
+            let (resolved_path, source) = match parse_explicit_archive_request(path) {
+                Some(ExplicitArchiveRequest::TweetMedia { tweet_id }) => {
+                    (tweet_media_path(&tweet_id), Source::X)
+                }
+                None => {
+                    let source = determine_source(path);
+                    if let Source::Other = source {
+                        eprintln!("Archiving from this source is not yet implemented.");
+                        process::exit(1);
+                    }
+                    (path.clone(), source)
+                }
+                Some(ExplicitArchiveRequest::Tweet(_)) => unreachable!(),
             };
 
             let hash = match source {
@@ -297,7 +380,11 @@ fn main() -> Result<()> {
                 | Source::TikTok
                 | Source::Reddit
                 | Source::Snapchat => {
-                    match downloader::ytdlp::download(path.clone(), &store_path, &timestamp) {
+                    match downloader::ytdlp::download(
+                        resolved_path.clone(),
+                        &store_path,
+                        &timestamp,
+                    ) {
                         Ok(h) => h,
                         Err(e) => {
                             eprintln!("Failed to download from YouTube: {e}");
@@ -306,7 +393,7 @@ fn main() -> Result<()> {
                     }
                 }
                 Source::Local => {
-                    match downloader::local::save(path.clone(), &store_path, &timestamp) {
+                    match downloader::local::save(resolved_path.clone(), &store_path, &timestamp) {
                         Ok(h) => h,
                         Err(e) => {
                             eprintln!("Failed to archive local file: {e}");
@@ -326,7 +413,7 @@ fn main() -> Result<()> {
                 | Source::Reddit
                 | Source::Snapchat => ".mp4",
                 Source::Local => {
-                    let p = Path::new(path.trim_start_matches("file://"));
+                    let p = Path::new(resolved_path.trim_start_matches("file://"));
                     &p.extension()
                         .map_or(String::new(), |ext| format!(".{}", ext.to_string_lossy()))
                 }
@@ -417,9 +504,7 @@ fn main() -> Result<()> {
                 archive_path.join("store_path"),
                 store_path.canonicalize().unwrap().to_str().unwrap(),
             );
-            fs::create_dir_all(store_path.join("raw")).unwrap();
-            fs::create_dir_all(store_path.join("structured")).unwrap();
-            fs::create_dir_all(store_path.join("tmp")).unwrap();
+            initialize_store_directories(&store_path).unwrap();
 
             println!("Initialized empty archive in {}", archive_path.display());
 
@@ -435,6 +520,94 @@ mod tests {
     struct TestCase<'a> {
         url: &'a str,
         expected: Source,
+    }
+
+    #[test]
+    fn test_explicit_tweet_archive_parsing() {
+        let cases = [
+            (
+                "tweet:1234567890",
+                Some(ExplicitArchiveRequest::Tweet(
+                    downloader::tweets::TweetArchiveRequest {
+                        tweet_id: "1234567890".to_string(),
+                        mode: downloader::tweets::TweetArchiveMode::Tweet,
+                    },
+                )),
+            ),
+            (
+                "x:tweet:1234567890",
+                Some(ExplicitArchiveRequest::Tweet(
+                    downloader::tweets::TweetArchiveRequest {
+                        tweet_id: "1234567890".to_string(),
+                        mode: downloader::tweets::TweetArchiveMode::Tweet,
+                    },
+                )),
+            ),
+            (
+                "x:x:1234567890",
+                Some(ExplicitArchiveRequest::Tweet(
+                    downloader::tweets::TweetArchiveRequest {
+                        tweet_id: "1234567890".to_string(),
+                        mode: downloader::tweets::TweetArchiveMode::Tweet,
+                    },
+                )),
+            ),
+            (
+                "twitter:x:1234567890",
+                Some(ExplicitArchiveRequest::Tweet(
+                    downloader::tweets::TweetArchiveRequest {
+                        tweet_id: "1234567890".to_string(),
+                        mode: downloader::tweets::TweetArchiveMode::Tweet,
+                    },
+                )),
+            ),
+            (
+                "twitter:tweet:1234567890",
+                Some(ExplicitArchiveRequest::Tweet(
+                    downloader::tweets::TweetArchiveRequest {
+                        tweet_id: "1234567890".to_string(),
+                        mode: downloader::tweets::TweetArchiveMode::Tweet,
+                    },
+                )),
+            ),
+            (
+                "tweet:media:1234567890",
+                Some(ExplicitArchiveRequest::TweetMedia {
+                    tweet_id: "1234567890".to_string(),
+                }),
+            ),
+            (
+                "x:thread:1234567890",
+                Some(ExplicitArchiveRequest::Tweet(
+                    downloader::tweets::TweetArchiveRequest {
+                        tweet_id: "1234567890".to_string(),
+                        mode: downloader::tweets::TweetArchiveMode::Thread,
+                    },
+                )),
+            ),
+            (
+                "twitter:thread:1234567890",
+                Some(ExplicitArchiveRequest::Tweet(
+                    downloader::tweets::TweetArchiveRequest {
+                        tweet_id: "1234567890".to_string(),
+                        mode: downloader::tweets::TweetArchiveMode::Thread,
+                    },
+                )),
+            ),
+            ("tweet:thread:1234567890", None),
+            ("x:media:1234567890", None),
+            ("tweet:not-a-number", None),
+            ("tweet:media:not-a-number", None),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_explicit_archive_request(input),
+                expected,
+                "Failed for input: {}",
+                input
+            );
+        }
     }
 
     #[test]
@@ -684,5 +857,23 @@ mod tests {
                 case.url
             );
         }
+    }
+
+    #[test]
+    fn test_initialize_store_directories() {
+        let store_path = env::temp_dir().join(format!(
+            "archivr-test-{}",
+            Local::now().format("%Y%m%d%H%M%S%3f")
+        ));
+
+        initialize_store_directories(&store_path).unwrap();
+
+        assert!(store_path.join("raw").is_dir());
+        assert!(store_path.join("raw_tweets").is_dir());
+        assert!(store_path.join("structured").is_dir());
+        assert!(store_path.join("temp").is_dir());
+        assert!(!store_path.join("tmp").exists());
+
+        fs::remove_dir_all(store_path).unwrap();
     }
 }
