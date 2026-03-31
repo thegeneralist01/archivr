@@ -4,7 +4,7 @@ An open-source self-hosted archiving tool. Work in progress.
 
 ## Milestones
 - [ ] Archiving
-    - [ ] Archiving media files from social media platforms
+    - [X] Archiving media files from social media platforms
         - [X] YouTube Videos
         - [X] Twitter Videos
         - [X] Instagram
@@ -12,14 +12,14 @@ An open-source self-hosted archiving tool. Work in progress.
         - [X] TikTok
         - [X] Reddit
         - [X] Snapchat
-        - [ ] YouTube Posts (?)
-        - (Some of these could be postponed for later.)
+        - [ ] YouTube Posts (postponed)
     - [X] Archiving local files
     - [ ] Archiving files from cloud storage services (Google Drive, Dropbox, OneDrive) and from URLs
         - [ ] URLs
         - [ ] Google Drive
         - [ ] Dropbox
         - [ ] OneDrive
+        - (Some of these could be postponed for later.)
     - [ ] Archiving Twitter threads
     - [ ] Archive web pages (HTML, CSS, JS, images)
     - [ ] Archiving emails (???)
