@@ -350,7 +350,7 @@ fn main() -> Result<()> {
             // Dir or whatever. it's midnight and my brain ain't wording/braining.
             if hash_exists {
                 println!("File already archived.");
-                let _ = fs::remove_file(store_path.join("temp").join(&timestamp));
+                let _ = fs::remove_dir_all(store_path.join("temp").join(&timestamp));
             } else {
                 move_temp_to_raw(
                     &store_path
@@ -360,7 +360,7 @@ fn main() -> Result<()> {
                     &hash,
                     &store_path,
                 )?;
-                let _ = fs::remove_file(store_path.join("temp").join(&timestamp));
+                let _ = fs::remove_dir_all(store_path.join("temp").join(&timestamp));
 
                 println!("File archived successfully.");
             }
