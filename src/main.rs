@@ -163,23 +163,47 @@ fn determine_source(path: &str) -> Source {
             return Source::X;
         }
 
-        if path.contains("instagram.com/") {
+        if path.starts_with("https://instagram.com/")
+            || path.starts_with("https://www.instagram.com/")
+            || path.starts_with("http://instagram.com/")
+            || path.starts_with("http://www.instagram.com/")
+        {
             return Source::Instagram;
         }
 
-        if path.contains("facebook.com/") || path.contains("fb.watch/") {
+        if path.starts_with("https://facebook.com/")
+            || path.starts_with("https://www.facebook.com/")
+            || path.starts_with("http://facebook.com/")
+            || path.starts_with("http://www.facebook.com/")
+            || path.starts_with("https://fb.watch/")
+            || path.starts_with("http://fb.watch/")
+        {
             return Source::Facebook;
         }
 
-        if path.contains("tiktok.com/") {
+        if path.starts_with("https://tiktok.com/")
+            || path.starts_with("https://www.tiktok.com/")
+            || path.starts_with("http://tiktok.com/")
+            || path.starts_with("http://www.tiktok.com/")
+        {
             return Source::TikTok;
         }
 
-        if path.contains("reddit.com/") || path.contains("redd.it/") {
+        if path.starts_with("https://reddit.com/")
+            || path.starts_with("https://www.reddit.com/")
+            || path.starts_with("http://reddit.com/")
+            || path.starts_with("http://www.reddit.com/")
+            || path.starts_with("https://redd.it/")
+            || path.starts_with("http://redd.it/")
+        {
             return Source::Reddit;
         }
 
-        if path.contains("snapchat.com/") {
+        if path.starts_with("https://snapchat.com/")
+            || path.starts_with("https://www.snapchat.com/")
+            || path.starts_with("http://snapchat.com/")
+            || path.starts_with("http://www.snapchat.com/")
+        {
             return Source::Snapchat;
         }
     }
@@ -640,6 +664,14 @@ mod tests {
             },
             TestCase {
                 url: "https://example.com/",
+                expected: Source::Other,
+            },
+            TestCase {
+                url: "https://example.com/?redirect=instagram.com/reel/ABC123",
+                expected: Source::Other,
+            },
+            TestCase {
+                url: "https://notfacebook.com/watch?v=123456",
                 expected: Source::Other,
             },
         ];
