@@ -1,6 +1,6 @@
+use anyhow::Result;
 use sha3::{Digest, Sha3_256};
 use std::{fs::File, io::Read, path::Path};
-use anyhow::Result;
 
 pub fn hash_file(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;

@@ -1,7 +1,9 @@
 *
 
 !.gitignore
-!*.md
+
+!docs
+!docs/**
 
 !src
 !src/**

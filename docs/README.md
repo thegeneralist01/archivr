@@ -1,29 +1,26 @@
 # archivr
 
-An open-source self-hosted archiving solution. Work in progress.
+An open-source self-hosted archiving tool. Work in progress.
 
 ## Milestones
 - [ ] Archiving
-    - [ ] Archiving media files from social media platforms
-        - [ ] YouTube
-        - [ ] Twitter
-        - [ ] Instagram
-        - [ ] Facebook
-        - [ ] TikTok
-        - [ ] Reddit
-        - [ ] Snapchat
-        - (Some of these could be postponed for later.)
-    - [ ] Archiving local files
-        - [ ] Archive videos (MP4, WebM)
-        - [ ] Archive audio files (MP3, WAV)
-        - [ ] Archive documents (DOCX, XLSX, PPTX)
-        - [ ] Archive PDFs
-        - [ ] Archive images (JPEG, PNG, GIF)
+    - [X] Archiving media files from social media platforms
+        - [X] YouTube Videos
+        - [X] Twitter Videos
+        - [X] Instagram
+        - [X] Facebook
+        - [X] TikTok
+        - [X] Reddit
+        - [X] Snapchat
+        - [ ] YouTube Posts (postponed)
+    - [X] Archiving local files
     - [ ] Archiving files from cloud storage services (Google Drive, Dropbox, OneDrive) and from URLs
         - [ ] URLs
         - [ ] Google Drive
         - [ ] Dropbox
         - [ ] OneDrive
+        - (Some of these could be postponed for later.)
+    - [ ] Archiving Twitter threads
     - [ ] Archive web pages (HTML, CSS, JS, images)
     - [ ] Archiving emails (???)
         - [ ] Gmail
