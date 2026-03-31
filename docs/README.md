@@ -7,11 +7,11 @@ An open-source self-hosted archiving tool. Work in progress.
     - [ ] Archiving media files from social media platforms
         - [X] YouTube Videos
         - [X] Twitter Videos
-        - [ ] Instagram
-        - [ ] Facebook
-        - [ ] TikTok
-        - [ ] Reddit
-        - [ ] Snapchat
+        - [X] Instagram
+        - [X] Facebook
+        - [X] TikTok
+        - [X] Reddit
+        - [X] Snapchat
         - [ ] YouTube Posts (?)
         - (Some of these could be postponed for later.)
     - [X] Archiving local files

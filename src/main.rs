@@ -70,6 +70,11 @@ enum Source {
     YouTubePlaylist,
     YouTubeChannel,
     X,
+    Instagram,
+    Facebook,
+    TikTok,
+    Reddit,
+    Snapchat,
     Local,
     Other,
 }
@@ -114,6 +119,23 @@ fn determine_source(path: &str) -> Source {
         return Source::X;
     }
 
+    // Shorthand schemes for other yt-dlp extractors
+    if path.starts_with("instagram:") {
+        return Source::Instagram;
+    }
+    if path.starts_with("facebook:") {
+        return Source::Facebook;
+    }
+    if path.starts_with("tiktok:") {
+        return Source::TikTok;
+    }
+    if path.starts_with("reddit:") {
+        return Source::Reddit;
+    }
+    if path.starts_with("snapchat:") {
+        return Source::Snapchat;
+    }
+
     if path.starts_with("file://") {
         return Source::Local;
     } else if path.starts_with("http://") || path.starts_with("https://") {
@@ -139,6 +161,26 @@ fn determine_source(path: &str) -> Source {
 
         if path.starts_with("https://x.com/") {
             return Source::X;
+        }
+
+        if path.contains("instagram.com/") {
+            return Source::Instagram;
+        }
+
+        if path.contains("facebook.com/") || path.contains("fb.watch/") {
+            return Source::Facebook;
+        }
+
+        if path.contains("tiktok.com/") {
+            return Source::TikTok;
+        }
+
+        if path.contains("reddit.com/") || path.contains("redd.it/") {
+            return Source::Reddit;
+        }
+
+        if path.contains("snapchat.com/") {
+            return Source::Snapchat;
         }
     }
     Source::Other
@@ -224,7 +266,13 @@ fn main() -> Result<()> {
             };
 
             let hash = match source {
-                Source::YouTubeVideo | Source::X => {
+                Source::YouTubeVideo
+                | Source::X
+                | Source::Instagram
+                | Source::Facebook
+                | Source::TikTok
+                | Source::Reddit
+                | Source::Snapchat => {
                     match downloader::ytdlp::download(path.clone(), &store_path, &timestamp) {
                         Ok(h) => h,
                         Err(e) => {
@@ -246,7 +294,13 @@ fn main() -> Result<()> {
             };
 
             let file_extension = match source {
-                Source::YouTubeVideo | Source::X => ".mp4",
+                Source::YouTubeVideo
+                | Source::X
+                | Source::Instagram
+                | Source::Facebook
+                | Source::TikTok
+                | Source::Reddit
+                | Source::Snapchat => ".mp4",
                 Source::Local => {
                     let p = Path::new(path.trim_start_matches("file://"));
                     &p.extension()
@@ -513,6 +567,61 @@ mod tests {
         ];
 
         for case in &x_cases {
+            assert_eq!(
+                determine_source(case.url),
+                case.expected,
+                "Failed for URL: {}",
+                case.url
+            );
+        }
+    }
+
+    #[test]
+    fn test_other_social_sources() {
+        let social_cases = [
+            TestCase {
+                url: "https://www.instagram.com/reel/ABC123/",
+                expected: Source::Instagram,
+            },
+            TestCase {
+                url: "instagram:reel/ABC123",
+                expected: Source::Instagram,
+            },
+            TestCase {
+                url: "https://www.facebook.com/watch/?v=123456",
+                expected: Source::Facebook,
+            },
+            TestCase {
+                url: "facebook:watch?v=123456",
+                expected: Source::Facebook,
+            },
+            TestCase {
+                url: "https://www.tiktok.com/@someone/video/123456789",
+                expected: Source::TikTok,
+            },
+            TestCase {
+                url: "tiktok:@someone/video/123456789",
+                expected: Source::TikTok,
+            },
+            TestCase {
+                url: "https://www.reddit.com/r/videos/comments/abc123/example/",
+                expected: Source::Reddit,
+            },
+            TestCase {
+                url: "reddit:r/videos/comments/abc123/example",
+                expected: Source::Reddit,
+            },
+            TestCase {
+                url: "https://www.snapchat.com/discover/some-story/1234567890",
+                expected: Source::Snapchat,
+            },
+            TestCase {
+                url: "snapchat:discover/some-story/1234567890",
+                expected: Source::Snapchat,
+            },
+        ];
+
+        for case in &social_cases {
             assert_eq!(
                 determine_source(case.url),
                 case.expected,
