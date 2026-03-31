@@ -77,7 +77,7 @@ enum Source {
 // INFO: yt-dlp supports a lot of sites; so, when archiving (for example) a website, the user
 // -> should be asked whether they want to archive the whole website or just the video(s) on it.
 fn determine_source(path: &str) -> Source {
-    // INFO: Extractors' URLs can be found here:
+    // INFO: Extractor URLs can be found here:
     // -> https://github.com/yt-dlp/yt-dlp/tree/dfc0a84c192a7357dd1768cc345d590253a14fe5/yt_dlp/extractor
     // TEST: X posts can have multiple videos.
 
@@ -272,13 +272,7 @@ fn main() -> Result<()> {
             // Dir or whatever. it's midnight and my brain ain't wording/braining.
             if hash_exists {
                 println!("File already archived.");
-                let _ = fs::remove_file(
-                    store_path
-                        .join("temp")
-                        .join(&timestamp)
-                        .join(format!("{timestamp}{file_extension}")),
-                );
-                process::exit(0);
+                let _ = fs::remove_file(store_path.join("temp").join(&timestamp));
             } else {
                 move_temp_to_raw(
                     &store_path
@@ -288,6 +282,7 @@ fn main() -> Result<()> {
                     &hash,
                     &store_path,
                 )?;
+                let _ = fs::remove_file(store_path.join("temp").join(&timestamp));
 
                 println!("File archived successfully.");
             }
