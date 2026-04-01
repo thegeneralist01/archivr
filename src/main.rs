@@ -42,6 +42,8 @@ enum Command {
         ///     ...
         ///   raw/
         ///     ...
+        ///   raw_tweets/
+        ///     ...
         ///   structured/
         ///     ...
         #[arg(default_value = "./.archivr/store")]
@@ -346,8 +348,12 @@ fn main() -> Result<()> {
                 parse_explicit_archive_request(path)
             {
                 match downloader::tweets::archive(&request, &store_path, &timestamp) {
-                    Ok(output_dir) => {
+                    Ok(downloader::tweets::TweetArchiveResult::Archived(output_dir)) => {
                         println!("Tweet archived successfully to {}", output_dir.display());
+                        return Ok(());
+                    }
+                    Ok(downloader::tweets::TweetArchiveResult::Skipped(output_dir)) => {
+                        println!("Tweet already archived in {}", output_dir.display());
                         return Ok(());
                     }
                     Err(e) => {

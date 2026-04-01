@@ -50,6 +50,8 @@ This project aims to provide a reliable solution for archiving important data fr
 - Tweet media/video: `tweet:media:ID`
 - Thread TOML content: `x:thread:ID`, `twitter:thread:ID`
 
+Tweet and thread TOMLs are stored directly in `raw_tweets/`. Downloaded tweet media and avatars are re-archived into the hashed `raw/` store, and the TOMLs point at those archived files using store-relative `raw/...` paths.
+
 Twitter tweet/thread scraping requires `ARCHIVR_TWITTER_CREDENTIALS_FILE` to point to a cookies file for the vendored scraper.
 
 ## License
