@@ -19,6 +19,14 @@ pub struct TweetArchiveRequest {
     pub mode: TweetArchiveMode,
 }
 
+fn resolve_from_cwd(path: PathBuf, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
 fn build_scraper_args(
     request: &TweetArchiveRequest,
     output_dir: &Path,
@@ -54,6 +62,7 @@ pub fn archive(
     store_path: &Path,
     timestamp: &str,
 ) -> Result<PathBuf> {
+    let invocation_cwd = env::current_dir().context("Failed to read current working directory")?;
     let output_dir = store_path.join("raw_tweets").join(timestamp);
     let temp_dir = store_path.join("temp").join(timestamp);
     fs::create_dir_all(&output_dir)?;
@@ -63,16 +72,24 @@ pub fn archive(
     let scraper_path = env::var_os("ARCHIVR_TWEET_SCRAPER")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("vendor/twitter/scrape_user_tweet_contents.py"));
+    let scraper_path = resolve_from_cwd(scraper_path, &invocation_cwd);
 
     let credentials_file = if let Some(credentials_file) =
         env::var_os("ARCHIVR_TWITTER_CREDENTIALS_FILE")
     {
-        PathBuf::from(credentials_file)
+        resolve_from_cwd(PathBuf::from(credentials_file), &invocation_cwd)
     } else {
         bail!(
             "Twitter scraping requires ARCHIVR_TWITTER_CREDENTIALS_FILE to point to a cookies file."
         );
     };
+
+    if !credentials_file.is_file() {
+        bail!(
+            "Twitter credentials file not found: {}",
+            credentials_file.display()
+        );
+    }
 
     let mut cmd = Command::new(&python);
     cmd.current_dir(&temp_dir).arg(&scraper_path);
@@ -99,9 +116,13 @@ pub fn archive(
 
     let root_toml = output_dir.join(format!("tweet-{}.toml", request.tweet_id));
     if !root_toml.exists() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         bail!(
-            "Tweet scraper completed but did not create expected TOML file: {}",
-            root_toml.display()
+            "Tweet scraper completed but did not create expected TOML file: {}\nstdout:\n{}\nstderr:\n{}",
+            root_toml.display(),
+            stdout.trim(),
+            stderr.trim()
         );
     }
 
@@ -148,5 +169,17 @@ mod tests {
         assert!(args.contains(&"--recursive-replied-to-tweets".to_string()));
         assert!(args.contains(&"--recursive-replied-to-tweets-quotes-retweets".to_string()));
         assert!(!args.contains(&"--no-recursive".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_from_cwd_keeps_absolute_paths() {
+        let path = resolve_from_cwd(PathBuf::from("/tmp/creds.txt"), Path::new("/work"));
+        assert_eq!(path, PathBuf::from("/tmp/creds.txt"));
+    }
+
+    #[test]
+    fn test_resolve_from_cwd_expands_relative_paths() {
+        let path = resolve_from_cwd(PathBuf::from("creds.txt"), Path::new("/work"));
+        assert_eq!(path, PathBuf::from("/work/creds.txt"));
     }
 }
