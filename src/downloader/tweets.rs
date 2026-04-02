@@ -12,6 +12,7 @@ use std::{
 
 use super::local;
 
+/// Returns `Some(id)` if `id` is a non-empty string of ASCII digits, otherwise `None`.
 fn parse_tweet_id(id: &str) -> Option<String> {
     if !id.is_empty() && id.chars().all(|char| char.is_ascii_digit()) {
         Some(id.to_string())
@@ -20,11 +21,14 @@ fn parse_tweet_id(id: &str) -> Option<String> {
     }
 }
 
+/// Extracts a tweet ID from an archivr path like `"tweet:123"` by taking the
+/// last colon-separated segment and validating it as a numeric ID.
 fn tweet_id_from_path(path: &str) -> Option<String> {
     path.split(':').next_back().and_then(parse_tweet_id)
 }
 
-fn resolve_from_cwd(path: PathBuf, cwd: &Path) -> PathBuf {
+/// Resolves `path` relative to `cwd` if it is not already absolute.
+fn absolutize_path_from_cwd(path: PathBuf, cwd: &Path) -> PathBuf {
     if path.is_absolute() {
         path
     } else {
@@ -32,6 +36,8 @@ fn resolve_from_cwd(path: PathBuf, cwd: &Path) -> PathBuf {
     }
 }
 
+/// Builds the CLI argument list for the Python tweet scraper.
+/// When `thread` is true, recursive flags are added to follow reply chains.
 fn build_scraper_args(
     tweet_id: &str,
     thread: bool,
@@ -62,15 +68,27 @@ fn build_scraper_args(
     args
 }
 
+/// Archives a tweet (or full thread) identified by `path` (e.g. `"tweet:123"`).
+///
+/// Invokes the Python scraper, then moves all produced media assets into the
+/// content-addressed raw store and rewrites the TOML output to use the new
+/// store-relative paths. Returns `true` if new content was archived, `false`
+/// if the tweet was already present and `thread` is `false`.
+///
+/// Requires `ARCHIVR_TWITTER_CREDENTIALS_FILE` to be set. The scraper binary
+/// can be overridden via `ARCHIVR_TWEET_SCRAPER` and `ARCHIVR_TWEET_PYTHON`.
 pub fn archive(path: &str, thread: bool, store_path: &Path, timestamp: &str) -> Result<bool> {
     let invocation_cwd = env::current_dir().context("Failed to read current working directory")?;
+    // Output directory for Tweet TOML files.
     let output_dir = store_path.join("raw_tweets");
+    // Temporary directory for media assets downloaded by the scraper in `temp/...`.
     let temp_dir = store_path.join("temp").join(timestamp).join("tweets");
     let tweet_id = tweet_id_from_path(path).context("Invalid tweet ID")?;
 
     fs::create_dir_all(&output_dir)?;
     fs::create_dir_all(&temp_dir)?;
 
+    // Path to the root - the to-be-archived tweet's TOML file.
     let root_toml = output_dir.join(format!("tweet-{tweet_id}.toml"));
     if !thread && root_toml.exists() {
         return Ok(false);
@@ -82,12 +100,12 @@ pub fn archive(path: &str, thread: bool, store_path: &Path, timestamp: &str) -> 
     let scraper_path = env::var_os("ARCHIVR_TWEET_SCRAPER")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("vendor/twitter/scrape_user_tweet_contents.py"));
-    let scraper_path = resolve_from_cwd(scraper_path, &invocation_cwd);
+    let scraper_path = absolutize_path_from_cwd(scraper_path, &invocation_cwd);
 
     let credentials_file = if let Some(credentials_file) =
         env::var_os("ARCHIVR_TWITTER_CREDENTIALS_FILE")
     {
-        resolve_from_cwd(PathBuf::from(credentials_file), &invocation_cwd)
+        absolutize_path_from_cwd(PathBuf::from(credentials_file), &invocation_cwd)
     } else {
         bail!(
             "Twitter scraping requires ARCHIVR_TWITTER_CREDENTIALS_FILE to point to a cookies file."
@@ -144,6 +162,7 @@ pub fn archive(path: &str, thread: bool, store_path: &Path, timestamp: &str) -> 
     Ok(true)
 }
 
+/// Removes the `scraping_summary.toml` file left by the scraper, if present.
 fn cleanup_summary(output_dir: &Path) -> Result<()> {
     let summary_path = output_dir.join("scraping_summary.toml");
     if summary_path.exists() {
@@ -152,6 +171,7 @@ fn cleanup_summary(output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Returns the set of `tweet-*.toml` files present in `output_dir`.
 fn tweet_toml_files(output_dir: &Path) -> Result<HashSet<PathBuf>> {
     let mut files = HashSet::new();
 
@@ -172,22 +192,27 @@ fn tweet_toml_files(output_dir: &Path) -> Result<HashSet<PathBuf>> {
     Ok(files)
 }
 
+/// Returns the sorted list of TOML files present in `after` but not in `before`.
 fn new_tweet_tomls(before: &HashSet<PathBuf>, after: &HashSet<PathBuf>) -> Vec<PathBuf> {
     let mut files = after.difference(before).cloned().collect::<Vec<_>>();
     files.sort();
     files
 }
 
+/// Returns a lazily-compiled regex matching `avatar_local_path = "..."` in TOML.
 fn avatar_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| Regex::new(r#"avatar_local_path = "([^"\n]+)""#).unwrap())
 }
 
+/// Returns a lazily-compiled regex matching `local_path = "..."` in TOML.
 fn media_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| Regex::new(r#"(?m)\blocal_path = "([^"\n]+)""#).unwrap())
 }
 
+/// Rewrites asset paths in each newly-created TOML file, moving assets into
+/// the content-addressed store. Files are written back only if content changed.
 fn rewrite_tweet_outputs(
     tweet_tomls: &[PathBuf],
     output_dir: &Path,
@@ -214,6 +239,10 @@ fn rewrite_tweet_outputs(
     Ok(())
 }
 
+/// Rewrites all `avatar_local_path` and `local_path` references in `contents`,
+/// archiving each referenced file into the raw store and returning the updated
+/// TOML string. `archived_assets` is a cache to avoid re-archiving the same
+/// file when it is referenced by multiple tweets.
 fn rewrite_toml_asset_paths(
     contents: &str,
     output_dir: &Path,
@@ -246,6 +275,10 @@ fn rewrite_toml_asset_paths(
     Ok(rewritten)
 }
 
+/// Archives the asset at `old_path` (relative to `base_dir`) into the raw store
+/// and returns its new store-relative path. Already-archived paths (starting
+/// with `"raw/"`) are returned unchanged. Results are cached in `archived_assets`
+/// by `"<kind>:<old_path>"` key to deduplicate work across TOML files.
 fn archive_asset_reference(
     old_path: &str,
     base_dir: &Path,
@@ -421,13 +454,13 @@ avatar_local_path = "../temp/ts/tweets/media/avatars/avatar.jpg"
 
     #[test]
     fn test_resolve_from_cwd_keeps_absolute_paths() {
-        let path = resolve_from_cwd(PathBuf::from("/tmp/creds.txt"), Path::new("/work"));
+        let path = absolutize_path_from_cwd(PathBuf::from("/tmp/creds.txt"), Path::new("/work"));
         assert_eq!(path, PathBuf::from("/tmp/creds.txt"));
     }
 
     #[test]
     fn test_resolve_from_cwd_expands_relative_paths() {
-        let path = resolve_from_cwd(PathBuf::from("creds.txt"), Path::new("/work"));
+        let path = absolutize_path_from_cwd(PathBuf::from("creds.txt"), Path::new("/work"));
         assert_eq!(path, PathBuf::from("/work/creds.txt"));
     }
 

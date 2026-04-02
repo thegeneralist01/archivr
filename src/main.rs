@@ -357,6 +357,7 @@ fn main() -> Result<()> {
 
             let source = determine_source(path);
 
+            // Sources: Tweets or Twitter Threads
             match source {
                 Source::Other => {
                     eprintln!("Archiving from this source is not yet implemented.");
@@ -392,7 +393,7 @@ fn main() -> Result<()> {
                 _ => {}
             }
 
-            // Other sources
+            // Sources, for which yt-dlp is needed
             let path = resolve_source_path(path, &source);
             let hash = match source {
                 Source::YouTubeVideo

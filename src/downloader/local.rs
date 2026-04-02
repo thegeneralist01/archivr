@@ -31,6 +31,12 @@ pub fn save(path: String, store_path: &Path, timestamp: &String) -> Result<Strin
     hash_file(&out_file)
 }
 
+/// Moves `file` into the content-addressed raw store under `store_path`.
+///
+/// The destination path is derived from the file's SHA-256 hash:
+/// `raw/<first-char>/<second-char>/<hash><ext>`. If the destination already
+/// exists the source file is removed (deduplication); otherwise it is renamed.
+/// Returns the store-relative destination path.
 pub fn archive_staged_file(file: &Path, store_path: &Path) -> Result<PathBuf> {
     let hash = hash_file(file)?;
     let destination = raw_relative_path(file, &hash)?;
@@ -49,6 +55,9 @@ pub fn archive_staged_file(file: &Path, store_path: &Path) -> Result<PathBuf> {
     Ok(destination)
 }
 
+/// Computes the store-relative path for a file given its `hash`.
+/// The layout is `raw/<c1>/<c2>/<hash><ext>` where `c1`/`c2` are the first
+/// two characters of the hash, providing a two-level directory sharding.
 fn raw_relative_path(file: &Path, hash: &str) -> Result<PathBuf> {
     let mut chars = hash.chars();
     let first_letter = chars.next().context("hash must not be empty")?;
