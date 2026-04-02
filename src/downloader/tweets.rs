@@ -7,7 +7,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Mutex, OnceLock},
+    sync::OnceLock,
 };
 
 use super::local;
@@ -281,7 +281,7 @@ fn archive_asset_reference(
 mod tests {
     use super::*;
     use std::{
-        sync::MutexGuard,
+        sync::{Mutex, MutexGuard},
         time::{SystemTime, UNIX_EPOCH},
     };
 

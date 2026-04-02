@@ -356,7 +356,6 @@ fn main() -> Result<()> {
             };
 
             let source = determine_source(path);
-            let resolved_path = resolve_source_path(path, &source);
 
             match source {
                 Source::Other => {
@@ -394,6 +393,7 @@ fn main() -> Result<()> {
             }
 
             // Other sources
+            let path = resolve_source_path(path, &source);
             let hash = match source {
                 Source::YouTubeVideo
                 | Source::X
@@ -402,11 +402,7 @@ fn main() -> Result<()> {
                 | Source::TikTok
                 | Source::Reddit
                 | Source::Snapchat => {
-                    match downloader::ytdlp::download(
-                        resolved_path.clone(),
-                        &store_path,
-                        &timestamp,
-                    ) {
+                    match downloader::ytdlp::download(path.clone(), &store_path, &timestamp) {
                         Ok(h) => h,
                         Err(e) => {
                             eprintln!("Failed to download from YouTube: {e}");
@@ -415,7 +411,7 @@ fn main() -> Result<()> {
                     }
                 }
                 Source::Local => {
-                    match downloader::local::save(resolved_path.clone(), &store_path, &timestamp) {
+                    match downloader::local::save(path.clone(), &store_path, &timestamp) {
                         Ok(h) => h,
                         Err(e) => {
                             eprintln!("Failed to archive local file: {e}");
@@ -435,7 +431,7 @@ fn main() -> Result<()> {
                 | Source::Reddit
                 | Source::Snapchat => ".mp4",
                 Source::Local => {
-                    let p = Path::new(resolved_path.trim_start_matches("file://"));
+                    let p = Path::new(path.trim_start_matches("file://"));
                     &p.extension()
                         .map_or(String::new(), |ext| format!(".{}", ext.to_string_lossy()))
                 }
