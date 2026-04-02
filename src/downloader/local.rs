@@ -7,7 +7,21 @@ use std::{
 
 use crate::hash::hash_file;
 
-pub fn save(path: String, store_path: &Path, timestamp: &String) -> Result<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawArchiveResult {
+    Archived(PathBuf),
+    AlreadyArchived(PathBuf),
+}
+
+impl RawArchiveResult {
+    pub fn relative_path(&self) -> &Path {
+        match self {
+            Self::Archived(path) | Self::AlreadyArchived(path) => path,
+        }
+    }
+}
+
+pub fn save(path: String, store_path: &Path, timestamp: &str) -> Result<PathBuf> {
     println!("Saving path: {path}");
 
     let temp_dir = store_path.join("temp").join(timestamp);
@@ -28,10 +42,10 @@ pub fn save(path: String, store_path: &Path, timestamp: &String) -> Result<Strin
         bail!("yt-dlp failed: {stderr}");
     }
 
-    hash_file(&out_file)
+    Ok(out_file)
 }
 
-pub fn archive_staged_file(file: &Path, store_path: &Path) -> Result<PathBuf> {
+pub fn archive_staged_file(file: &Path, store_path: &Path) -> Result<RawArchiveResult> {
     let hash = hash_file(file)?;
     let destination = raw_relative_path(file, &hash)?;
     let absolute_destination = store_path.join(&destination);
@@ -42,11 +56,11 @@ pub fn archive_staged_file(file: &Path, store_path: &Path) -> Result<PathBuf> {
 
     if absolute_destination.exists() {
         fs::remove_file(file)?;
+        Ok(RawArchiveResult::AlreadyArchived(destination))
     } else {
         fs::rename(file, &absolute_destination)?;
+        Ok(RawArchiveResult::Archived(destination))
     }
-
-    Ok(destination)
 }
 
 fn raw_relative_path(file: &Path, hash: &str) -> Result<PathBuf> {
@@ -79,12 +93,12 @@ mod tests {
         let staged = root.join("temp").join("photo.jpg");
         fs::write(&staged, b"image-bytes").unwrap();
 
-        let relative = archive_staged_file(&staged, &root).unwrap();
-        let absolute = root.join(&relative);
+        let result = archive_staged_file(&staged, &root).unwrap();
+        let absolute = root.join(result.relative_path());
 
         assert!(absolute.is_file());
         assert!(!staged.exists());
-        assert!(relative.starts_with("raw"));
+        assert!(result.relative_path().starts_with("raw"));
 
         let _ = fs::remove_dir_all(&root);
     }

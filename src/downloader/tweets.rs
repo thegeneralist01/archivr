@@ -277,7 +277,10 @@ fn archive_asset_reference(
     }
 
     let relative_path = local::archive_staged_file(&absolute_path, store_path)?;
-    let relative_path = relative_path.to_string_lossy().replace('\\', "/");
+    let relative_path = relative_path
+        .relative_path()
+        .to_string_lossy()
+        .replace('\\', "/");
     archived_assets.insert(key, relative_path.clone());
 
     Ok(relative_path)
