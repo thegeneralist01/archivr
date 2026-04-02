@@ -12,22 +12,16 @@ use std::{
 
 use super::local;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TweetArchiveMode {
-    Tweet,
-    Thread,
+fn parse_tweet_id(id: &str) -> Option<String> {
+    if !id.is_empty() && id.chars().all(|char| char.is_ascii_digit()) {
+        Some(id.to_string())
+    } else {
+        None
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TweetArchiveRequest {
-    pub tweet_id: String,
-    pub mode: TweetArchiveMode,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TweetArchiveResult {
-    Archived(PathBuf),
-    Skipped(PathBuf),
+fn tweet_id_from_path(path: &str) -> Option<String> {
+    path.split(':').next_back().and_then(parse_tweet_id)
 }
 
 fn resolve_from_cwd(path: PathBuf, cwd: &Path) -> PathBuf {
@@ -39,14 +33,15 @@ fn resolve_from_cwd(path: PathBuf, cwd: &Path) -> PathBuf {
 }
 
 fn build_scraper_args(
-    request: &TweetArchiveRequest,
+    tweet_id: &str,
+    thread: bool,
     output_dir: &Path,
     temp_dir: &Path,
     credentials_file: &Path,
 ) -> Vec<String> {
     let mut args = vec![
         "--tweet-ids".to_string(),
-        request.tweet_id.clone(),
+        tweet_id.to_string(),
         "--output-dir".to_string(),
         output_dir.display().to_string(),
         "--media-dir".to_string(),
@@ -56,34 +51,29 @@ fn build_scraper_args(
         credentials_file.display().to_string(),
     ];
 
-    match request.mode {
-        TweetArchiveMode::Tweet => {
-            args.push("--no-recursive".to_string());
-        }
-        TweetArchiveMode::Thread => {
-            args.push("--recursive-replied-to-tweets".to_string());
-            args.push("--recursive-replied-to-tweets-quotes-retweets".to_string());
-            args.push("--download-replied-to-tweets-media".to_string());
-        }
+    if thread {
+        args.push("--recursive-replied-to-tweets".to_string());
+        args.push("--recursive-replied-to-tweets-quotes-retweets".to_string());
+        args.push("--download-replied-to-tweets-media".to_string());
+    } else {
+        args.push("--no-recursive".to_string());
     }
 
     args
 }
 
-pub fn archive(
-    request: &TweetArchiveRequest,
-    store_path: &Path,
-    timestamp: &str,
-) -> Result<TweetArchiveResult> {
+pub fn archive(path: &str, thread: bool, store_path: &Path, timestamp: &str) -> Result<bool> {
     let invocation_cwd = env::current_dir().context("Failed to read current working directory")?;
     let output_dir = store_path.join("raw_tweets");
     let temp_dir = store_path.join("temp").join(timestamp).join("tweets");
+    let tweet_id = tweet_id_from_path(path).context("Invalid tweet ID")?;
+
     fs::create_dir_all(&output_dir)?;
     fs::create_dir_all(&temp_dir)?;
 
-    let root_toml = output_dir.join(format!("tweet-{}.toml", request.tweet_id));
-    if request.mode == TweetArchiveMode::Tweet && root_toml.exists() {
-        return Ok(TweetArchiveResult::Skipped(output_dir));
+    let root_toml = output_dir.join(format!("tweet-{tweet_id}.toml"));
+    if !thread && root_toml.exists() {
+        return Ok(false);
     }
 
     let before = tweet_toml_files(&output_dir)?;
@@ -113,7 +103,7 @@ pub fn archive(
 
     let mut cmd = Command::new(&python);
     cmd.current_dir(&temp_dir).arg(&scraper_path);
-    for arg in build_scraper_args(request, &output_dir, &temp_dir, &credentials_file) {
+    for arg in build_scraper_args(&tweet_id, thread, &output_dir, &temp_dir, &credentials_file) {
         cmd.arg(arg);
     }
 
@@ -151,7 +141,7 @@ pub fn archive(
     rewrite_tweet_outputs(&new_tomls, &output_dir, &temp_dir, store_path)?;
     let _ = fs::remove_dir_all(store_path.join("temp").join(timestamp));
 
-    Ok(TweetArchiveResult::Archived(output_dir))
+    Ok(true)
 }
 
 fn cleanup_summary(output_dir: &Path) -> Result<()> {
@@ -164,9 +154,11 @@ fn cleanup_summary(output_dir: &Path) -> Result<()> {
 
 fn tweet_toml_files(output_dir: &Path) -> Result<HashSet<PathBuf>> {
     let mut files = HashSet::new();
+
     for entry in fs::read_dir(output_dir)? {
         let entry = entry?;
         let path = entry.path();
+
         if path.is_file()
             && path
                 .file_name()
@@ -176,6 +168,7 @@ fn tweet_toml_files(output_dir: &Path) -> Result<HashSet<PathBuf>> {
             files.insert(path);
         }
     }
+
     Ok(files)
 }
 
@@ -212,6 +205,7 @@ fn rewrite_tweet_outputs(
             store_path,
             &mut archived_assets,
         )?;
+
         if rewritten != contents {
             fs::write(path, rewritten)?;
         }
@@ -277,10 +271,7 @@ fn archive_asset_reference(
     }
 
     let relative_path = local::archive_staged_file(&absolute_path, store_path)?;
-    let relative_path = relative_path
-        .relative_path()
-        .to_string_lossy()
-        .replace('\\', "/");
+    let relative_path = relative_path.to_string_lossy().replace('\\', "/");
     archived_assets.insert(key, relative_path.clone());
 
     Ok(relative_path)
@@ -290,7 +281,6 @@ fn archive_asset_reference(
 mod tests {
     use super::*;
     use std::{
-        env, fs,
         sync::MutexGuard,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -323,10 +313,8 @@ mod tests {
     #[test]
     fn test_build_scraper_args_for_single_tweet() {
         let args = build_scraper_args(
-            &TweetArchiveRequest {
-                tweet_id: "1234567890".to_string(),
-                mode: TweetArchiveMode::Tweet,
-            },
+            "1234567890",
+            false,
             Path::new("/tmp/raw_tweets"),
             Path::new("/tmp/temp/tweets"),
             Path::new("/tmp/twitter-creds.txt"),
@@ -338,7 +326,6 @@ mod tests {
         assert!(args.contains(&"--download-media".to_string()));
         assert!(args.contains(&"--credentials-file".to_string()));
         assert!(args.contains(&"--no-recursive".to_string()));
-        assert!(!args.contains(&"--no-download-avatars".to_string()));
         assert!(!args.contains(&"--recursive-replied-to-tweets".to_string()));
         assert!(!args.contains(&"--recursive-replied-to-tweets-quotes-retweets".to_string()));
         assert!(!args.contains(&"--download-replied-to-tweets-media".to_string()));
@@ -347,10 +334,8 @@ mod tests {
     #[test]
     fn test_build_scraper_args_for_thread() {
         let args = build_scraper_args(
-            &TweetArchiveRequest {
-                tweet_id: "1234567890".to_string(),
-                mode: TweetArchiveMode::Thread,
-            },
+            "1234567890",
+            true,
             Path::new("/tmp/raw_tweets"),
             Path::new("/tmp/temp/tweets"),
             Path::new("/tmp/twitter-creds.txt"),
@@ -459,17 +444,9 @@ avatar_local_path = "../temp/ts/tweets/media/avatars/avatar.jpg"
         fs::write(&credentials, "ct0=test;auth_token=test").unwrap();
         set_test_env("ARCHIVR_TWITTER_CREDENTIALS_FILE", &credentials);
 
-        let result = archive(
-            &TweetArchiveRequest {
-                tweet_id: "123".to_string(),
-                mode: TweetArchiveMode::Tweet,
-            },
-            &store_path,
-            "ts",
-        )
-        .unwrap();
+        let archived = archive("tweet:123", false, &store_path, "ts").unwrap();
 
-        assert_eq!(result, TweetArchiveResult::Skipped(output_dir));
+        assert!(!archived);
 
         remove_test_env("ARCHIVR_TWITTER_CREDENTIALS_FILE");
         let _ = fs::remove_dir_all(store_path);
@@ -532,7 +509,7 @@ EOF
 "#,
         )
         .unwrap();
-        std::process::Command::new("chmod")
+        Command::new("chmod")
             .arg("+x")
             .arg(&script)
             .status()
@@ -542,20 +519,11 @@ EOF
         set_test_env("ARCHIVR_TWEET_SCRAPER", &script);
         set_test_env("ARCHIVR_TWEET_PYTHON", "/bin/sh");
 
-        let result = archive(
-            &TweetArchiveRequest {
-                tweet_id: "123".to_string(),
-                mode: TweetArchiveMode::Tweet,
-            },
-            &store_path,
-            "ts",
-        )
-        .unwrap();
-
+        let archived = archive("tweet:123", false, &store_path, "ts").unwrap();
         let tweet_file = output_dir.join("tweet-123.toml");
         let contents = fs::read_to_string(&tweet_file).unwrap();
 
-        assert_eq!(result, TweetArchiveResult::Archived(output_dir.clone()));
+        assert!(archived);
         assert!(tweet_file.exists());
         assert!(!output_dir.join("scraping_summary.toml").exists());
         assert!(contents.contains(r#"avatar_local_path = "raw/"#));

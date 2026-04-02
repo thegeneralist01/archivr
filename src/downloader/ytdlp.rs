@@ -1,11 +1,9 @@
 use anyhow::{Context, Result, bail};
-use std::{
-    env,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{env, path::Path, process::Command};
 
-pub fn download(path: String, store_path: &Path, timestamp: &str) -> Result<PathBuf> {
+use crate::hash::hash_file;
+
+pub fn download(path: String, store_path: &Path, timestamp: &String) -> Result<String> {
     println!("Downloading with yt-dlp: {path}");
 
     let ytdlp = env::var("ARCHIVR_YT_DLP").unwrap_or_else(|_| "yt-dlp".to_string());
@@ -31,5 +29,5 @@ pub fn download(path: String, store_path: &Path, timestamp: &str) -> Result<Path
         bail!("yt-dlp failed: {stderr}");
     }
 
-    Ok(out_file)
+    hash_file(&out_file)
 }
