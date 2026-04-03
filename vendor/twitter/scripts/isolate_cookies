@@ -1,0 +1,13 @@
+#!/usr/bin/env python
+cookie_str = input("Input your cookies in the Header String format: ")
+
+cookie_dict = dict(item.split("=", 1) for item in cookie_str.split(";"))
+
+output_cookies = {}
+auth_token = cookie_dict['auth_token']
+ct0 = cookie_dict['ct0']
+
+login_string = f"auth_token={auth_token};ct0={ct0}"
+
+with open("creds.txt", "w") as file:
+    file.write(login_string)
