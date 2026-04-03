@@ -9,6 +9,7 @@ use std::{
 
 mod downloader;
 mod hash;
+mod twitter;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -83,17 +84,8 @@ enum Source {
     Other,
 }
 
-/// Returns the tweet ID when `id` is non-empty and contains only ASCII digits.
-fn parse_tweet_id(id: &str) -> Option<String> {
-    if !id.is_empty() && id.chars().all(|char| char.is_ascii_digit()) {
-        Some(id.to_string())
-    } else {
-        None
-    }
-}
+use crate::twitter::parse_tweet_id;
 
-// TODO: Get rid of this somehow, probably encoding the ID logic into a struct.
-// TODO: Error handling for inputs?
 fn expand_shorthand_to_url(path: &str, source: &Source) -> String {
     if *source == Source::X && (path.starts_with("tweet:media:") || path.starts_with("x:media:")) {
         return format!(

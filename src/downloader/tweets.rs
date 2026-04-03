@@ -10,16 +10,9 @@ use std::{
     sync::OnceLock,
 };
 
-use super::local;
+use crate::twitter::parse_tweet_id;
 
-/// Returns `Some(id)` if `id` is a non-empty string of ASCII digits, otherwise `None`.
-fn parse_tweet_id(id: &str) -> Option<String> {
-    if !id.is_empty() && id.chars().all(|char| char.is_ascii_digit()) {
-        Some(id.to_string())
-    } else {
-        None
-    }
-}
+use super::store;
 
 /// Extracts a tweet ID from an archivr path like `"tweet:123"` by taking the
 /// last colon-separated segment and validating it as a numeric ID.
@@ -303,7 +296,7 @@ fn archive_asset_reference(
         );
     }
 
-    let relative_path = local::archive_staged_file(&absolute_path, store_path)?;
+    let relative_path = store::archive_staged_file(&absolute_path, store_path)?;
     let relative_path = relative_path.to_string_lossy().replace('\\', "/");
     archived_assets.insert(key, relative_path.clone());
 
