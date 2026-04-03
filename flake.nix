@@ -29,37 +29,6 @@
         system:
         let
           pkgs = import nixpkgs { inherit system; };
-          pyPkgs = pkgs.python312Packages;
-          twitterApiClient = pyPkgs.buildPythonPackage rec {
-            pname = "twitter-api-client";
-            version = "0.10.22";
-            format = "setuptools";
-            src = pkgs.fetchPypi {
-              pname = "twitter_api_client";
-              inherit version;
-              hash = "sha256-S5KzQRDIQroc2bJsPLaKR9xocHKniqd9Z055CsC5rbQ=";
-            };
-            nativeBuildInputs = [ pyPkgs.setuptools pyPkgs.wheel ];
-            propagatedBuildInputs = [
-              pyPkgs.aiofiles
-              pyPkgs."nest-asyncio"
-              pyPkgs.httpx
-              pyPkgs.tqdm
-              pyPkgs.orjson
-              pyPkgs.m3u8
-              pyPkgs.websockets
-              pyPkgs.uvloop
-            ];
-            pythonImportsCheck = [ "twitter" ];
-            doCheck = false;
-          };
-          tweetPython = pkgs.python312.withPackages (
-            ps: [
-              ps.tomlkit
-              ps."tomli-w"
-              twitterApiClient
-            ]
-          );
           archivr_unwrapped = pkgs.rustPlatform.buildRustPackage {
             pname = "archivr";
             version = "0.1.0";
@@ -73,24 +42,18 @@
             nativeBuildInputs = [ pkgs.makeWrapper ];
             buildInputs = [
               pkgs.yt-dlp
-              tweetPython
             ];
             phases = [ "installPhase" ];
             installPhase = ''
-              mkdir -p $out/bin $out/libexec/archivr
+              mkdir -p $out/bin
               cp -r ${archivr_unwrapped}/bin/* $out/bin/
-              cp ${./vendor/twitter/scrape_user_tweet_contents.py} $out/libexec/archivr/scrape_user_tweet_contents.py
-              chmod +x $out/libexec/archivr/scrape_user_tweet_contents.py
               for f in $out/bin/*; do
                 mv "$f" "$f.orig"
                 makeWrapper "$f.orig" "$f" \
                   --set ARCHIVR_YT_DLP ${pkgs.yt-dlp}/bin/yt-dlp \
-                  --set ARCHIVR_TWEET_PYTHON ${tweetPython}/bin/python3 \
-                  --set ARCHIVR_TWEET_SCRAPER $out/libexec/archivr/scrape_user_tweet_contents.py \
                   --prefix PATH : ${
                     lib.makeBinPath [
                       pkgs.yt-dlp
-                      tweetPython
                     ]
                   }
               done
@@ -108,49 +71,16 @@
         system:
         let
           pkgs = import nixpkgs { inherit system; };
-          pyPkgs = pkgs.python312Packages;
-          twitterApiClient = pyPkgs.buildPythonPackage rec {
-            pname = "twitter-api-client";
-            version = "0.10.22";
-            format = "setuptools";
-            src = pkgs.fetchPypi {
-              pname = "twitter_api_client";
-              inherit version;
-              hash = "sha256-S5KzQRDIQroc2bJsPLaKR9xocHKniqd9Z055CsC5rbQ=";
-            };
-            nativeBuildInputs = [ pyPkgs.setuptools pyPkgs.wheel ];
-            propagatedBuildInputs = [
-              pyPkgs.aiofiles
-              pyPkgs."nest-asyncio"
-              pyPkgs.httpx
-              pyPkgs.tqdm
-              pyPkgs.orjson
-              pyPkgs.m3u8
-              pyPkgs.websockets
-              pyPkgs.uvloop
-            ];
-            pythonImportsCheck = [ "twitter" ];
-            doCheck = false;
-          };
-          tweetPython = pkgs.python312.withPackages (
-            ps: [
-              ps.tomlkit
-              ps."tomli-w"
-              twitterApiClient
-            ]
-          );
         in
         {
           default = pkgs.mkShell {
             buildInputs = [
               pkgs.yt-dlp
               pkgs.nushell
-              pkgs.uv
-              tweetPython
             ];
             shellHook = ''
               export SHELL=${pkgs.nushell}/bin/nu
-              echo "nushell dev shell active – yt-dlp, uv, and tweet scraper Python on PATH"
+              echo "nushell dev shell active – yt-dlp on PATH"
               nu
             '';
           };
