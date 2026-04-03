@@ -8,6 +8,9 @@
 !src
 !src/**
 
+!vendor
+!vendor/**
+
 !flake.nix
 !flake.lock
 
