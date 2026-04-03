@@ -83,6 +83,7 @@ enum Source {
     Other,
 }
 
+/// Returns the tweet ID when `id` is non-empty and contains only ASCII digits.
 fn parse_tweet_id(id: &str) -> Option<String> {
     if !id.is_empty() && id.chars().all(|char| char.is_ascii_digit()) {
         Some(id.to_string())
@@ -91,15 +92,16 @@ fn parse_tweet_id(id: &str) -> Option<String> {
     }
 }
 
-fn tweet_id_from_path(path: &str) -> Option<String> {
-    path.split(':').next_back().and_then(parse_tweet_id)
-}
-
-fn resolve_source_path(path: &str, source: &Source) -> String {
+// TODO: Get rid of this somehow, probably encoding the ID logic into a struct.
+// TODO: Error handling for inputs?
+fn expand_shorthand_to_url(path: &str, source: &Source) -> String {
     if *source == Source::X && path.starts_with("tweet:media:") {
         format!(
             "https://x.com/i/status/{}",
-            tweet_id_from_path(path).unwrap()
+            path.split(':')
+                .next_back()
+                .and_then(parse_tweet_id)
+                .unwrap()
         )
     } else {
         path.to_string()
@@ -394,7 +396,7 @@ fn main() -> Result<()> {
             }
 
             // Sources, for which yt-dlp is needed
-            let path = resolve_source_path(path, &source);
+            let path = expand_shorthand_to_url(path, &source);
             let hash = match source {
                 Source::YouTubeVideo
                 | Source::X
@@ -602,30 +604,13 @@ mod tests {
     }
 
     #[test]
-    fn test_tweet_id_from_path() {
-        assert_eq!(
-            tweet_id_from_path("tweet:1234567890"),
-            Some("1234567890".to_string())
-        );
-        assert_eq!(
-            tweet_id_from_path("tweet:media:1234567890"),
-            Some("1234567890".to_string())
-        );
-        assert_eq!(
-            tweet_id_from_path("x:thread:1234567890"),
-            Some("1234567890".to_string())
-        );
-        assert_eq!(tweet_id_from_path("tweet:not-a-number"), None);
-    }
-
-    #[test]
     fn test_resolve_source_path() {
         assert_eq!(
-            resolve_source_path("tweet:media:1234567890", &Source::X),
+            expand_shorthand_to_url("tweet:media:1234567890", &Source::X),
             "https://x.com/i/status/1234567890"
         );
         assert_eq!(
-            resolve_source_path("tweet:1234567890", &Source::Tweet),
+            expand_shorthand_to_url("tweet:1234567890", &Source::Tweet),
             "tweet:1234567890"
         );
     }
