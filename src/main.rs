@@ -9,6 +9,7 @@ use std::{
 
 mod downloader;
 mod hash;
+mod twitter;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -35,6 +36,8 @@ enum Command {
         ///   temp/
         ///     ...
         ///   raw/
+        ///     ...
+        ///   raw_tweets/
         ///     ...
         ///   structured/
         ///     ...
@@ -64,12 +67,14 @@ fn get_archive_path() -> Option<PathBuf> {
     None
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Source {
     YouTubeVideo,
     YouTubePlaylist,
     YouTubeChannel,
     X,
+    Tweet,
+    TweetThread,
     Instagram,
     Facebook,
     TikTok,
@@ -77,6 +82,41 @@ enum Source {
     Snapchat,
     Local,
     Other,
+}
+
+use crate::twitter::parse_tweet_id;
+
+fn expand_shorthand_to_url(path: &str, source: &Source) -> String {
+    if *source == Source::X && (path.starts_with("tweet:media:") || path.starts_with("x:media:")) {
+        return format!(
+            "https://x.com/i/status/{}",
+            path.split(':')
+                .next_back()
+                .and_then(parse_tweet_id)
+                .unwrap()
+        );
+    }
+
+    if let Some(path) = path.strip_prefix("instagram:") {
+        if let Some(id) = path.strip_prefix("reel:") {
+            return format!("https://www.instagram.com/reel/{id}");
+        }
+        return format!("https://www.instagram.com/{path}");
+    }
+    if let Some(path) = path.strip_prefix("facebook:") {
+        return format!("https://www.facebook.com/{path}");
+    }
+    if let Some(path) = path.strip_prefix("tiktok:") {
+        return format!("https://www.tiktok.com/{path}");
+    }
+    if let Some(path) = path.strip_prefix("reddit:") {
+        return format!("https://www.reddit.com/{path}");
+    }
+    if let Some(path) = path.strip_prefix("snapchat:") {
+        return format!("https://www.snapchat.com/{path}");
+    }
+
+    path.to_string()
 }
 
 // INFO: yt-dlp supports a lot of sites; so, when archiving (for example) a website, the user
@@ -114,9 +154,50 @@ fn determine_source(path: &str) -> Source {
         }
     }
 
-    // Shorthand schemes: x: or twitter:
-    if path.starts_with("x:") || path.starts_with("twitter:") {
-        return Source::X;
+    // Shorthand schemes: tweet:, x:, or twitter:
+    if let Some(after_scheme) = path
+        .strip_prefix("x:")
+        .or_else(|| path.strip_prefix("twitter:"))
+        .or_else(|| path.strip_prefix("tweet:"))
+    {
+        // For this scope, in comments, N is an alias for a string of type ('twitter' | 'x' | 'tweet').
+
+        // N:media:id
+        if after_scheme.starts_with("media:")
+            && after_scheme
+                .strip_prefix("media:")
+                .and_then(parse_tweet_id)
+                .is_some()
+        {
+            return Source::X;
+        }
+
+        // N:tweet:id or N:x:id
+        if after_scheme
+            .strip_prefix("tweet:")
+            .or_else(|| after_scheme.strip_prefix("x:"))
+            .and_then(parse_tweet_id)
+            .is_some()
+        {
+            return Source::Tweet;
+        }
+
+        // N:thread:id
+        if after_scheme
+            .strip_prefix("thread:")
+            .and_then(parse_tweet_id)
+            .is_some()
+        {
+            return Source::TweetThread;
+        }
+
+        // N:id
+        if parse_tweet_id(after_scheme).is_some() {
+            return Source::Tweet;
+        }
+
+        // N:non-id
+        return Source::Other;
     }
 
     // Shorthand schemes for other yt-dlp extractors
@@ -260,27 +341,31 @@ fn move_temp_to_raw(file: &Path, hash: &String, store_path: &Path) -> Result<()>
     Ok(())
 }
 
+fn initialize_store_directories(store_path: &Path) -> Result<()> {
+    fs::create_dir_all(store_path.join("raw"))?;
+    fs::create_dir_all(store_path.join("raw_tweets"))?;
+    fs::create_dir_all(store_path.join("structured"))?;
+    fs::create_dir_all(store_path.join("temp"))?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
         Command::Archive { ref path } => {
-            let archive_path = get_archive_path();
-            if get_archive_path().is_none() {
-                eprintln!("Not in an archive. Use 'archivr init' to create one.");
-                process::exit(1);
-            }
+            let archive_path = match get_archive_path() {
+                Some(path) => path,
+                None => {
+                    eprintln!("Not in an archive. Use 'archivr init' to create one.");
+                    process::exit(1);
+                }
+            };
 
             // let download_id = uuid::Uuid::new_v4();
             let timestamp = Local::now().format("%Y-%m-%dT%H-%M-%S%.3f").to_string();
 
-            let source = determine_source(path);
-            if let Source::Other = source {
-                eprintln!("Archiving from this source is not yet implemented.");
-                process::exit(1);
-            }
-
-            let store_path_string_file = archive_path.unwrap().join("store_path");
+            let store_path_string_file = archive_path.join("store_path");
             let store_path = match fs::read_to_string(store_path_string_file) {
                 Ok(p) => PathBuf::from(p.trim()),
                 Err(e) => {
@@ -289,6 +374,46 @@ fn main() -> Result<()> {
                 }
             };
 
+            let source = determine_source(path);
+
+            // Sources: Tweets or Twitter Threads
+            match source {
+                Source::Other => {
+                    eprintln!("Archiving from this source is not yet implemented.");
+                    process::exit(1);
+                }
+                Source::Tweet | Source::TweetThread => {
+                    match downloader::tweets::archive(
+                        path,
+                        source == Source::TweetThread,
+                        &store_path,
+                        &timestamp,
+                    ) {
+                        Ok(true) => {
+                            println!(
+                                "Tweet archived successfully to {}",
+                                store_path.join("raw_tweets").display()
+                            );
+                            return Ok(());
+                        }
+                        Ok(false) => {
+                            println!(
+                                "Tweet already archived in {}",
+                                store_path.join("raw_tweets").display()
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to archive tweet: {e}");
+                            process::exit(1);
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            // Sources, for which yt-dlp is needed
+            let path = expand_shorthand_to_url(path, &source);
             let hash = match source {
                 Source::YouTubeVideo
                 | Source::X
@@ -417,9 +542,7 @@ fn main() -> Result<()> {
                 archive_path.join("store_path"),
                 store_path.canonicalize().unwrap().to_str().unwrap(),
             );
-            fs::create_dir_all(store_path.join("raw")).unwrap();
-            fs::create_dir_all(store_path.join("structured")).unwrap();
-            fs::create_dir_all(store_path.join("tmp")).unwrap();
+            initialize_store_directories(&store_path).unwrap();
 
             println!("Initialized empty archive in {}", archive_path.display());
 
@@ -431,10 +554,110 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     struct TestCase<'a> {
         url: &'a str,
         expected: Source,
+    }
+
+    #[test]
+    fn test_tweet_sources() {
+        let cases = [
+            TestCase {
+                url: "tweet:1234567890",
+                expected: Source::Tweet,
+            },
+            TestCase {
+                url: "x:tweet:1234567890",
+                expected: Source::Tweet,
+            },
+            TestCase {
+                url: "x:x:1234567890",
+                expected: Source::Tweet,
+            },
+            TestCase {
+                url: "twitter:x:1234567890",
+                expected: Source::Tweet,
+            },
+            TestCase {
+                url: "twitter:tweet:1234567890",
+                expected: Source::Tweet,
+            },
+            TestCase {
+                url: "tweet:media:1234567890",
+                expected: Source::X,
+            },
+            TestCase {
+                url: "x:media:1234567890",
+                expected: Source::X,
+            },
+            TestCase {
+                url: "x:thread:1234567890",
+                expected: Source::TweetThread,
+            },
+            TestCase {
+                url: "twitter:thread:1234567890",
+                expected: Source::TweetThread,
+            },
+            TestCase {
+                url: "tweet:thread:1234567890",
+                expected: Source::TweetThread,
+            },
+            TestCase {
+                url: "tweet:not-a-number",
+                expected: Source::Other,
+            },
+            TestCase {
+                url: "tweet:media:not-a-number",
+                expected: Source::Other,
+            },
+            TestCase {
+                url: "x:media:not-a-number",
+                expected: Source::Other,
+            },
+        ];
+
+        for case in &cases {
+            assert_eq!(
+                determine_source(case.url),
+                case.expected,
+                "Failed for URL: {}",
+                case.url
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_source_path() {
+        assert_eq!(
+            expand_shorthand_to_url("tweet:media:1234567890", &Source::X),
+            "https://x.com/i/status/1234567890"
+        );
+        assert_eq!(
+            expand_shorthand_to_url("instagram:reel/ABC123", &Source::Instagram),
+            "https://www.instagram.com/reel/ABC123"
+        );
+        assert_eq!(
+            expand_shorthand_to_url("facebook:watch?v=123456", &Source::Facebook),
+            "https://www.facebook.com/watch?v=123456"
+        );
+        assert_eq!(
+            expand_shorthand_to_url("tiktok:@someone/video/123456789", &Source::TikTok),
+            "https://www.tiktok.com/@someone/video/123456789"
+        );
+        assert_eq!(
+            expand_shorthand_to_url("reddit:r/videos/comments/abc123/example", &Source::Reddit),
+            "https://www.reddit.com/r/videos/comments/abc123/example"
+        );
+        assert_eq!(
+            expand_shorthand_to_url("snapchat:discover/some-story/1234567890", &Source::Snapchat),
+            "https://www.snapchat.com/discover/some-story/1234567890"
+        );
+        assert_eq!(
+            expand_shorthand_to_url("tweet:1234567890", &Source::Tweet),
+            "tweet:1234567890"
+        );
     }
 
     #[test]
@@ -582,11 +805,11 @@ mod tests {
             },
             TestCase {
                 url: "x:1234567890",
-                expected: Source::X,
+                expected: Source::Tweet,
             },
             TestCase {
                 url: "twitter:1234567890",
-                expected: Source::X,
+                expected: Source::Tweet,
             },
         ];
 
@@ -684,5 +907,23 @@ mod tests {
                 case.url
             );
         }
+    }
+
+    #[test]
+    fn test_initialize_store_directories() {
+        let store_path = env::temp_dir().join(format!(
+            "archivr-test-{}",
+            Local::now().format("%Y%m%d%H%M%S%3f")
+        ));
+
+        initialize_store_directories(&store_path).unwrap();
+
+        assert!(store_path.join("raw").is_dir());
+        assert!(store_path.join("raw_tweets").is_dir());
+        assert!(store_path.join("structured").is_dir());
+        assert!(store_path.join("temp").is_dir());
+        assert!(!store_path.join("tmp").exists());
+
+        fs::remove_dir_all(store_path).unwrap();
     }
 }
