@@ -95,17 +95,36 @@ fn parse_tweet_id(id: &str) -> Option<String> {
 // TODO: Get rid of this somehow, probably encoding the ID logic into a struct.
 // TODO: Error handling for inputs?
 fn expand_shorthand_to_url(path: &str, source: &Source) -> String {
-    if *source == Source::X && path.starts_with("tweet:media:") {
-        format!(
+    if *source == Source::X && (path.starts_with("tweet:media:") || path.starts_with("x:media:")) {
+        return format!(
             "https://x.com/i/status/{}",
             path.split(':')
                 .next_back()
                 .and_then(parse_tweet_id)
                 .unwrap()
-        )
-    } else {
-        path.to_string()
+        );
     }
+
+    if let Some(path) = path.strip_prefix("instagram:") {
+        if let Some(id) = path.strip_prefix("reel:") {
+            return format!("https://www.instagram.com/reel/{id}");
+        }
+        return format!("https://www.instagram.com/{path}");
+    }
+    if let Some(path) = path.strip_prefix("facebook:") {
+        return format!("https://www.facebook.com/{path}");
+    }
+    if let Some(path) = path.strip_prefix("tiktok:") {
+        return format!("https://www.tiktok.com/{path}");
+    }
+    if let Some(path) = path.strip_prefix("reddit:") {
+        return format!("https://www.reddit.com/{path}");
+    }
+    if let Some(path) = path.strip_prefix("snapchat:") {
+        return format!("https://www.snapchat.com/{path}");
+    }
+
+    path.to_string()
 }
 
 // INFO: yt-dlp supports a lot of sites; so, when archiving (for example) a website, the user
@@ -144,7 +163,14 @@ fn determine_source(path: &str) -> Source {
     }
 
     // Shorthand schemes: tweet:, x:, or twitter:
-    if let Some(after_scheme) = path.strip_prefix("tweet:") {
+    if let Some(after_scheme) = path
+        .strip_prefix("x:")
+        .or_else(|| path.strip_prefix("twitter:"))
+        .or_else(|| path.strip_prefix("tweet:"))
+    {
+        // For this scope, in comments, N is an alias for a string of type ('twitter' | 'x' | 'tweet').
+
+        // N:media:id
         if after_scheme.starts_with("media:")
             && after_scheme
                 .strip_prefix("media:")
@@ -154,23 +180,7 @@ fn determine_source(path: &str) -> Source {
             return Source::X;
         }
 
-        if parse_tweet_id(after_scheme).is_some() {
-            return Source::Tweet;
-        }
-    }
-
-    if let Some(after_scheme) = path
-        .strip_prefix("x:")
-        .or_else(|| path.strip_prefix("twitter:"))
-    {
-        if after_scheme
-            .strip_prefix("thread:")
-            .and_then(parse_tweet_id)
-            .is_some()
-        {
-            return Source::TweetThread;
-        }
-
+        // N:tweet:id or N:x:id
         if after_scheme
             .strip_prefix("tweet:")
             .or_else(|| after_scheme.strip_prefix("x:"))
@@ -180,7 +190,22 @@ fn determine_source(path: &str) -> Source {
             return Source::Tweet;
         }
 
-        return Source::X;
+        // N:thread:id
+        if after_scheme
+            .strip_prefix("thread:")
+            .and_then(parse_tweet_id)
+            .is_some()
+        {
+            return Source::TweetThread;
+        }
+
+        // N:id
+        if parse_tweet_id(after_scheme).is_some() {
+            return Source::Tweet;
+        }
+
+        // N:non-id
+        return Source::Other;
     }
 
     // Shorthand schemes for other yt-dlp extractors
@@ -572,6 +597,10 @@ mod tests {
                 expected: Source::X,
             },
             TestCase {
+                url: "x:media:1234567890",
+                expected: Source::X,
+            },
+            TestCase {
                 url: "x:thread:1234567890",
                 expected: Source::TweetThread,
             },
@@ -581,7 +610,7 @@ mod tests {
             },
             TestCase {
                 url: "tweet:thread:1234567890",
-                expected: Source::Other,
+                expected: Source::TweetThread,
             },
             TestCase {
                 url: "tweet:not-a-number",
@@ -589,6 +618,10 @@ mod tests {
             },
             TestCase {
                 url: "tweet:media:not-a-number",
+                expected: Source::Other,
+            },
+            TestCase {
+                url: "x:media:not-a-number",
                 expected: Source::Other,
             },
         ];
@@ -608,6 +641,26 @@ mod tests {
         assert_eq!(
             expand_shorthand_to_url("tweet:media:1234567890", &Source::X),
             "https://x.com/i/status/1234567890"
+        );
+        assert_eq!(
+            expand_shorthand_to_url("instagram:reel/ABC123", &Source::Instagram),
+            "https://www.instagram.com/reel/ABC123"
+        );
+        assert_eq!(
+            expand_shorthand_to_url("facebook:watch?v=123456", &Source::Facebook),
+            "https://www.facebook.com/watch?v=123456"
+        );
+        assert_eq!(
+            expand_shorthand_to_url("tiktok:@someone/video/123456789", &Source::TikTok),
+            "https://www.tiktok.com/@someone/video/123456789"
+        );
+        assert_eq!(
+            expand_shorthand_to_url("reddit:r/videos/comments/abc123/example", &Source::Reddit),
+            "https://www.reddit.com/r/videos/comments/abc123/example"
+        );
+        assert_eq!(
+            expand_shorthand_to_url("snapchat:discover/some-story/1234567890", &Source::Snapchat),
+            "https://www.snapchat.com/discover/some-story/1234567890"
         );
         assert_eq!(
             expand_shorthand_to_url("tweet:1234567890", &Source::Tweet),
@@ -760,11 +813,11 @@ mod tests {
             },
             TestCase {
                 url: "x:1234567890",
-                expected: Source::X,
+                expected: Source::Tweet,
             },
             TestCase {
                 url: "twitter:1234567890",
-                expected: Source::X,
+                expected: Source::Tweet,
             },
         ];
 

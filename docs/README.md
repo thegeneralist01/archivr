@@ -15,13 +15,14 @@ An open-source self-hosted archiving tool. Work in progress.
     - [x] Snapchat
     - [ ] YouTube Posts (postponed)
   - [x] Archiving local files
+  - [x] Archiving Twitter Tweets & Threads
   - [ ] Archiving files from cloud storage services (Google Drive, Dropbox, OneDrive) and from URLs
     - [ ] URLs
     - [ ] Google Drive
     - [ ] Dropbox
     - [ ] OneDrive
     - (Some of these could be postponed for later.)
-  - [x] Archiving Twitter threads
+  - [ ] Archiving Twitter articles
   - [ ] Archive web pages (HTML, CSS, JS, images)
   - [ ] Archiving emails (???)
     - [ ] Gmail
