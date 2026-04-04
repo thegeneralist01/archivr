@@ -64,7 +64,7 @@ fn build_scraper_args(
 /// Archives a tweet (or full thread) identified by `path` (e.g. `"tweet:123"`).
 ///
 /// Invokes the Python scraper, then moves all produced media assets into the
-/// content-addressed raw store and rewrites the TOML output to use the new
+/// content-addressed raw store and rewrites the JSON output to use the new
 /// store-relative paths. Returns `true` if new content was archived, `false`
 /// if the tweet was already present and `thread` is `false`.
 ///
@@ -72,7 +72,7 @@ fn build_scraper_args(
 /// can be overridden via `ARCHIVR_TWEET_SCRAPER` and `ARCHIVR_TWEET_PYTHON`.
 pub fn archive(path: &str, thread: bool, store_path: &Path, timestamp: &str) -> Result<bool> {
     let invocation_cwd = env::current_dir().context("Failed to read current working directory")?;
-    // Output directory for Tweet TOML files.
+    // Output directory for Tweet JSON files.
     let output_dir = store_path.join("raw_tweets");
     // Temporary directory for media assets downloaded by the scraper in `temp/...`.
     let temp_dir = store_path.join("temp").join(timestamp).join("tweets");
@@ -81,13 +81,13 @@ pub fn archive(path: &str, thread: bool, store_path: &Path, timestamp: &str) -> 
     fs::create_dir_all(&output_dir)?;
     fs::create_dir_all(&temp_dir)?;
 
-    // Path to the root - the to-be-archived tweet's TOML file.
-    let root_toml = output_dir.join(format!("tweet-{tweet_id}.toml"));
-    if !thread && root_toml.exists() {
+    // Path to the root - the to-be-archived tweet's JSON file.
+    let root_json = output_dir.join(format!("tweet-{tweet_id}.json"));
+    if !thread && root_json.exists() {
         return Ok(false);
     }
 
-    let before = tweet_toml_files(&output_dir)?;
+    let before = tweet_json_files(&output_dir)?;
 
     let python = env::var_os("ARCHIVR_TWEET_PYTHON").unwrap_or_else(|| OsString::from("python3"));
     let scraper_path = env::var_os("ARCHIVR_TWEET_SCRAPER")
@@ -135,37 +135,37 @@ pub fn archive(path: &str, thread: bool, store_path: &Path, timestamp: &str) -> 
         );
     }
 
-    if !root_toml.exists() {
+    if !root_json.exists() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         bail!(
-            "Tweet scraper completed but did not create expected TOML file: {}\nstdout:\n{}\nstderr:\n{}",
-            root_toml.display(),
+            "Tweet scraper completed but did not create expected JSON file: {}\nstdout:\n{}\nstderr:\n{}",
+            root_json.display(),
             stdout.trim(),
             stderr.trim()
         );
     }
 
     cleanup_summary(&output_dir)?;
-    let after = tweet_toml_files(&output_dir)?;
-    let new_tomls = new_tweet_tomls(&before, &after);
-    rewrite_tweet_outputs(&new_tomls, &output_dir, &temp_dir, store_path)?;
+    let after = tweet_json_files(&output_dir)?;
+    let new_jsons = new_tweet_jsons(&before, &after);
+    rewrite_tweet_outputs(&new_jsons, &output_dir, &temp_dir, store_path)?;
     let _ = fs::remove_dir_all(store_path.join("temp").join(timestamp));
 
     Ok(true)
 }
 
-/// Removes the `scraping_summary.toml` file left by the scraper, if present.
+/// Removes the `scraping_summary.json` file left by the scraper, if present.
 fn cleanup_summary(output_dir: &Path) -> Result<()> {
-    let summary_path = output_dir.join("scraping_summary.toml");
+    let summary_path = output_dir.join("scraping_summary.json");
     if summary_path.exists() {
         fs::remove_file(summary_path)?;
     }
     Ok(())
 }
 
-/// Returns the set of `tweet-*.toml` files present in `output_dir`.
-fn tweet_toml_files(output_dir: &Path) -> Result<HashSet<PathBuf>> {
+/// Returns the set of `tweet-*.json` files present in `output_dir`.
+fn tweet_json_files(output_dir: &Path) -> Result<HashSet<PathBuf>> {
     let mut files = HashSet::new();
 
     for entry in fs::read_dir(output_dir)? {
@@ -176,7 +176,7 @@ fn tweet_toml_files(output_dir: &Path) -> Result<HashSet<PathBuf>> {
             && path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("tweet-") && name.ends_with(".toml"))
+                .is_some_and(|name| name.starts_with("tweet-") && name.ends_with(".json"))
         {
             files.insert(path);
         }
@@ -185,38 +185,38 @@ fn tweet_toml_files(output_dir: &Path) -> Result<HashSet<PathBuf>> {
     Ok(files)
 }
 
-/// Returns the sorted list of TOML files present in `after` but not in `before`.
-fn new_tweet_tomls(before: &HashSet<PathBuf>, after: &HashSet<PathBuf>) -> Vec<PathBuf> {
+/// Returns the sorted list of JSON files present in `after` but not in `before`.
+fn new_tweet_jsons(before: &HashSet<PathBuf>, after: &HashSet<PathBuf>) -> Vec<PathBuf> {
     let mut files = after.difference(before).cloned().collect::<Vec<_>>();
     files.sort();
     files
 }
 
-/// Returns a lazily-compiled regex matching `avatar_local_path = "..."` in TOML.
+/// Returns a lazily-compiled regex matching `"avatar_local_path": "..."` in JSON.
 fn avatar_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r#"avatar_local_path = "([^"\n]+)""#).unwrap())
+    REGEX.get_or_init(|| Regex::new(r#""avatar_local_path": "([^"\n]+)""#).unwrap())
 }
 
-/// Returns a lazily-compiled regex matching `local_path = "..."` in TOML.
+/// Returns a lazily-compiled regex matching `"local_path": "..."` in JSON.
 fn media_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r#"(?m)\blocal_path = "([^"\n]+)""#).unwrap())
+    REGEX.get_or_init(|| Regex::new(r#"(?m)"local_path": "([^"\n]+)""#).unwrap())
 }
 
-/// Rewrites asset paths in each newly-created TOML file, moving assets into
+/// Rewrites asset paths in each newly-created JSON file, moving assets into
 /// the content-addressed store. Files are written back only if content changed.
 fn rewrite_tweet_outputs(
-    tweet_tomls: &[PathBuf],
+    tweet_jsons: &[PathBuf],
     output_dir: &Path,
     temp_dir: &Path,
     store_path: &Path,
 ) -> Result<()> {
     let mut archived_assets = HashMap::new();
 
-    for path in tweet_tomls {
+    for path in tweet_jsons {
         let contents = fs::read_to_string(path)?;
-        let rewritten = rewrite_toml_asset_paths(
+        let rewritten = rewrite_json_asset_paths(
             &contents,
             output_dir,
             temp_dir,
@@ -234,9 +234,9 @@ fn rewrite_tweet_outputs(
 
 /// Rewrites all `avatar_local_path` and `local_path` references in `contents`,
 /// archiving each referenced file into the raw store and returning the updated
-/// TOML string. `archived_assets` is a cache to avoid re-archiving the same
+/// JSON string. `archived_assets` is a cache to avoid re-archiving the same
 /// file when it is referenced by multiple tweets.
-fn rewrite_toml_asset_paths(
+fn rewrite_json_asset_paths(
     contents: &str,
     output_dir: &Path,
     temp_dir: &Path,
@@ -250,8 +250,8 @@ fn rewrite_toml_asset_paths(
         let new_path =
             archive_asset_reference(&old_path, output_dir, store_path, "avatar", archived_assets)?;
         rewritten = rewritten.replace(
-            &format!(r#"avatar_local_path = "{old_path}""#),
-            &format!(r#"avatar_local_path = "{new_path}""#),
+            &format!(r#""avatar_local_path": "{old_path}""#),
+            &format!(r#""avatar_local_path": "{new_path}""#),
         );
     }
 
@@ -260,8 +260,8 @@ fn rewrite_toml_asset_paths(
         let new_path =
             archive_asset_reference(&old_path, temp_dir, store_path, "media", archived_assets)?;
         rewritten = rewritten.replace(
-            &format!(r#"local_path = "{old_path}""#),
-            &format!(r#"local_path = "{new_path}""#),
+            &format!(r#""local_path": "{old_path}""#),
+            &format!(r#""local_path": "{new_path}""#),
         );
     }
 
@@ -377,19 +377,19 @@ mod tests {
     fn test_cleanup_summary_removes_summary_only() {
         let output_dir = unique_path("archivr-tweet-summary");
         fs::create_dir_all(&output_dir).unwrap();
-        fs::write(output_dir.join("scraping_summary.toml"), "summary").unwrap();
-        fs::write(output_dir.join("tweet-1.toml"), "tweet").unwrap();
+        fs::write(output_dir.join("scraping_summary.json"), "summary").unwrap();
+        fs::write(output_dir.join("tweet-1.json"), "tweet").unwrap();
 
         cleanup_summary(&output_dir).unwrap();
 
-        assert!(!output_dir.join("scraping_summary.toml").exists());
-        assert!(output_dir.join("tweet-1.toml").exists());
+        assert!(!output_dir.join("scraping_summary.json").exists());
+        assert!(output_dir.join("tweet-1.json").exists());
 
         let _ = fs::remove_dir_all(output_dir);
     }
 
     #[test]
-    fn test_rewrite_toml_asset_paths_rearchives_assets() {
+    fn test_rewrite_json_asset_paths_rearchives_assets() {
         let store_path = unique_path("archivr-tweet-store");
         let output_dir = store_path.join("raw_tweets");
         let temp_dir = store_path.join("temp").join("ts").join("tweets");
@@ -408,15 +408,12 @@ mod tests {
         )
         .unwrap();
 
-        let contents = r#"
-[entities]
-media = [{ local_path = "media/123/media_1.jpg" }]
+        let contents = r#"{
+  "entities": { "media": [{ "local_path": "media/123/media_1.jpg" }] },
+  "author": { "avatar_local_path": "../temp/ts/tweets/media/avatars/avatar.jpg" }
+}"#;
 
-[author]
-avatar_local_path = "../temp/ts/tweets/media/avatars/avatar.jpg"
-"#;
-
-        let rewritten = rewrite_toml_asset_paths(
+        let rewritten = rewrite_json_asset_paths(
             contents,
             &output_dir,
             &temp_dir,
@@ -425,8 +422,8 @@ avatar_local_path = "../temp/ts/tweets/media/avatars/avatar.jpg"
         )
         .unwrap();
 
-        assert!(rewritten.contains(r#"avatar_local_path = "raw/"#));
-        assert!(rewritten.contains(r#"local_path = "raw/"#));
+        assert!(rewritten.contains(r#""avatar_local_path": "raw/"#));
+        assert!(rewritten.contains(r#""local_path": "raw/"#));
         assert!(
             !temp_dir
                 .join("media")
@@ -464,7 +461,7 @@ avatar_local_path = "../temp/ts/tweets/media/avatars/avatar.jpg"
         let output_dir = store_path.join("raw_tweets");
         fs::create_dir_all(&output_dir).unwrap();
         fs::create_dir_all(store_path.join("temp")).unwrap();
-        fs::write(output_dir.join("tweet-123.toml"), "id = \"123\"").unwrap();
+        fs::write(output_dir.join("tweet-123.json"), r#"{"id":"123"}"#).unwrap();
 
         let credentials = store_path.join("creds.txt");
         fs::write(&credentials, "ct0=test;auth_token=test").unwrap();
@@ -522,15 +519,13 @@ done
 mkdir -p "$output_dir" "$media_dir/avatars" "$media_dir/$tweet_id"
 printf 'avatar' > "$media_dir/avatars/author.jpg"
 printf 'media' > "$media_dir/$tweet_id/media_1.jpg"
-printf 'summary = true\n' > "$output_dir/scraping_summary.toml"
-cat > "$output_dir/tweet-$tweet_id.toml" <<EOF
-id = "$tweet_id"
-
-[entities]
-media = [{ local_path = "media/$tweet_id/media_1.jpg" }]
-
-[author]
-avatar_local_path = "../temp/ts/tweets/media/avatars/author.jpg"
+printf '{"summary":true}\n' > "$output_dir/scraping_summary.json"
+cat > "$output_dir/tweet-$tweet_id.json" <<EOF
+{
+  "id": "$tweet_id",
+  "entities": { "media": [{ "local_path": "media/$tweet_id/media_1.jpg" }] },
+  "author": { "avatar_local_path": "../temp/ts/tweets/media/avatars/author.jpg" }
+}
 EOF
 "#,
         )
@@ -546,14 +541,14 @@ EOF
         set_test_env("ARCHIVR_TWEET_PYTHON", "/bin/sh");
 
         let archived = archive("tweet:123", false, &store_path, "ts").unwrap();
-        let tweet_file = output_dir.join("tweet-123.toml");
+        let tweet_file = output_dir.join("tweet-123.json");
         let contents = fs::read_to_string(&tweet_file).unwrap();
 
         assert!(archived);
         assert!(tweet_file.exists());
-        assert!(!output_dir.join("scraping_summary.toml").exists());
-        assert!(contents.contains(r#"avatar_local_path = "raw/"#));
-        assert!(contents.contains(r#"local_path = "raw/"#));
+        assert!(!output_dir.join("scraping_summary.json").exists());
+        assert!(contents.contains(r#""avatar_local_path": "raw/"#));
+        assert!(contents.contains(r#""local_path": "raw/"#));
         assert!(!store_path.join("temp").join("ts").exists());
 
         remove_test_env("ARCHIVR_TWITTER_CREDENTIALS_FILE");

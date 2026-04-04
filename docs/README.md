@@ -62,7 +62,7 @@ This project aims to provide a reliable solution for archiving important data fr
 - Local files: `file:///absolute/path/to/file.ext`
 - YouTube media: standard video/short URLs, plus [shorthand video inputs](#supported-shorthand-inputs)
 - X/Twitter media from Tweets: normal Tweet URLs or the `tweet:media:ID` shorthand
-- X/Twitter Tweet content scrape: [Tweet and Thread shorthands](#supported-shorthand-inputs). (These are saved as TOML files in `raw_tweets/`)
+- X/Twitter Tweet content scrape: [Tweet and Thread shorthands](#supported-shorthand-inputs). (These are saved as JSON files in `raw_tweets/`)
 - Instagram, Facebook, TikTok, Reddit, Snapchat: direct URLs or platform-prefixed shorthand passed through to `yt-dlp`
 
 ### Supported Shorthand Inputs
@@ -73,7 +73,7 @@ This project aims to provide a reliable solution for archiving important data fr
   - `yt:short/ID`
   - `yt:shorts/ID`
   - `youtube:shorts/ID`
-- X/Twitter tweet TOML content:
+- X/Twitter tweet JSON content:
   - `tweet:ID`
   - `x:tweet:ID`
   - `x:x:ID`
@@ -81,7 +81,7 @@ This project aims to provide a reliable solution for archiving important data fr
   - `twitter:tweet:ID`
 - X/Twitter media/video download:
   - `tweet:media:ID`
-- X/Twitter thread TOML content:
+- X/Twitter thread JSON content:
   - `x:thread:ID`
   - `twitter:thread:ID`
 - Other platform shorthands:
