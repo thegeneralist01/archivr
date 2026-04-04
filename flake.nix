@@ -39,7 +39,10 @@
               inherit version;
               hash = "sha256-S5KzQRDIQroc2bJsPLaKR9xocHKniqd9Z055CsC5rbQ=";
             };
-            nativeBuildInputs = [ pyPkgs.setuptools pyPkgs.wheel ];
+            nativeBuildInputs = [
+              pyPkgs.setuptools
+              pyPkgs.wheel
+            ];
             propagatedBuildInputs = [
               pyPkgs.aiofiles
               pyPkgs."nest-asyncio"
@@ -53,13 +56,9 @@
             pythonImportsCheck = [ "twitter" ];
             doCheck = false;
           };
-          tweetPython = pkgs.python312.withPackages (
-            ps: [
-              ps.tomlkit
-              ps."tomli-w"
-              twitterApiClient
-            ]
-          );
+          tweetPython = pkgs.python312.withPackages (ps: [
+            twitterApiClient
+          ]);
           archivr_unwrapped = pkgs.rustPlatform.buildRustPackage {
             pname = "archivr";
             version = "0.1.0";
@@ -118,7 +117,10 @@
               inherit version;
               hash = "sha256-S5KzQRDIQroc2bJsPLaKR9xocHKniqd9Z055CsC5rbQ=";
             };
-            nativeBuildInputs = [ pyPkgs.setuptools pyPkgs.wheel ];
+            nativeBuildInputs = [
+              pyPkgs.setuptools
+              pyPkgs.wheel
+            ];
             propagatedBuildInputs = [
               pyPkgs.aiofiles
               pyPkgs."nest-asyncio"
@@ -132,13 +134,9 @@
             pythonImportsCheck = [ "twitter" ];
             doCheck = false;
           };
-          tweetPython = pkgs.python312.withPackages (
-            ps: [
-              ps.tomlkit
-              ps."tomli-w"
-              twitterApiClient
-            ]
-          );
+          tweetPython = pkgs.python312.withPackages (ps: [
+            twitterApiClient
+          ]);
         in
         {
           default = pkgs.mkShell {
