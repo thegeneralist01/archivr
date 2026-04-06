@@ -481,8 +481,14 @@ def extract_tweet_data(
     # Extract legacy data (main tweet content)
     legacy = tweet_result.get("legacy", {})
 
-    # Extract full text (bare)
-    tweet_data["full_text"] = legacy.get("full_text", "")
+    # Extract full text (bare) - prefer note_tweet text when present, as legacy.full_text is truncated for long tweets
+    note_tweet_text = (
+        tweet_result.get("note_tweet", {})
+        .get("note_tweet_results", {})
+        .get("result", {})
+        .get("text")
+    )
+    tweet_data["full_text"] = note_tweet_text if note_tweet_text else legacy.get("full_text", "")
 
     # Extract is_quote_status (bare)
     tweet_data["is_quote_status"] = legacy.get("is_quote_status", False)
