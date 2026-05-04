@@ -1,12 +1,14 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Local;
 use clap::{Parser, Subcommand};
 use std::{
+    collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
     process,
 };
 
+mod database;
 mod downloader;
 mod hash;
 mod twitter;
@@ -349,6 +351,298 @@ fn initialize_store_directories(store_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn raw_relative_path_from_hash(hash: &str, file_extension: &str) -> Result<PathBuf> {
+    let mut chars = hash.chars();
+    let first_letter = chars.next().context("hash must not be empty")?;
+    let second_letter = chars
+        .next()
+        .context("hash must be at least two characters")?;
+
+    Ok(PathBuf::from("raw")
+        .join(first_letter.to_string())
+        .join(second_letter.to_string())
+        .join(format!("{hash}{file_extension}")))
+}
+
+fn path_to_store_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn extension_without_dot(file_extension: &str) -> Option<String> {
+    file_extension
+        .strip_prefix('.')
+        .filter(|extension| !extension.is_empty())
+        .map(|extension| extension.to_string())
+}
+
+fn blob_record_for_raw_relpath(
+    store_path: &Path,
+    raw_relpath: &Path,
+) -> Result<database::BlobRecord> {
+    let absolute_path = store_path.join(raw_relpath);
+    let file_name = raw_relpath
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("raw artifact path must have a UTF-8 file name")?;
+    let (sha256, extension) = match file_name.rsplit_once('.') {
+        Some((hash, extension)) => (hash.to_string(), Some(extension.to_string())),
+        None => (file_name.to_string(), None),
+    };
+
+    Ok(database::BlobRecord {
+        sha256,
+        byte_size: fs::metadata(&absolute_path)
+            .with_context(|| format!("failed to stat raw artifact {}", absolute_path.display()))?
+            .len() as i64,
+        mime_type: None,
+        extension,
+        raw_relpath: path_to_store_string(raw_relpath),
+    })
+}
+
+fn source_metadata(source: Source) -> (&'static str, &'static str, &'static str) {
+    match source {
+        Source::YouTubeVideo => ("youtube", "video", "video"),
+        Source::YouTubePlaylist => ("youtube", "playlist", "container"),
+        Source::YouTubeChannel => ("youtube", "channel", "container"),
+        Source::X => ("x", "post", "video"),
+        Source::Tweet => ("x", "tweet", "tweet_json"),
+        Source::TweetThread => ("x", "tweet_thread", "tweet_json"),
+        Source::Instagram => ("instagram", "post", "video"),
+        Source::Facebook => ("facebook", "post", "video"),
+        Source::TikTok => ("tiktok", "video", "video"),
+        Source::Reddit => ("reddit", "post", "video"),
+        Source::Snapchat => ("snapchat", "story", "video"),
+        Source::Local => ("local", "file", "file"),
+        Source::Other => ("other", "unknown", "unknown"),
+    }
+}
+
+fn local_file_extension(path: &str) -> String {
+    Path::new(path.trim_start_matches("file://"))
+        .extension()
+        .map_or(String::new(), |ext| format!(".{}", ext.to_string_lossy()))
+}
+
+fn media_file_extension(source: Source, path: &str) -> String {
+    match source {
+        Source::YouTubeVideo
+        | Source::X
+        | Source::Instagram
+        | Source::Facebook
+        | Source::TikTok
+        | Source::Reddit
+        | Source::Snapchat => ".mp4".to_string(),
+        Source::Local => local_file_extension(path),
+        _ => String::new(),
+    }
+}
+
+fn tweet_id_from_archive_path(path: &str) -> Option<String> {
+    path.split(':').next_back().and_then(parse_tweet_id)
+}
+
+fn create_structured_root(store_path: &Path, entry: &database::ArchivedEntry) -> Result<()> {
+    debug_assert!(entry.entry_uid.starts_with("entry_"));
+    fs::create_dir_all(store_path.join(&entry.structured_root_relpath))?;
+    Ok(())
+}
+
+fn record_media_entry(
+    conn: &rusqlite::Connection,
+    store_path: &Path,
+    user_id: i64,
+    run: &database::ArchiveRun,
+    item: &database::ArchiveRunItem,
+    requested_locator: &str,
+    canonical_locator: &str,
+    source: Source,
+    hash: &str,
+    file_extension: &str,
+    byte_size: i64,
+) -> Result<database::ArchivedEntry> {
+    debug_assert!(run.run_uid.starts_with("run_"));
+    debug_assert!(item.item_uid.starts_with("item_"));
+    let (source_kind, entity_kind, representation_kind) = source_metadata(source);
+    let raw_relpath = raw_relative_path_from_hash(hash, file_extension)?;
+    let blob = database::BlobRecord {
+        sha256: hash.to_string(),
+        byte_size,
+        mime_type: None,
+        extension: extension_without_dot(file_extension),
+        raw_relpath: path_to_store_string(&raw_relpath),
+    };
+    let blob_id = database::upsert_blob(conn, &blob)?;
+    let source_identity_id = database::upsert_source_identity(
+        conn,
+        source_kind,
+        entity_kind,
+        None,
+        Some(canonical_locator),
+        canonical_locator,
+    )?;
+    let entry = database::create_archived_entry(
+        conn,
+        &database::NewEntry {
+            source_identity_id,
+            archive_run_id: run.id,
+            parent_entry_id: None,
+            root_entry_id: None,
+            created_by_user_id: user_id,
+            owned_by_user_id: user_id,
+            source_kind: source_kind.to_string(),
+            entity_kind: entity_kind.to_string(),
+            title: None,
+            visibility: "private".to_string(),
+            representation_kind: representation_kind.to_string(),
+            source_metadata_json: format!(
+                r#"{{"requested_locator":"{}","canonical_locator":"{}"}}"#,
+                json_escape(requested_locator),
+                json_escape(canonical_locator)
+            ),
+            display_metadata_json: None,
+        },
+    )?;
+    create_structured_root(store_path, &entry)?;
+    database::add_entry_artifact(
+        conn,
+        &database::NewArtifact {
+            entry_id: entry.id,
+            artifact_role: "primary_media".to_string(),
+            storage_area: "raw".to_string(),
+            relpath: blob.raw_relpath,
+            blob_id: Some(blob_id),
+            logical_path: None,
+            metadata_json: None,
+        },
+    )?;
+    database::complete_archive_run_item(conn, item.id, entry.id)?;
+    database::finish_archive_run(conn, run.id)?;
+    Ok(entry)
+}
+
+fn record_tweet_entry(
+    conn: &rusqlite::Connection,
+    store_path: &Path,
+    user_id: i64,
+    run: &database::ArchiveRun,
+    item: &database::ArchiveRunItem,
+    requested_locator: &str,
+    source: Source,
+    tweet_id: &str,
+) -> Result<database::ArchivedEntry> {
+    debug_assert!(run.run_uid.starts_with("run_"));
+    debug_assert!(item.item_uid.starts_with("item_"));
+    let (source_kind, entity_kind, representation_kind) = source_metadata(source);
+    let canonical_locator = format!("https://x.com/i/status/{tweet_id}");
+    let source_identity_id = database::upsert_source_identity(
+        conn,
+        source_kind,
+        entity_kind,
+        Some(tweet_id),
+        Some(&canonical_locator),
+        &canonical_locator,
+    )?;
+    let entry = database::create_archived_entry(
+        conn,
+        &database::NewEntry {
+            source_identity_id,
+            archive_run_id: run.id,
+            parent_entry_id: None,
+            root_entry_id: None,
+            created_by_user_id: user_id,
+            owned_by_user_id: user_id,
+            source_kind: source_kind.to_string(),
+            entity_kind: entity_kind.to_string(),
+            title: None,
+            visibility: "private".to_string(),
+            representation_kind: representation_kind.to_string(),
+            source_metadata_json: format!(
+                r#"{{"tweet_id":"{}","requested_locator":"{}"}}"#,
+                json_escape(tweet_id),
+                json_escape(requested_locator)
+            ),
+            display_metadata_json: None,
+        },
+    )?;
+    create_structured_root(store_path, &entry)?;
+
+    let tweet_json_relpath = PathBuf::from("raw_tweets").join(format!("tweet-{tweet_id}.json"));
+    database::add_entry_artifact(
+        conn,
+        &database::NewArtifact {
+            entry_id: entry.id,
+            artifact_role: "raw_tweet_json".to_string(),
+            storage_area: "raw_tweets".to_string(),
+            relpath: path_to_store_string(&tweet_json_relpath),
+            blob_id: None,
+            logical_path: None,
+            metadata_json: None,
+        },
+    )?;
+
+    let tweet_json = fs::read_to_string(store_path.join(&tweet_json_relpath))?;
+    for (role, raw_relpath) in tweet_raw_artifacts(&tweet_json) {
+        let raw_path = PathBuf::from(&raw_relpath);
+        let blob = blob_record_for_raw_relpath(store_path, &raw_path)?;
+        let blob_id = database::upsert_blob(conn, &blob)?;
+        database::add_entry_artifact(
+            conn,
+            &database::NewArtifact {
+                entry_id: entry.id,
+                artifact_role: role,
+                storage_area: "raw".to_string(),
+                relpath: raw_relpath,
+                blob_id: Some(blob_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )?;
+    }
+
+    database::complete_archive_run_item(conn, item.id, entry.id)?;
+    database::finish_archive_run(conn, run.id)?;
+    Ok(entry)
+}
+
+fn tweet_raw_artifacts(tweet_json: &str) -> Vec<(String, String)> {
+    let regex = regex::Regex::new(r#""(avatar_local_path|local_path)": "([^"\n]+)""#).unwrap();
+    let mut seen = HashSet::new();
+    let mut artifacts = Vec::new();
+
+    for captures in regex.captures_iter(tweet_json) {
+        let relpath = captures[2].to_string();
+        if !relpath.starts_with("raw/") || !seen.insert(relpath.clone()) {
+            continue;
+        }
+
+        let role = if &captures[1] == "avatar_local_path" {
+            "avatar"
+        } else {
+            "media"
+        };
+        artifacts.push((role.to_string(), relpath));
+    }
+
+    artifacts
+}
+
+fn json_escape(input: &str) -> String {
+    input.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn fail_archive_and_exit(
+    conn: &rusqlite::Connection,
+    run: &database::ArchiveRun,
+    item: &database::ArchiveRunItem,
+    message: &str,
+) -> ! {
+    let _ = database::fail_archive_run_item(conn, item.id, message);
+    let _ = database::fail_archive_run(conn, run.id, message);
+    eprintln!("{message}");
+    process::exit(1);
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -375,14 +669,42 @@ fn main() -> Result<()> {
             };
 
             let source = determine_source(path);
+            let (source_kind, entity_kind, _) = source_metadata(source);
+            let conn = database::open_or_initialize(&archive_path)?;
+            let user_id = database::ensure_default_user(&conn)?;
+            let run = database::create_archive_run(&conn, user_id, 1)?;
+            let item = database::create_archive_run_item(
+                &conn,
+                run.id,
+                None,
+                0,
+                path,
+                None,
+                source_kind,
+                entity_kind,
+            )?;
 
             // Sources: Tweets or Twitter Threads
             match source {
                 Source::Other => {
-                    eprintln!("Archiving from this source is not yet implemented.");
-                    process::exit(1);
+                    fail_archive_and_exit(
+                        &conn,
+                        &run,
+                        &item,
+                        "Archiving from this source is not yet implemented.",
+                    );
                 }
                 Source::Tweet | Source::TweetThread => {
+                    let tweet_id = match tweet_id_from_archive_path(path) {
+                        Some(tweet_id) => tweet_id,
+                        None => fail_archive_and_exit(
+                            &conn,
+                            &run,
+                            &item,
+                            "Failed to archive tweet: invalid tweet ID",
+                        ),
+                    };
+
                     match downloader::tweets::archive(
                         path,
                         source == Source::TweetThread,
@@ -390,6 +712,16 @@ fn main() -> Result<()> {
                         &timestamp,
                     ) {
                         Ok(true) => {
+                            record_tweet_entry(
+                                &conn,
+                                &store_path,
+                                user_id,
+                                &run,
+                                &item,
+                                path,
+                                source,
+                                &tweet_id,
+                            )?;
                             println!(
                                 "Tweet archived successfully to {}",
                                 store_path.join("raw_tweets").display()
@@ -397,6 +729,16 @@ fn main() -> Result<()> {
                             return Ok(());
                         }
                         Ok(false) => {
+                            record_tweet_entry(
+                                &conn,
+                                &store_path,
+                                user_id,
+                                &run,
+                                &item,
+                                path,
+                                source,
+                                &tweet_id,
+                            )?;
                             println!(
                                 "Tweet already archived in {}",
                                 store_path.join("raw_tweets").display()
@@ -404,8 +746,12 @@ fn main() -> Result<()> {
                             return Ok(());
                         }
                         Err(e) => {
-                            eprintln!("Failed to archive tweet: {e}");
-                            process::exit(1);
+                            fail_archive_and_exit(
+                                &conn,
+                                &run,
+                                &item,
+                                &format!("Failed to archive tweet: {e}"),
+                            );
                         }
                     }
                 }
@@ -413,6 +759,7 @@ fn main() -> Result<()> {
             }
 
             // Sources, for which yt-dlp is needed
+            let requested_path = path.to_string();
             let path = expand_shorthand_to_url(path, &source);
             let hash = match source {
                 Source::YouTubeVideo
@@ -425,8 +772,12 @@ fn main() -> Result<()> {
                     match downloader::ytdlp::download(path.clone(), &store_path, &timestamp) {
                         Ok(h) => h,
                         Err(e) => {
-                            eprintln!("Failed to download from YouTube: {e}");
-                            process::exit(1);
+                            fail_archive_and_exit(
+                                &conn,
+                                &run,
+                                &item,
+                                &format!("Failed to download media: {e}"),
+                            );
                         }
                     }
                 }
@@ -434,29 +785,34 @@ fn main() -> Result<()> {
                     match downloader::local::save(path.clone(), &store_path, &timestamp) {
                         Ok(h) => h,
                         Err(e) => {
-                            eprintln!("Failed to archive local file: {e}");
-                            process::exit(1);
+                            fail_archive_and_exit(
+                                &conn,
+                                &run,
+                                &item,
+                                &format!("Failed to archive local file: {e}"),
+                            );
                         }
                     }
+                }
+                Source::YouTubePlaylist | Source::YouTubeChannel => {
+                    fail_archive_and_exit(
+                        &conn,
+                        &run,
+                        &item,
+                        "Playlist and channel container expansion are not yet implemented.",
+                    );
                 }
                 _ => unreachable!(),
             };
 
-            let file_extension = match source {
-                Source::YouTubeVideo
-                | Source::X
-                | Source::Instagram
-                | Source::Facebook
-                | Source::TikTok
-                | Source::Reddit
-                | Source::Snapchat => ".mp4",
-                Source::Local => {
-                    let p = Path::new(path.trim_start_matches("file://"));
-                    &p.extension()
-                        .map_or(String::new(), |ext| format!(".{}", ext.to_string_lossy()))
-                }
-                _ => "",
-            };
+            let file_extension = media_file_extension(source, &path);
+            let temp_file = store_path
+                .join("temp")
+                .join(&timestamp)
+                .join(format!("{timestamp}{file_extension}"));
+            let byte_size = fs::metadata(&temp_file)
+                .with_context(|| format!("failed to stat staged file {}", temp_file.display()))?
+                .len() as i64;
 
             let hash_exists = hash_exists(format!("{hash}{file_extension}"), &store_path);
 
@@ -490,9 +846,19 @@ fn main() -> Result<()> {
                 println!("File archived successfully.");
             }
 
-            // TODO: DB INSERT, inserting a record
-            // https://github.com/rusqlite/rusqlite
-            // Think of the DB schema
+            record_media_entry(
+                &conn,
+                &store_path,
+                user_id,
+                &run,
+                &item,
+                &requested_path,
+                &path,
+                source,
+                &hash,
+                &file_extension,
+                byte_size,
+            )?;
 
             Ok(())
         }
@@ -543,6 +909,8 @@ fn main() -> Result<()> {
                 store_path.canonicalize().unwrap().to_str().unwrap(),
             );
             initialize_store_directories(&store_path).unwrap();
+            let conn = database::open_or_initialize(&archive_path)?;
+            let _ = database::ensure_default_user(&conn)?;
 
             println!("Initialized empty archive in {}", archive_path.display());
 
