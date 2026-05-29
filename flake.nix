@@ -63,7 +63,7 @@
             pname = "archivr";
             version = "0.1.0";
             src = pkgs.lib.cleanSource ./.;
-            cargoHash = "sha256-4m+4SMYA/rJ0eHEOc32zA2VdZI1pqzB5NenD0R0f2zM=";
+            cargoHash = "";
             nativeBuildInputs = [ pkgs.pkg-config ];
           };
           archivr = pkgs.stdenv.mkDerivation {
