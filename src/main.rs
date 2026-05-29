@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Local;
 use clap::{Parser, Subcommand};
+use serde_json::json;
 use std::{
     collections::HashSet,
     env, fs,
@@ -495,11 +496,11 @@ fn record_media_entry(
             title: None,
             visibility: "private".to_string(),
             representation_kind: representation_kind.to_string(),
-            source_metadata_json: format!(
-                r#"{{"requested_locator":"{}","canonical_locator":"{}"}}"#,
-                json_escape(requested_locator),
-                json_escape(canonical_locator)
-            ),
+            source_metadata_json: json!({
+                "requested_locator": requested_locator,
+                "canonical_locator": canonical_locator
+            })
+            .to_string(),
             display_metadata_json: None,
         },
     )?;
@@ -557,11 +558,11 @@ fn record_tweet_entry(
             title: None,
             visibility: "private".to_string(),
             representation_kind: representation_kind.to_string(),
-            source_metadata_json: format!(
-                r#"{{"tweet_id":"{}","requested_locator":"{}"}}"#,
-                json_escape(tweet_id),
-                json_escape(requested_locator)
-            ),
+            source_metadata_json: json!({
+                "tweet_id": tweet_id,
+                "requested_locator": requested_locator
+            })
+            .to_string(),
             display_metadata_json: None,
         },
     )?;
@@ -625,10 +626,6 @@ fn tweet_raw_artifacts(tweet_json: &str) -> Vec<(String, String)> {
     }
 
     artifacts
-}
-
-fn json_escape(input: &str) -> String {
-    input.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn fail_archive_and_exit(
