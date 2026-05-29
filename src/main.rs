@@ -57,17 +57,17 @@ enum Command {
     },
 }
 
-fn get_archive_path() -> Option<PathBuf> {
-    let mut dir = env::current_dir().unwrap();
+fn get_archive_path() -> Result<Option<PathBuf>> {
+    let mut dir = env::current_dir().context("failed to read current working directory")?;
     loop {
         if dir.join(".archivr").is_dir() {
-            return Some(dir.join(".archivr"));
+            return Ok(Some(dir.join(".archivr")));
         }
         if !dir.pop() {
             break;
         }
     }
-    None
+    Ok(None)
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -91,13 +91,9 @@ use crate::twitter::parse_tweet_id;
 
 fn expand_shorthand_to_url(path: &str, source: &Source) -> String {
     if *source == Source::X && (path.starts_with("tweet:media:") || path.starts_with("x:media:")) {
-        return format!(
-            "https://x.com/i/status/{}",
-            path.split(':')
-                .next_back()
-                .and_then(parse_tweet_id)
-                .unwrap()
-        );
+        if let Some(tweet_id) = path.split(':').next_back().and_then(parse_tweet_id) {
+            return format!("https://x.com/i/status/{tweet_id}");
+        }
     }
 
     if let Some(path) = path.strip_prefix("instagram:") {
@@ -294,52 +290,26 @@ fn determine_source(path: &str) -> Source {
     Source::Other
 }
 
-fn hash_exists(filename: String, store_path: &Path) -> bool {
-    let mut chars = filename.chars();
-    let first_letter = chars.next().unwrap();
-    let second_letter = chars.next().unwrap();
-
-    let path = store_path
-        .join("raw")
-        .join(first_letter.to_string())
-        .join(second_letter.to_string())
-        .join(filename);
+fn hash_exists(hash: &str, file_extension: &str, store_path: &Path) -> Result<bool> {
+    let path = store_path.join(raw_relative_path_from_hash(hash, file_extension)?);
 
     println!("Checking {}", path.display());
 
-    path.exists()
+    Ok(path.exists())
 }
 
-fn move_temp_to_raw(file: &Path, hash: &String, store_path: &Path) -> Result<()> {
-    let mut chars = hash.chars();
-    let first_letter = chars.next().unwrap().to_string();
-    let second_letter = chars.next().unwrap().to_string();
+fn move_temp_to_raw(file: &Path, hash: &str, store_path: &Path) -> Result<()> {
     let file_extension = file
         .extension()
         .map_or(String::new(), |ext| format!(".{}", ext.to_string_lossy()));
+    let raw_relpath = raw_relative_path_from_hash(hash, &file_extension)?;
+    let destination = store_path.join(raw_relpath);
 
-    fs::create_dir_all(
-        store_path
-            .join("raw")
-            .join(&first_letter)
-            .join(&second_letter),
-    )?;
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
 
-    fs::rename(
-        file,
-        store_path
-            .join("raw")
-            .join(&first_letter)
-            .join(&second_letter)
-            .join(format!(
-                "{hash}{}",
-                if file_extension.is_empty() {
-                    ""
-                } else {
-                    &file_extension
-                }
-            )),
-    )?;
+    fs::rename(file, destination)?;
 
     Ok(())
 }
@@ -582,7 +552,7 @@ fn record_tweet_entry(
     )?;
 
     let tweet_json = fs::read_to_string(store_path.join(&tweet_json_relpath))?;
-    for (role, raw_relpath) in tweet_raw_artifacts(&tweet_json) {
+    for (role, raw_relpath) in tweet_raw_artifacts(&tweet_json)? {
         let raw_path = PathBuf::from(&raw_relpath);
         let blob = blob_record_for_raw_relpath(store_path, &raw_path)?;
         let blob_id = database::upsert_blob(conn, &blob)?;
@@ -604,8 +574,8 @@ fn record_tweet_entry(
     Ok(entry)
 }
 
-fn tweet_raw_artifacts(tweet_json: &str) -> Vec<(String, String)> {
-    let regex = regex::Regex::new(r#""(avatar_local_path|local_path)": "([^"\n]+)""#).unwrap();
+fn tweet_raw_artifacts(tweet_json: &str) -> Result<Vec<(String, String)>> {
+    let regex = regex::Regex::new(r#""(avatar_local_path|local_path)": "([^"\n]+)""#)?;
     let mut seen = HashSet::new();
     let mut artifacts = Vec::new();
 
@@ -623,7 +593,7 @@ fn tweet_raw_artifacts(tweet_json: &str) -> Vec<(String, String)> {
         artifacts.push((role.to_string(), relpath));
     }
 
-    artifacts
+    Ok(artifacts)
 }
 
 fn fail_archive_and_exit(
@@ -643,7 +613,7 @@ fn main() -> Result<()> {
 
     match args.command {
         Command::Archive { ref path } => {
-            let archive_path = match get_archive_path() {
+            let archive_path = match get_archive_path()? {
                 Some(path) => path,
                 None => {
                     eprintln!("Not in an archive. Use 'archivr init' to create one.");
@@ -811,7 +781,7 @@ fn main() -> Result<()> {
                 .with_context(|| format!("failed to stat staged file {}", temp_file.display()))?
                 .len() as i64;
 
-            let hash_exists = hash_exists(format!("{hash}{file_extension}"), &store_path);
+            let hash_exists = hash_exists(&hash, &file_extension, &store_path)?;
 
             // TODO: check for repeated archives?
             // There could be one of the following:
@@ -869,7 +839,9 @@ fn main() -> Result<()> {
         } => {
             let archive_path = Path::new(&archive_path_string).join(".archivr");
             let store_path = if Path::new(&store_path_string).is_relative() {
-                env::current_dir().unwrap().join(store_path_string)
+                env::current_dir()
+                    .context("failed to read current working directory")?
+                    .join(store_path_string)
             } else {
                 Path::new(store_path_string).to_path_buf()
             };
@@ -899,14 +871,18 @@ fn main() -> Result<()> {
                 process::exit(1);
             }
 
-            fs::create_dir_all(&archive_path).unwrap();
-            fs::create_dir_all(&store_path).unwrap();
-            fs::write(archive_path.join("name"), archive_name).unwrap();
-            let _ = fs::write(
+            fs::create_dir_all(&archive_path)?;
+            fs::create_dir_all(&store_path)?;
+            fs::write(archive_path.join("name"), archive_name)?;
+            fs::write(
                 archive_path.join("store_path"),
-                store_path.canonicalize().unwrap().to_str().unwrap(),
-            );
-            initialize_store_directories(&store_path).unwrap();
+                store_path
+                    .canonicalize()
+                    .with_context(|| format!("failed to canonicalize {}", store_path.display()))?
+                    .to_str()
+                    .context("store path is not valid UTF-8")?,
+            )?;
+            initialize_store_directories(&store_path)?;
             let conn = database::open_or_initialize(&archive_path)?;
             let _ = database::ensure_default_user(&conn)?;
 
