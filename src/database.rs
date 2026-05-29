@@ -484,7 +484,7 @@ pub fn add_entry_artifact(conn: &Connection, artifact: &NewArtifact) -> Result<i
     Ok(conn.last_insert_rowid())
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn set_public_settings(
     conn: &Connection,
     public_index_enabled: bool,
@@ -506,7 +506,7 @@ pub fn set_public_settings(
     Ok(())
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn public_index_entry_count(conn: &Connection) -> Result<i64> {
     let count = conn.query_row(
         "SELECT COUNT(*)
@@ -521,7 +521,7 @@ pub fn public_index_entry_count(conn: &Connection) -> Result<i64> {
     Ok(count)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn main_archive_entry_count(conn: &Connection) -> Result<i64> {
     let count = conn.query_row(
         "SELECT COUNT(*) FROM archived_entries WHERE parent_entry_id IS NULL",
@@ -531,7 +531,7 @@ pub fn main_archive_entry_count(conn: &Connection) -> Result<i64> {
     Ok(count)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn create_taxonomy_path(conn: &Connection, full_path: &str) -> Result<i64> {
     let segments = normalized_taxonomy_segments(full_path)?;
     let mut parent_id = None;
@@ -573,7 +573,7 @@ pub fn create_taxonomy_path(conn: &Connection, full_path: &str) -> Result<i64> {
     Ok(current_id)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn assign_entry_to_taxonomy(conn: &Connection, entry_id: i64, node_id: i64) -> Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO entry_taxonomy_assignments (entry_id, node_id)
@@ -583,7 +583,7 @@ pub fn assign_entry_to_taxonomy(conn: &Connection, entry_id: i64, node_id: i64) 
     Ok(())
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn entry_count_for_taxonomy_path(conn: &Connection, full_path: &str) -> Result<i64> {
     let count = conn.query_row(
         "WITH RECURSIVE descendants(id) AS (
@@ -649,7 +649,7 @@ fn validate_visibility(visibility: &str) -> Result<()> {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn normalized_taxonomy_segments(full_path: &str) -> Result<Vec<&str>> {
     let segments = full_path
         .trim()
@@ -665,7 +665,7 @@ fn normalized_taxonomy_segments(full_path: &str) -> Result<Vec<&str>> {
     Ok(segments)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn humanize_slug(slug: &str) -> String {
     slug.split('-')
         .map(|part| {
