@@ -518,7 +518,6 @@ fn record_media_entry(
         },
     )?;
     database::complete_archive_run_item(conn, item.id, entry.id)?;
-    database::finish_archive_run(conn, run.id)?;
     Ok(entry)
 }
 
@@ -602,7 +601,6 @@ fn record_tweet_entry(
     }
 
     database::complete_archive_run_item(conn, item.id, entry.id)?;
-    database::finish_archive_run(conn, run.id)?;
     Ok(entry)
 }
 
@@ -719,6 +717,7 @@ fn main() -> Result<()> {
                                 source,
                                 &tweet_id,
                             )?;
+                            database::finish_archive_run(&conn, run.id)?;
                             println!(
                                 "Tweet archived successfully to {}",
                                 store_path.join("raw_tweets").display()
@@ -736,6 +735,7 @@ fn main() -> Result<()> {
                                 source,
                                 &tweet_id,
                             )?;
+                            database::finish_archive_run(&conn, run.id)?;
                             println!(
                                 "Tweet already archived in {}",
                                 store_path.join("raw_tweets").display()
@@ -856,6 +856,7 @@ fn main() -> Result<()> {
                 &file_extension,
                 byte_size,
             )?;
+            database::finish_archive_run(&conn, run.id)?;
 
             Ok(())
         }
