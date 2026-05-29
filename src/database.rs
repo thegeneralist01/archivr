@@ -79,6 +79,7 @@ pub fn open_or_initialize(archive_path: &Path) -> Result<Connection> {
 }
 
 pub fn initialize_schema(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.execute_batch(
         r#"
@@ -153,7 +154,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             source_identity_id INTEGER NOT NULL REFERENCES source_identities(id),
             archive_run_id INTEGER NOT NULL REFERENCES archive_runs(id),
             parent_entry_id INTEGER REFERENCES archived_entries(id),
-            root_entry_id INTEGER NOT NULL REFERENCES archived_entries(id),
+            root_entry_id INTEGER REFERENCES archived_entries(id),
             created_by_user_id INTEGER NOT NULL REFERENCES users(id),
             owned_by_user_id INTEGER NOT NULL REFERENCES users(id),
             source_kind TEXT NOT NULL,
@@ -205,6 +206,8 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_archive_run_items_run_id ON archive_run_items(run_id);
+        CREATE INDEX IF NOT EXISTS idx_archived_entries_source_identity_id ON archived_entries(source_identity_id);
+        CREATE INDEX IF NOT EXISTS idx_archived_entries_created_by_user_id ON archived_entries(created_by_user_id);
         CREATE INDEX IF NOT EXISTS idx_archived_entries_parent_entry_id ON archived_entries(parent_entry_id);
         CREATE INDEX IF NOT EXISTS idx_archived_entries_root_entry_id ON archived_entries(root_entry_id);
         CREATE INDEX IF NOT EXISTS idx_archived_entries_visibility ON archived_entries(visibility);
@@ -419,32 +422,25 @@ pub fn upsert_blob(conn: &Connection, blob: &BlobRecord) -> Result<i64> {
 
 pub fn create_archived_entry(conn: &Connection, entry: &NewEntry) -> Result<ArchivedEntry> {
     validate_visibility(&entry.visibility)?;
-    let id: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(id), 0) + 1 FROM archived_entries",
-        [],
-        |row| row.get(0),
-    )?;
     let entry_uid = public_id("entry");
-    let root_entry_id = entry.root_entry_id.unwrap_or(id);
     let structured_root_relpath = format!("structured/{entry_uid}");
 
     conn.execute(
         "INSERT INTO archived_entries (
-            id, entry_uid, source_identity_id, archive_run_id, parent_entry_id, root_entry_id,
+            entry_uid, source_identity_id, archive_run_id, parent_entry_id, root_entry_id,
             created_by_user_id, owned_by_user_id, source_kind, entity_kind, title, visibility,
             archived_at, original_published_at, structured_root_relpath, representation_kind,
             source_metadata_json, display_metadata_json
         ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-            ?13, NULL, ?14, ?15, ?16, ?17
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+            ?12, NULL, ?13, ?14, ?15, ?16
         )",
         params![
-            id,
             entry_uid,
             entry.source_identity_id,
             entry.archive_run_id,
             entry.parent_entry_id,
-            root_entry_id,
+            entry.root_entry_id,
             entry.created_by_user_id,
             entry.owned_by_user_id,
             entry.source_kind,
@@ -458,6 +454,14 @@ pub fn create_archived_entry(conn: &Connection, entry: &NewEntry) -> Result<Arch
             entry.display_metadata_json
         ],
     )?;
+    let id = conn.last_insert_rowid();
+
+    if entry.root_entry_id.is_none() {
+        conn.execute(
+            "UPDATE archived_entries SET root_entry_id = ?1 WHERE id = ?1",
+            [id],
+        )?;
+    }
 
     Ok(ArchivedEntry {
         id,
@@ -638,7 +642,7 @@ fn identity_key(
     canonical_url: Option<&str>,
     normalized_locator: &str,
 ) -> String {
-    let stable_locator = canonical_url.or(external_id).unwrap_or(normalized_locator);
+    let stable_locator = external_id.or(canonical_url).unwrap_or(normalized_locator);
     format!("{source_kind}:{entity_kind}:{stable_locator}")
 }
 
@@ -682,11 +686,23 @@ fn humanize_slug(slug: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        env, fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         initialize_schema(&conn).unwrap();
         conn
+    }
+
+    fn unique_db_path(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("{prefix}-{nanos}-{}.sqlite", std::process::id()))
     }
 
     fn create_entry_fixture(
@@ -741,6 +757,39 @@ mod tests {
             .unwrap();
 
         assert_eq!(defaults, (0, 0, 0));
+    }
+
+    #[test]
+    fn file_database_uses_wal_journal_mode() {
+        let path = unique_db_path("archivr-wal-test");
+        let conn = Connection::open(&path).unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(journal_mode, "wal");
+
+        drop(conn);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    #[test]
+    fn root_entry_sets_root_id_after_insert() {
+        let conn = conn();
+        let entry = create_entry_fixture(&conn, "private", None, None);
+        let root_entry_id: i64 = conn
+            .query_row(
+                "SELECT root_entry_id FROM archived_entries WHERE id = ?1",
+                [entry.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(root_entry_id, entry.id);
     }
 
     #[test]
@@ -831,6 +880,31 @@ mod tests {
         assert_eq!(entry_count, 2);
         assert_eq!(source_count, 1);
         assert_eq!(blob_count, 1);
+    }
+
+    #[test]
+    fn source_identity_key_prefers_external_id_over_shared_canonical_url() {
+        let conn = conn();
+        let first_source_id = upsert_source_identity(
+            &conn,
+            "x",
+            "tweet",
+            Some("tweet-1"),
+            Some("https://x.com/some-profile"),
+            "https://x.com/some-profile/status/tweet-1",
+        )
+        .unwrap();
+        let second_source_id = upsert_source_identity(
+            &conn,
+            "x",
+            "tweet",
+            Some("tweet-2"),
+            Some("https://x.com/some-profile"),
+            "https://x.com/some-profile/status/tweet-2",
+        )
+        .unwrap();
+
+        assert_ne!(first_source_id, second_source_id);
     }
 
     #[test]
