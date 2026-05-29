@@ -1268,4 +1268,96 @@ mod tests {
 
         fs::remove_dir_all(store_path).unwrap();
     }
+
+    #[test]
+    fn test_record_tweet_entry_links_json_and_raw_artifacts() {
+        let store_path = env::temp_dir().join(format!(
+            "archivr-tweet-db-test-{}",
+            Local::now().format("%Y%m%d%H%M%S%3f")
+        ));
+        let _ = fs::remove_dir_all(&store_path);
+        initialize_store_directories(&store_path).unwrap();
+        fs::create_dir_all(store_path.join("raw").join("a").join("b")).unwrap();
+        fs::create_dir_all(store_path.join("raw").join("c").join("d")).unwrap();
+        fs::write(
+            store_path
+                .join("raw")
+                .join("a")
+                .join("b")
+                .join("abcdef.jpg"),
+            b"avatar",
+        )
+        .unwrap();
+        fs::write(
+            store_path
+                .join("raw")
+                .join("c")
+                .join("d")
+                .join("cdef01.mp4"),
+            b"media",
+        )
+        .unwrap();
+        fs::write(
+            store_path.join("raw_tweets").join("tweet-123.json"),
+            r#"{
+  "author": { "avatar_local_path": "raw/a/b/abcdef.jpg" },
+  "entities": { "media": [{ "local_path": "raw/c/d/cdef01.mp4" }] }
+}"#,
+        )
+        .unwrap();
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        database::initialize_schema(&conn).unwrap();
+        let user_id = database::ensure_default_user(&conn).unwrap();
+        let run = database::create_archive_run(&conn, user_id, 1).unwrap();
+        let item = database::create_archive_run_item(
+            &conn,
+            run.id,
+            None,
+            0,
+            "tweet:123",
+            None,
+            "x",
+            "tweet",
+        )
+        .unwrap();
+
+        let entry = record_tweet_entry(
+            &conn,
+            &store_path,
+            user_id,
+            &run,
+            &item,
+            "tweet:123",
+            Source::Tweet,
+            "123",
+        )
+        .unwrap();
+        database::finish_archive_run(&conn, run.id).unwrap();
+
+        let artifact_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entry_artifacts WHERE entry_id = ?1",
+                [entry.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let blob_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .unwrap();
+        let run_status: String = conn
+            .query_row(
+                "SELECT status FROM archive_runs WHERE id = ?1",
+                [run.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(artifact_count, 3);
+        assert_eq!(blob_count, 2);
+        assert_eq!(run_status, "completed");
+        assert!(store_path.join(&entry.structured_root_relpath).is_dir());
+
+        let _ = fs::remove_dir_all(store_path);
+    }
 }
