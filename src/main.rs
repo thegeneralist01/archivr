@@ -220,7 +220,8 @@ fn determine_source(path: &str) -> Source {
         return Source::Local;
     } else if path.starts_with("http://") || path.starts_with("https://") {
         // Video URLs (watch, youtu.be, shorts)
-        let video_re = regex::Regex::new(r"^https?://(?:www\.)?(?:youtu\.be/[0-9A-Za-z_-]+|youtube\.com/watch\?v=[0-9A-Za-z_-]+|youtube\.com/shorts/[0-9A-Za-z_-]+)").unwrap();
+        let video_re = regex::Regex::new(r"^https?://(?:www\.)?(?:youtu\.be/[0-9A-Za-z_-]+|youtube\.com/watch\?v=[0-9A-Za-z_-]+|youtube\.com/shorts/[0-9A-Za-z_-]+)")
+            .expect("YouTube video URL regex literal must be valid");
         if video_re.is_match(path) {
             return Source::YouTubeVideo;
         }
@@ -228,13 +229,14 @@ fn determine_source(path: &str) -> Source {
         // Playlist URLs
         let playlist_re =
             regex::Regex::new(r"^https?://(?:www\.)?youtube\.com/playlist\?list=[0-9A-Za-z_-]+")
-                .unwrap();
+                .expect("YouTube playlist URL regex literal must be valid");
         if playlist_re.is_match(path) {
             return Source::YouTubePlaylist;
         }
 
         // Channel or user URLs (channel IDs, /c/, /user/, or @handles)
-        let channel_re = regex::Regex::new(r"^https?://(?:www\.)?youtube\.com/(?:channel/[0-9A-Za-z_-]+|c/[0-9A-Za-z_-]+|user/[0-9A-Za-z_-]+|@[0-9A-Za-z_-]+)").unwrap();
+        let channel_re = regex::Regex::new(r"^https?://(?:www\.)?youtube\.com/(?:channel/[0-9A-Za-z_-]+|c/[0-9A-Za-z_-]+|user/[0-9A-Za-z_-]+|@[0-9A-Za-z_-]+)")
+            .expect("YouTube channel URL regex literal must be valid");
         if channel_re.is_match(path) {
             return Source::YouTubeChannel;
         }
