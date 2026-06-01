@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use archivr_core::{database, downloader, twitter::parse_tweet_id};
+use archivr_core::{archive, database, downloader, twitter::parse_tweet_id};
 use chrono::Local;
 use clap::{Parser, Subcommand};
 use serde_json::json;
@@ -51,19 +51,6 @@ enum Command {
         #[arg(long = "force-with-info-removal")]
         force_with_info_removal: bool,
     },
-}
-
-fn get_archive_path() -> Result<Option<PathBuf>> {
-    let mut dir = env::current_dir().context("failed to read current working directory")?;
-    loop {
-        if dir.join(".archivr").is_dir() {
-            return Ok(Some(dir.join(".archivr")));
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-    Ok(None)
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -307,14 +294,6 @@ fn move_temp_to_raw(file: &Path, hash: &str, store_path: &Path) -> Result<()> {
 
     fs::rename(file, destination)?;
 
-    Ok(())
-}
-
-fn initialize_store_directories(store_path: &Path) -> Result<()> {
-    fs::create_dir_all(store_path.join("raw"))?;
-    fs::create_dir_all(store_path.join("raw_tweets"))?;
-    fs::create_dir_all(store_path.join("structured"))?;
-    fs::create_dir_all(store_path.join("temp"))?;
     Ok(())
 }
 
@@ -609,7 +588,7 @@ fn main() -> Result<()> {
 
     match args.command {
         Command::Archive { ref path } => {
-            let archive_path = match get_archive_path()? {
+            let archive_path = match archive::find_archive_path()? {
                 Some(path) => path,
                 None => {
                     eprintln!("Not in an archive. Use 'archivr init' to create one.");
@@ -833,7 +812,7 @@ fn main() -> Result<()> {
             name: ref archive_name,
             force_with_info_removal,
         } => {
-            let archive_path = Path::new(&archive_path_string).join(".archivr");
+            let archive_parent = Path::new(&archive_path_string);
             let store_path = if Path::new(&store_path_string).is_relative() {
                 env::current_dir()
                     .context("failed to read current working directory")?
@@ -842,47 +821,17 @@ fn main() -> Result<()> {
                 Path::new(store_path_string).to_path_buf()
             };
 
-            if archive_path.exists() {
-                if !archive_path.is_dir() {
-                    eprintln!(
-                        "Archive path exists and is not a directory: {}",
-                        archive_path.display()
-                    );
-                    process::exit(1);
-                }
-
-                if force_with_info_removal {
-                    fs::remove_dir_all(&archive_path)?;
-                } else if fs::read_dir(&archive_path)?.next().is_some() {
-                    eprintln!(
-                        "Archive already exists at {} and is not empty. Use --force-with-info-removal to reinitialize.",
-                        archive_path.display()
-                    );
-                    process::exit(1);
-                }
-            }
-
-            if store_path.exists() && !force_with_info_removal {
-                eprintln!("Store path already exists at {}", store_path.display());
-                process::exit(1);
-            }
-
-            fs::create_dir_all(&archive_path)?;
-            fs::create_dir_all(&store_path)?;
-            fs::write(archive_path.join("name"), archive_name)?;
-            fs::write(
-                archive_path.join("store_path"),
-                store_path
-                    .canonicalize()
-                    .with_context(|| format!("failed to canonicalize {}", store_path.display()))?
-                    .to_str()
-                    .context("store path is not valid UTF-8")?,
+            let paths = archive::initialize_archive(
+                archive_parent,
+                &store_path,
+                archive_name,
+                force_with_info_removal,
             )?;
-            initialize_store_directories(&store_path)?;
-            let conn = database::open_or_initialize(&archive_path)?;
-            let _ = database::ensure_default_user(&conn)?;
 
-            println!("Initialized empty archive in {}", archive_path.display());
+            println!(
+                "Initialized empty archive in {}",
+                paths.archive_path.display()
+            );
 
             Ok(())
         } // _ => eprintln!("Unknown command: {:?}", args.command),
@@ -1254,7 +1203,7 @@ mod tests {
             Local::now().format("%Y%m%d%H%M%S%3f")
         ));
 
-        initialize_store_directories(&store_path).unwrap();
+        archive::initialize_store_directories(&store_path).unwrap();
 
         assert!(store_path.join("raw").is_dir());
         assert!(store_path.join("raw_tweets").is_dir());
@@ -1272,7 +1221,7 @@ mod tests {
             Local::now().format("%Y%m%d%H%M%S%3f")
         ));
         let _ = fs::remove_dir_all(&store_path);
-        initialize_store_directories(&store_path).unwrap();
+        archive::initialize_store_directories(&store_path).unwrap();
         fs::create_dir_all(store_path.join("raw").join("a").join("b")).unwrap();
         fs::create_dir_all(store_path.join("raw").join("c").join("d")).unwrap();
         fs::write(

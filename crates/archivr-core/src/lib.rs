@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod database;
 pub mod downloader;
 pub mod hash;
