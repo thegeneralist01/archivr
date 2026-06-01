@@ -10,9 +10,7 @@ use std::{
     sync::OnceLock,
 };
 
-use crate::twitter::parse_tweet_id;
-
-use super::store;
+use crate::{downloader::store, twitter::parse_tweet_id};
 
 /// Extracts a tweet ID from an archivr path like `"tweet:123"` by taking the
 /// last colon-separated segment and validating it as a numeric ID.

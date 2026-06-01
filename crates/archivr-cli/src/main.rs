@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use archivr_core::{database, downloader, twitter::parse_tweet_id};
 use chrono::Local;
 use clap::{Parser, Subcommand};
 use serde_json::json;
@@ -8,11 +9,6 @@ use std::{
     path::{Path, PathBuf},
     process,
 };
-
-mod database;
-mod downloader;
-mod hash;
-mod twitter;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -86,8 +82,6 @@ enum Source {
     Local,
     Other,
 }
-
-use crate::twitter::parse_tweet_id;
 
 fn expand_shorthand_to_url(path: &str, source: &Source) -> String {
     if *source == Source::X && (path.starts_with("tweet:media:") || path.starts_with("x:media:")) {

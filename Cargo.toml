@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/archivr-core",
     "crates/archivr-cli",
 ]
 resolver = "2"

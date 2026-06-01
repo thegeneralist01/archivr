@@ -1,17 +1,14 @@
 [package]
-name = "archivr-cli"
+name = "archivr-core"
 version.workspace = true
 edition.workspace = true
 
-[[bin]]
-name = "archivr"
-path = "src/main.rs"
-
 [dependencies]
-archivr-core = { path = "../archivr-core" }
 anyhow.workspace = true
 chrono.workspace = true
-clap.workspace = true
+hex.workspace = true
 regex.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
+sha3.workspace = true
+uuid.workspace = true

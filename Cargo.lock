@@ -93,8 +93,20 @@ name = "archivr-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "archivr-core",
  "chrono",
  "clap",
+ "regex",
+ "rusqlite",
+ "serde_json",
+]
+
+[[package]]
+name = "archivr-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
  "hex",
  "regex",
  "rusqlite",
