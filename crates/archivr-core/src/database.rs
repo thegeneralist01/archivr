@@ -190,19 +190,19 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             metadata_json TEXT
         );
 
-        CREATE TABLE IF NOT EXISTS taxonomy_nodes (
+        CREATE TABLE IF NOT EXISTS tags (
             id INTEGER PRIMARY KEY,
-            node_uid TEXT NOT NULL UNIQUE,
-            parent_id INTEGER REFERENCES taxonomy_nodes(id),
+            tag_uid TEXT NOT NULL UNIQUE,
+            parent_tag_id INTEGER REFERENCES tags(id),
             name TEXT NOT NULL,
             slug TEXT NOT NULL,
             full_path TEXT NOT NULL UNIQUE
         );
 
-        CREATE TABLE IF NOT EXISTS entry_taxonomy_assignments (
+        CREATE TABLE IF NOT EXISTS entry_tag_assignments (
             entry_id INTEGER NOT NULL REFERENCES archived_entries(id) ON DELETE CASCADE,
-            node_id INTEGER NOT NULL REFERENCES taxonomy_nodes(id) ON DELETE CASCADE,
-            PRIMARY KEY (entry_id, node_id)
+            tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+            PRIMARY KEY (entry_id, tag_id)
         );
 
         CREATE INDEX IF NOT EXISTS idx_archive_run_items_run_id ON archive_run_items(run_id);
@@ -213,7 +213,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_archived_entries_visibility ON archived_entries(visibility);
         CREATE INDEX IF NOT EXISTS idx_entry_artifacts_entry_id ON entry_artifacts(entry_id);
         CREATE INDEX IF NOT EXISTS idx_entry_artifacts_blob_id ON entry_artifacts(blob_id);
-        CREATE INDEX IF NOT EXISTS idx_taxonomy_nodes_parent_id ON taxonomy_nodes(parent_id);
+        CREATE INDEX IF NOT EXISTS idx_tags_parent_tag_id ON tags(parent_tag_id);
         "#,
     )?;
     Ok(())
@@ -536,9 +536,9 @@ pub fn main_archive_entry_count(conn: &Connection) -> Result<i64> {
 }
 
 #[cfg(test)]
-pub fn create_taxonomy_path(conn: &Connection, full_path: &str) -> Result<i64> {
-    let segments = normalized_taxonomy_segments(full_path)?;
-    let mut parent_id = None;
+pub fn create_tag_path(conn: &Connection, full_path: &str) -> Result<i64> {
+    let segments = normalized_tag_segments(full_path)?;
+    let mut parent_tag_id = None;
     let mut current_path = String::new();
     let mut current_id = 0;
 
@@ -548,58 +548,58 @@ pub fn create_taxonomy_path(conn: &Connection, full_path: &str) -> Result<i64> {
 
         if let Some(id) = conn
             .query_row(
-                "SELECT id FROM taxonomy_nodes WHERE full_path = ?1",
+                "SELECT id FROM tags WHERE full_path = ?1",
                 [current_path.as_str()],
                 |row| row.get(0),
             )
             .optional()?
         {
             current_id = id;
-            parent_id = Some(id);
+            parent_tag_id = Some(id);
             continue;
         }
 
         conn.execute(
-            "INSERT INTO taxonomy_nodes (node_uid, parent_id, name, slug, full_path)
+            "INSERT INTO tags (tag_uid, parent_tag_id, name, slug, full_path)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                public_id("node"),
-                parent_id,
+                public_id("tag"),
+                parent_tag_id,
                 humanize_slug(segment),
                 segment,
                 current_path
             ],
         )?;
         current_id = conn.last_insert_rowid();
-        parent_id = Some(current_id);
+        parent_tag_id = Some(current_id);
     }
 
     Ok(current_id)
 }
 
 #[cfg(test)]
-pub fn assign_entry_to_taxonomy(conn: &Connection, entry_id: i64, node_id: i64) -> Result<()> {
+pub fn assign_entry_to_tag(conn: &Connection, entry_id: i64, tag_id: i64) -> Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO entry_taxonomy_assignments (entry_id, node_id)
+        "INSERT OR IGNORE INTO entry_tag_assignments (entry_id, tag_id)
          VALUES (?1, ?2)",
-        params![entry_id, node_id],
+        params![entry_id, tag_id],
     )?;
     Ok(())
 }
 
 #[cfg(test)]
-pub fn entry_count_for_taxonomy_path(conn: &Connection, full_path: &str) -> Result<i64> {
+pub fn entry_count_for_tag_path(conn: &Connection, full_path: &str) -> Result<i64> {
     let count = conn.query_row(
         "WITH RECURSIVE descendants(id) AS (
-            SELECT id FROM taxonomy_nodes WHERE full_path = ?1
+            SELECT id FROM tags WHERE full_path = ?1
             UNION ALL
             SELECT child.id
-            FROM taxonomy_nodes child
-            JOIN descendants parent ON child.parent_id = parent.id
+            FROM tags child
+            JOIN descendants parent ON child.parent_tag_id = parent.id
          )
          SELECT COUNT(DISTINCT eta.entry_id)
-         FROM entry_taxonomy_assignments eta
-         JOIN descendants d ON eta.node_id = d.id",
+         FROM entry_tag_assignments eta
+         JOIN descendants d ON eta.tag_id = d.id",
         [full_path],
         |row| row.get(0),
     )?;
@@ -654,7 +654,7 @@ fn validate_visibility(visibility: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-fn normalized_taxonomy_segments(full_path: &str) -> Result<Vec<&str>> {
+fn normalized_tag_segments(full_path: &str) -> Result<Vec<&str>> {
     let segments = full_path
         .trim()
         .trim_matches('/')
@@ -663,7 +663,7 @@ fn normalized_taxonomy_segments(full_path: &str) -> Result<Vec<&str>> {
         .collect::<Vec<_>>();
 
     if segments.is_empty() {
-        bail!("taxonomy path must contain at least one segment");
+        bail!("tag path must contain at least one segment");
     }
 
     Ok(segments)
@@ -981,23 +981,20 @@ mod tests {
     }
 
     #[test]
-    fn taxonomy_assignments_are_discoverable_through_ancestors() {
+    fn hierarchical_tag_assignments_are_discoverable_through_ancestors() {
         let conn = conn();
         let entry = create_entry_fixture(&conn, "private", None, None);
-        let node_id = create_taxonomy_path(&conn, "/sciences/computer-science/compilers").unwrap();
-        assign_entry_to_taxonomy(&conn, entry.id, node_id).unwrap();
+        let tag_id = create_tag_path(&conn, "/sciences/computer-science/compilers").unwrap();
+        assign_entry_to_tag(&conn, entry.id, tag_id).unwrap();
 
         assert_eq!(
-            entry_count_for_taxonomy_path(&conn, "/sciences/computer-science/compilers").unwrap(),
+            entry_count_for_tag_path(&conn, "/sciences/computer-science/compilers").unwrap(),
             1
         );
         assert_eq!(
-            entry_count_for_taxonomy_path(&conn, "/sciences/computer-science").unwrap(),
+            entry_count_for_tag_path(&conn, "/sciences/computer-science").unwrap(),
             1
         );
-        assert_eq!(
-            entry_count_for_taxonomy_path(&conn, "/sciences").unwrap(),
-            1
-        );
+        assert_eq!(entry_count_for_tag_path(&conn, "/sciences").unwrap(), 1);
     }
 }
