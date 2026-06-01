@@ -5,8 +5,8 @@
 !docs
 !docs/**
 
-!src
-!src/**
+!crates
+!crates/**
 
 !vendor
 !vendor/**
