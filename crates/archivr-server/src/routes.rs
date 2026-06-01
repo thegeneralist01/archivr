@@ -8,6 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::registry::{MountedArchive, ServerRegistry};
 
@@ -20,6 +21,7 @@ pub fn app(registry: ServerRegistry) -> Router {
     let state = AppState {
         registry: Arc::new(registry),
     };
+    let static_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static");
 
     Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -30,6 +32,8 @@ pub fn app(registry: ServerRegistry) -> Router {
             get(entry_detail),
         )
         .route("/api/archives/:archive_id/runs", get(list_runs))
+        .nest_service("/assets", ServeDir::new(&static_dir))
+        .fallback_service(ServeFile::new(static_dir.join("index.html")))
         .with_state(state)
 }
 
