@@ -14,7 +14,7 @@ pub struct ArchivePaths {
     pub name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct EntrySummary {
     pub entry_uid: String,
     pub archived_at: String,
@@ -27,7 +27,7 @@ pub struct EntrySummary {
     pub total_artifact_bytes: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct EntryDetail {
     pub summary: EntrySummary,
     pub structured_root_relpath: String,
@@ -36,7 +36,7 @@ pub struct EntryDetail {
     pub artifacts: Vec<EntryArtifactSummary>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct EntryArtifactSummary {
     pub artifact_role: String,
     pub storage_area: String,
@@ -44,7 +44,7 @@ pub struct EntryArtifactSummary {
     pub byte_size: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RunSummary {
     pub run_uid: String,
     pub started_at: String,

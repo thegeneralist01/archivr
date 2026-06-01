@@ -110,6 +110,7 @@ dependencies = [
  "hex",
  "regex",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha3",
  "uuid",
@@ -126,6 +127,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "tower",
  "tower-http",
 ]
 
