@@ -26,6 +26,7 @@ pub fn load_registry(path: &Path) -> Result<ServerRegistry> {
     Ok(registry)
 }
 
+#[cfg(test)]
 pub fn save_registry(path: &Path, registry: &ServerRegistry) -> Result<()> {
     validate_registry(registry)?;
     let contents = toml::to_string_pretty(registry)?;

@@ -270,6 +270,9 @@ fn determine_source(path: &str) -> Source {
             return Source::Snapchat;
         }
     }
+    if Path::new(path).exists() {
+        return Source::Local;
+    }
     Source::Other
 }
 
@@ -1194,6 +1197,16 @@ mod tests {
                 case.url
             );
         }
+    }
+
+    #[test]
+    fn test_existing_local_path_source() {
+        let path = env::current_dir().unwrap().join("Cargo.toml");
+        assert_eq!(
+            determine_source(path.to_str().unwrap()),
+            Source::Local,
+            "existing filesystem paths should be archived as local files"
+        );
     }
 
     #[test]
