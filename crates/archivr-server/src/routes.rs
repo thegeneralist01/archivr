@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use archivr_core::{archive, database};
 use axum::{
@@ -21,7 +21,7 @@ pub fn app(registry: ServerRegistry) -> Router {
     let state = AppState {
         registry: Arc::new(registry),
     };
-    let static_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static");
+    let static_dir = static_dir();
 
     Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -35,6 +35,12 @@ pub fn app(registry: ServerRegistry) -> Router {
         .nest_service("/assets", ServeDir::new(&static_dir))
         .fallback_service(ServeFile::new(static_dir.join("index.html")))
         .with_state(state)
+}
+
+fn static_dir() -> PathBuf {
+    std::env::var_os("ARCHIVR_STATIC_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static"))
 }
 
 async fn list_archives(State(state): State<AppState>) -> Json<Vec<MountedArchive>> {
