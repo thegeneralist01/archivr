@@ -59,12 +59,45 @@
           tweetPython = pkgs.python312.withPackages (ps: [
             twitterApiClient
           ]);
-          archivr_unwrapped = pkgs.rustPlatform.buildRustPackage {
-            pname = "archivr";
-            version = "0.1.0";
-            src = pkgs.lib.cleanSource ./.;
-            cargoHash = "sha256-4m+4SMYA/rJ0eHEOc32zA2VdZI1pqzB5NenD0R0f2zM=";
-            nativeBuildInputs = [ pkgs.pkg-config ];
+          version = "0.1.0";
+          src = pkgs.lib.cleanSource ./.;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+          };
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          archivr_cli_unwrapped = pkgs.rustPlatform.buildRustPackage {
+            pname = "archivr-cli";
+            inherit
+              version
+              src
+              cargoLock
+              nativeBuildInputs
+              ;
+            cargoBuildFlags = [
+              "-p"
+              "archivr-cli"
+            ];
+            cargoTestFlags = [
+              "-p"
+              "archivr-cli"
+            ];
+          };
+          archivr_server_unwrapped = pkgs.rustPlatform.buildRustPackage {
+            pname = "archivr-server";
+            inherit
+              version
+              src
+              cargoLock
+              nativeBuildInputs
+              ;
+            cargoBuildFlags = [
+              "-p"
+              "archivr-server"
+            ];
+            cargoTestFlags = [
+              "-p"
+              "archivr-server"
+            ];
           };
           archivr = pkgs.stdenv.mkDerivation {
             pname = "archivr-wrapped";
@@ -77,29 +110,43 @@
             phases = [ "installPhase" ];
             installPhase = ''
               mkdir -p $out/bin $out/libexec/archivr
-              cp -r ${archivr_unwrapped}/bin/* $out/bin/
+              cp ${archivr_cli_unwrapped}/bin/archivr $out/libexec/archivr/archivr
               cp ${./vendor/twitter/scrape_user_tweet_contents.py} $out/libexec/archivr/scrape_user_tweet_contents.py
               chmod +x $out/libexec/archivr/scrape_user_tweet_contents.py
-              for f in $out/bin/*; do
-                mv "$f" "$f.orig"
-                makeWrapper "$f.orig" "$f" \
-                  --set ARCHIVR_YT_DLP ${pkgs.yt-dlp}/bin/yt-dlp \
-                  --set ARCHIVR_TWEET_PYTHON ${tweetPython}/bin/python3 \
-                  --set ARCHIVR_TWEET_SCRAPER $out/libexec/archivr/scrape_user_tweet_contents.py \
-                  --prefix PATH : ${
-                    lib.makeBinPath [
-                      pkgs.yt-dlp
-                      tweetPython
-                    ]
-                  }
-              done
+              makeWrapper $out/libexec/archivr/archivr $out/bin/archivr \
+                --set ARCHIVR_YT_DLP ${pkgs.yt-dlp}/bin/yt-dlp \
+                --set ARCHIVR_TWEET_PYTHON ${tweetPython}/bin/python3 \
+                --set ARCHIVR_TWEET_SCRAPER $out/libexec/archivr/scrape_user_tweet_contents.py \
+                --prefix PATH : ${
+                  lib.makeBinPath [
+                    pkgs.yt-dlp
+                    tweetPython
+                  ]
+                }
+            '';
+          };
+          archivr_server = pkgs.stdenv.mkDerivation {
+            pname = "archivr-server-wrapped";
+            inherit version;
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            phases = [ "installPhase" ];
+            installPhase = ''
+              mkdir -p $out/bin $out/libexec/archivr-server $out/share/archivr-server/static
+              cp ${archivr_server_unwrapped}/bin/archivr-server $out/libexec/archivr-server/archivr-server
+              cp -r ${./crates/archivr-server/static}/* $out/share/archivr-server/static/
+              makeWrapper $out/libexec/archivr-server/archivr-server $out/bin/archivr-server \
+                --set ARCHIVR_STATIC_DIR $out/share/archivr-server/static
             '';
           };
         in
         {
           default = archivr;
           archivr = archivr;
-          archivr-unwrapped = archivr_unwrapped;
+          archivr-cli = archivr;
+          archivr-cli-unwrapped = archivr_cli_unwrapped;
+          archivr-unwrapped = archivr_cli_unwrapped;
+          archivr-server = archivr_server;
+          archivr-server-unwrapped = archivr_server_unwrapped;
         }
       );
 
