@@ -3,12 +3,14 @@ use std::{path::PathBuf, sync::Arc};
 use archivr_core::{archive, database};
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    body::Body,
+    extract::{Path, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
 };
 use tower_http::services::{ServeDir, ServeFile};
+use tower::ServiceExt;
 
 use crate::registry::{MountedArchive, ServerRegistry};
 
@@ -30,6 +32,10 @@ pub fn app(registry: ServerRegistry) -> Router {
         .route(
             "/api/archives/:archive_id/entries/:entry_uid",
             get(entry_detail),
+        )
+        .route(
+            "/api/archives/:archive_id/entries/:entry_uid/artifacts/:artifact_index",
+            get(serve_artifact),
         )
         .route("/api/archives/:archive_id/runs", get(list_runs))
         .nest_service("/assets", ServeDir::new(&static_dir))
@@ -74,6 +80,30 @@ async fn list_runs(
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     Ok(Json(archive::list_runs(&conn)?))
+}
+
+async fn serve_artifact(
+    State(state): State<AppState>,
+    Path((archive_id, entry_uid, artifact_index)): Path<(String, String, usize)>,
+    req: Request,
+) -> Result<Response, ApiError> {
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let paths = archive::read_archive_paths(&mounted.archive_path)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let detail = archive::get_entry_detail(&conn, &entry_uid)?
+        .ok_or(ApiError::not_found("entry not found"))?;
+    let artifact = detail
+        .artifacts
+        .get(artifact_index)
+        .ok_or(ApiError::not_found("artifact index out of range"))?;
+    let file_path = archive::resolve_artifact_path(&paths.store_path, artifact)?;
+    // ServeFile streams the file, handles Range requests (video seeking),
+    // sets Content-Type/ETag/Last-Modified. Error type is Infallible.
+    Ok(ServeFile::new(&file_path)
+        .oneshot(req)
+        .await
+        .unwrap()
+        .into_response())
 }
 
 fn mounted_archive<'a>(
@@ -163,6 +193,80 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn artifact_missing_archive_returns_404() {
+        let response = app(ServerRegistry::default())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/nope/entries/entry_abc/artifacts/0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn artifact_missing_entry_returns_404() {
+        let dir = tempfile::tempdir().unwrap();
+        archivr_core::archive::initialize_archive(
+            dir.path(),
+            &dir.path().join("store"),
+            "test",
+            false,
+        )
+        .unwrap();
+        let archive_path = dir.path().join(".archivr");
+        let registry = ServerRegistry {
+            archives: vec![MountedArchive {
+                id: "test".to_string(),
+                label: "Test".to_string(),
+                archive_path,
+            }],
+        };
+        let response = app(registry)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/entries/entry_doesnotexist/artifacts/0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn artifact_out_of_range_index_returns_404() {
+        let dir = tempfile::tempdir().unwrap();
+        archivr_core::archive::initialize_archive(
+            dir.path(),
+            &dir.path().join("store"),
+            "test",
+            false,
+        )
+        .unwrap();
+        let archive_path = dir.path().join(".archivr");
+        let registry = ServerRegistry {
+            archives: vec![MountedArchive {
+                id: "test".to_string(),
+                label: "Test".to_string(),
+                archive_path,
+            }],
+        };
+        let response = app(registry)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/entries/entry_doesnotexist/artifacts/99")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

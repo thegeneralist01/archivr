@@ -278,6 +278,31 @@ pub fn list_runs(conn: &rusqlite::Connection) -> Result<Vec<RunSummary>> {
     Ok(runs)
 }
 
+/// Resolves an artifact to its absolute on-disk path under `store_path`.
+///
+/// `artifact.relpath` is a store-relative path (e.g. `raw/a/b/abc.pdf`).
+/// The returned path is canonicalized. Returns an error if the resolved path
+/// escapes `store_path` (path traversal protection) or if the file does not exist.
+pub fn resolve_artifact_path(
+    store_path: &Path,
+    artifact: &EntryArtifactSummary,
+) -> Result<PathBuf> {
+    let joined = store_path.join(&artifact.relpath);
+    let canonical_store = store_path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize store path: {}", store_path.display()))?;
+    let canonical_artifact = joined
+        .canonicalize()
+        .with_context(|| format!("artifact path does not exist: {}", joined.display()))?;
+    if !canonical_artifact.starts_with(&canonical_store) {
+        bail!(
+            "artifact path escapes store: {}",
+            canonical_artifact.display()
+        );
+    }
+    Ok(canonical_artifact)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,5 +459,39 @@ mod tests {
         let runs = list_runs(&conn).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "completed");
+    }
+
+    #[test]
+    fn resolve_artifact_path_returns_absolute_path_within_store() {
+        let root = unique_path("archivr-resolve-artifact");
+        let store_path = root.join("store");
+        fs::create_dir_all(store_path.join("raw/a/b")).unwrap();
+        let artifact_file = store_path.join("raw/a/b/abc.pdf");
+        fs::write(&artifact_file, b"data").unwrap();
+
+        let artifact = EntryArtifactSummary {
+            artifact_role: "primary".to_string(),
+            storage_area: "raw".to_string(),
+            relpath: "raw/a/b/abc.pdf".to_string(),
+            byte_size: Some(4),
+        };
+        let resolved = resolve_artifact_path(&store_path, &artifact).unwrap();
+        assert_eq!(resolved, artifact_file.canonicalize().unwrap());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_artifact_path_rejects_traversal() {
+        let root = unique_path("archivr-resolve-traversal");
+        let store_path = root.join("store");
+        fs::create_dir_all(&store_path).unwrap();
+        let artifact = EntryArtifactSummary {
+            artifact_role: "primary".to_string(),
+            storage_area: "raw".to_string(),
+            relpath: "../escaped.txt".to_string(),
+            byte_size: None,
+        };
+        assert!(resolve_artifact_path(&store_path, &artifact).is_err());
+        let _ = fs::remove_dir_all(&root);
     }
 }

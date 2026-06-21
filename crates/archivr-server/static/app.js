@@ -132,22 +132,83 @@ function renderEntries() {
 
 function renderContextDetail(detail) {
   contextBody.innerHTML = "";
-  const title = document.createElement("strong");
-  title.textContent = valueText(detail.summary.title) || valueText(detail.summary.entry_uid);
-  contextBody.append(title);
 
-  const items = [
+  // Title
+  const titleEl = document.createElement("strong");
+  titleEl.className = "rail-entry-title";
+  titleEl.textContent =
+    valueText(detail.summary.title) || valueText(detail.summary.entry_uid);
+  contextBody.append(titleEl);
+
+  // Metadata section
+  const metaSection = document.createElement("div");
+  metaSection.className = "rail-section";
+
+  if (detail.summary.original_url) {
+    const urlRow = document.createElement("div");
+    urlRow.className = "rail-item";
+    const urlLabel = document.createElement("span");
+    urlLabel.className = "rail-label";
+    urlLabel.textContent = "Original URL";
+    const urlLink = document.createElement("a");
+    urlLink.href = detail.summary.original_url;
+    urlLink.target = "_blank";
+    urlLink.rel = "noopener noreferrer";
+    urlLink.className = "rail-url-link";
+    urlLink.textContent = detail.summary.original_url;
+    urlRow.append(urlLabel, document.createTextNode(": "), urlLink);
+    metaSection.append(urlRow);
+  }
+
+  const metaFields = [
+    ["Added", detail.summary.archived_at],
+    ["Source", detail.summary.source_kind],
     ["Type", detail.summary.entity_kind],
     ["Visibility", detail.summary.visibility],
-    ["Artifacts", detail.artifacts.length],
     ["Structured root", detail.structured_root_relpath],
   ];
-
-  for (const [label, value] of items) {
+  for (const [label, value] of metaFields) {
     const item = document.createElement("div");
     item.className = "rail-item";
-    item.textContent = `${label}: ${valueText(value)}`;
-    contextBody.append(item);
+    const labelEl = document.createElement("span");
+    labelEl.className = "rail-label";
+    labelEl.textContent = label;
+    item.append(labelEl, document.createTextNode(`: ${valueText(value)}`));
+    metaSection.append(item);
+  }
+  contextBody.append(metaSection);
+
+  // Artifacts section
+  if (detail.artifacts.length > 0) {
+    const artifactsSection = document.createElement("div");
+    artifactsSection.className = "rail-section";
+    const artifactsHeading = document.createElement("div");
+    artifactsHeading.className = "rail-section-heading";
+    artifactsHeading.textContent = `Artifacts (${detail.artifacts.length})`;
+    artifactsSection.append(artifactsHeading);
+    const list = document.createElement("ul");
+    list.className = "artifact-list";
+    detail.artifacts.forEach((artifact, index) => {
+      const li = document.createElement("li");
+      const a = document.createElement("a");
+      a.href = `/api/archives/${state.archiveId}/entries/${detail.summary.entry_uid}/artifacts/${index}`;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      a.className = "artifact-link";
+      const roleName = artifact.artifact_role.replace(/_/g, " ");
+      const size =
+        artifact.byte_size != null ? ` (${formatBytes(artifact.byte_size)})` : "";
+      a.textContent = `${roleName}${size}`;
+      li.append(a);
+      list.append(li);
+    });
+    artifactsSection.append(list);
+    contextBody.append(artifactsSection);
+  } else {
+    const noArtifacts = document.createElement("div");
+    noArtifacts.className = "rail-item muted";
+    noArtifacts.textContent = "No artifacts.";
+    contextBody.append(noArtifacts);
   }
 }
 
