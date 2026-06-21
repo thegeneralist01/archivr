@@ -303,6 +303,144 @@ pub fn resolve_artifact_path(
     Ok(canonical_artifact)
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SearchEntriesQuery {
+    /// Free-text term: LIKE-matched against title, canonical_url, entry_uid, source_kind, entity_kind, visibility
+    pub q: Option<String>,
+    /// Exact match on e.source_kind
+    pub source_kind: Option<String>,
+    /// Exact match on e.entity_kind
+    pub entity_kind: Option<String>,
+    /// LIKE-matched against si.canonical_url
+    pub url: Option<String>,
+    /// LIKE-matched against e.title
+    pub title: Option<String>,
+    /// e.archived_at >= after (inclusive, ISO 8601)
+    pub after: Option<String>,
+    /// e.archived_at < before (exclusive, ISO 8601)
+    pub before: Option<String>,
+}
+
+/// Parses a raw search string into a [`SearchEntriesQuery`].
+///
+/// Recognized prefixes: `source:`, `type:`, `url:`, `title:`, `after:`, `before:`.
+/// Tokens with an unrecognized `prefix:` return `Err(prefix)`.
+/// Remaining non-prefix tokens are joined as the free-text `q`.
+/// Quoted values (`title:"resume templates"`) are supported for single-word values
+/// after the colon; leading/trailing double quotes are stripped.
+pub fn parse_search_query(raw: &str) -> Result<SearchEntriesQuery, String> {
+    let mut query = SearchEntriesQuery::default();
+    let mut free_text_tokens: Vec<&str> = Vec::new();
+
+    for token in raw.split_whitespace() {
+        if let Some(colon_pos) = token.find(':') {
+            let prefix = &token[..colon_pos];
+            let value_raw = &token[colon_pos + 1..];
+            // Strip surrounding double quotes if present
+            let value = value_raw.trim_matches('"').to_string();
+
+            match prefix {
+                "source" => query.source_kind = Some(value),
+                "type"   => query.entity_kind = Some(value),
+                "url"    => query.url = Some(value),
+                "title"  => query.title = Some(value),
+                "after"  => query.after = Some(value),
+                "before" => query.before = Some(value),
+                other    => return Err(other.to_string()),
+            }
+        } else {
+            free_text_tokens.push(token);
+        }
+    }
+
+    let q = free_text_tokens.join(" ");
+    query.q = if q.is_empty() { None } else { Some(q) };
+
+    Ok(query)
+}
+
+/// Searches archived entries matching all non-`None` fields in `query`.
+///
+/// Returns root entries only (same scope as [`list_root_entries`]).
+pub fn search_entries(
+    conn: &rusqlite::Connection,
+    query: &SearchEntriesQuery,
+) -> Result<Vec<EntrySummary>> {
+    let mut sql = String::from(
+        "SELECT e.entry_uid, e.archived_at, e.source_kind, e.entity_kind, e.title, \
+         e.visibility, si.canonical_url, COUNT(ea.id) AS artifact_count, \
+         COALESCE(SUM(b.byte_size), 0) AS total_artifact_bytes \
+         FROM archived_entries e \
+         JOIN source_identities si ON si.id = e.source_identity_id \
+         LEFT JOIN entry_artifacts ea ON ea.entry_id = e.id \
+         LEFT JOIN blobs b ON b.id = ea.blob_id \
+         WHERE e.parent_entry_id IS NULL",
+    );
+
+    let mut params: Vec<String> = Vec::new();
+
+    if let Some(q) = &query.q {
+        let term = format!("%{}%", q.to_lowercase());
+        let n = params.len() + 1;
+        sql.push_str(&format!(
+            " AND (LOWER(e.title) LIKE ?{n} OR LOWER(si.canonical_url) LIKE ?{n} \
+             OR LOWER(e.entry_uid) LIKE ?{n} OR LOWER(e.source_kind) LIKE ?{n} \
+             OR LOWER(e.entity_kind) LIKE ?{n} OR LOWER(e.visibility) LIKE ?{n})"
+        ));
+        params.push(term);
+    }
+    if let Some(sk) = &query.source_kind {
+        let n = params.len() + 1;
+        sql.push_str(&format!(" AND e.source_kind = ?{n}"));
+        params.push(sk.clone());
+    }
+    if let Some(ek) = &query.entity_kind {
+        let n = params.len() + 1;
+        sql.push_str(&format!(" AND e.entity_kind = ?{n}"));
+        params.push(ek.clone());
+    }
+    if let Some(u) = &query.url {
+        let n = params.len() + 1;
+        sql.push_str(&format!(" AND LOWER(si.canonical_url) LIKE ?{n}"));
+        params.push(format!("%{}%", u.to_lowercase()));
+    }
+    if let Some(t) = &query.title {
+        let n = params.len() + 1;
+        sql.push_str(&format!(" AND LOWER(e.title) LIKE ?{n}"));
+        params.push(format!("%{}%", t.to_lowercase()));
+    }
+    if let Some(a) = &query.after {
+        let n = params.len() + 1;
+        sql.push_str(&format!(" AND e.archived_at >= ?{n}"));
+        params.push(a.clone());
+    }
+    if let Some(b) = &query.before {
+        let n = params.len() + 1;
+        sql.push_str(&format!(" AND e.archived_at < ?{n}"));
+        params.push(b.clone());
+    }
+
+    sql.push_str(" GROUP BY e.id ORDER BY e.archived_at DESC, e.id DESC");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let entries = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok(EntrySummary {
+                entry_uid: row.get(0)?,
+                archived_at: row.get(1)?,
+                source_kind: row.get(2)?,
+                entity_kind: row.get(3)?,
+                title: row.get(4)?,
+                visibility: row.get(5)?,
+                original_url: row.get(6)?,
+                artifact_count: row.get(7)?,
+                total_artifact_bytes: row.get(8)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,5 +631,178 @@ mod tests {
         };
         assert!(resolve_artifact_path(&store_path, &artifact).is_err());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- parse_search_query tests ----
+
+    #[test]
+    fn parse_empty_query_returns_default() {
+        let q = parse_search_query("").unwrap();
+        assert!(q.q.is_none());
+        assert!(q.source_kind.is_none());
+        assert!(q.entity_kind.is_none());
+    }
+
+    #[test]
+    fn parse_plain_text_sets_q() {
+        let q = parse_search_query("polymarket").unwrap();
+        assert_eq!(q.q.as_deref(), Some("polymarket"));
+    }
+
+    #[test]
+    fn parse_prefix_source_sets_source_kind() {
+        let q = parse_search_query("source:x").unwrap();
+        assert_eq!(q.source_kind.as_deref(), Some("x"));
+        assert!(q.q.is_none());
+    }
+
+    #[test]
+    fn parse_prefix_type_sets_entity_kind() {
+        let q = parse_search_query("type:tweet").unwrap();
+        assert_eq!(q.entity_kind.as_deref(), Some("tweet"));
+    }
+
+    #[test]
+    fn parse_mixed_plain_and_prefix() {
+        let q = parse_search_query("polymarket type:tweet").unwrap();
+        assert_eq!(q.q.as_deref(), Some("polymarket"));
+        assert_eq!(q.entity_kind.as_deref(), Some("tweet"));
+    }
+
+    #[test]
+    fn parse_unknown_prefix_returns_err() {
+        let result = parse_search_query("foo:bar");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "foo");
+    }
+
+    #[test]
+    fn parse_after_before_dates() {
+        let q = parse_search_query("after:2026-01-01 before:2026-04-01").unwrap();
+        assert_eq!(q.after.as_deref(), Some("2026-01-01"));
+        assert_eq!(q.before.as_deref(), Some("2026-04-01"));
+    }
+
+    // ---- search_entries tests ----
+
+    fn make_test_db_with_entries() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        database::initialize_schema(&conn).unwrap();
+        let user_id = database::ensure_default_user(&conn).unwrap();
+        let run = database::create_archive_run(&conn, user_id, 2).unwrap();
+
+        // Entry 1: tweet by source x
+        let si1 = database::upsert_source_identity(
+            &conn, "x", "tweet", Some("t-1"),
+            Some("https://x.com/user/status/1"),
+            "https://x.com/user/status/1",
+        ).unwrap();
+        database::create_archived_entry(
+            &conn,
+            &database::NewEntry {
+                source_identity_id: si1,
+                archive_run_id: run.id,
+                parent_entry_id: None,
+                root_entry_id: None,
+                created_by_user_id: user_id,
+                owned_by_user_id: user_id,
+                source_kind: "x".to_string(),
+                entity_kind: "tweet".to_string(),
+                title: Some("Polymarket tweet".to_string()),
+                visibility: "private".to_string(),
+                representation_kind: "json".to_string(),
+                source_metadata_json: "{}".to_string(),
+                display_metadata_json: None,
+            },
+        ).unwrap();
+
+        // Entry 2: web page
+        let si2 = database::upsert_source_identity(
+            &conn, "web", "page", Some("page-1"),
+            Some("https://medium.com/article"),
+            "https://medium.com/article",
+        ).unwrap();
+        database::create_archived_entry(
+            &conn,
+            &database::NewEntry {
+                source_identity_id: si2,
+                archive_run_id: run.id,
+                parent_entry_id: None,
+                root_entry_id: None,
+                created_by_user_id: user_id,
+                owned_by_user_id: user_id,
+                source_kind: "web".to_string(),
+                entity_kind: "page".to_string(),
+                title: Some("Resume Templates".to_string()),
+                visibility: "private".to_string(),
+                representation_kind: "html".to_string(),
+                source_metadata_json: "{}".to_string(),
+                display_metadata_json: None,
+            },
+        ).unwrap();
+
+        conn
+    }
+
+    #[test]
+    fn search_empty_query_returns_all_root_entries() {
+        let conn = make_test_db_with_entries();
+        let all = list_root_entries(&conn).unwrap();
+        let searched = search_entries(&conn, &SearchEntriesQuery::default()).unwrap();
+        assert_eq!(all.len(), searched.len());
+    }
+
+    #[test]
+    fn search_q_filters_on_title() {
+        let conn = make_test_db_with_entries();
+        let results = search_entries(&conn, &SearchEntriesQuery {
+            q: Some("polymarket".to_string()),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entity_kind, "tweet");
+    }
+
+    #[test]
+    fn search_entity_kind_exact_match() {
+        let conn = make_test_db_with_entries();
+        let results = search_entries(&conn, &SearchEntriesQuery {
+            entity_kind: Some("page".to_string()),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source_kind, "web");
+    }
+
+    #[test]
+    fn search_url_like_filter() {
+        let conn = make_test_db_with_entries();
+        let results = search_entries(&conn, &SearchEntriesQuery {
+            url: Some("medium.com".to_string()),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title.as_deref(), Some("Resume Templates"));
+    }
+
+    #[test]
+    fn search_no_match_returns_empty() {
+        let conn = make_test_db_with_entries();
+        let results = search_entries(&conn, &SearchEntriesQuery {
+            q: Some("zzznonexistent".to_string()),
+            ..Default::default()
+        }).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_multiple_filters_compound() {
+        let conn = make_test_db_with_entries();
+        let results = search_entries(&conn, &SearchEntriesQuery {
+            source_kind: Some("x".to_string()),
+            entity_kind: Some("tweet".to_string()),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(results.len(), 1);
     }
 }

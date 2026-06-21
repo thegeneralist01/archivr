@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use archivr_core::{archive, database};
 use axum::{
     Json, Router,
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
@@ -18,6 +18,11 @@ pub struct AppState {
     registry: Arc<ServerRegistry>,
 }
 
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct EntrySearchParams {
+    pub q: Option<String>,
+}
+
 pub fn app(registry: ServerRegistry) -> Router {
     let state = AppState {
         registry: Arc::new(registry),
@@ -28,6 +33,7 @@ pub fn app(registry: ServerRegistry) -> Router {
         .route("/health", get(|| async { "ok" }))
         .route("/api/archives", get(list_archives))
         .route("/api/archives/:archive_id/entries", get(list_entries))
+        .route("/api/archives/:archive_id/entries/search", get(search_entries_handler))
         .route(
             "/api/archives/:archive_id/entries/:entry_uid",
             get(entry_detail),
@@ -59,6 +65,23 @@ async fn list_entries(
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     Ok(Json(archive::list_root_entries(&conn)?))
+}
+
+async fn search_entries_handler(
+    State(state): State<AppState>,
+    Path(archive_id): Path<String>,
+    Query(params): Query<EntrySearchParams>,
+) -> Result<Json<Vec<archive::EntrySummary>>, ApiError> {
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let raw = params.q.as_deref().unwrap_or("");
+    let search_query = archive::parse_search_query(raw)
+        .map_err(|prefix| ApiError::bad_request(&format!("unknown search prefix: {prefix}")));
+    let search_query = match search_query {
+        Ok(q) => q,
+        Err(e) => return Err(e),
+    };
+    Ok(Json(archive::search_entries(&conn, &search_query)?))
 }
 
 async fn entry_detail(
@@ -127,6 +150,13 @@ impl ApiError {
     fn not_found(message: &str) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: message.to_string(),
+        }
+    }
+
+    fn bad_request(message: &str) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
             message: message.to_string(),
         }
     }
@@ -358,5 +388,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn search_missing_archive_returns_404() {
+        let response = app(ServerRegistry::default())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/nope/entries/search?q=anything")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn search_empty_q_returns_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        archivr_core::archive::initialize_archive(
+            dir.path(),
+            &dir.path().join("store"),
+            "test",
+            false,
+        )
+        .unwrap();
+        let archive_path = dir.path().join(".archivr");
+        let registry = ServerRegistry {
+            archives: vec![MountedArchive {
+                id: "test".to_string(),
+                label: "Test".to_string(),
+                archive_path,
+            }],
+        };
+        let response = app(registry)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/entries/search")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn search_unknown_prefix_returns_400() {
+        let dir = tempfile::tempdir().unwrap();
+        archivr_core::archive::initialize_archive(
+            dir.path(),
+            &dir.path().join("store"),
+            "test",
+            false,
+        )
+        .unwrap();
+        let archive_path = dir.path().join(".archivr");
+        let registry = ServerRegistry {
+            archives: vec![MountedArchive {
+                id: "test".to_string(),
+                label: "Test".to_string(),
+                archive_path,
+            }],
+        };
+        let response = app(registry)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/entries/search?q=unknownprefix%3Aval")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

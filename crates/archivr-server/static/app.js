@@ -2,7 +2,6 @@ const state = {
   archives: [],
   archiveId: null,
   entries: [],
-  filteredEntries: [],
   selectedEntryUid: null,
 };
 
@@ -71,33 +70,16 @@ function renderArchives() {
   }
 }
 
-function applyEntryFilter() {
-  const query = searchInput.value.trim().toLowerCase();
-  if (!query) {
-    state.filteredEntries = state.entries;
-    return;
-  }
-  state.filteredEntries = state.entries.filter((entry) => {
-    const haystack = [
-      entry.title,
-      entry.original_url,
-      entry.entry_uid,
-      entry.source_kind,
-      entry.entity_kind,
-      entry.visibility,
-    ]
-      .filter(Boolean)
-      .join(" ")
-      .toLowerCase();
-    return haystack.includes(query);
-  });
-}
 
 function renderEntries() {
   entriesBody.innerHTML = "";
-  resultCount.textContent = `${state.filteredEntries.length} entries`;
+  if (state.entries.length === 0 && searchInput.value.trim()) {
+    resultCount.textContent = "No results.";
+  } else {
+    resultCount.textContent = `${state.entries.length} entries`;
+  }
 
-  for (const entry of state.filteredEntries) {
+  for (const entry of state.entries) {
     const row = document.createElement("tr");
     row.tabIndex = 0;
     row.dataset.entryUid = entry.entry_uid;
@@ -233,12 +215,21 @@ async function loadRuns() {
   }
 }
 
-async function loadEntries() {
-  state.entries = await getJson(`/api/archives/${state.archiveId}/entries`);
-  state.selectedEntryUid = null;
-  applyEntryFilter();
+async function loadEntries(q = "") {
+  const trimmed = q.trim();
+  const url = trimmed
+    ? `/api/archives/${state.archiveId}/entries/search?q=${encodeURIComponent(trimmed)}`
+    : `/api/archives/${state.archiveId}/entries`;
+  searchInput.setAttribute("aria-busy", "true");
+  try {
+    state.entries = await getJson(url);
+  } catch (err) {
+    resultCount.textContent = "Search failed. Try again.";
+    state.entries = [];
+  } finally {
+    searchInput.removeAttribute("aria-busy");
+  }
   renderEntries();
-  contextBody.textContent = "Select an entry.";
 }
 
 async function loadArchives() {
@@ -254,15 +245,26 @@ async function loadArchives() {
   }
 }
 
+function debounce(fn, ms) {
+  let timer;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), ms);
+  };
+}
+
 archiveSwitcher.addEventListener("change", async () => {
   state.archiveId = archiveSwitcher.value;
   await loadEntries();
   await loadRuns();
 });
 
+const debouncedSearch = debounce((q) => {
+  if (state.archiveId) loadEntries(q);
+}, 300);
+
 searchInput.addEventListener("input", () => {
-  applyEntryFilter();
-  renderEntries();
+  debouncedSearch(searchInput.value);
 });
 
 navButtons.forEach((button) => {

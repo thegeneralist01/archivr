@@ -370,3 +370,7 @@ select {
   background: var(--line);
   text-decoration: underline;
 }
+/* Search loading state */
+.search-input[aria-busy="true"] {
+  cursor: progress;
+}
