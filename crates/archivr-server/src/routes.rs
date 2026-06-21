@@ -3,7 +3,6 @@ use std::{path::PathBuf, sync::Arc};
 use archivr_core::{archive, database};
 use axum::{
     Json, Router,
-    body::Body,
     extract::{Path, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -268,5 +267,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn artifact_serves_file_with_ok_status() {
+        // Initialize archive (creates .archivr dir, store dirs, and db)
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("store");
+        let paths =
+            archivr_core::archive::initialize_archive(dir.path(), &store_path, "test", false)
+                .unwrap();
+
+        // Write artifact file to the store
+        let artifact_relpath = "raw/a/b/test.html";
+        let artifact_dir = store_path.join("raw").join("a").join("b");
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        std::fs::write(artifact_dir.join("test.html"), b"<html>hello</html>").unwrap();
+
+        // Populate the database with user, source identity, run, entry, blob, artifact
+        let conn = database::open_or_initialize(&paths.archive_path).unwrap();
+        let user_id = database::ensure_default_user(&conn).unwrap();
+        let source_identity_id = database::upsert_source_identity(
+            &conn,
+            "web",
+            "page",
+            Some("test-page"),
+            Some("https://example.com/page"),
+            "https://example.com/page",
+        )
+        .unwrap();
+        let run = database::create_archive_run(&conn, user_id, 1).unwrap();
+        let entry = database::create_archived_entry(
+            &conn,
+            &database::NewEntry {
+                source_identity_id,
+                archive_run_id: run.id,
+                parent_entry_id: None,
+                root_entry_id: None,
+                created_by_user_id: user_id,
+                owned_by_user_id: user_id,
+                source_kind: "web".to_string(),
+                entity_kind: "page".to_string(),
+                title: Some("Test Page".to_string()),
+                visibility: "private".to_string(),
+                representation_kind: "html".to_string(),
+                source_metadata_json: r#"{"source":"test"}"#.to_string(),
+                display_metadata_json: None,
+            },
+        )
+        .unwrap();
+        let blob_id = database::upsert_blob(
+            &conn,
+            &database::BlobRecord {
+                sha256: "abc123testblob".to_string(),
+                byte_size: 18,
+                mime_type: Some("text/html".to_string()),
+                extension: Some("html".to_string()),
+                raw_relpath: artifact_relpath.to_string(),
+            },
+        )
+        .unwrap();
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id: entry.id,
+                artifact_role: "primary_media".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: artifact_relpath.to_string(),
+                blob_id: Some(blob_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+        drop(conn); // release before the HTTP handler opens the same db file
+
+        let registry = ServerRegistry {
+            archives: vec![MountedArchive {
+                id: "test".to_string(),
+                label: "Test".to_string(),
+                archive_path: paths.archive_path.clone(),
+            }],
+        };
+        let uri = format!(
+            "/api/archives/test/entries/{}/artifacts/0",
+            entry.entry_uid
+        );
+        let response = app(registry)
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
