@@ -56,6 +56,49 @@ This project aims to provide a reliable solution for archiving important data fr
 - Direct platform URLs
 - Platform shorthand inputs such as `tweet:...`, `yt:...`, or `instagram:...`
 
+## Running Archivr
+
+Archivr currently ships as two binaries:
+
+- `archivr`
+  - The CLI for creating and writing to one archive.
+  - Use this for `init` and `archive`.
+- `archivr-server`
+  - The web server for reading one or more existing archives through the browser UI.
+  - Use this after archives already exist.
+
+With Nix, run the CLI with:
+
+```sh
+nix run .#archivr -- init ./my-archive --name "My Archive"
+nix run .#archivr -- archive file:///absolute/path/to/file.pdf
+```
+
+Run the web server with:
+
+```sh
+nix run .#archivr-server -- ./archivr-server.toml
+```
+
+The server expects a TOML registry file. If no path is passed, it reads `./archivr-server.toml`.
+
+Example:
+
+```toml
+[[archives]]
+id = "personal"
+label = "Personal"
+archive_path = "/absolute/path/to/my-archive/.archivr"
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8080
+```
+
+When installed through Nix, `archivr-server` is wrapped so it can find the static web UI assets automatically. The wrapper sets `ARCHIVR_STATIC_DIR` to the installed static asset directory. Running from source with `cargo run -p archivr-server` falls back to `crates/archivr-server/static`.
+
 ### Supported Platforms
 
 - Local files: `file:///absolute/path/to/file.ext`

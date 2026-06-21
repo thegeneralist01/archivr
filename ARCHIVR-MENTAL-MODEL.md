@@ -57,6 +57,40 @@ label = "Personal"
 archive_path = "/path/to/archive/.archivr"
 ```
 
+## How To Run It
+
+There are two user-facing binaries:
+
+| Binary | Purpose |
+|---|---|
+| `archivr` | CLI for initializing archives and capturing material into one archive |
+| `archivr-server` | Web server for browsing one or more existing archives |
+
+The CLI writes archive data:
+
+```sh
+nix run .#archivr -- init ./my-archive --name "My Archive"
+nix run .#archivr -- archive file:///absolute/path/to/file.pdf
+```
+
+The server reads archive data:
+
+```sh
+nix run .#archivr-server -- ./archivr-server.toml
+```
+
+If no config path is passed, the server reads `./archivr-server.toml`.
+The config is a server registry, not archive data:
+
+```toml
+[[archives]]
+id = "personal"
+label = "Personal"
+archive_path = "/absolute/path/to/my-archive/.archivr"
+```
+
+The packaged Nix server wrapper sets `ARCHIVR_STATIC_DIR` so the server can find the installed web UI assets. Source-tree runs do not need that variable because they fall back to `crates/archivr-server/static`.
+
 ## Write Data Flow
 
 When archiving something through the CLI:
