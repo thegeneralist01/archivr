@@ -129,13 +129,18 @@
             pname = "archivr-server-wrapped";
             inherit version;
             nativeBuildInputs = [ pkgs.makeWrapper ];
+            buildInputs = [ tweetPython ];
             phases = [ "installPhase" ];
             installPhase = ''
               mkdir -p $out/bin $out/libexec/archivr-server $out/share/archivr-server/static
               cp ${archivr_server_unwrapped}/bin/archivr-server $out/libexec/archivr-server/archivr-server
+              cp ${./vendor/twitter/scrape_user_tweet_contents.py} $out/libexec/archivr-server/scrape_user_tweet_contents.py
+              chmod +x $out/libexec/archivr-server/scrape_user_tweet_contents.py
               cp -r ${./crates/archivr-server/static}/* $out/share/archivr-server/static/
               makeWrapper $out/libexec/archivr-server/archivr-server $out/bin/archivr-server \
-                --set ARCHIVR_STATIC_DIR $out/share/archivr-server/static
+                --set ARCHIVR_STATIC_DIR $out/share/archivr-server/static \
+                --set ARCHIVR_TWEET_PYTHON ${tweetPython}/bin/python3 \
+                --set ARCHIVR_TWEET_SCRAPER $out/libexec/archivr-server/scrape_user_tweet_contents.py
             '';
           };
         in
