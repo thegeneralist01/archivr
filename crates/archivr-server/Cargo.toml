@@ -16,3 +16,4 @@ tower-http.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tower.workspace = true
+serde_json.workspace = true

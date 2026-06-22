@@ -6,7 +6,7 @@ use axum::{
     extract::{Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{delete, get},
 };
 use tower_http::services::{ServeDir, ServeFile};
 use tower::ServiceExt;
@@ -21,6 +21,7 @@ pub struct AppState {
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct EntrySearchParams {
     pub q: Option<String>,
+    pub tag: Option<String>,
 }
 
 pub fn app(registry: ServerRegistry) -> Router {
@@ -43,6 +44,15 @@ pub fn app(registry: ServerRegistry) -> Router {
             get(serve_artifact),
         )
         .route("/api/archives/:archive_id/runs", get(list_runs))
+        .route("/api/archives/:archive_id/tags", get(list_tags).post(create_tag_handler))
+        .route(
+            "/api/archives/:archive_id/entries/:entry_uid/tags",
+            get(list_entry_tags).post(assign_entry_tag_handler),
+        )
+        .route(
+            "/api/archives/:archive_id/entries/:entry_uid/tags/:tag_uid",
+            delete(remove_entry_tag_handler),
+        )
         .nest_service("/assets", ServeDir::new(&static_dir))
         .fallback_service(ServeFile::new(static_dir.join("index.html")))
         .with_state(state)
@@ -75,12 +85,11 @@ async fn search_entries_handler(
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let raw = params.q.as_deref().unwrap_or("");
-    let search_query = archive::parse_search_query(raw)
-        .map_err(|prefix| ApiError::bad_request(&format!("unknown search prefix: {prefix}")));
-    let search_query = match search_query {
-        Ok(q) => q,
-        Err(e) => return Err(e),
-    };
+    let mut search_query = archive::parse_search_query(raw)
+        .map_err(|prefix| ApiError::bad_request(&format!("unknown search prefix: {prefix}")))?;
+    if let Some(tag) = params.tag {
+        search_query.tag = Some(tag);
+    }
     Ok(Json(archive::search_entries(&conn, &search_query)?))
 }
 
@@ -126,6 +135,80 @@ async fn serve_artifact(
         .await
         .unwrap()
         .into_response())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CreateTagBody {
+    path: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AssignTagBody {
+    tag_path: String,
+}
+
+async fn list_tags(
+    State(state): State<AppState>,
+    Path(archive_id): Path<String>,
+) -> Result<Json<Vec<archive::TagNode>>, ApiError> {
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    Ok(Json(archive::list_tag_tree(&conn)?))
+}
+
+async fn create_tag_handler(
+    State(state): State<AppState>,
+    Path(archive_id): Path<String>,
+    Json(body): Json<CreateTagBody>,
+) -> Result<(StatusCode, Json<archive::Tag>), ApiError> {
+    if body.path.trim().is_empty() {
+        return Err(ApiError::bad_request("tag path must not be empty"));
+    }
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let tag = archive::create_tag(&conn, &body.path)?;
+    Ok((StatusCode::CREATED, Json(tag)))
+}
+
+async fn list_entry_tags(
+    State(state): State<AppState>,
+    Path((archive_id, entry_uid)): Path<(String, String)>,
+) -> Result<Json<Vec<archive::Tag>>, ApiError> {
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    match archive::get_entry_tags(&conn, &entry_uid)? {
+        Some(tags) => Ok(Json(tags)),
+        None => Err(ApiError::not_found("entry not found")),
+    }
+}
+
+async fn assign_entry_tag_handler(
+    State(state): State<AppState>,
+    Path((archive_id, entry_uid)): Path<(String, String)>,
+    Json(body): Json<AssignTagBody>,
+) -> Result<(StatusCode, Json<archive::Tag>), ApiError> {
+    if body.tag_path.trim().is_empty() {
+        return Err(ApiError::bad_request("tag_path must not be empty"));
+    }
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    match archive::assign_entry_tag(&conn, &entry_uid, &body.tag_path)? {
+        Some(tag) => Ok((StatusCode::CREATED, Json(tag))),
+        None => Err(ApiError::not_found("entry not found")),
+    }
+}
+
+async fn remove_entry_tag_handler(
+    State(state): State<AppState>,
+    Path((archive_id, entry_uid, tag_uid)): Path<(String, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    if archive::remove_entry_tag(&conn, &entry_uid, &tag_uid)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("entry or tag not found"))
+    }
 }
 
 fn mounted_archive<'a>(
@@ -462,5 +545,351 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ---- helpers ----
+
+    fn make_test_registry(dir: &tempfile::TempDir) -> (ServerRegistry, std::path::PathBuf) {
+        let paths = archivr_core::archive::initialize_archive(
+            dir.path(),
+            &dir.path().join("store"),
+            "test",
+            false,
+        )
+        .unwrap();
+        let registry = ServerRegistry {
+            archives: vec![MountedArchive {
+                id: "test".to_string(),
+                label: "Test".to_string(),
+                archive_path: paths.archive_path.clone(),
+            }],
+        };
+        (registry, paths.archive_path)
+    }
+
+    fn make_test_entry(archive_path: &std::path::Path) -> archivr_core::database::ArchivedEntry {
+        let conn = database::open_or_initialize(archive_path).unwrap();
+        let user_id = database::ensure_default_user(&conn).unwrap();
+        let run = database::create_archive_run(&conn, user_id, 1).unwrap();
+        let si = database::upsert_source_identity(
+            &conn, "web", "page", None,
+            Some("https://example.com/test"),
+            "https://example.com/test",
+        )
+        .unwrap();
+        database::create_archived_entry(
+            &conn,
+            &database::NewEntry {
+                source_identity_id: si,
+                archive_run_id: run.id,
+                parent_entry_id: None,
+                root_entry_id: None,
+                created_by_user_id: user_id,
+                owned_by_user_id: user_id,
+                source_kind: "web".to_string(),
+                entity_kind: "page".to_string(),
+                title: Some("Test Entry".to_string()),
+                visibility: "private".to_string(),
+                representation_kind: "html".to_string(),
+                source_metadata_json: "{}".to_string(),
+                display_metadata_json: None,
+            },
+        )
+        .unwrap()
+    }
+
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn json_body(payload: &serde_json::Value) -> Body {
+        Body::from(serde_json::to_vec(payload).unwrap())
+    }
+
+    // ---- tag route tests ----
+
+    #[tokio::test]
+    async fn test_list_tags_unknown_archive() {
+        let response = app(ServerRegistry::default())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/ghost/tags")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_create_tag_unknown_archive() {
+        let response = app(ServerRegistry::default())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/ghost/tags")
+                    .header("content-type", "application/json")
+                    .body(json_body(&serde_json::json!({"path": "/science"})))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_create_tag_empty_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _) = make_test_registry(&dir);
+        let response = app(registry)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/tags")
+                    .header("content-type", "application/json")
+                    .body(json_body(&serde_json::json!({"path": ""})))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_tag_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _) = make_test_registry(&dir);
+
+        let create_response = app(registry.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/tags")
+                    .header("content-type", "application/json")
+                    .body(json_body(&serde_json::json!({"path": "/science"})))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+
+        let list_response = app(registry.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/tags")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let tree = body_json(list_response).await;
+        let slugs: Vec<&str> = tree
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["tag"]["slug"].as_str().unwrap())
+            .collect();
+        assert!(slugs.contains(&"science"), "expected 'science' in tag tree, got {slugs:?}");
+    }
+
+    #[tokio::test]
+    async fn test_entry_tag_assign_and_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        let entry_uid = entry.entry_uid.clone();
+        let entry_tags_uri = format!("/api/archives/test/entries/{entry_uid}/tags");
+
+        // Assign tag
+        let assign_response = app(registry.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&entry_tags_uri)
+                    .header("content-type", "application/json")
+                    .body(json_body(&serde_json::json!({"tag_path": "/science"})))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(assign_response.status(), StatusCode::CREATED);
+        let assigned_tag = body_json(assign_response).await;
+        let tag_uid = assigned_tag["tag_uid"].as_str().unwrap().to_string();
+
+        // List entry tags — should contain the assigned tag
+        let list_response = app(registry.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(&entry_tags_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let tags = body_json(list_response).await;
+        assert_eq!(tags.as_array().unwrap().len(), 1);
+
+        // Remove tag
+        let delete_uri = format!("{entry_tags_uri}/{tag_uid}");
+        let delete_response = app(registry.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(&delete_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
+
+        // List entry tags again — should be empty
+        let list2_response = app(registry.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(&entry_tags_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list2_response.status(), StatusCode::OK);
+        let tags2 = body_json(list2_response).await;
+        assert!(tags2.as_array().unwrap().is_empty(), "tags should be empty after removal");
+    }
+
+    #[tokio::test]
+    async fn test_search_with_tag_param() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        let entry_uid = entry.entry_uid.clone();
+
+        // Assign /science tag to entry
+        let assign_resp = app(registry.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/archives/test/entries/{entry_uid}/tags"))
+                    .header("content-type", "application/json")
+                    .body(json_body(&serde_json::json!({"tag_path": "/science"})))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(assign_resp.status(), StatusCode::CREATED, "assign tag should return 201");
+
+        // Search with ?tag=/science — entry should appear
+        let response = app(registry.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/entries/search?tag=%2Fscience")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let results = body_json(response).await;
+        assert_eq!(
+            results.as_array().unwrap().len(),
+            1,
+            "expected 1 result for /science tag, got {}",
+            results.as_array().unwrap().len()
+        );
+
+        // Search with ?tag=/art — should return empty
+        let response2 = app(registry.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/entries/search?tag=%2Fart")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response2.status(), StatusCode::OK);
+        let results2 = body_json(response2).await;
+        assert!(
+            results2.as_array().unwrap().is_empty(),
+            "expected 0 results for /art tag"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_entry_tags_unknown_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _) = make_test_registry(&dir);
+        let response = app(registry)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/entries/ghost_uid/tags")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_assign_entry_tag_unknown_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _) = make_test_registry(&dir);
+        let response = app(registry)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/entries/ghost_uid/tags")
+                    .header("content-type", "application/json")
+                    .body(json_body(&serde_json::json!({"tag_path": "/science"})))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_assign_entry_tag_empty_tag_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        let entry_uid = entry.entry_uid.clone();
+        let response = app(registry)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/archives/test/entries/{entry_uid}/tags"))
+                    .header("content-type", "application/json")
+                    .body(json_body(&serde_json::json!({"tag_path": ""})))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_remove_entry_tag_unknown_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _) = make_test_registry(&dir);
+        let response = app(registry)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/archives/test/entries/ghost_uid/tags/ghost_tag_uid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

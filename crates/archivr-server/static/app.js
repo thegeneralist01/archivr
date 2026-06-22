@@ -3,7 +3,10 @@ const state = {
   archiveId: null,
   entries: [],
   selectedEntryUid: null,
+  selectedEntry: null,
+  tagFilter: null,
 };
+let selectSeq = 0;
 
 const archiveSwitcher = document.querySelector("#archive-switcher");
 const entriesBody = document.querySelector("#entries-body");
@@ -13,6 +16,11 @@ const navButtons = document.querySelectorAll(".nav-link");
 const searchInput = document.querySelector("#search");
 const resultCount = document.querySelector("#result-count");
 const adminArchives = document.querySelector("#admin-archives");
+const tagTree = document.querySelector("#tag-tree");
+const entryTagsEl = document.querySelector("#entry-tags");
+const assignTagForm = document.querySelector("#assign-tag-form");
+const assignTagInput = document.querySelector("#assign-tag-input");
+const assignTagBtn = document.querySelector("#assign-tag-btn");
 
 function formatBytes(bytes) {
   if (!bytes) return "0 B";
@@ -77,6 +85,16 @@ function renderEntries() {
     resultCount.textContent = "No results.";
   } else {
     resultCount.textContent = `${state.entries.length} entries`;
+  }
+  if (state.tagFilter) {
+    const badge = document.createElement("button");
+    badge.className = "tag-filter-badge";
+    badge.textContent = `× ${state.tagFilter}`;
+    badge.addEventListener("click", () => {
+      state.tagFilter = null;
+      if (state.archiveId) loadEntries(searchInput.value);
+    });
+    resultCount.appendChild(badge);
   }
 
   for (const entry of state.entries) {
@@ -194,11 +212,59 @@ function renderContextDetail(detail) {
   }
 }
 
+function renderEntryTags(tags, entryUid) {
+  entryTagsEl.innerHTML = "";
+  if (!tags.length) {
+    entryTagsEl.textContent = "No tags.";
+    return;
+  }
+  for (const tag of tags) {
+    const pill = document.createElement("span");
+    pill.className = "tag-pill";
+    pill.textContent = tag.name;
+    pill.title = tag.full_path;
+    const removeBtn = document.createElement("button");
+    removeBtn.className = "remove-tag";
+    removeBtn.textContent = "×";
+    removeBtn.title = `Remove tag ${tag.full_path}`;
+    removeBtn.addEventListener("click", async () => {
+      const resp = await fetch(
+        `/api/archives/${state.archiveId}/entries/${entryUid}/tags/${tag.tag_uid}`,
+        { method: "DELETE" }
+      );
+      if (!resp.ok) {
+        removeBtn.title = `Remove failed (${resp.status})`;
+        return;
+      }
+      const updated = await getJson(
+        `/api/archives/${state.archiveId}/entries/${entryUid}/tags`
+      );
+      renderEntryTags(updated, entryUid);
+      loadTagTree();
+    });
+    pill.appendChild(removeBtn);
+    entryTagsEl.appendChild(pill);
+  }
+}
+
 async function selectEntry(entry) {
+  const seq = ++selectSeq;
   state.selectedEntryUid = entry.entry_uid;
+  state.selectedEntry = entry;
   renderEntries();
-  const detail = await getJson(`/api/archives/${state.archiveId}/entries/${entry.entry_uid}`);
+  const detail = await getJson(
+    `/api/archives/${state.archiveId}/entries/${entry.entry_uid}`
+  );
+  if (seq !== selectSeq) return;
   renderContextDetail(detail);
+  entryTagsEl.hidden = false;
+  assignTagForm.hidden = false;
+  entryTagsEl.innerHTML = "";
+  const tags = await getJson(
+    `/api/archives/${state.archiveId}/entries/${entry.entry_uid}/tags`
+  );
+  if (seq !== selectSeq) return;
+  renderEntryTags(tags, entry.entry_uid);
 }
 
 async function loadRuns() {
@@ -217,9 +283,13 @@ async function loadRuns() {
 
 async function loadEntries(q = "") {
   const trimmed = q.trim();
-  const url = trimmed
-    ? `/api/archives/${state.archiveId}/entries/search?q=${encodeURIComponent(trimmed)}`
-    : `/api/archives/${state.archiveId}/entries`;
+  const params = new URLSearchParams();
+  if (trimmed) params.set("q", trimmed);
+  if (state.tagFilter) params.set("tag", state.tagFilter);
+  const url =
+    trimmed || state.tagFilter
+      ? `/api/archives/${state.archiveId}/entries/search?${params}`
+      : `/api/archives/${state.archiveId}/entries`;
   searchInput.setAttribute("aria-busy", "true");
   try {
     state.entries = await getJson(url);
@@ -232,6 +302,49 @@ async function loadEntries(q = "") {
   renderEntries();
 }
 
+async function loadTagTree() {
+  if (!state.archiveId) return;
+  const nodes = await getJson(`/api/archives/${state.archiveId}/tags`);
+  tagTree.innerHTML = "";
+  renderTagTree(nodes, tagTree);
+}
+
+function renderTagTree(nodes, container) {
+  if (!nodes.length) {
+    container.textContent = "No tags yet.";
+    return;
+  }
+  const ul = document.createElement("ul");
+  ul.className = "tag-tree-list";
+  for (const node of nodes) {
+    const li = document.createElement("li");
+    const btn = document.createElement("button");
+    btn.className = "tag-node-btn";
+    if (state.tagFilter === node.tag.full_path) btn.classList.add("is-active");
+    btn.textContent = node.tag.name;
+    btn.title = node.tag.full_path;
+    btn.addEventListener("click", () => {
+      if (state.tagFilter === node.tag.full_path) {
+        state.tagFilter = null;
+      } else {
+        state.tagFilter = node.tag.full_path;
+      }
+      // Switch to archive view and reload
+      switchView("archive");
+      if (state.archiveId) loadEntries(searchInput.value);
+    });
+    li.appendChild(btn);
+    if (node.children?.length) {
+      const childContainer = document.createElement("div");
+      childContainer.className = "tag-children";
+      renderTagTree(node.children, childContainer);
+      li.appendChild(childContainer);
+    }
+    ul.appendChild(li);
+  }
+  container.appendChild(ul);
+}
+
 async function loadArchives() {
   state.archives = await getJson("/api/archives");
   state.archiveId = state.archives[0]?.id ?? null;
@@ -239,6 +352,7 @@ async function loadArchives() {
   if (state.archiveId) {
     await loadEntries();
     await loadRuns();
+    loadTagTree();
   } else {
     contextBody.textContent = "No archives mounted.";
     resultCount.textContent = "0 entries";
@@ -254,9 +368,15 @@ function debounce(fn, ms) {
 }
 
 archiveSwitcher.addEventListener("change", async () => {
+  state.tagFilter = null;
+  state.selectedEntry = null;
+  state.selectedEntryUid = null;
+  entryTagsEl.hidden = true;
+  assignTagForm.hidden = true;
   state.archiveId = archiveSwitcher.value;
   await loadEntries();
   await loadRuns();
+  loadTagTree();
 });
 
 const debouncedSearch = debounce((q) => {
@@ -267,13 +387,42 @@ searchInput.addEventListener("input", () => {
   debouncedSearch(searchInput.value);
 });
 
+function switchView(name) {
+  navButtons.forEach(b => b.classList.toggle("is-active", b.dataset.view === name));
+  document.querySelectorAll(".view").forEach(v => v.classList.remove("is-active"));
+  document.querySelector(`#${name}-view`)?.classList.add("is-active");
+}
+
 navButtons.forEach((button) => {
   button.addEventListener("click", () => {
-    navButtons.forEach((candidate) => candidate.classList.remove("is-active"));
-    document.querySelectorAll(".view").forEach((view) => view.classList.remove("is-active"));
-    button.classList.add("is-active");
-    document.querySelector(`#${button.dataset.view}-view`).classList.add("is-active");
+    switchView(button.dataset.view);
+    if (button.dataset.view === "tags") loadTagTree();
   });
+});
+
+assignTagBtn.addEventListener("click", async () => {
+  const path = assignTagInput.value.trim();
+  if (!path || !state.selectedEntry) return;
+  const resp = await fetch(
+    `/api/archives/${state.archiveId}/entries/${state.selectedEntry.entry_uid}/tags`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tag_path: path }),
+    }
+  );
+  if (resp.ok) {
+    assignTagInput.setCustomValidity("");
+    assignTagInput.value = "";
+    const tags = await getJson(
+      `/api/archives/${state.archiveId}/entries/${state.selectedEntry.entry_uid}/tags`
+    );
+    renderEntryTags(tags, state.selectedEntry.entry_uid);
+    loadTagTree();
+  } else {
+    assignTagInput.setCustomValidity(`Failed to add tag (${resp.status})`);
+    assignTagInput.reportValidity();
+  }
 });
 
 loadArchives().catch((error) => {
