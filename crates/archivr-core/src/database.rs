@@ -63,6 +63,16 @@ pub struct NewArtifact {
     pub metadata_json: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TagRecord {
+    pub id: i64,
+    pub tag_uid: String,
+    pub parent_tag_id: Option<i64>,
+    pub name: String,
+    pub slug: String,
+    pub full_path: String,
+}
+
 pub fn database_path(archive_path: &Path) -> PathBuf {
     archive_path.join(DATABASE_FILE_NAME)
 }
@@ -214,6 +224,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_entry_artifacts_entry_id ON entry_artifacts(entry_id);
         CREATE INDEX IF NOT EXISTS idx_entry_artifacts_blob_id ON entry_artifacts(blob_id);
         CREATE INDEX IF NOT EXISTS idx_tags_parent_tag_id ON tags(parent_tag_id);
+        CREATE INDEX IF NOT EXISTS idx_entry_tag_assignments_tag_id ON entry_tag_assignments(tag_id);
         "#,
     )?;
     Ok(())
@@ -488,6 +499,104 @@ pub fn add_entry_artifact(conn: &Connection, artifact: &NewArtifact) -> Result<i
     Ok(conn.last_insert_rowid())
 }
 
+pub fn remove_entry_tag_assignment(
+    conn: &Connection,
+    entry_id: i64,
+    tag_id: i64,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM entry_tag_assignments WHERE entry_id = ?1 AND tag_id = ?2",
+        params![entry_id, tag_id],
+    )?;
+    Ok(())
+}
+
+pub fn list_all_tags(conn: &Connection) -> Result<Vec<TagRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, tag_uid, parent_tag_id, name, slug, full_path
+         FROM tags
+         ORDER BY full_path",
+    )?;
+    let records = stmt
+        .query_map([], |row| {
+            Ok(TagRecord {
+                id: row.get(0)?,
+                tag_uid: row.get(1)?,
+                parent_tag_id: row.get(2)?,
+                name: row.get(3)?,
+                slug: row.get(4)?,
+                full_path: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .context("failed to list tags")?;
+    Ok(records)
+}
+
+pub fn list_tags_for_entry(conn: &Connection, entry_id: i64) -> Result<Vec<TagRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.tag_uid, t.parent_tag_id, t.name, t.slug, t.full_path
+         FROM tags t
+         JOIN entry_tag_assignments eta ON eta.tag_id = t.id
+         WHERE eta.entry_id = ?1
+         ORDER BY t.full_path",
+    )?;
+    let records = stmt
+        .query_map([entry_id], |row| {
+            Ok(TagRecord {
+                id: row.get(0)?,
+                tag_uid: row.get(1)?,
+                parent_tag_id: row.get(2)?,
+                name: row.get(3)?,
+                slug: row.get(4)?,
+                full_path: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .context("failed to list tags for entry")?;
+    Ok(records)
+}
+
+pub fn get_tag_by_uid(conn: &Connection, tag_uid: &str) -> Result<Option<TagRecord>> {
+    conn.query_row(
+        "SELECT id, tag_uid, parent_tag_id, name, slug, full_path
+         FROM tags WHERE tag_uid = ?1",
+        [tag_uid],
+        |row| {
+            Ok(TagRecord {
+                id: row.get(0)?,
+                tag_uid: row.get(1)?,
+                parent_tag_id: row.get(2)?,
+                name: row.get(3)?,
+                slug: row.get(4)?,
+                full_path: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .context("failed to get tag by uid")
+}
+
+pub fn get_tag_by_path(conn: &Connection, full_path: &str) -> Result<Option<TagRecord>> {
+    conn.query_row(
+        "SELECT id, tag_uid, parent_tag_id, name, slug, full_path
+         FROM tags WHERE full_path = ?1",
+        [full_path],
+        |row| {
+            Ok(TagRecord {
+                id: row.get(0)?,
+                tag_uid: row.get(1)?,
+                parent_tag_id: row.get(2)?,
+                name: row.get(3)?,
+                slug: row.get(4)?,
+                full_path: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .context("failed to get tag by path")
+}
+
 #[cfg(test)]
 pub fn set_public_settings(
     conn: &Connection,
@@ -535,7 +644,6 @@ pub fn main_archive_entry_count(conn: &Connection) -> Result<i64> {
     Ok(count)
 }
 
-#[cfg(test)]
 pub fn create_tag_path(conn: &Connection, full_path: &str) -> Result<i64> {
     let segments = normalized_tag_segments(full_path)?;
     let mut parent_tag_id = None;
@@ -577,7 +685,6 @@ pub fn create_tag_path(conn: &Connection, full_path: &str) -> Result<i64> {
     Ok(current_id)
 }
 
-#[cfg(test)]
 pub fn assign_entry_to_tag(conn: &Connection, entry_id: i64, tag_id: i64) -> Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO entry_tag_assignments (entry_id, tag_id)
@@ -587,7 +694,6 @@ pub fn assign_entry_to_tag(conn: &Connection, entry_id: i64, tag_id: i64) -> Res
     Ok(())
 }
 
-#[cfg(test)]
 pub fn entry_count_for_tag_path(conn: &Connection, full_path: &str) -> Result<i64> {
     let count = conn.query_row(
         "WITH RECURSIVE descendants(id) AS (
@@ -653,7 +759,6 @@ fn validate_visibility(visibility: &str) -> Result<()> {
     }
 }
 
-#[cfg(test)]
 fn normalized_tag_segments(full_path: &str) -> Result<Vec<&str>> {
     let segments = full_path
         .trim()
@@ -669,7 +774,6 @@ fn normalized_tag_segments(full_path: &str) -> Result<Vec<&str>> {
     Ok(segments)
 }
 
-#[cfg(test)]
 fn humanize_slug(slug: &str) -> String {
     slug.split('-')
         .map(|part| {

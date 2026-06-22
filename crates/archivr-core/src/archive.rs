@@ -25,6 +25,7 @@ pub struct EntrySummary {
     pub original_url: Option<String>,
     pub artifact_count: i64,
     pub total_artifact_bytes: i64,
+    pub parent_entry_uid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -55,6 +56,20 @@ pub struct RunSummary {
     pub completed_count: i64,
     pub failed_count: i64,
     pub error_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Tag {
+    pub tag_uid: String,
+    pub name: String,
+    pub slug: String,
+    pub full_path: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TagNode {
+    pub tag: Tag,
+    pub children: Vec<TagNode>,
 }
 
 pub fn find_archive_path_from(start: &Path) -> Result<Option<PathBuf>> {
@@ -167,7 +182,8 @@ pub fn list_root_entries(conn: &rusqlite::Connection) -> Result<Vec<EntrySummary
             e.visibility,
             si.canonical_url,
             COUNT(ea.id) AS artifact_count,
-            COALESCE(SUM(b.byte_size), 0) AS total_artifact_bytes
+            COALESCE(SUM(b.byte_size), 0) AS total_artifact_bytes,
+            NULL AS parent_entry_uid
          FROM archived_entries e
          JOIN source_identities si ON si.id = e.source_identity_id
          LEFT JOIN entry_artifacts ea ON ea.entry_id = e.id
@@ -189,6 +205,7 @@ pub fn list_root_entries(conn: &rusqlite::Connection) -> Result<Vec<EntrySummary
                 original_url: row.get(6)?,
                 artifact_count: row.get(7)?,
                 total_artifact_bytes: row.get(8)?,
+                parent_entry_uid: row.get(9)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -319,11 +336,13 @@ pub struct SearchEntriesQuery {
     pub after: Option<String>,
     /// e.archived_at < before (exclusive, ISO 8601)
     pub before: Option<String>,
+    /// Tag full_path filter; includes all entries (root + child) matching the tag subtree
+    pub tag: Option<String>,
 }
 
 /// Parses a raw search string into a [`SearchEntriesQuery`].
 ///
-/// Recognized prefixes: `source:`, `type:`, `url:`, `title:`, `after:`, `before:`.
+/// Recognized prefixes: `source:`, `type:`, `url:`, `title:`, `after:`, `before:`, `tag:`.
 /// Tokens with an unrecognized `prefix:` return `Err(prefix)`.
 /// Remaining non-prefix tokens are joined as the free-text `q`.
 /// Quoted values (`title:"resume templates"`) are supported for single-word values
@@ -346,6 +365,7 @@ pub fn parse_search_query(raw: &str) -> Result<SearchEntriesQuery, String> {
                 "title"  => query.title = Some(value),
                 "after"  => query.after = Some(value),
                 "before" => query.before = Some(value),
+                "tag"    => query.tag = Some(value),
                 other    => return Err(other.to_string()),
             }
         } else {
@@ -359,25 +379,52 @@ pub fn parse_search_query(raw: &str) -> Result<SearchEntriesQuery, String> {
     Ok(query)
 }
 
+const ENTRY_SELECT_COLS: &str =
+    "SELECT e.entry_uid, e.archived_at, e.source_kind, e.entity_kind, e.title, \
+    e.visibility, si.canonical_url, COUNT(ea.id) AS artifact_count, \
+    COALESCE(SUM(b.byte_size), 0) AS total_artifact_bytes, \
+    parent.entry_uid AS parent_entry_uid";
+
+const ENTRY_FROM_JOINS: &str =
+    "FROM archived_entries e \
+    JOIN source_identities si ON si.id = e.source_identity_id \
+    LEFT JOIN entry_artifacts ea ON ea.entry_id = e.id \
+    LEFT JOIN blobs b ON b.id = ea.blob_id \
+    LEFT JOIN archived_entries parent ON parent.id = e.parent_entry_id";
+
 /// Searches archived entries matching all non-`None` fields in `query`.
 ///
-/// Returns root entries only (same scope as [`list_root_entries`]).
+/// Without a tag filter, returns root entries only (same scope as [`list_root_entries`]).
+/// With a tag filter, returns ALL entries (root and child) assigned to that tag subtree.
 pub fn search_entries(
     conn: &rusqlite::Connection,
     query: &SearchEntriesQuery,
 ) -> Result<Vec<EntrySummary>> {
-    let mut sql = String::from(
-        "SELECT e.entry_uid, e.archived_at, e.source_kind, e.entity_kind, e.title, \
-         e.visibility, si.canonical_url, COUNT(ea.id) AS artifact_count, \
-         COALESCE(SUM(b.byte_size), 0) AS total_artifact_bytes \
-         FROM archived_entries e \
-         JOIN source_identities si ON si.id = e.source_identity_id \
-         LEFT JOIN entry_artifacts ea ON ea.entry_id = e.id \
-         LEFT JOIN blobs b ON b.id = ea.blob_id \
-         WHERE e.parent_entry_id IS NULL",
-    );
-
     let mut params: Vec<String> = Vec::new();
+    let mut sql;
+
+    if let Some(tag_path) = &query.tag {
+        params.push(tag_path.clone());
+        sql = format!(
+            "WITH RECURSIVE descendants(id) AS (\
+                SELECT id FROM tags WHERE full_path = ?1 \
+                UNION ALL \
+                SELECT child.id FROM tags child \
+                JOIN descendants d ON child.parent_tag_id = d.id\
+            ) {} {} \
+            JOIN entry_tag_assignments eta ON eta.entry_id = e.id \
+            JOIN descendants d ON eta.tag_id = d.id \
+            WHERE 1=1",
+            ENTRY_SELECT_COLS,
+            ENTRY_FROM_JOINS,
+        );
+    } else {
+        sql = format!(
+            "{} {} WHERE e.parent_entry_id IS NULL",
+            ENTRY_SELECT_COLS,
+            ENTRY_FROM_JOINS,
+        );
+    }
 
     if let Some(q) = &query.q {
         let term = format!("%{}%", q.to_lowercase());
@@ -435,6 +482,191 @@ pub fn search_entries(
                 original_url: row.get(6)?,
                 artifact_count: row.get(7)?,
                 total_artifact_bytes: row.get(8)?,
+                parent_entry_uid: row.get(9)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(entries)
+}
+
+fn tag_by_id(conn: &rusqlite::Connection, id: i64) -> Result<Tag> {
+    conn.query_row(
+        "SELECT tag_uid, name, slug, full_path FROM tags WHERE id = ?1",
+        [id],
+        |row| {
+            Ok(Tag {
+                tag_uid: row.get(0)?,
+                name: row.get(1)?,
+                slug: row.get(2)?,
+                full_path: row.get(3)?,
+            })
+        },
+    )
+    .context("tag not found by id")
+}
+
+/// Creates all tag path segments (idempotent) and returns the leaf `Tag`.
+pub fn create_tag(conn: &rusqlite::Connection, full_path: &str) -> Result<Tag> {
+    let id = database::create_tag_path(conn, full_path)?;
+    tag_by_id(conn, id)
+}
+
+/// Returns the full tag tree with root nodes at the top level and children nested.
+pub fn list_tag_tree(conn: &rusqlite::Connection) -> Result<Vec<TagNode>> {
+    use std::collections::HashMap;
+
+    let records = database::list_all_tags(conn)?;
+
+    let mut by_parent: HashMap<Option<i64>, Vec<database::TagRecord>> = HashMap::new();
+    for record in records {
+        by_parent.entry(record.parent_tag_id).or_default().push(record);
+    }
+
+    fn build_nodes(
+        parent_id: Option<i64>,
+        by_parent: &HashMap<Option<i64>, Vec<database::TagRecord>>,
+    ) -> Vec<TagNode> {
+        let Some(children) = by_parent.get(&parent_id) else {
+            return Vec::new();
+        };
+        children
+            .iter()
+            .map(|r| TagNode {
+                tag: Tag {
+                    tag_uid: r.tag_uid.clone(),
+                    name: r.name.clone(),
+                    slug: r.slug.clone(),
+                    full_path: r.full_path.clone(),
+                },
+                children: build_nodes(Some(r.id), by_parent),
+            })
+            .collect()
+    }
+
+    Ok(build_nodes(None, &by_parent))
+}
+
+/// Returns the tags assigned to an entry.
+///
+/// Returns `Ok(None)` if the entry_uid does not exist (caller maps to 404).
+/// Returns `Ok(Some([]))` if the entry exists but has no tags.
+pub fn get_entry_tags(
+    conn: &rusqlite::Connection,
+    entry_uid: &str,
+) -> Result<Option<Vec<Tag>>> {
+    let Some(entry_id) = conn
+        .query_row(
+            "SELECT id FROM archived_entries WHERE entry_uid = ?1",
+            [entry_uid],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let records = database::list_tags_for_entry(conn, entry_id)?;
+    Ok(Some(
+        records
+            .into_iter()
+            .map(|r| Tag {
+                tag_uid: r.tag_uid,
+                name: r.name,
+                slug: r.slug,
+                full_path: r.full_path,
+            })
+            .collect(),
+    ))
+}
+
+/// Assigns a tag (by full path, creating it if needed) to an entry.
+///
+/// Returns `Ok(None)` if the entry_uid does not exist.
+/// Returns `Ok(Some(tag))` on success.
+pub fn assign_entry_tag(
+    conn: &rusqlite::Connection,
+    entry_uid: &str,
+    tag_full_path: &str,
+) -> Result<Option<Tag>> {
+    let Some(entry_id) = conn
+        .query_row(
+            "SELECT id FROM archived_entries WHERE entry_uid = ?1",
+            [entry_uid],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let tag_id = database::create_tag_path(conn, tag_full_path)?;
+    database::assign_entry_to_tag(conn, entry_id, tag_id)?;
+    Ok(Some(tag_by_id(conn, tag_id)?))
+}
+
+/// Removes a tag assignment from an entry.
+///
+/// Returns `Ok(false)` if either the entry_uid or tag_uid is not found.
+/// Returns `Ok(true)` on success (even if no row was deleted, i.e. assignment didn't exist).
+pub fn remove_entry_tag(
+    conn: &rusqlite::Connection,
+    entry_uid: &str,
+    tag_uid: &str,
+) -> Result<bool> {
+    let Some(entry_id) = conn
+        .query_row(
+            "SELECT id FROM archived_entries WHERE entry_uid = ?1",
+            [entry_uid],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    else {
+        return Ok(false);
+    };
+    let Some(tag_record) = database::get_tag_by_uid(conn, tag_uid)? else {
+        return Ok(false);
+    };
+    database::remove_entry_tag_assignment(conn, entry_id, tag_record.id)?;
+    Ok(true)
+}
+
+/// Returns all entries (root and child) assigned to any tag in the subtree rooted at `tag_full_path`.
+pub fn entries_for_tag(
+    conn: &rusqlite::Connection,
+    tag_full_path: &str,
+) -> Result<Vec<EntrySummary>> {
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE descendants(id) AS (
+             SELECT id FROM tags WHERE full_path = ?1
+             UNION ALL
+             SELECT child.id FROM tags child
+             JOIN descendants d ON child.parent_tag_id = d.id
+         )
+         SELECT e.entry_uid, e.archived_at, e.source_kind, e.entity_kind, e.title,
+                e.visibility, si.canonical_url, COUNT(ea.id) AS artifact_count,
+                COALESCE(SUM(b.byte_size), 0) AS total_artifact_bytes,
+                parent.entry_uid AS parent_entry_uid
+         FROM archived_entries e
+         JOIN source_identities si ON si.id = e.source_identity_id
+         LEFT JOIN entry_artifacts ea ON ea.entry_id = e.id
+         LEFT JOIN blobs b ON b.id = ea.blob_id
+         LEFT JOIN archived_entries parent ON parent.id = e.parent_entry_id
+         JOIN entry_tag_assignments eta ON eta.entry_id = e.id
+         JOIN descendants d ON eta.tag_id = d.id
+         GROUP BY e.id
+         ORDER BY e.archived_at DESC, e.id DESC",
+    )?;
+    let entries = stmt
+        .query_map([tag_full_path], |row| {
+            Ok(EntrySummary {
+                entry_uid: row.get(0)?,
+                archived_at: row.get(1)?,
+                source_kind: row.get(2)?,
+                entity_kind: row.get(3)?,
+                title: row.get(4)?,
+                visibility: row.get(5)?,
+                original_url: row.get(6)?,
+                artifact_count: row.get(7)?,
+                total_artifact_bytes: row.get(8)?,
+                parent_entry_uid: row.get(9)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -683,6 +915,13 @@ mod tests {
         assert_eq!(q.before.as_deref(), Some("2026-04-01"));
     }
 
+    #[test]
+    fn parse_search_query_tag_prefix() {
+        let q = parse_search_query("tag:/science/cs").unwrap();
+        assert_eq!(q.tag.as_deref(), Some("/science/cs"));
+        assert_eq!(q.q, None);
+    }
+
     // ---- search_entries tests ----
 
     fn make_test_db_with_entries() -> rusqlite::Connection {
@@ -804,5 +1043,154 @@ mod tests {
             ..Default::default()
         }).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    // ---- tag API tests ----
+
+    fn make_tag_test_db() -> (rusqlite::Connection, i64, i64) {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        database::initialize_schema(&conn).unwrap();
+        let user_id = database::ensure_default_user(&conn).unwrap();
+        let run = database::create_archive_run(&conn, user_id, 2).unwrap();
+        (conn, user_id, run.id)
+    }
+
+    fn make_entry_in_db(
+        conn: &rusqlite::Connection,
+        user_id: i64,
+        run_id: i64,
+        parent_entry_id: Option<i64>,
+        root_entry_id: Option<i64>,
+        title: &str,
+        url: &str,
+    ) -> database::ArchivedEntry {
+        let si = database::upsert_source_identity(
+            conn, "web", "page", None, Some(url), url,
+        ).unwrap();
+        database::create_archived_entry(
+            conn,
+            &database::NewEntry {
+                source_identity_id: si,
+                archive_run_id: run_id,
+                parent_entry_id,
+                root_entry_id,
+                created_by_user_id: user_id,
+                owned_by_user_id: user_id,
+                source_kind: "web".to_string(),
+                entity_kind: "page".to_string(),
+                title: Some(title.to_string()),
+                visibility: "private".to_string(),
+                representation_kind: "html".to_string(),
+                source_metadata_json: "{}".to_string(),
+                display_metadata_json: None,
+            },
+        ).unwrap()
+    }
+
+    #[test]
+    fn tag_tree_roots_and_children() {
+        let (conn, _, _) = make_tag_test_db();
+        create_tag(&conn, "/science/cs").unwrap();
+        create_tag(&conn, "/art").unwrap();
+
+        let tree = list_tag_tree(&conn).unwrap();
+        assert_eq!(tree.len(), 2, "expected two root nodes");
+
+        let science = tree.iter().find(|n| n.tag.slug == "science").expect("science root missing");
+        assert_eq!(science.children.len(), 1, "science should have one child");
+        assert_eq!(science.children[0].tag.slug, "cs");
+
+        let art = tree.iter().find(|n| n.tag.slug == "art").expect("art root missing");
+        assert!(art.children.is_empty(), "art should have no children");
+    }
+
+    #[test]
+    fn assign_entry_tag_is_idempotent() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        let entry = make_entry_in_db(&conn, user_id, run_id, None, None, "Test", "https://example.com/t1");
+
+        assign_entry_tag(&conn, &entry.entry_uid, "/science").unwrap();
+        assign_entry_tag(&conn, &entry.entry_uid, "/science").unwrap();
+
+        let tags = get_entry_tags(&conn, &entry.entry_uid).unwrap().unwrap();
+        assert_eq!(tags.len(), 1, "idempotent assign should yield exactly one tag");
+    }
+
+    #[test]
+    fn remove_entry_tag_clears_assignment() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        let entry = make_entry_in_db(&conn, user_id, run_id, None, None, "Test", "https://example.com/t2");
+
+        let tag = assign_entry_tag(&conn, &entry.entry_uid, "/science").unwrap().unwrap();
+        remove_entry_tag(&conn, &entry.entry_uid, &tag.tag_uid).unwrap();
+
+        let tags = get_entry_tags(&conn, &entry.entry_uid).unwrap().unwrap();
+        assert!(tags.is_empty(), "tag should be removed");
+    }
+
+    #[test]
+    fn entries_for_tag_includes_descendants() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        let entry = make_entry_in_db(&conn, user_id, run_id, None, None, "Compilers Paper", "https://example.com/c1");
+
+        assign_entry_tag(&conn, &entry.entry_uid, "/science/cs/compilers").unwrap();
+
+        let results = entries_for_tag(&conn, "/science").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry_uid, entry.entry_uid);
+    }
+
+    #[test]
+    fn entries_for_tag_includes_child_entries() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        let parent = make_entry_in_db(&conn, user_id, run_id, None, None, "Playlist", "https://example.com/pl");
+        let child = make_entry_in_db(
+            &conn, user_id, run_id,
+            Some(parent.id), Some(parent.id),
+            "Video 1", "https://example.com/pl/v1",
+        );
+
+        assign_entry_tag(&conn, &child.entry_uid, "/science").unwrap();
+
+        let results = entries_for_tag(&conn, "/science").unwrap();
+        assert_eq!(results.len(), 1, "only the tagged child should appear");
+        assert_eq!(results[0].entry_uid, child.entry_uid);
+        assert_eq!(results[0].parent_entry_uid.as_deref(), Some(parent.entry_uid.as_str()));
+    }
+
+    #[test]
+    fn search_with_tag_filter_works() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        let entry = make_entry_in_db(&conn, user_id, run_id, None, None, "Science Article", "https://example.com/s1");
+
+        assign_entry_tag(&conn, &entry.entry_uid, "/science").unwrap();
+
+        let results = search_entries(&conn, &SearchEntriesQuery {
+            tag: Some("/science".to_string()),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry_uid, entry.entry_uid);
+
+        let empty = search_entries(&conn, &SearchEntriesQuery {
+            tag: Some("/art".to_string()),
+            ..Default::default()
+        }).unwrap();
+        assert!(empty.is_empty(), "no entries under /art");
+    }
+
+    #[test]
+    fn search_without_tag_returns_roots_only() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        let parent = make_entry_in_db(&conn, user_id, run_id, None, None, "Parent", "https://example.com/par");
+        let _child = make_entry_in_db(
+            &conn, user_id, run_id,
+            Some(parent.id), Some(parent.id),
+            "Child", "https://example.com/par/c",
+        );
+
+        let results = search_entries(&conn, &SearchEntriesQuery::default()).unwrap();
+        assert_eq!(results.len(), 1, "plain search should return root entries only");
+        assert_eq!(results[0].entry_uid, parent.entry_uid);
     }
 }
