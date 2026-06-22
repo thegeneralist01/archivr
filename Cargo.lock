@@ -124,6 +124,7 @@ dependencies = [
  "archivr-core",
  "axum",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "toml",

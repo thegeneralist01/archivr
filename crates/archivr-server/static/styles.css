@@ -374,3 +374,125 @@ select {
 .search-input[aria-busy="true"] {
   cursor: progress;
 }
+
+/* Tag tree */
+.tag-tree {
+  padding: 12px;
+}
+
+.tag-tree-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.tag-children {
+  padding-left: 16px;
+}
+
+.tag-node-btn {
+  border: 0;
+  background: transparent;
+  color: var(--link);
+  cursor: pointer;
+  padding: 3px 0;
+  text-align: left;
+  font-size: 13px;
+  display: block;
+  width: 100%;
+}
+
+.tag-node-btn:hover {
+  text-decoration: underline;
+}
+
+.tag-node-btn.is-active {
+  font-weight: 600;
+  color: var(--ink);
+}
+
+/* Tag pills in context rail */
+.entry-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 0;
+}
+
+.tag-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--paper-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font-size: 12px;
+  padding: 2px 6px;
+  color: var(--ink);
+}
+
+.remove-tag {
+  border: 0;
+  background: none;
+  cursor: pointer;
+  color: var(--muted);
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.remove-tag:hover {
+  color: var(--accent);
+}
+
+/* Assign tag form */
+.assign-tag-form {
+  display: flex;
+  gap: 6px;
+  padding: 6px 0 8px;
+  border-top: 1px solid var(--line-soft);
+  margin-top: 4px;
+}
+
+.assign-tag-input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--line);
+  background: var(--paper-3);
+  color: var(--ink);
+  padding: 4px 7px;
+  font-size: 12px;
+}
+
+.assign-tag-btn {
+  border: 1px solid var(--line);
+  background: var(--paper-2);
+  color: var(--ink);
+  cursor: pointer;
+  padding: 4px 10px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.assign-tag-btn:hover {
+  background: var(--paper);
+}
+
+/* Tag filter badge in search row */
+.tag-filter-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--accent);
+  color: #fff;
+  border: 0;
+  border-radius: 3px;
+  font-size: 12px;
+  padding: 2px 8px;
+  cursor: pointer;
+  margin-left: 8px;
+}
+
+.tag-filter-badge:hover {
+  opacity: 0.85;
+}
