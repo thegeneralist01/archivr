@@ -6,7 +6,7 @@ use axum::{
     extract::{Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get},
 };
 use tower_http::services::{ServeDir, ServeFile};
 use tower::ServiceExt;
