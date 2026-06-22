@@ -1,12 +1,12 @@
 use std::{path::PathBuf, sync::Arc};
 
-use archivr_core::{archive, database};
+use archivr_core::{archive, capture, database};
 use axum::{
     Json, Router,
     extract::{Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, get},
+    routing::{delete, get, post},
 };
 use tower_http::services::{ServeDir, ServeFile};
 use tower::ServiceExt;
@@ -44,6 +44,7 @@ pub fn app(registry: ServerRegistry) -> Router {
             get(serve_artifact),
         )
         .route("/api/archives/:archive_id/runs", get(list_runs))
+        .route("/api/archives/:archive_id/captures", post(capture_handler))
         .route("/api/archives/:archive_id/tags", get(list_tags).post(create_tag_handler))
         .route(
             "/api/archives/:archive_id/entries/:entry_uid/tags",
@@ -209,6 +210,27 @@ async fn remove_entry_tag_handler(
     } else {
         Err(ApiError::not_found("entry or tag not found"))
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CaptureBody {
+    locator: String,
+}
+
+async fn capture_handler(
+    State(state): State<AppState>,
+    Path(archive_id): Path<String>,
+    Json(body): Json<CaptureBody>,
+) -> Result<Json<capture::CaptureResult>, ApiError> {
+    if body.locator.trim().is_empty() {
+        return Err(ApiError::bad_request("locator must not be empty"));
+    }
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let archive_paths = archive::read_archive_paths(&mounted.archive_path)
+        .map_err(ApiError::from)?;
+    let result = capture::perform_capture(&archive_paths, &body.locator)
+        .map_err(ApiError::from)?;
+    Ok(Json(result))
 }
 
 fn mounted_archive<'a>(
@@ -886,6 +908,38 @@ mod tests {
                     .method("DELETE")
                     .uri("/api/archives/test/entries/ghost_uid/tags/ghost_tag_uid")
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn capture_rejects_empty_locator() {
+        let response = app(ServerRegistry::default())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"locator":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn capture_rejects_unknown_archive() {
+        let response = app(ServerRegistry::default())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/nonexistent/captures")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"locator":"tweet:1234567890"}"#))
                     .unwrap(),
             )
             .await

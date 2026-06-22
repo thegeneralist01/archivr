@@ -21,6 +21,12 @@ const entryTagsEl = document.querySelector("#entry-tags");
 const assignTagForm = document.querySelector("#assign-tag-form");
 const assignTagInput = document.querySelector("#assign-tag-input");
 const assignTagBtn = document.querySelector("#assign-tag-btn");
+const captureButton = document.querySelector('.capture-button');
+const captureDialog = document.querySelector('#capture-dialog');
+const captureLocatorInput = document.querySelector('#capture-locator');
+const captureSubmitBtn = document.querySelector('#capture-submit-btn');
+const captureCancelBtn = document.querySelector('#capture-cancel-btn');
+const captureError = document.querySelector('#capture-error');
 
 function formatBytes(bytes) {
   if (!bytes) return "0 B";
@@ -422,6 +428,45 @@ assignTagBtn.addEventListener("click", async () => {
   } else {
     assignTagInput.setCustomValidity(`Failed to add tag (${resp.status})`);
     assignTagInput.reportValidity();
+  }
+});
+
+captureButton.addEventListener('click', () => {
+  captureLocatorInput.value = '';
+  captureError.hidden = true;
+  captureDialog.showModal();
+});
+
+captureCancelBtn.addEventListener('click', () => captureDialog.close());
+
+captureSubmitBtn.addEventListener('click', async () => {
+  const locator = captureLocatorInput.value.trim();
+  if (!locator) {
+    captureError.textContent = 'Enter a locator.';
+    captureError.hidden = false;
+    return;
+  }
+  captureSubmitBtn.disabled = true;
+  captureSubmitBtn.textContent = 'Capturing\u2026';
+  captureError.hidden = true;
+  try {
+    const res = await fetch(`/api/archives/${state.archiveId}/captures`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ locator }),
+    });
+    if (!res.ok) {
+      const msg = await res.text();
+      throw new Error(msg || `HTTP ${res.status}`);
+    }
+    captureDialog.close();
+    await Promise.all([loadEntries(searchInput.value), loadRuns()]);
+  } catch (e) {
+    captureError.textContent = e.message;
+    captureError.hidden = false;
+  } finally {
+    captureSubmitBtn.disabled = false;
+    captureSubmitBtn.textContent = 'Capture';
   }
 });
 

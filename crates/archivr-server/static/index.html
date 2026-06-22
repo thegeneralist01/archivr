@@ -84,6 +84,20 @@
       </aside>
     </main>
 
+  <dialog id="capture-dialog" class="capture-dialog">
+    <div class="capture-dialog-inner">
+      <h2 class="capture-dialog-title">Capture</h2>
+      <label for="capture-locator" class="capture-label">Locator</label>
+      <input id="capture-locator" class="capture-input" type="text"
+             placeholder="tweet:1234567890 or https://..." autocomplete="off">
+      <div id="capture-error" class="capture-error" hidden></div>
+      <div class="capture-actions">
+        <button type="button" id="capture-cancel-btn" class="capture-cancel">Cancel</button>
+        <button type="button" id="capture-submit-btn" class="capture-submit">Capture</button>
+      </div>
+    </div>
+  </dialog>
+
     <script type="module" src="/assets/app.js"></script>
   </body>
 </html>
