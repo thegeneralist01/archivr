@@ -32,6 +32,34 @@ pub struct CaptureResult {
 }
 
 fn expand_shorthand_to_url(path: &str, source: &Source) -> String {
+    // YouTube shorthands: yt:video/ID, yt:playlist/ID, yt:@handle, yt:channel/ID, etc.
+    if matches!(source, Source::YouTubeVideo | Source::YouTubePlaylist | Source::YouTubeChannel) {
+        if let Some(after) = path.strip_prefix("yt:").or_else(|| path.strip_prefix("youtube:")) {
+            if let Some(id) = after
+                .strip_prefix("video/")
+                .or_else(|| after.strip_prefix("short/"))
+                .or_else(|| after.strip_prefix("shorts/"))
+            {
+                return format!("https://www.youtube.com/watch?v={id}");
+            }
+            if let Some(id) = after.strip_prefix("playlist/") {
+                return format!("https://www.youtube.com/playlist?list={id}");
+            }
+            if let Some(id) = after.strip_prefix("channel/") {
+                return format!("https://www.youtube.com/channel/{id}");
+            }
+            if let Some(id) = after.strip_prefix("c/") {
+                return format!("https://www.youtube.com/c/{id}");
+            }
+            if let Some(id) = after.strip_prefix("user/") {
+                return format!("https://www.youtube.com/user/{id}");
+            }
+            if let Some(handle) = after.strip_prefix("@") {
+                return format!("https://www.youtube.com/@{handle}");
+            }
+        }
+    }
+
     if *source == Source::X && (path.starts_with("tweet:media:") || path.starts_with("x:media:")) {
         if let Some(tweet_id) = path.split(':').next_back().and_then(parse_tweet_id) {
             return format!("https://x.com/i/status/{tweet_id}");
@@ -829,6 +857,36 @@ mod tests {
         assert_eq!(
             expand_shorthand_to_url("tweet:1234567890", &Source::Tweet),
             "tweet:1234567890"
+        );
+        // YouTube shorthands must expand to full URLs before yt-dlp sees them
+        assert_eq!(
+            expand_shorthand_to_url("yt:video/MntbN1DdEP0", &Source::YouTubeVideo),
+            "https://www.youtube.com/watch?v=MntbN1DdEP0"
+        );
+        assert_eq!(
+            expand_shorthand_to_url("yt:shorts/EtC99eWiwRI", &Source::YouTubeVideo),
+            "https://www.youtube.com/watch?v=EtC99eWiwRI"
+        );
+        assert_eq!(
+            expand_shorthand_to_url("youtube:video/UHxw-L2WyyY", &Source::YouTubeVideo),
+            "https://www.youtube.com/watch?v=UHxw-L2WyyY"
+        );
+        assert_eq!(
+            expand_shorthand_to_url("yt:playlist/PL9vTTBa7QaQO", &Source::YouTubePlaylist),
+            "https://www.youtube.com/playlist?list=PL9vTTBa7QaQO"
+        );
+        assert_eq!(
+            expand_shorthand_to_url("yt:@CoreDumpped", &Source::YouTubeChannel),
+            "https://www.youtube.com/@CoreDumpped"
+        );
+        assert_eq!(
+            expand_shorthand_to_url("yt:channel/UCxyz123", &Source::YouTubeChannel),
+            "https://www.youtube.com/channel/UCxyz123"
+        );
+        // Full YouTube URLs pass through unchanged
+        assert_eq!(
+            expand_shorthand_to_url("https://www.youtube.com/watch?v=UHxw-L2WyyY", &Source::YouTubeVideo),
+            "https://www.youtube.com/watch?v=UHxw-L2WyyY"
         );
     }
 
