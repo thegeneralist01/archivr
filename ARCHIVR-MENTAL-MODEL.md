@@ -2,6 +2,13 @@
 
 This document explains the current project shape after the workspace refactor.
 
+## Key Documents
+
+| Document | Role |
+|---|---|
+| `ARCHIVR-MENTAL-MODEL.md` | **This file.** Current architecture, data flows, and where to edit. |
+| `docs/README.md` | User-facing docs: how to run the tool, supported inputs, environment variables. |
+
 ## The Big Model
 
 Archivr is now a Rust workspace with three crates:
