@@ -31,6 +31,65 @@ pub struct CaptureResult {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PlatformMetadata {
+    /// Uploader / creator handle (without @)
+    pub author: Option<String>,
+    /// Video title, playlist name, post title, or filename
+    pub title: Option<String>,
+    /// Tweet text, Instagram caption, TikTok caption
+    pub caption: Option<String>,
+    /// Reddit subreddit name (without r/)
+    pub subreddit: Option<String>,
+    /// Reddit post author handle (without u/)
+    pub post_author: Option<String>,
+}
+
+impl PlatformMetadata {
+    /// Returns caption trimmed to 100 chars followed by "..." when longer.
+    pub fn caption_excerpt(&self) -> Option<String> {
+        self.caption.as_ref().and_then(|c| {
+            let t = c.trim();
+            if t.is_empty() {
+                None
+            } else if t.len() > 100 {
+                Some(format!("{}...", &t[..100]))
+            } else {
+                Some(t.to_string())
+            }
+        })
+    }
+}
+
+fn generate_entry_title(source: Source, meta: &PlatformMetadata) -> String {
+    match source {
+        Source::YouTubeVideo => meta.title.clone().unwrap_or_else(|| "YouTube Video".to_string()),
+        Source::YouTubePlaylist => meta.title.clone().unwrap_or_else(|| "YouTube Playlist".to_string()),
+        Source::YouTubeChannel => format!(
+            "Archival of {}",
+            meta.author.as_deref().unwrap_or("Unknown Channel")
+        ),
+        Source::X => format!("X Media by {}", meta.author.as_deref().unwrap_or("unknown")),
+        Source::Tweet => {
+            let excerpt = meta.caption_excerpt().unwrap_or_else(|| "Tweet".to_string());
+            format!("{} \u{2014} @{}", excerpt, meta.author.as_deref().unwrap_or("unknown"))
+        }
+        Source::TweetThread => format!("Thread by @{}", meta.author.as_deref().unwrap_or("unknown")),
+        Source::Instagram => format!("Post by @{}", meta.author.as_deref().unwrap_or("unknown")),
+        Source::Facebook => format!("Post by {}", meta.author.as_deref().unwrap_or("unknown")),
+        Source::TikTok => format!("TikTok by @{}", meta.author.as_deref().unwrap_or("unknown")),
+        Source::Reddit => format!(
+            "{} \u{2014} r/{} (u/{})",
+            meta.title.as_deref().unwrap_or("Reddit Post"),
+            meta.subreddit.as_deref().unwrap_or("reddit"),
+            meta.post_author.as_deref().unwrap_or("unknown")
+        ),
+        Source::Snapchat => format!("Snap by {}", meta.author.as_deref().unwrap_or("unknown")),
+        Source::Local => meta.title.clone().unwrap_or_else(|| "Local File".to_string()),
+        Source::Other => "Archived Content".to_string(),
+    }
+}
+
 fn expand_shorthand_to_url(path: &str, source: &Source) -> String {
     // YouTube shorthands: yt:video/ID, yt:playlist/ID, yt:@handle, yt:channel/ID, etc.
     if matches!(source, Source::YouTubeVideo | Source::YouTubePlaylist | Source::YouTubeChannel) {
@@ -398,6 +457,7 @@ fn record_media_entry(
     hash: &str,
     file_extension: &str,
     byte_size: i64,
+    title: Option<String>,
 ) -> Result<database::ArchivedEntry> {
     debug_assert!(run.run_uid.starts_with("run_"));
     debug_assert!(item.item_uid.starts_with("item_"));
@@ -430,7 +490,7 @@ fn record_media_entry(
             owned_by_user_id: user_id,
             source_kind: source_kind.to_string(),
             entity_kind: entity_kind.to_string(),
-            title: None,
+            title,
             visibility: "private".to_string(),
             representation_kind: representation_kind.to_string(),
             source_metadata_json: json!({
@@ -458,6 +518,33 @@ fn record_media_entry(
     Ok(entry)
 }
 
+/// Extracts PlatformMetadata from a tweet JSON string.
+/// Returns Default on any parse failure.
+fn tweet_metadata_from_json(json_str: &str) -> PlatformMetadata {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return PlatformMetadata::default();
+    };
+
+    let screen_name = v
+        .get("author")
+        .and_then(|a| a.get("screen_name"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let full_text = v
+        .get("full_text")
+        .and_then(|t| t.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    PlatformMetadata {
+        author: screen_name,
+        caption: full_text,
+        ..Default::default()
+    }
+}
+
 fn record_tweet_entry(
     conn: &rusqlite::Connection,
     store_path: &Path,
@@ -480,6 +567,12 @@ fn record_tweet_entry(
         Some(&canonical_locator),
         &canonical_locator,
     )?;
+    // Read tweet JSON early to extract title before entry creation
+    let tweet_json_relpath = PathBuf::from("raw_tweets").join(format!("tweet-{tweet_id}.json"));
+    let tweet_json = fs::read_to_string(store_path.join(&tweet_json_relpath))?;
+    let tweet_meta = tweet_metadata_from_json(&tweet_json);
+    let tweet_title = generate_entry_title(source, &tweet_meta);
+
     let entry = database::create_archived_entry(
         conn,
         &database::NewEntry {
@@ -491,7 +584,7 @@ fn record_tweet_entry(
             owned_by_user_id: user_id,
             source_kind: source_kind.to_string(),
             entity_kind: entity_kind.to_string(),
-            title: None,
+            title: Some(tweet_title),
             visibility: "private".to_string(),
             representation_kind: representation_kind.to_string(),
             source_metadata_json: json!({
@@ -504,7 +597,6 @@ fn record_tweet_entry(
     )?;
     create_structured_root(store_path, &entry)?;
 
-    let tweet_json_relpath = PathBuf::from("raw_tweets").join(format!("tweet-{tweet_id}.json"));
     database::add_entry_artifact(
         conn,
         &database::NewArtifact {
@@ -518,7 +610,6 @@ fn record_tweet_entry(
         },
     )?;
 
-    let tweet_json = fs::read_to_string(store_path.join(&tweet_json_relpath))?;
     for (role, raw_relpath) in tweet_raw_artifacts(&tweet_json)? {
         let raw_path = PathBuf::from(&raw_relpath);
         let blob = blob_record_for_raw_relpath(store_path, &raw_path)?;
@@ -659,6 +750,30 @@ pub fn perform_capture(archive_paths: &ArchivePaths, locator: &str) -> Result<Ca
     // Sources, for which yt-dlp is needed
     let requested_locator = locator.to_string();
     let path = expand_shorthand_to_url(locator, &source);
+    // Fetch yt-dlp metadata before downloading — separate invocation
+    // because --dump-json is a simulate flag that suppresses the download.
+    let ytdlp_metadata_json: Option<String> = match source {
+        Source::YouTubeVideo
+        | Source::X
+        | Source::Instagram
+        | Source::Facebook
+        | Source::TikTok
+        | Source::Reddit
+        | Source::Snapchat => downloader::ytdlp::fetch_metadata(&path),
+        _ => None,
+    };
+
+    let local_filename_title: Option<String> = match source {
+        Source::Local => {
+            // path is a file:// URI; strip the scheme and take the last component.
+            let file_path = path.trim_start_matches("file://");
+            std::path::Path::new(file_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        }
+        _ => None,
+    };
+
     let hash = match source {
         Source::YouTubeVideo
         | Source::X
@@ -728,6 +843,19 @@ pub fn perform_capture(archive_paths: &ArchivePaths, locator: &str) -> Result<Ca
         let _ = fs::remove_dir_all(store_path.join("temp").join(&timestamp));
     }
 
+    let entry_title: Option<String> = if let Some(ref json) = ytdlp_metadata_json {
+        let metadata = downloader::metadata::extract_from_ytdlp_json(json);
+        Some(generate_entry_title(source, &metadata))
+    } else if let Some(filename) = local_filename_title {
+        let metadata = PlatformMetadata {
+            title: Some(filename),
+            ..Default::default()
+        };
+        Some(generate_entry_title(source, &metadata))
+    } else {
+        None
+    };
+
     record_media_entry(
         &conn,
         store_path,
@@ -740,6 +868,7 @@ pub fn perform_capture(archive_paths: &ArchivePaths, locator: &str) -> Result<Ca
         &hash,
         &file_extension,
         byte_size,
+        entry_title,
     )?;
     database::finish_archive_run(&conn, run.id)?;
 
@@ -1257,5 +1386,133 @@ mod tests {
         assert!(store_path.join(&entry.structured_root_relpath).is_dir());
 
         let _ = fs::remove_dir_all(store_path);
+    }
+
+    mod title_tests {
+        use super::*;
+
+        fn meta(
+            author: Option<&str>,
+            title: Option<&str>,
+            caption: Option<&str>,
+            subreddit: Option<&str>,
+            post_author: Option<&str>,
+        ) -> PlatformMetadata {
+            PlatformMetadata {
+                author: author.map(str::to_string),
+                title: title.map(str::to_string),
+                caption: caption.map(str::to_string),
+                subreddit: subreddit.map(str::to_string),
+                post_author: post_author.map(str::to_string),
+            }
+        }
+
+        #[test]
+        fn youtube_video_uses_title() {
+            let m = meta(None, Some("How to Rust"), None, None, None);
+            assert_eq!(generate_entry_title(Source::YouTubeVideo, &m), "How to Rust");
+        }
+
+        #[test]
+        fn youtube_video_fallback() {
+            let m = meta(None, None, None, None, None);
+            assert_eq!(generate_entry_title(Source::YouTubeVideo, &m), "YouTube Video");
+        }
+
+        #[test]
+        fn youtube_playlist_uses_title() {
+            let m = meta(None, Some("Rust Tutorial Series"), None, None, None);
+            assert_eq!(generate_entry_title(Source::YouTubePlaylist, &m), "Rust Tutorial Series");
+        }
+
+        #[test]
+        fn youtube_channel_uses_author() {
+            let m = meta(Some("Rust By Example"), None, None, None, None);
+            assert_eq!(generate_entry_title(Source::YouTubeChannel, &m), "Archival of Rust By Example");
+        }
+
+        #[test]
+        fn x_media_uses_author() {
+            let m = meta(Some("alice"), None, None, None, None);
+            assert_eq!(generate_entry_title(Source::X, &m), "X Media by alice");
+        }
+
+        #[test]
+        fn tweet_uses_excerpt_and_author() {
+            let m = meta(Some("alice"), None, Some("Hello world"), None, None);
+            assert_eq!(generate_entry_title(Source::Tweet, &m), "Hello world \u{2014} @alice");
+        }
+
+        #[test]
+        fn tweet_truncates_long_caption() {
+            let long = "a".repeat(150);
+            let m = meta(Some("bob"), None, Some(&long), None, None);
+            let title = generate_entry_title(Source::Tweet, &m);
+            assert!(title.starts_with(&"a".repeat(100)));
+            assert!(title.contains("..."));
+            assert!(title.ends_with("\u{2014} @bob"));
+        }
+
+        #[test]
+        fn tweet_thread_uses_author() {
+            let m = meta(Some("bob"), None, None, None, None);
+            assert_eq!(generate_entry_title(Source::TweetThread, &m), "Thread by @bob");
+        }
+
+        #[test]
+        fn instagram_uses_author() {
+            let m = meta(Some("photographer"), None, None, None, None);
+            assert_eq!(generate_entry_title(Source::Instagram, &m), "Post by @photographer");
+        }
+
+        #[test]
+        fn facebook_uses_author_no_at() {
+            let m = meta(Some("John Doe"), None, None, None, None);
+            assert_eq!(generate_entry_title(Source::Facebook, &m), "Post by John Doe");
+        }
+
+        #[test]
+        fn tiktok_uses_author() {
+            let m = meta(Some("dancemaster"), None, None, None, None);
+            assert_eq!(generate_entry_title(Source::TikTok, &m), "TikTok by @dancemaster");
+        }
+
+        #[test]
+        fn reddit_full_fields() {
+            let m = meta(None, Some("My first Rust project"), None, Some("rust"), Some("newbie"));
+            assert_eq!(
+                generate_entry_title(Source::Reddit, &m),
+                "My first Rust project \u{2014} r/rust (u/newbie)"
+            );
+        }
+
+        #[test]
+        fn snapchat_uses_author() {
+            let m = meta(Some("snapuser"), None, None, None, None);
+            assert_eq!(generate_entry_title(Source::Snapchat, &m), "Snap by snapuser");
+        }
+
+        #[test]
+        fn local_uses_title_field() {
+            let m = meta(None, Some("document.pdf"), None, None, None);
+            assert_eq!(generate_entry_title(Source::Local, &m), "document.pdf");
+        }
+
+        #[test]
+        fn all_none_falls_back() {
+            let m = meta(None, None, None, None, None);
+            assert!(!generate_entry_title(Source::Instagram, &m).is_empty());
+        }
+
+        #[test]
+        fn tweet_title_extracted_from_json() {
+            let json = r#"{
+                "full_text": "Hello Rust world, this is a test tweet",
+                "author": { "screen_name": "rustacean", "name": "The Rustacean" }
+            }"#;
+            let meta = tweet_metadata_from_json(json);
+            assert_eq!(meta.author, Some("rustacean".to_string()));
+            assert_eq!(meta.caption, Some("Hello Rust world, this is a test tweet".to_string()));
+        }
     }
 }
