@@ -14,7 +14,12 @@ pub struct MountedArchive {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ServerRegistry {
+    #[serde(default)]
     pub archives: Vec<MountedArchive>,
+    /// Optional bind address for the server. Defaults to `127.0.0.1:8080`.
+    /// Set this to `0.0.0.0:8080` only on trusted networks — the server has no authentication.
+    #[serde(default)]
+    pub bind: Option<String>,
 }
 
 pub fn load_registry(path: &Path) -> Result<ServerRegistry> {
@@ -78,6 +83,7 @@ mod tests {
                 label: "Personal".to_string(),
                 archive_path: archive_path.clone(),
             }],
+            bind: None,
         };
         let path = temp.path().join("server.toml");
         save_registry(&path, &registry).unwrap();
@@ -102,10 +108,36 @@ mod tests {
                     archive_path: PathBuf::from("/tmp/b/.archivr"),
                 },
             ],
+            bind: None,
         };
 
         let err = validate_registry(&registry).unwrap_err().to_string();
 
         assert!(err.contains("duplicate archive id"));
+    }
+
+    #[test]
+    fn registry_bind_field_round_trips() {
+        let toml = r#"bind = "127.0.0.1:9090""#;
+        let registry: ServerRegistry = toml::from_str(toml).unwrap();
+        assert_eq!(registry.bind.as_deref(), Some("127.0.0.1:9090"));
+        assert!(registry.archives.is_empty());
+    }
+
+    #[test]
+    fn registry_bind_field_defaults_to_none_when_absent() {
+        let toml = r#""#;
+        let registry: ServerRegistry = toml::from_str(toml).unwrap();
+        assert!(registry.bind.is_none());
+    }
+
+    #[test]
+    fn registry_bind_field_does_not_affect_archive_validation() {
+        let registry = ServerRegistry {
+            archives: vec![],
+            bind: Some("0.0.0.0:8080".to_string()),
+        };
+        // validate_registry does not reject non-loopback bind — that's main's concern.
+        assert!(validate_registry(&registry).is_ok());
     }
 }

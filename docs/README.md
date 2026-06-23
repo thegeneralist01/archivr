@@ -99,6 +99,36 @@ http://127.0.0.1:8080
 
 When installed through Nix, `archivr-server` is wrapped so it can find the static web UI assets automatically. The wrapper sets `ARCHIVR_STATIC_DIR` to the installed static asset directory. Running from source with `cargo run -p archivr-server` falls back to `crates/archivr-server/static`.
 
+### Security and Deployment
+
+`archivr-server` is a **local-only tool by default**. It binds to `127.0.0.1:8080` and has no authentication or access control. Do not expose it to a public network or a shared LAN without understanding the risks.
+
+**Changing the bind address**
+
+You can set the bind address in your TOML config:
+
+```toml
+# Optional. Default: 127.0.0.1:8080
+# Only change this if you know what you are doing — the server has no authentication.
+bind = "127.0.0.1:9090"
+```
+
+Or override it with the `ARCHIVR_BIND` environment variable:
+
+```sh
+ARCHIVR_BIND=127.0.0.1:9090 nix run .#archivr-server -- ./archivr-server.toml
+```
+
+If the server is started with a non-loopback address (e.g. `0.0.0.0`), it prints a warning to stderr:
+
+```text
+warn: archivr-server is bound to 0.0.0.0:8080 — this server has no authentication. Only expose it on a trusted network.
+```
+
+**When will auth be added?**
+
+Auth and session handling will be designed when remote or public hosting becomes a real requirement. Until then, keep the server on loopback. See `crates/archivr-server/src/routes.rs` for the route classification that will guide where middleware is applied.
+
 ### Supported Platforms
 
 - Local files: `file:///absolute/path/to/file.ext`

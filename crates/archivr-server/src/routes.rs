@@ -1,3 +1,27 @@
+// ── Security Boundary ────────────────────────────────────────────────────────
+// All routes are currently trusted-local: no authentication or authorization
+// middleware is applied. The server is designed to bind on 127.0.0.1 only.
+//
+// Route classification (for when middleware is added later):
+//
+//   STATIC  — safe to expose publicly: GET / and static /assets/*
+//   READ    — safe to expose read-only: GET /health
+//                                       GET /api/archives
+//                                       GET /api/archives/:id/entries
+//                                       GET /api/archives/:id/entries/search
+//                                       GET /api/archives/:id/entries/:uid
+//                                       GET /api/archives/:id/entries/:uid/artifacts/:idx
+//                                       GET /api/archives/:id/runs
+//                                       GET /api/archives/:id/tags
+//   ADMIN   — requires auth if ever public: GET /api/admin/archives
+//   WRITE   — requires auth if ever public: POST /api/archives/:id/captures
+//                                           POST /api/archives/:id/tags
+//                                           PUT  /api/archives/:id/tags/:tag_id
+//                                           DELETE /api/archives/:id/tags/:tag_id
+//
+// Do not add middleware here until the auth model is chosen. See docs/README.md.
+// ─────────────────────────────────────────────────────────────────────────────
+
 use std::{path::PathBuf, sync::Arc};
 
 use archivr_core::{archive, capture, database};
@@ -301,6 +325,7 @@ mod tests {
                 label: "Personal".to_string(),
                 archive_path: std::path::PathBuf::from("/tmp/personal/.archivr"),
             }],
+            bind: None,
         };
         let response = app(registry)
             .oneshot(
@@ -361,6 +386,7 @@ mod tests {
                 label: "Test".to_string(),
                 archive_path,
             }],
+            bind: None,
         };
         let response = app(registry)
             .oneshot(
@@ -391,6 +417,7 @@ mod tests {
                 label: "Test".to_string(),
                 archive_path,
             }],
+            bind: None,
         };
         let response = app(registry)
             .oneshot(
@@ -483,6 +510,7 @@ mod tests {
                 label: "Test".to_string(),
                 archive_path: paths.archive_path.clone(),
             }],
+            bind: None,
         };
         let uri = format!(
             "/api/archives/test/entries/{}/artifacts/0",
@@ -526,6 +554,7 @@ mod tests {
                 label: "Test".to_string(),
                 archive_path,
             }],
+            bind: None,
         };
         let response = app(registry)
             .oneshot(
@@ -556,6 +585,7 @@ mod tests {
                 label: "Test".to_string(),
                 archive_path,
             }],
+            bind: None,
         };
         let response = app(registry)
             .oneshot(
@@ -585,6 +615,7 @@ mod tests {
                 label: "Test".to_string(),
                 archive_path: paths.archive_path.clone(),
             }],
+            bind: None,
         };
         (registry, paths.archive_path)
     }

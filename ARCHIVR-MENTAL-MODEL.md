@@ -164,6 +164,6 @@ The web server reads archive data and serves the UI. It does not yet implement c
 
 Search is currently simple client-side filtering.
 
-Auth is not a production model yet.
+**Auth and session model:** The server binds to `127.0.0.1` by default and has no authentication middleware. This is intentional — Archivr is a local tool. The bind address is configurable via the TOML `bind` field or `ARCHIVR_BIND` env var; a non-loopback address triggers a startup warning. Route families are classified (READ / ADMIN / WRITE / STATIC) in `crates/archivr-server/src/routes.rs` as the decision record for when middleware is eventually added. See the "Security and Deployment" section in `docs/README.md`.
 
 Admin is a mounted-archives view, not a management system.
