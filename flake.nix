@@ -143,9 +143,17 @@
                 --set ARCHIVR_TWEET_SCRAPER $out/libexec/archivr-server/scrape_user_tweet_contents.py
             '';
           };
+          archivr-all = pkgs.symlinkJoin {
+            name = "archivr-all";
+            paths = [
+              archivr
+              archivr_server
+            ];
+          };
         in
         {
-          default = archivr;
+          default = archivr-all;
+          archivr-all = archivr-all;
           archivr = archivr;
           archivr-cli = archivr;
           archivr-cli-unwrapped = archivr_cli_unwrapped;

@@ -2,8 +2,9 @@
 
 !.gitignore
 
-!docs
-!docs/**
+!docs/
+!docs/LICENSE
+!docs/README*
 
 !crates
 !crates/**
