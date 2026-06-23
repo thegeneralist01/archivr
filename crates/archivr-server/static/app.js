@@ -82,7 +82,7 @@ async function getJson(url) {
 }
 
 function appendCell(row, text, className) {
-  const cell = document.createElement("td");
+  const cell = document.createElement("div");
   if (className) cell.className = className;
   cell.textContent = text;
   row.append(cell);
@@ -133,30 +133,30 @@ function renderEntries() {
   }
 
   for (const entry of state.entries) {
-    const row = document.createElement("tr");
+    const row = document.createElement("div");
     row.tabIndex = 0;
     row.dataset.entryUid = entry.entry_uid;
     if (entry.entry_uid === state.selectedEntryUid) {
       row.classList.add("is-selected");
     }
 
-    appendCell(row, formatTimestamp(entry.archived_at));
+    appendCell(row, formatTimestamp(entry.archived_at), "col-added");
 
-    const titleCell = appendCell(row, "");
+    const titleCell = appendCell(row, "", "col-title");
     titleCell.append(sourceIcon(entry.source_kind));
     const title = document.createElement("span");
     title.className = "entry-title";
     title.textContent = valueText(entry.title) || valueText(entry.entry_uid);
     titleCell.append(title);
 
-    const typeCell = appendCell(row, "");
+    const typeCell = appendCell(row, "", "col-type");
     const type = document.createElement("span");
     type.className = "type-pill";
     type.textContent = valueText(entry.entity_kind);
     typeCell.append(type);
 
-    appendCell(row, formatBytes(entry.total_artifact_bytes));
-    appendCell(row, valueText(entry.original_url), "url-cell");
+    appendCell(row, formatBytes(entry.total_artifact_bytes), "col-size");
+    appendCell(row, valueText(entry.original_url), "url-cell col-url");
 
     row.addEventListener("click", () => selectEntry(entry));
     row.addEventListener("keydown", (event) => {
@@ -308,11 +308,11 @@ async function loadRuns() {
   runsBody.innerHTML = "";
   for (const run of runs) {
     const row = document.createElement("tr");
-    appendCell(row, valueText(run.started_at));
-    appendCell(row, valueText(run.status));
-    appendCell(row, String(run.requested_count));
-    appendCell(row, String(run.completed_count));
-    appendCell(row, String(run.failed_count));
+    for (const val of [run.started_at, run.status, run.requested_count, run.completed_count, run.failed_count]) {
+      const td = document.createElement("td");
+      td.textContent = valueText(String(val ?? ""));
+      row.append(td);
+    }
     runsBody.append(row);
   }
 }

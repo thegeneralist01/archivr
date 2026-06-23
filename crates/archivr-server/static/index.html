@@ -27,25 +27,16 @@
         </div>
 
         <section id="archive-view" class="view is-active">
-          <table class="entry-table">
-            <colgroup>
-              <col class="col-added">
-              <col class="col-title">
-              <col class="col-type">
-              <col class="col-size">
-              <col class="col-url">
-            </colgroup>
-            <thead>
-              <tr>
-                <th>Added</th>
-                <th>Title</th>
-                <th>Type</th>
-                <th>Size</th>
-                <th>Original URL</th>
-              </tr>
-            </thead>
-            <tbody id="entries-body"></tbody>
-          </table>
+          <div class="entry-table">
+            <div class="entry-header-row">
+              <div class="col-added">Added</div>
+              <div class="col-title">Title</div>
+              <div class="col-type">Type</div>
+              <div class="col-size">Size</div>
+              <div class="col-url">Original URL</div>
+            </div>
+            <div id="entries-body"></div>
+          </div>
         </section>
 
         <section id="runs-view" class="view">
