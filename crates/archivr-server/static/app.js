@@ -67,8 +67,7 @@ function sourceIcon(kind) {
 
 function formatTimestamp(value) {
   if (!value) return "";
-  // value is an ISO-8601 string from SQLite; display as "YYYY-MM-DD HH:MM"
-  const d = new Date(value.endsWith("Z") ? value : value + "Z");
+  const d = new Date(value);
   if (isNaN(d)) return value;
   const pad = (n) => String(n).padStart(2, "0");
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
