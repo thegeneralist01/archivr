@@ -22,7 +22,7 @@ An open-source self-hosted archiving tool. Work in progress.
     - [ ] Dropbox
     - [ ] OneDrive
     - (Some of these could be postponed for later.)
-  - [ ] Archive web pages (HTML, CSS, JS, images)
+  - [x] Archive web pages (HTML, CSS, JS, images)
   - [ ] Archiving emails (???)
     - [ ] Gmail
     - [ ] Outlook
@@ -168,6 +168,12 @@ Auth and session handling will be designed when remote or public hosting becomes
 - `ARCHIVR_YT_DLP`
   - Optional.
   - Overrides the `yt-dlp` binary used for YouTube, X media posts, Instagram, Facebook, TikTok, Reddit, and Snapchat downloads.
+- `ARCHIVR_SINGLE_FILE`
+  - Optional.
+  - Overrides the `single-file` binary used for web page archiving. When installed through Nix, this is set automatically to the Nixpkgs `single-file-cli` binary.
+- `ARCHIVR_CHROME`
+  - Optional.
+  - Overrides the Chromium/Chrome executable passed to `single-file` via `--browser-executable-path`. When installed through Nix, this is set automatically to the Nixpkgs `chromium` binary. Default: `chromium`.
 - `ARCHIVR_TWITTER_CREDENTIALS_FILE`
   - Required for tweet/thread scraping inputs such as `tweet:ID` and `x:thread:ID`.
   - Must point to a cookies file for the vendored scraper.
@@ -180,7 +186,7 @@ Auth and session handling will be designed when remote or public hosting becomes
 
 ### Current Limitations
 
-- Arbitrary `http://` or `https://` pages are not archived yet unless they match one of the currently supported platforms above.
+- Arbitrary `http://` or `https://` URLs that return HTML are archived as self-contained single-file HTML snapshots via `single-file-cli` (requires Chromium). Plain file URLs (PDFs, images, zips, etc.) are downloaded directly. Requires `single-file` and a Chromium binary on PATH, or the `ARCHIVR_SINGLE_FILE` / `ARCHIVR_CHROME` env vars set.
 - Local files currently need to be passed as `file://...` paths.
 
 ## License
