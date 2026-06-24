@@ -67,6 +67,10 @@ pub fn app(registry: ServerRegistry) -> Router {
             "/api/archives/:archive_id/entries/:entry_uid/artifacts/:artifact_index",
             get(serve_artifact),
         )
+        .route(
+            "/api/archives/:archive_id/entries/:entry_uid/favicon",
+            get(serve_entry_favicon),
+        )
         .route("/api/archives/:archive_id/runs", get(list_runs))
         .route("/api/archives/:archive_id/captures", post(capture_handler))
         .route("/api/archives/:archive_id/tags", get(list_tags).post(create_tag_handler))
@@ -155,6 +159,29 @@ async fn serve_artifact(
     let file_path = archive::resolve_artifact_path(&paths.store_path, artifact)?;
     // ServeFile streams the file, handles Range requests (video seeking),
     // sets Content-Type/ETag/Last-Modified. Error type is Infallible.
+    Ok(ServeFile::new(&file_path)
+        .oneshot(req)
+        .await
+        .unwrap()
+        .into_response())
+}
+
+async fn serve_entry_favicon(
+    State(state): State<AppState>,
+    Path((archive_id, entry_uid)): Path<(String, String)>,
+    req: Request,
+) -> Result<Response, ApiError> {
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let paths = archive::read_archive_paths(&mounted.archive_path)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let detail = archive::get_entry_detail(&conn, &entry_uid)?
+        .ok_or(ApiError::not_found("entry not found"))?;
+    let artifact = detail
+        .artifacts
+        .iter()
+        .find(|a| a.artifact_role == "favicon")
+        .ok_or(ApiError::not_found("no favicon for this entry"))?;
+    let file_path = archive::resolve_artifact_path(&paths.store_path, artifact)?;
     Ok(ServeFile::new(&file_path)
         .oneshot(req)
         .await
