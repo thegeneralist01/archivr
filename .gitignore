@@ -17,3 +17,9 @@
 
 !Cargo.toml
 !Cargo.lock
+!ARCHIVR-MENTAL-MODEL.md
+
+!frontend/
+!frontend/**
+frontend/node_modules/
+frontend/node_modules/**
