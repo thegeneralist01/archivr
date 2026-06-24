@@ -26,6 +26,8 @@ pub struct EntrySummary {
     pub artifact_count: i64,
     pub total_artifact_bytes: i64,
     pub parent_entry_uid: Option<String>,
+    /// True if a `favicon` artifact exists for this entry.
+    pub has_favicon: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -183,7 +185,8 @@ pub fn list_root_entries(conn: &rusqlite::Connection) -> Result<Vec<EntrySummary
             si.canonical_url,
             COUNT(ea.id) AS artifact_count,
             COALESCE(SUM(b.byte_size), 0) AS total_artifact_bytes,
-            NULL AS parent_entry_uid
+            NULL AS parent_entry_uid,
+            EXISTS(SELECT 1 FROM entry_artifacts fav WHERE fav.entry_id = e.id AND fav.artifact_role = 'favicon') AS has_favicon
          FROM archived_entries e
          JOIN source_identities si ON si.id = e.source_identity_id
          LEFT JOIN entry_artifacts ea ON ea.entry_id = e.id
@@ -206,6 +209,7 @@ pub fn list_root_entries(conn: &rusqlite::Connection) -> Result<Vec<EntrySummary
                 artifact_count: row.get(7)?,
                 total_artifact_bytes: row.get(8)?,
                 parent_entry_uid: row.get(9)?,
+                has_favicon: row.get::<_, i64>(10)? != 0,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -383,7 +387,8 @@ const ENTRY_SELECT_COLS: &str =
     "SELECT e.entry_uid, e.archived_at, e.source_kind, e.entity_kind, e.title, \
     e.visibility, si.canonical_url, COUNT(ea.id) AS artifact_count, \
     COALESCE(SUM(b.byte_size), 0) AS total_artifact_bytes, \
-    parent.entry_uid AS parent_entry_uid";
+    parent.entry_uid AS parent_entry_uid, \
+    EXISTS(SELECT 1 FROM entry_artifacts fav WHERE fav.entry_id = e.id AND fav.artifact_role = 'favicon') AS has_favicon";
 
 const ENTRY_FROM_JOINS: &str =
     "FROM archived_entries e \
@@ -483,6 +488,7 @@ pub fn search_entries(
                 artifact_count: row.get(7)?,
                 total_artifact_bytes: row.get(8)?,
                 parent_entry_uid: row.get(9)?,
+                has_favicon: row.get::<_, i64>(10)? != 0,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -643,7 +649,8 @@ pub fn entries_for_tag(
          SELECT e.entry_uid, e.archived_at, e.source_kind, e.entity_kind, e.title,
                 e.visibility, si.canonical_url, COUNT(ea.id) AS artifact_count,
                 COALESCE(SUM(b.byte_size), 0) AS total_artifact_bytes,
-                parent.entry_uid AS parent_entry_uid
+                parent.entry_uid AS parent_entry_uid,
+                EXISTS(SELECT 1 FROM entry_artifacts fav WHERE fav.entry_id = e.id AND fav.artifact_role = 'favicon') AS has_favicon
          FROM archived_entries e
          JOIN source_identities si ON si.id = e.source_identity_id
          LEFT JOIN entry_artifacts ea ON ea.entry_id = e.id
@@ -667,6 +674,7 @@ pub fn entries_for_tag(
                 artifact_count: row.get(7)?,
                 total_artifact_bytes: row.get(8)?,
                 parent_entry_uid: row.get(9)?,
+                has_favicon: row.get::<_, i64>(10)? != 0,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
