@@ -22,6 +22,7 @@ pub enum Source {
     Reddit,
     Snapchat,
     Local,
+    Url,
     Other,
 }
 
@@ -86,6 +87,7 @@ fn generate_entry_title(source: Source, meta: &PlatformMetadata) -> String {
         ),
         Source::Snapchat => format!("Snap by {}", meta.author.as_deref().unwrap_or("unknown")),
         Source::Local => meta.title.clone().unwrap_or_else(|| "Local File".to_string()),
+        Source::Url => meta.title.clone().unwrap_or_else(|| "Downloaded File".to_string()),
         Source::Other => "Archived Content".to_string(),
     }
 }
@@ -317,6 +319,8 @@ fn determine_source(path: &str) -> Source {
         {
             return Source::Snapchat;
         }
+        // No platform matched — treat as a generic file URL
+        return Source::Url;
     }
     if Path::new(path).exists() {
         return Source::Local;
@@ -411,6 +415,7 @@ fn source_metadata(source: Source) -> (&'static str, &'static str, &'static str)
         Source::Reddit => ("reddit", "post", "video"),
         Source::Snapchat => ("snapchat", "story", "video"),
         Source::Local => ("local", "file", "file"),
+        Source::Url => ("web", "file", "file"),
         Source::Other => ("other", "unknown", "unknown"),
     }
 }
@@ -697,6 +702,64 @@ pub fn perform_capture(archive_paths: &ArchivePaths, locator: &str) -> Result<Ca
             &item,
             "Archiving from this source is not yet implemented.",
         ));
+    }
+
+    // Source: generic HTTP/S file URL
+    if source == Source::Url {
+        match downloader::http::download(locator, store_path, &timestamp) {
+            Ok((hash, file_extension)) => {
+                let temp_file = store_path
+                    .join("temp")
+                    .join(&timestamp)
+                    .join(format!("{timestamp}{file_extension}"));
+                let byte_size = fs::metadata(&temp_file)
+                    .with_context(|| format!("failed to stat staged file {}", temp_file.display()))?
+                    .len() as i64;
+
+                let hash_exists = hash_exists(&hash, &file_extension, store_path)?;
+                if hash_exists {
+                    let _ = fs::remove_dir_all(store_path.join("temp").join(&timestamp));
+                } else {
+                    move_temp_to_raw(
+                        &store_path
+                            .join("temp")
+                            .join(&timestamp)
+                            .join(format!("{timestamp}{file_extension}")),
+                        &hash,
+                        store_path,
+                    )?;
+                    let _ = fs::remove_dir_all(store_path.join("temp").join(&timestamp));
+                }
+
+                record_media_entry(
+                    &conn,
+                    store_path,
+                    user_id,
+                    &run,
+                    &item,
+                    locator,
+                    locator,
+                    source,
+                    &hash,
+                    &file_extension,
+                    byte_size,
+                    None,
+                )?;
+                database::finish_archive_run(&conn, run.id)?;
+                return Ok(CaptureResult {
+                    run_uid: run.run_uid.clone(),
+                    status: "completed".to_string(),
+                });
+            }
+            Err(e) => {
+                return Err(fail_run(
+                    &conn,
+                    &run,
+                    &item,
+                    &format!("Failed to download URL: {e}"),
+                ));
+            }
+        }
     }
 
     // Sources: Tweets or Twitter Threads
@@ -1210,15 +1273,15 @@ mod tests {
             },
             TestCase {
                 url: "https://example.com/",
-                expected: Source::Other,
+                expected: Source::Url,
             },
             TestCase {
                 url: "https://example.com/?redirect=instagram.com/reel/ABC123",
-                expected: Source::Other,
+                expected: Source::Url,
             },
             TestCase {
                 url: "https://notfacebook.com/watch?v=123456",
-                expected: Source::Other,
+                expected: Source::Url,
             },
         ];
 

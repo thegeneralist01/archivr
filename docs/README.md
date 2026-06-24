@@ -17,7 +17,7 @@ An open-source self-hosted archiving tool. Work in progress.
   - [x] Archiving local files
   - [x] Archiving Twitter Tweets, Threads, and Articles
   - [ ] Archiving files from cloud storage services (Google Drive, Dropbox, OneDrive) and from URLs
-    - [ ] URLs
+    - [x] URLs
     - [ ] Google Drive
     - [ ] Dropbox
     - [ ] OneDrive

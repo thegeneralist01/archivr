@@ -13,3 +13,4 @@ serde.workspace = true
 serde_json.workspace = true
 sha3.workspace = true
 uuid.workspace = true
+reqwest = { workspace = true }

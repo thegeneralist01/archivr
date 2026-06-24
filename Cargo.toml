@@ -27,3 +27,4 @@ toml = "0.8.19"
 tower = "0.5.1"
 tower-http = { version = "0.6.2", features = ["fs", "trace"] }
 uuid = { version = "1.18.1", features = ["v4"] }
+reqwest = { version = "0.12", features = ["blocking"] }
