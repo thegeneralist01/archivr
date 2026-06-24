@@ -48,19 +48,45 @@ fn save_with(
 
     let out_file = temp_dir.join(format!("{timestamp}.html"));
 
+    // Write a user script that strips <script> elements from the live DOM
+    // just before SingleFile serializes it. This lets scripts execute during
+    // capture (so JS-applied CSS is present) without leaving data:-URL ES
+    // modules in the saved file that would cause "base scheme isn't
+    // hierarchical" errors in the viewer. JSON-LD structured data is kept.
+    let user_script_path = temp_dir.join("sf-strip-scripts.js");
+    std::fs::write(
+        &user_script_path,
+        "addEventListener('single-file-on-before-capture-start',()=>{\
+          document.querySelectorAll('script:not([type=\"application/ld+json\"])')\
+          .forEach(el=>el.remove());\
+        });",
+    )
+    .context("failed to write single-file user script")?;
+
     let out = Command::new(single_file)
         .arg(url)
         .arg(&out_file)
         .arg(format!("--browser-executable-path={chrome}"))
         .arg("--browser-headless")
         .arg("--browser-wait-until=networkidle2")
+        // Extra delay after networkidle2: Cloudflare Fonts injects @font-face
+        // CSS after HTML parse, so the font hook needs more time to see it.
+        .arg("--browser-wait-delay=2000")
         // Preserve all CSS: single-file's defaults strip rules it considers
-        // "unused" (breaking CSS nesting) and remove @media blocks that don't
-        // match the capture viewport (breaking responsive layout). Allow scripts
-        // to run so JS-applied classes are present when CSS is evaluated.
+        // "unused" (breaks CSS nesting) and remove @media blocks that don't
+        // match the capture viewport (breaks responsive layout).
         .arg("--remove-unused-styles=false")
         .arg("--remove-alternative-medias=false")
+        // Allow scripts to run during capture so JS-applied classes exist in
+        // the DOM when CSS is evaluated. The user script above strips <script>
+        // elements before serialization so no broken module imports end up in
+        // the saved file.
         .arg("--block-scripts=false")
+        .arg(format!("--browser-script={}", user_script_path.display()))
+        // Preserve fonts: defaults strip @font-face rules deemed "unused" or
+        // "alternative" (unicode-range subsets), losing CDN-served fonts.
+        .arg("--remove-unused-fonts=false")
+        .arg("--remove-alternative-fonts=false")
         .output()
         .with_context(|| format!("failed to spawn {single_file} process"))?;
 
