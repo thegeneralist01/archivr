@@ -23,6 +23,7 @@ pub enum Source {
     Snapchat,
     Local,
     Url,
+    WebPage,
     Other,
 }
 
@@ -88,6 +89,7 @@ fn generate_entry_title(source: Source, meta: &PlatformMetadata) -> String {
         Source::Snapchat => format!("Snap by {}", meta.author.as_deref().unwrap_or("unknown")),
         Source::Local => meta.title.clone().unwrap_or_else(|| "Local File".to_string()),
         Source::Url => meta.title.clone().unwrap_or_else(|| "Downloaded File".to_string()),
+        Source::WebPage => meta.title.clone().unwrap_or_else(|| "Archived Web Page".to_string()),
         Source::Other => "Archived Content".to_string(),
     }
 }
@@ -416,6 +418,7 @@ fn source_metadata(source: Source) -> (&'static str, &'static str, &'static str)
         Source::Snapchat => ("snapchat", "story", "video"),
         Source::Local => ("local", "file", "file"),
         Source::Url => ("web", "file", "file"),
+        Source::WebPage => ("web", "page", "webpage"),
         Source::Other => ("other", "unknown", "unknown"),
     }
 }
@@ -679,7 +682,23 @@ pub fn perform_capture(archive_paths: &ArchivePaths, locator: &str) -> Result<Ca
     let conn = database::open_or_initialize(&archive_paths.archive_path)?;
     let user_id = database::ensure_default_user(&conn)?;
 
-    let source = determine_source(locator);
+    let mut source = determine_source(locator);
+
+    // For generic http/https URLs, probe Content-Type to distinguish a plain
+    // file download from an HTML page that needs single-file archiving.
+    // The probe runs before creating DB records so source_kind is set correctly.
+    //
+    // Note: probe failures return early without a DB run record. This is
+    // intentional — a failed network probe means we haven't started archiving
+    // and there is nothing meaningful to record.
+    if source == Source::Url {
+        match downloader::http::probe_url_kind(locator) {
+            Ok(downloader::http::UrlKind::Html) => source = Source::WebPage,
+            Ok(downloader::http::UrlKind::File) => {}
+            Err(e) => return Err(anyhow::anyhow!("Failed to probe URL: {e}")),
+        }
+    }
+
     let (source_kind, entity_kind, _) = source_metadata(source);
 
     let run = database::create_archive_run(&conn, user_id, 1)?;
@@ -757,6 +776,65 @@ pub fn perform_capture(archive_paths: &ArchivePaths, locator: &str) -> Result<Ca
                     &run,
                     &item,
                     &format!("Failed to download URL: {e}"),
+                ));
+            }
+        }
+    }
+
+    // Source: web page — archive as a self-contained HTML snapshot via single-file-cli
+    if source == Source::WebPage {
+        match downloader::singlefile::save(locator, store_path, &timestamp) {
+            Ok((hash, title_hint)) => {
+                let file_extension = ".html".to_string();
+                let temp_file = store_path
+                    .join("temp")
+                    .join(&timestamp)
+                    .join(format!("{timestamp}{file_extension}"));
+                let byte_size = fs::metadata(&temp_file)
+                    .with_context(|| format!("failed to stat staged file {}", temp_file.display()))?
+                    .len() as i64;
+
+                let hash_exists = hash_exists(&hash, &file_extension, store_path)?;
+                if hash_exists {
+                    let _ = fs::remove_dir_all(store_path.join("temp").join(&timestamp));
+                } else {
+                    move_temp_to_raw(
+                        &store_path
+                            .join("temp")
+                            .join(&timestamp)
+                            .join(format!("{timestamp}{file_extension}")),
+                        &hash,
+                        store_path,
+                    )?;
+                    let _ = fs::remove_dir_all(store_path.join("temp").join(&timestamp));
+                }
+
+                record_media_entry(
+                    &conn,
+                    store_path,
+                    user_id,
+                    &run,
+                    &item,
+                    locator,
+                    locator,
+                    source,
+                    &hash,
+                    &file_extension,
+                    byte_size,
+                    title_hint,
+                )?;
+                database::finish_archive_run(&conn, run.id)?;
+                return Ok(CaptureResult {
+                    run_uid: run.run_uid.clone(),
+                    status: "completed".to_string(),
+                });
+            }
+            Err(e) => {
+                return Err(fail_run(
+                    &conn,
+                    &run,
+                    &item,
+                    &format!("Failed to archive web page: {e}"),
                 ));
             }
         }
@@ -1542,4 +1620,31 @@ mod tests {
             assert_eq!(meta.caption, Some("Hello Rust world, this is a test tweet".to_string()));
         }
     }
+
+    #[test]
+    fn source_metadata_webpage() {
+        let (kind, entity, _) = source_metadata(Source::WebPage);
+        assert_eq!(kind, "web");
+        assert_eq!(entity, "page");
+    }
+
+    #[test]
+    fn generate_entry_title_webpage_with_title() {
+        let mut meta = PlatformMetadata::default();
+        meta.title = Some("Paul Graham \u{2014} Great Work".to_string());
+        assert_eq!(
+            generate_entry_title(Source::WebPage, &meta),
+            "Paul Graham \u{2014} Great Work"
+        );
+    }
+
+    #[test]
+    fn generate_entry_title_webpage_fallback() {
+        let meta = PlatformMetadata::default();
+        assert_eq!(
+            generate_entry_title(Source::WebPage, &meta),
+            "Archived Web Page"
+        );
+    }
+
 }
