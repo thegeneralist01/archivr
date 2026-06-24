@@ -106,9 +106,8 @@
             buildInputs = [
               pkgs.yt-dlp
               pkgs.single-file-cli
-              pkgs.chromium
               tweetPython
-            ];
+            ] ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.chromium ];
             phases = [ "installPhase" ];
             installPhase = ''
               mkdir -p $out/bin $out/libexec/archivr
@@ -118,16 +117,15 @@
               makeWrapper $out/libexec/archivr/archivr $out/bin/archivr \
                 --set ARCHIVR_YT_DLP ${pkgs.yt-dlp}/bin/yt-dlp \
                 --set ARCHIVR_SINGLE_FILE ${pkgs.single-file-cli}/bin/single-file \
-                --set ARCHIVR_CHROME ${pkgs.chromium}/bin/chromium \
+                ${lib.optionalString pkgs.stdenv.isLinux "--set ARCHIVR_CHROME ${pkgs.chromium}/bin/chromium"} \
                 --set ARCHIVR_TWEET_PYTHON ${tweetPython}/bin/python3 \
                 --set ARCHIVR_TWEET_SCRAPER $out/libexec/archivr/scrape_user_tweet_contents.py \
                 --prefix PATH : ${
-                  lib.makeBinPath [
+                  lib.makeBinPath ([
                     pkgs.yt-dlp
                     pkgs.single-file-cli
-                    pkgs.chromium
                     tweetPython
-                  ]
+                  ] ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.chromium ])
                 }
             '';
           };
@@ -135,7 +133,7 @@
             pname = "archivr-server-wrapped";
             inherit version;
             nativeBuildInputs = [ pkgs.makeWrapper ];
-            buildInputs = [ tweetPython pkgs.single-file-cli pkgs.chromium ];
+            buildInputs = [ tweetPython pkgs.single-file-cli ] ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.chromium ];
             phases = [ "installPhase" ];
             installPhase = ''
               mkdir -p $out/bin $out/libexec/archivr-server $out/share/archivr-server/static
@@ -146,7 +144,7 @@
               makeWrapper $out/libexec/archivr-server/archivr-server $out/bin/archivr-server \
                 --set ARCHIVR_STATIC_DIR $out/share/archivr-server/static \
                 --set ARCHIVR_SINGLE_FILE ${pkgs.single-file-cli}/bin/single-file \
-                --set ARCHIVR_CHROME ${pkgs.chromium}/bin/chromium \
+                ${lib.optionalString pkgs.stdenv.isLinux "--set ARCHIVR_CHROME ${pkgs.chromium}/bin/chromium"} \
                 --set ARCHIVR_TWEET_PYTHON ${tweetPython}/bin/python3 \
                 --set ARCHIVR_TWEET_SCRAPER $out/libexec/archivr-server/scrape_user_tweet_contents.py
             '';
