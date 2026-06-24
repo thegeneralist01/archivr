@@ -784,32 +784,51 @@ pub fn perform_capture(archive_paths: &ArchivePaths, locator: &str) -> Result<Ca
     // Source: web page — archive as a self-contained HTML snapshot via single-file-cli
     if source == Source::WebPage {
         match downloader::singlefile::save(locator, store_path, &timestamp) {
-            Ok((hash, title_hint)) => {
+            Ok(result) => {
                 let file_extension = ".html".to_string();
-                let temp_file = store_path
+                let temp_html = store_path
                     .join("temp")
                     .join(&timestamp)
                     .join(format!("{timestamp}{file_extension}"));
-                let byte_size = fs::metadata(&temp_file)
-                    .with_context(|| format!("failed to stat staged file {}", temp_file.display()))?
+                let byte_size = fs::metadata(&temp_html)
+                    .with_context(|| format!("failed to stat staged file {}", temp_html.display()))?
                     .len() as i64;
 
-                let hash_exists = hash_exists(&hash, &file_extension, store_path)?;
-                if hash_exists {
-                    let _ = fs::remove_dir_all(store_path.join("temp").join(&timestamp));
-                } else {
-                    move_temp_to_raw(
-                        &store_path
-                            .join("temp")
-                            .join(&timestamp)
-                            .join(format!("{timestamp}{file_extension}")),
-                        &hash,
-                        store_path,
-                    )?;
-                    let _ = fs::remove_dir_all(store_path.join("temp").join(&timestamp));
+                // 1. Move HTML to raw store (if this hash hasn't been seen before).
+                if !hash_exists(&result.html_hash, &file_extension, store_path)? {
+                    move_temp_to_raw(&temp_html, &result.html_hash, store_path)?;
                 }
 
-                record_media_entry(
+                // 2. Process favicon while the temp dir still exists.
+                //    Errors here are silenced — favicon is supplementary.
+                let favicon_info: Option<(String, i64)> = (|| -> Option<(String, i64)> {
+                    let fav_hash = result.favicon_hash.as_deref()?;
+                    let fav_ext  = result.favicon_ext.as_deref()?;
+                    let fav_temp = store_path
+                        .join("temp").join(&timestamp)
+                        .join(format!("{timestamp}.favicon{fav_ext}"));
+                    if !fav_temp.exists() { return None; }
+                    let fav_size = fs::metadata(&fav_temp).ok()?.len() as i64;
+                    let fav_raw  = raw_relative_path_from_hash(fav_hash, fav_ext).ok()?;
+                    if !hash_exists(fav_hash, fav_ext, store_path).ok()? {
+                        move_temp_to_raw(&fav_temp, fav_hash, store_path).ok()?;
+                    }
+                    let fav_blob = database::BlobRecord {
+                        sha256:      fav_hash.to_string(),
+                        byte_size:   fav_size,
+                        mime_type:   None,
+                        extension:   extension_without_dot(fav_ext),
+                        raw_relpath: path_to_store_string(&fav_raw),
+                    };
+                    let fav_blob_id = database::upsert_blob(&conn, &fav_blob).ok()?;
+                    Some((fav_blob.raw_relpath, fav_blob_id))
+                })();
+
+                // 3. Remove the temp directory.
+                let _ = fs::remove_dir_all(store_path.join("temp").join(&timestamp));
+
+                // 4. Create the entry + primary_media artifact.
+                let entry = record_media_entry(
                     &conn,
                     store_path,
                     user_id,
@@ -818,11 +837,28 @@ pub fn perform_capture(archive_paths: &ArchivePaths, locator: &str) -> Result<Ca
                     locator,
                     locator,
                     source,
-                    &hash,
+                    &result.html_hash,
                     &file_extension,
                     byte_size,
-                    title_hint,
+                    result.title,
                 )?;
+
+                // 5. Add favicon artifact if we captured one.
+                if let Some((fav_relpath, fav_blob_id)) = favicon_info {
+                    let _ = database::add_entry_artifact(
+                        &conn,
+                        &database::NewArtifact {
+                            entry_id:      entry.id,
+                            artifact_role: "favicon".to_string(),
+                            storage_area:  "raw".to_string(),
+                            relpath:       fav_relpath,
+                            blob_id:       Some(fav_blob_id),
+                            logical_path:  None,
+                            metadata_json: None,
+                        },
+                    );
+                }
+
                 database::finish_archive_run(&conn, run.id)?;
                 return Ok(CaptureResult {
                     run_uid: run.run_uid.clone(),
