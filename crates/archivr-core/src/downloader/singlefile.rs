@@ -54,6 +54,13 @@ fn save_with(
         .arg(format!("--browser-executable-path={chrome}"))
         .arg("--browser-headless")
         .arg("--browser-wait-until=networkidle2")
+        // Preserve all CSS: single-file's defaults strip rules it considers
+        // "unused" (breaking CSS nesting) and remove @media blocks that don't
+        // match the capture viewport (breaking responsive layout). Allow scripts
+        // to run so JS-applied classes are present when CSS is evaluated.
+        .arg("--remove-unused-styles=false")
+        .arg("--remove-alternative-medias=false")
+        .arg("--block-scripts=false")
         .output()
         .with_context(|| format!("failed to spawn {single_file} process"))?;
 
