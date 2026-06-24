@@ -164,6 +164,7 @@ export default function App() {
               entries={entries}
               selectedEntryUid={selectedEntryUid}
               onSelectEntry={selectEntry}
+              archiveId={archiveId}
               tagFilter={tagFilter}
               onClearTagFilter={handleClearTagFilter}
               searchQuery={searchQuery}

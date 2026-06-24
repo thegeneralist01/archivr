@@ -1,6 +1,6 @@
 import EntryRow from './EntryRow';
 
-export default function EntriesView({ entries, selectedEntryUid, onSelectEntry }) {
+export default function EntriesView({ entries, selectedEntryUid, onSelectEntry, archiveId }) {
   return (
     <section id="archive-view" className="view is-active">
       <div className="entry-table">
@@ -16,6 +16,7 @@ export default function EntriesView({ entries, selectedEntryUid, onSelectEntry }
             <EntryRow
               key={entry.entry_uid}
               entry={entry}
+              archiveId={archiveId}
               isSelected={entry.entry_uid === selectedEntryUid}
               onSelect={() => onSelectEntry(entry)}
             />
