@@ -707,7 +707,7 @@ pub fn perform_capture(archive_paths: &ArchivePaths, locator: &str) -> Result<Ca
     // Source: generic HTTP/S file URL
     if source == Source::Url {
         match downloader::http::download(locator, store_path, &timestamp) {
-            Ok((hash, file_extension)) => {
+            Ok((hash, file_extension, title_hint)) => {
                 let temp_file = store_path
                     .join("temp")
                     .join(&timestamp)
@@ -743,7 +743,7 @@ pub fn perform_capture(archive_paths: &ArchivePaths, locator: &str) -> Result<Ca
                     &hash,
                     &file_extension,
                     byte_size,
-                    None,
+                    title_hint,
                 )?;
                 database::finish_archive_run(&conn, run.id)?;
                 return Ok(CaptureResult {
