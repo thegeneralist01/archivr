@@ -78,7 +78,7 @@ pub fn app(registry: ServerRegistry) -> Router {
             "/api/archives/:archive_id/entries/:entry_uid/tags/:tag_uid",
             delete(remove_entry_tag_handler),
         )
-        .nest_service("/assets", ServeDir::new(&static_dir))
+        .nest_service("/assets", ServeDir::new(static_dir.join("assets")))
         .fallback_service(ServeFile::new(static_dir.join("index.html")))
         .with_state(state)
 }
