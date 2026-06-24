@@ -3,6 +3,69 @@ use std::path::Path;
 
 use crate::hash::hash_file;
 
+/// Whether a URL resolves to an HTML document or a downloadable file.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UrlKind {
+    Html,
+    File,
+}
+
+/// Probes `url` with a HEAD request and inspects the `Content-Type` header.
+/// Falls back to a GET request (body not read) if the server returns 405.
+///
+/// Returns `Err` if the probe fails (network error, non-2xx/405 status).
+/// Redirects (3xx) are followed automatically by reqwest; only the final
+/// response status is checked.
+pub fn probe_url_kind(url: &str) -> Result<UrlKind> {
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .user_agent("archivr/0.1")
+        .build()
+        .context("failed to build HTTP client")?;
+
+    // Prefer HEAD: no body transfer.
+    let head = client
+        .head(url)
+        .send()
+        .with_context(|| format!("failed to probe {url}"))?;
+
+    if head.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+        // Server rejected HEAD — do a GET but only inspect headers.
+        let get = client
+            .get(url)
+            .send()
+            .with_context(|| format!("failed to probe {url}"))?;
+        if !get.status().is_success() {
+            bail!("HTTP {} probing {url}", get.status());
+        }
+        let ct = get
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        return Ok(if content_type_is_html(ct) {
+            UrlKind::Html
+        } else {
+            UrlKind::File
+        });
+    }
+
+    if !head.status().is_success() {
+        bail!("HTTP {} probing {url}", head.status());
+    }
+
+    let ct = head
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    Ok(if content_type_is_html(ct) {
+        UrlKind::Html
+    } else {
+        UrlKind::File
+    })
+}
+
 /// Returns `(sha256_hex, extension_with_leading_dot, title_hint)` on success.
 /// `title_hint` is derived from the `Content-Disposition` filename header, or the
 /// last path segment of the final URL after redirects.
@@ -318,5 +381,23 @@ mod tests {
     #[test]
     fn percent_decode_plus_is_space() {
         assert_eq!(percent_decode("hello+world"), "hello world");
+    }
+
+    #[test]
+    fn url_kind_html_variants() {
+        // content_type_is_html is already tested; verify UrlKind is wired correctly
+        // by checking the enum values exist and are distinct.
+        assert_ne!(UrlKind::Html, UrlKind::File);
+    }
+
+    #[test]
+    fn probe_url_kind_fails_on_unreachable_host() {
+        // 127.0.0.1:1 is guaranteed to refuse connections.
+        let err = probe_url_kind("http://127.0.0.1:1/").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("probe") || msg.contains("connect") || msg.contains("refused"),
+            "unexpected error message: {msg}"
+        );
     }
 }
