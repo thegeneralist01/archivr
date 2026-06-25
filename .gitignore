@@ -5,6 +5,8 @@
 !docs/
 !docs/LICENSE
 !docs/README*
+!docs/superpowers/
+!docs/superpowers/**
 
 !crates
 !crates/**
@@ -18,6 +20,7 @@
 !Cargo.toml
 !Cargo.lock
 !ARCHIVR-MENTAL-MODEL.md
+!NEXT.md
 
 !frontend/
 !frontend/**
