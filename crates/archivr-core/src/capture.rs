@@ -332,9 +332,6 @@ fn determine_source(path: &str) -> Source {
 
 fn hash_exists(hash: &str, file_extension: &str, store_path: &Path) -> Result<bool> {
     let path = store_path.join(raw_relative_path_from_hash(hash, file_extension)?);
-
-    println!("Checking {}", path.display());
-
     Ok(path.exists())
 }
 
