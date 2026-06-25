@@ -63,6 +63,16 @@ fn save_with(
     )
     .context("failed to write single-file user script")?;
 
+    // Chrome's user-data-dir for this capture. Required alongside
+    // --disable-web-security — newer Chromium silently ignores that flag
+    // without a writable user-data-dir. Using a subdirectory of temp_dir
+    // keeps it isolated and it gets cleaned up with the rest of the temp dir.
+    let chrome_data_dir = temp_dir.join("chrome-data");
+    let browser_args = format!(
+        "[\"--disable-web-security\",\"--user-data-dir={}\"]",
+        chrome_data_dir.display()
+    );
+
     let out = Command::new(single_file)
         .arg(url)
         .arg(&out_file)
@@ -72,6 +82,11 @@ fn save_with(
         // Extra delay after networkidle2: Cloudflare Fonts injects @font-face
         // CSS after HTML parse, so the font hook needs more time to see it.
         .arg("--browser-wait-delay=2000")
+        // Realistic UA: some origins block headless Chrome's default UA string.
+        .arg("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
+        // Chrome-level flags: disable CORS so fonts from any CDN origin can be
+        // read and inlined (e.g. fonts.gstatic.com without ACAO:*).
+        .arg(format!("--browser-args={browser_args}"))
         // Preserve all CSS: single-file's defaults strip rules it considers
         // "unused" (breaks CSS nesting) and remove @media blocks that don't
         // match the capture viewport (breaks responsive layout).
