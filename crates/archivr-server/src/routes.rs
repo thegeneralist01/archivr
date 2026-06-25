@@ -71,6 +71,10 @@ pub fn app(registry: ServerRegistry) -> Router {
             "/api/archives/:archive_id/entries/:entry_uid/favicon",
             get(serve_entry_favicon),
         )
+        .route(
+            "/api/archives/:archive_id/blobs/:sha256",
+            get(serve_blob),
+        )
         .route("/api/archives/:archive_id/runs", get(list_runs))
         .route("/api/archives/:archive_id/captures", post(capture_handler))
         .route("/api/archives/:archive_id/tags", get(list_tags).post(create_tag_handler))
@@ -188,6 +192,38 @@ async fn serve_entry_favicon(
         .unwrap()
         .into_response())
 }
+async fn serve_blob(
+    State(state): State<AppState>,
+    Path((archive_id, sha256)): Path<(String, String)>,
+    req: Request,
+) -> Result<Response, ApiError> {
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let paths = archive::read_archive_paths(&mounted.archive_path)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+
+    let blob = database::get_blob_by_sha256(&conn, &sha256)?
+        .ok_or(ApiError::not_found("blob not found"))?;
+
+    let file_path = paths.store_path.join(&blob.raw_relpath);
+
+    // Path-traversal guard: resolved path must stay inside store_path.
+    let canonical_file = file_path
+        .canonicalize()
+        .map_err(|_| ApiError::not_found("blob file not found"))?;
+    let canonical_store = paths
+        .store_path
+        .canonicalize()
+        .map_err(|_| ApiError::internal("invalid store path"))?;
+    if !canonical_file.starts_with(&canonical_store) {
+        return Err(ApiError::not_found("blob not found"));
+    }
+
+    Ok(ServeFile::new(&canonical_file)
+        .oneshot(req)
+        .await
+        .unwrap()
+        .into_response())
+}
 
 #[derive(Debug, serde::Deserialize)]
 struct CreateTagBody {
@@ -279,7 +315,7 @@ async fn capture_handler(
     let mounted = mounted_archive(&state, &archive_id)?;
     let archive_paths = archive::read_archive_paths(&mounted.archive_path)
         .map_err(ApiError::from)?;
-    let result = capture::perform_capture(&archive_paths, &body.locator)
+    let result = capture::perform_capture(&archive_paths, &body.locator, Some(&archive_id))
         .map_err(ApiError::from)?;
     Ok(Json(result))
 }
@@ -313,6 +349,13 @@ impl ApiError {
     fn bad_request(message: &str) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
+            message: message.to_string(),
+        }
+    }
+
+    fn internal(message: &str) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.to_string(),
         }
     }
@@ -1004,4 +1047,36 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
+
+    #[tokio::test]
+    async fn get_blob_returns_404_for_unknown_sha256() {
+        let dir = tempfile::tempdir().unwrap();
+        archivr_core::archive::initialize_archive(
+            dir.path(),
+            &dir.path().join("store"),
+            "test",
+            false,
+        )
+        .unwrap();
+        let archive_path = dir.path().join(".archivr");
+        let registry = ServerRegistry {
+            archives: vec![MountedArchive {
+                id: "test".to_string(),
+                label: "Test".to_string(),
+                archive_path,
+            }],
+            bind: None,
+        };
+        let response = app(registry)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/blobs/0000000000000000000000000000000000000000000000000000000000000000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
 }

@@ -675,7 +675,11 @@ fn fail_run(
     anyhow::anyhow!("{}", message)
 }
 
-pub fn perform_capture(archive_paths: &ArchivePaths, locator: &str) -> Result<CaptureResult> {
+pub fn perform_capture(
+    archive_paths: &ArchivePaths,
+    locator: &str,
+    archive_id: Option<&str>,
+) -> Result<CaptureResult> {
     let timestamp = Local::now().format("%Y-%m-%dT%H-%M-%S%.3f").to_string();
     let store_path = &archive_paths.store_path;
 
@@ -790,13 +794,32 @@ pub fn perform_capture(archive_paths: &ArchivePaths, locator: &str) -> Result<Ca
                     .join("temp")
                     .join(&timestamp)
                     .join(format!("{timestamp}{file_extension}"));
-                let byte_size = fs::metadata(&temp_html)
-                    .with_context(|| format!("failed to stat staged file {}", temp_html.display()))?
-                    .len() as i64;
+
+                // Font extraction: rewrite the HTML in-place before hashing.
+                // Only runs when archive_id is known (server context). CLI passes
+                // None and keeps fonts embedded — no behaviour change for CLI.
+                let (html_hash, byte_size, extracted_fonts) =
+                    if let Some(aid) = archive_id {
+                        let content = fs::read_to_string(&temp_html)
+                            .with_context(|| format!("failed to read {}", temp_html.display()))?;
+                        let (rewritten, fonts) =
+                            downloader::font_extractor::extract_and_rewrite(&content, store_path, aid)
+                                .unwrap_or_else(|_| (content.clone(), vec![])); // non-fatal
+                        fs::write(&temp_html, rewritten.as_bytes())
+                            .with_context(|| "failed to write rewritten HTML")?;
+                        let size = rewritten.len() as i64;
+                        let new_hash = crate::hash::hash_bytes(rewritten.as_bytes());
+                        (new_hash, size, fonts)
+                    } else {
+                        let size = fs::metadata(&temp_html)
+                            .with_context(|| format!("failed to stat {}", temp_html.display()))?
+                            .len() as i64;
+                        (result.html_hash.clone(), size, vec![])
+                    };
 
                 // 1. Move HTML to raw store (if this hash hasn't been seen before).
-                if !hash_exists(&result.html_hash, &file_extension, store_path)? {
-                    move_temp_to_raw(&temp_html, &result.html_hash, store_path)?;
+                if !hash_exists(&html_hash, &file_extension, store_path)? {
+                    move_temp_to_raw(&temp_html, &html_hash, store_path)?;
                 }
 
                 // 2. Process favicon while the temp dir still exists.
@@ -837,7 +860,7 @@ pub fn perform_capture(archive_paths: &ArchivePaths, locator: &str) -> Result<Ca
                     locator,
                     locator,
                     source,
-                    &result.html_hash,
+                    &html_hash,
                     &file_extension,
                     byte_size,
                     result.title,
@@ -857,6 +880,31 @@ pub fn perform_capture(archive_paths: &ArchivePaths, locator: &str) -> Result<Ca
                             metadata_json: None,
                         },
                     );
+                }
+
+                // 6. Register each extracted font as a deduplicated blob + artifact.
+                for font in extracted_fonts {
+                    let font_blob = database::BlobRecord {
+                        sha256:      font.sha256.clone(),
+                        byte_size:   font.byte_size,
+                        mime_type:   mime_for_font_ext(&font.ext),
+                        extension:   font.ext.strip_prefix('.').map(|s| s.to_string()),
+                        raw_relpath: font.raw_relpath.clone(),
+                    };
+                    if let Ok(blob_id) = database::upsert_blob(&conn, &font_blob) {
+                        let _ = database::add_entry_artifact(
+                            &conn,
+                            &database::NewArtifact {
+                                entry_id:      entry.id,
+                                artifact_role: "font".to_string(),
+                                storage_area:  "raw".to_string(),
+                                relpath:       font.raw_relpath,
+                                blob_id:       Some(blob_id),
+                                logical_path:  None,
+                                metadata_json: None,
+                            },
+                        );
+                    }
                 }
 
                 database::finish_archive_run(&conn, run.id)?;
@@ -1017,6 +1065,16 @@ pub fn perform_capture(archive_paths: &ArchivePaths, locator: &str) -> Result<Ca
         run_uid: run.run_uid.clone(),
         status: "completed".to_string(),
     })
+}
+
+fn mime_for_font_ext(ext: &str) -> Option<String> {
+    match ext {
+        ".woff2" => Some("font/woff2".to_string()),
+        ".woff"  => Some("font/woff".to_string()),
+        ".ttf"   => Some("font/ttf".to_string()),
+        ".otf"   => Some("font/otf".to_string()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
