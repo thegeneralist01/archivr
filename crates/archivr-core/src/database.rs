@@ -431,6 +431,26 @@ pub fn upsert_blob(conn: &Connection, blob: &BlobRecord) -> Result<i64> {
     Ok(id)
 }
 
+/// Returns the `BlobRecord` for the given SHA-256 hex digest, or `None` if not found.
+pub fn get_blob_by_sha256(conn: &Connection, sha256: &str) -> Result<Option<BlobRecord>> {
+    conn.query_row(
+        "SELECT sha256, byte_size, mime_type, extension, raw_relpath
+         FROM blobs WHERE sha256 = ?1",
+        [sha256],
+        |row| {
+            Ok(BlobRecord {
+                sha256: row.get(0)?,
+                byte_size: row.get(1)?,
+                mime_type: row.get(2)?,
+                extension: row.get(3)?,
+                raw_relpath: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(anyhow::Error::from)
+}
+
 pub fn create_archived_entry(conn: &Connection, entry: &NewEntry) -> Result<ArchivedEntry> {
     validate_visibility(&entry.visibility)?;
     let entry_uid = public_id("entry");
@@ -1100,5 +1120,33 @@ mod tests {
             1
         );
         assert_eq!(entry_count_for_tag_path(&conn, "/sciences").unwrap(), 1);
+    }
+
+    #[test]
+    fn get_blob_by_sha256_round_trips() {
+        let conn = conn();
+        let blob = BlobRecord {
+            sha256: "deadbeef01234567".repeat(4), // 64-char hex string
+            byte_size: 1234,
+            mime_type: Some("font/woff2".to_string()),
+            extension: Some("woff2".to_string()),
+            raw_relpath: "raw/d/e/deadbeef.woff2".to_string(),
+        };
+        upsert_blob(&conn, &blob).unwrap();
+
+        let found = get_blob_by_sha256(&conn, &blob.sha256).unwrap();
+        assert!(found.is_some(), "should find the blob we just upserted");
+        let found = found.unwrap();
+        assert_eq!(found.sha256, blob.sha256);
+        assert_eq!(found.byte_size, 1234);
+        assert_eq!(found.mime_type, Some("font/woff2".to_string()));
+        assert_eq!(found.raw_relpath, blob.raw_relpath);
+    }
+
+    #[test]
+    fn get_blob_by_sha256_returns_none_for_unknown() {
+        let conn = conn();
+        let result = get_blob_by_sha256(&conn, "0000000000000000000000000000000000000000000000000000000000000000").unwrap();
+        assert!(result.is_none());
     }
 }
