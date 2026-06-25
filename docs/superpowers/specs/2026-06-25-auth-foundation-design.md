@@ -71,33 +71,31 @@ CREATE TABLE IF NOT EXISTS roles (
 Bit position 2 (value 4) is reserved for `admin`. Bit positions 4+ (values 16, 32, …) are assigned
 to custom roles in Track 5. Level 2 is reserved for custom roles sitting between `user` and `admin`.
 
-**Visibility bitmask semantics:**
+**role_bits computation — implicit guest floor:**
 
-A visibility value is an `INTEGER` where each bit indicates whether that role can see the content.
+`role_bits` for any **authenticated** user is computed as:
+```
+role_bits = ROLE_GUEST | (OR of bit values for all rows in user_roles)
+```
+The `ROLE_GUEST` bit (1) is always included for authenticated users so they can access
+public (guest-visible) content. Example: an owner assigned only the `owner` role gets
+`role_bits = 1 | 8 = 9`, which passes `role_bits & ROLE_USER (2) = 0` — still broken.
 
-- `0`  = nobody (completely private)
-- `2`  = logged-in users and above (`user` bit set)
-- `6`  = users + admins (`user` + `admin` bits)
-- `14` = everyone except guests (`user` + `admin` + `owner`)
-- `15` = public (all bits set)
+**Therefore, role assignment is cumulative by level.** When a role is assigned, all
+built-in roles at lower levels are also assigned:
+- Assigning `owner` (level 4) → also assign `admin`, `user` in `user_roles`
+- Assigning `admin` (level 3) → also assign `user` in `user_roles`
+- Assigning `user` (level 1) → no additional rows
+- `guest` is never assigned; it is the implicit unauthenticated floor
+
+Setup creates owner with three `user_roles` rows: `user`, `admin`, `owner`.
+Resulting `role_bits = ROLE_GUEST | ROLE_USER | ROLE_ADMIN | ROLE_OWNER = 1|2|4|8 = 15`.
+
+**Visibility check:** `viewer.role_bits & content.visibility != 0` passes if the viewer
+has any bit the content requires. Owner (15) can see everything. User (1|2=3) can see
+guest-visible (1) and user-visible (2) content but not admin-only (4). ✓
 
 `is_builtin = 1` rows cannot be deleted.
-
-### New table: `user_roles`
-
-```sql
-CREATE TABLE IF NOT EXISTS user_roles (
-    user_id             INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    role_id             INTEGER NOT NULL REFERENCES roles(id),
-    assigned_at         TEXT NOT NULL,
-    assigned_by_user_id INTEGER REFERENCES users(id),
-    PRIMARY KEY (user_id, role_id)
-);
-```
-
-A user can hold multiple roles. Their effective `role_bits` is the OR of all assigned roles'
-bit values. `guest` is never assigned via this table — it is the implicit role for unauthenticated
-requests.
 
 ### New table: `sessions`
 
@@ -133,20 +131,32 @@ CREATE INDEX IF NOT EXISTS idx_api_tokens_user_id ON api_tokens(user_id);
 
 ### `users` table — existing, minimally changed
 
-The existing `role TEXT CHECK('admin','user')` column is **kept but inert** — auth middleware
-reads from `user_roles`, not this column. It will be removed in Track 5 cleanup when a proper
-migration is warranted. No `ALTER TABLE` needed now.
+The existing `role TEXT NOT NULL CHECK (role IN ('admin','user'))` column is **kept but inert** —
+auth middleware reads from `user_roles`, not this column. It will be removed in Track 5 cleanup.
+`ensure_owner_exists` must supply a value for this column; use `'admin'` as the placeholder.
 
 `ensure_default_user` is replaced by `ensure_owner_exists` which returns `false` if no owner
-exists yet (triggers setup mode). The old local-admin stub is never created on fresh instances.
+row exists in `user_roles` (triggers setup mode). The old local-admin stub is never created on
+fresh instances. Session lookup JOINs `users` and checks `users.status = 'active'`; a session
+belonging to a disabled user resolves to `AuthUser::Guest`.
 
 ### `instance_settings` — one new column
 
+The column is added **inside** the existing `CREATE TABLE IF NOT EXISTS instance_settings` DDL,
+not via `ALTER TABLE` (which is not idempotent in `initialize_schema`):
+
 ```sql
-ALTER TABLE instance_settings ADD COLUMN
-    default_entry_visibility INTEGER NOT NULL DEFAULT 2;
--- Default 2 = 'user' bit only: logged-in users can see entries by default
+CREATE TABLE IF NOT EXISTS instance_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    public_index_enabled INTEGER NOT NULL DEFAULT 0 CHECK (public_index_enabled IN (0, 1)),
+    public_entry_content_enabled INTEGER NOT NULL DEFAULT 0 CHECK (public_entry_content_enabled IN (0, 1)),
+    public_archive_submission_enabled INTEGER NOT NULL DEFAULT 0 CHECK (public_archive_submission_enabled IN (0, 1)),
+    default_entry_visibility INTEGER NOT NULL DEFAULT 2   -- 2 = user-visible by default
+);
 ```
+
+The existing `INSERT OR IGNORE INTO instance_settings … VALUES (1, 0, 0, 0)` seed row must be
+updated to include the new column: `VALUES (1, 0, 0, 0, 2)`.
 
 ### `archived_entries.visibility` — deprecated, not removed
 
@@ -166,9 +176,11 @@ Body: { username: string, password: string }
 
 1. Look up user by username.
 2. Verify password with Argon2id (`argon2` crate).
-3. Compute `role_bits` = OR of all `user_roles` bit values for this user.
+3. Compute `role_bits = ROLE_GUEST | (OR of bit values for all user_roles rows)` (cumulative; see Schema § role_bits computation).
 4. Insert `sessions` row (`session_uid` = UUID, `expires_at` = now + 30 days).
-5. Return `Set-Cookie: session=<session_uid>; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000`.
+5. Set-Cookie: `session=<session_uid>; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000`.
+   Add `Secure` flag when the request arrived over HTTPS (detected via `X-Forwarded-Proto: https`
+   header or TLS connection info). Omit `Secure` for plain HTTP to support local dev without TLS.
 6. Return `200 { user_uid, username, role_bits }`.
 
 On failure: `401 { error: "invalid_credentials" }` — same message for unknown user and wrong
@@ -200,9 +212,11 @@ POST /api/auth/setup → 201 { user_uid, username }
 Body: { username: string, password: string }
 ```
 
-`setup_required` is `true` when the `users` table has no row with the `owner` role. On `POST`,
-the server creates the user, assigns the `owner` role, and seeds `instance_settings` if not
-already present. After setup, the normal login flow applies.
+`setup_required` is `true` when no user has the `owner` role in `user_roles`. On `POST`:
+- If setup is **already complete** (an owner exists): return `409 { error: "already_configured" }`.
+- Otherwise: create the user (with `users.role = 'admin'` as placeholder), assign `user_roles`
+  rows for `user`, `admin`, `owner` (cumulative), seed `instance_settings` row if absent.
+  Return `201 { user_uid, username }`. Normal login flow applies immediately after.
 
 All non-setup API routes return `503 { error: "setup_required" }` until setup is complete.
 The following routes are **exempt** from the 503 check: `GET /api/auth/setup`,
@@ -228,10 +242,12 @@ irrelevant once setup is required on fresh instances.
 
 ### Session expiry & cleanup
 
-`last_seen_at` is updated on every authenticated request (max once per minute to avoid write
-amplification). `expires_at` = `last_seen_at + 30 days`. A background task in `archivr-server/src/main.rs`
-runs `DELETE FROM sessions WHERE expires_at < now()` at startup and every 24 hours via
-`tokio::time::interval`.
+`last_seen_at` is updated on every authenticated request using a **conditional update**: the
+session row is already read during extraction; if `now() - last_seen_at > 60s`, issue an UPDATE.
+This adds no extra query — only an extra UPDATE when the threshold is crossed.
+`expires_at` = `last_seen_at + 30 days`, recalculated on each UPDATE. A background task in
+`archivr-server/src/main.rs` runs `DELETE FROM sessions WHERE expires_at < now()` at startup
+and every 24 hours via `tokio::time::interval`.
 
 ---
 
@@ -259,8 +275,15 @@ pub const ROLE_OWNER: u32  = 8;
 ```
 
 Implemented as an Axum `FromRequestParts` extractor. Tries `session` cookie first, then
-`Authorization: Bearer` header. A missing or invalid credential resolves to `AuthUser::Guest`
-(never a hard error at extraction time — handlers decide what to do with a guest).
+`Authorization: Bearer` header.
+- **Cookie path**: look up `sessions` row JOIN `users` WHERE `session_uid = ?`
+  AND `users.status = 'active'` AND `expires_at > now()`. Use cached `role_bits` from the
+  session row.
+- **Bearer path**: SHA-256 the token, look up `api_tokens` row JOIN `users` WHERE
+  `token_hash = ?` AND `users.status = 'active'` AND (`expires_at IS NULL OR expires_at > now()`).
+  Compute `role_bits` live: `ROLE_GUEST | (OR of user_roles bit values for that user)`.
+  Update `api_tokens.last_used_at`.
+- Missing or invalid credential → `AuthUser::Guest` (never a hard error at extraction time).
 
 ---
 
