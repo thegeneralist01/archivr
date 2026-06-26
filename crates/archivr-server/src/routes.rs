@@ -116,6 +116,8 @@ pub fn app(registry: ServerRegistry, auth_db_path: std::path::PathBuf) -> Router
         .route("/api/auth/login",  axum::routing::post(auth_login))
         .route("/api/auth/logout", axum::routing::post(auth_logout))
         .route("/api/auth/me",     axum::routing::get(auth_me))
+        .route("/api/auth/tokens", axum::routing::get(list_tokens).post(create_token))
+        .route("/api/auth/tokens/:token_uid", axum::routing::delete(delete_token))
         .nest_service("/assets", ServeDir::new(static_dir.join("assets")))
         .fallback_service(ServeFile::new(static_dir.join("index.html")))
         .layer(axum::middleware::from_fn_with_state(state.clone(), setup_guard))
@@ -348,6 +350,11 @@ struct SetupBody {
     password: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct CreateTokenBody {
+    name: String,
+}
+
 async fn capture_handler(
     State(state): State<AppState>,
     Path(archive_id): Path<String>,
@@ -468,6 +475,49 @@ async fn auth_me(
         "role_bits": role_bits,
         "username": username,
     })))
+}
+
+async fn create_token(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Json(body): Json<CreateTokenBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let (user_id, _) = auth_user.require_auth()?;
+    if body.name.trim().is_empty() {
+        return Err(ApiError::bad_request("token name is required"));
+    }
+    let raw_token = auth::generate_token();
+    let token_hash = auth::hash_token(&raw_token);
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    let token_uid = database::create_api_token(&conn, user_id, &token_hash, &body.name)?;
+    Ok((StatusCode::CREATED, Json(serde_json::json!({
+        "token_uid": token_uid,
+        "raw_token": raw_token,
+        "name": body.name,
+    }))))
+}
+
+async fn list_tokens(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+) -> Result<Json<Vec<database::ApiTokenRecord>>, ApiError> {
+    let (user_id, _) = auth_user.require_auth()?;
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    Ok(Json(database::list_user_tokens(&conn, user_id)?))
+}
+
+async fn delete_token(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(token_uid): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let (user_id, _) = auth_user.require_auth()?;
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    if database::delete_api_token(&conn, &token_uid, user_id)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("token not found"))
+    }
 }
 
 fn mounted_archive<'a>(
@@ -1315,6 +1365,18 @@ mod tests {
             .oneshot(Request::builder().method("POST").uri("/api/auth/login")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"username":"owner","password":"wrong"}"#))
+                .unwrap())
+            .await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn create_token_requires_auth() {
+        let (test_app, _dir) = make_test_app();
+        let response = test_app
+            .oneshot(Request::builder().method("POST").uri("/api/auth/tokens")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"my token"}"#))
                 .unwrap())
             .await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
