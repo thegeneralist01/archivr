@@ -1,5 +1,8 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
-import { fetchArchives, fetchEntries, searchEntries, fetchRuns, fetchTags } from './api'
+import { useState, useEffect, useCallback, useRef, createContext } from 'react'
+import { fetchArchives, fetchEntries, searchEntries, fetchRuns, fetchTags, checkSetup, fetchMe } from './api'
+import LoginPage from './components/LoginPage.jsx'
+import SetupPage from './components/SetupPage.jsx'
+
 import Topbar from './components/Topbar'
 import CaptureDialog from './components/CaptureDialog'
 import EntriesView from './components/EntriesView'
@@ -8,7 +11,29 @@ import AdminView from './components/AdminView'
 import TagsView from './components/TagsView'
 import ContextRail from './components/ContextRail'
 
+export const AuthContext = createContext(null);
+
 export default function App() {
+  const [authState, setAuthState] = useState('loading');
+  const [currentUser, setCurrentUser] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      const needsSetup = await checkSetup();
+      if (needsSetup) { setAuthState('setup'); return; }
+      const user = await fetchMe();
+      if (!user) { setAuthState('login'); return; }
+      setCurrentUser(user);
+      setAuthState('authenticated');
+    })();
+  }, []);
+
+  useEffect(() => {
+    const handler = () => { setCurrentUser(null); setAuthState('login'); };
+    window.addEventListener('auth:expired', handler);
+    return () => window.removeEventListener('auth:expired', handler);
+  }, []);
+
   const [archives, setArchives] = useState([])
   const [archiveId, setArchiveId] = useState(null)
   const [entries, setEntries] = useState([])
@@ -127,77 +152,83 @@ export default function App() {
     ])
   }, [archiveId, searchQuery, tagFilter, loadEntries])
 
+  if (authState === 'loading') return <div className="auth-loading">Loading\u2026</div>;
+  if (authState === 'setup')   return <SetupPage onComplete={() => setAuthState('login')} />;
+  if (authState === 'login')   return <LoginPage onLogin={user => { setCurrentUser(user); setAuthState('authenticated'); }} />;
+
   return (
-    <>
-      <Topbar
-        archives={archives}
-        archiveId={archiveId}
-        onArchiveChange={handleArchiveChange}
-        view={view}
-        onViewChange={handleViewChange}
-        onCaptureClick={handleCaptureClick}
-      />
-      <main className="app-shell">
-        <div className="workspace">
-          {view === 'archive' && (
-            <div className="search-row">
-              <input
-                className="search-input"
-                type="search"
-                aria-label="Search archive"
-                aria-busy={searchBusy}
-                value={searchQuery}
-                onChange={e => setSearchQuery(e.target.value)}
-              />
-              <div className="result-count">
-                {resultCount}
-                {tagFilter && (
-                  <button className="tag-filter-badge" onClick={handleClearTagFilter}>
-                    × {tagFilter}
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
-          {view === 'archive' && (
-            <EntriesView
-              entries={entries}
-              selectedEntryUid={selectedEntryUid}
-              onSelectEntry={selectEntry}
-              archiveId={archiveId}
-              tagFilter={tagFilter}
-              onClearTagFilter={handleClearTagFilter}
-              searchQuery={searchQuery}
-              onSearchChange={setSearchQuery}
-              resultCount={resultCount}
-              searchBusy={searchBusy}
-            />
-          )}
-          {view === 'runs' && <RunsView runs={runs} />}
-          {view === 'admin' && <AdminView archives={archives} />}
-          {view === 'tags' && (
-            <TagsView
-              tagNodes={tagNodes}
-              tagFilter={tagFilter}
-              onTagFilterSet={handleTagFilterSet}
-              onViewChange={handleViewChange}
-            />
-          )}
-        </div>
-        <ContextRail
+    <AuthContext.Provider value={{ currentUser, setCurrentUser }}>
+      <>
+        <Topbar
+          archives={archives}
           archiveId={archiveId}
-          selectedEntry={selectedEntry}
-          onTagFilterSet={handleTagFilterSet}
-          tagNodes={tagNodes}
-          onTagsRefresh={handleTagsRefresh}
+          onArchiveChange={handleArchiveChange}
+          view={view}
+          onViewChange={handleViewChange}
+          onCaptureClick={handleCaptureClick}
         />
-      </main>
-      <CaptureDialog
-        open={captureDialogOpen}
-        archiveId={archiveId}
-        onClose={handleCaptureClose}
-        onCaptured={handleCaptured}
-      />
-    </>
+        <main className="app-shell">
+          <div className="workspace">
+            {view === 'archive' && (
+              <div className="search-row">
+                <input
+                  className="search-input"
+                  type="search"
+                  aria-label="Search archive"
+                  aria-busy={searchBusy}
+                  value={searchQuery}
+                  onChange={e => setSearchQuery(e.target.value)}
+                />
+                <div className="result-count">
+                  {resultCount}
+                  {tagFilter && (
+                    <button className="tag-filter-badge" onClick={handleClearTagFilter}>
+                      × {tagFilter}
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+            {view === 'archive' && (
+              <EntriesView
+                entries={entries}
+                selectedEntryUid={selectedEntryUid}
+                onSelectEntry={selectEntry}
+                archiveId={archiveId}
+                tagFilter={tagFilter}
+                onClearTagFilter={handleClearTagFilter}
+                searchQuery={searchQuery}
+                onSearchChange={setSearchQuery}
+                resultCount={resultCount}
+                searchBusy={searchBusy}
+              />
+            )}
+            {view === 'runs' && <RunsView runs={runs} />}
+            {view === 'admin' && <AdminView archives={archives} />}
+            {view === 'tags' && (
+              <TagsView
+                tagNodes={tagNodes}
+                tagFilter={tagFilter}
+                onTagFilterSet={handleTagFilterSet}
+                onViewChange={handleViewChange}
+              />
+            )}
+          </div>
+          <ContextRail
+            archiveId={archiveId}
+            selectedEntry={selectedEntry}
+            onTagFilterSet={handleTagFilterSet}
+            tagNodes={tagNodes}
+            onTagsRefresh={handleTagsRefresh}
+          />
+        </main>
+        <CaptureDialog
+          open={captureDialogOpen}
+          archiveId={archiveId}
+          onClose={handleCaptureClose}
+          onCaptured={handleCaptured}
+        />
+      </>
+    </AuthContext.Provider>
   )
 }
