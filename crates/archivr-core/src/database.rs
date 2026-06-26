@@ -1692,6 +1692,45 @@ pub fn get_entry_collection_memberships(
     .map_err(Into::into)
 }
 
+/// Renames a collection and/or updates its default_visibility_bits.
+/// Returns true if updated, false if not found.
+/// Refuses to rename the '_default_' collection.
+pub fn update_collection(
+    conn: &Connection,
+    collection_uid: &str,
+    new_name: Option<&str>,
+    new_visibility_bits: Option<u32>,
+) -> Result<bool> {
+    let coll = get_collection_by_uid(conn, collection_uid)?;
+    let Some(coll) = coll else { return Ok(false) };
+    if coll.slug == "_default_" {
+        anyhow::bail!("cannot modify the default collection");
+    }
+    let name = new_name.unwrap_or(&coll.name);
+    let vbits = new_visibility_bits.unwrap_or(coll.default_visibility_bits);
+    conn.execute(
+        "UPDATE collections SET name = ?1, default_visibility_bits = ?2 WHERE id = ?3",
+        params![name, vbits as i64, coll.id],
+    )?;
+    Ok(true)
+}
+
+/// Deletes a collection and cascades to collection_entries.
+/// Returns true if deleted, false if not found.
+/// Refuses to delete the '_default_' collection.
+pub fn delete_collection(
+    conn: &Connection,
+    collection_uid: &str,
+) -> Result<bool> {
+    let coll = get_collection_by_uid(conn, collection_uid)?;
+    let Some(coll) = coll else { return Ok(false) };
+    if coll.slug == "_default_" {
+        anyhow::bail!("cannot delete the default collection");
+    }
+    conn.execute("DELETE FROM collections WHERE id = ?1", [coll.id])?;
+    Ok(true)
+}
+
 fn run_id_for_item(conn: &Connection, item_id: i64) -> Result<i64> {
     let run_id = conn.query_row(
         "SELECT run_id FROM archive_run_items WHERE id = ?1",

@@ -135,7 +135,9 @@ pub fn app(registry: ServerRegistry, auth_db_path: std::path::PathBuf) -> Router
         .route("/api/archives/:archive_id/collections",
             get(list_collections_handler).post(create_collection_handler))
         .route("/api/archives/:archive_id/collections/:coll_uid",
-            get(get_collection_handler))
+            get(get_collection_handler)
+            .patch(patch_collection_handler)
+            .delete(delete_collection_handler))
         .route("/api/archives/:archive_id/collections/:coll_uid/entries",
             post(add_entry_to_collection_handler))
         .route("/api/archives/:archive_id/collections/:coll_uid/entries/:entry_uid",
@@ -318,6 +320,12 @@ struct AddEntryBody {
 #[derive(Debug, serde::Deserialize)]
 struct UpdateVisibilityBody {
     visibility_bits: u32,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PatchCollectionBody {
+    name: Option<String>,
+    default_visibility_bits: Option<u32>,
 }
 
 async fn list_tags(
@@ -939,13 +947,41 @@ async fn get_collection_handler(
         .ok_or(ApiError::not_found("collection not found"))?;
     let caller_bits = auth_to_caller_bits(&auth);
     let entries = archive::list_entries_for_collection(&conn, record.id, caller_bits)?;
+    // Collect per-entry visibility bits from collection_entries
+    let mut vis_map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT ae.entry_uid, ce.visibility_bits \
+             FROM collection_entries ce \
+             JOIN archived_entries ae ON ae.id = ce.entry_id \
+             WHERE ce.collection_id = ?1",
+        )?;
+        let rows = stmt.query_map([record.id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32))
+        })?;
+        for r in rows {
+            if let Ok((uid, bits)) = r {
+                vis_map.insert(uid, bits);
+            }
+        }
+    }
+    let entries_json: Vec<serde_json::Value> = entries.iter().map(|e| {
+        let vis = vis_map.get(&e.entry_uid).copied().unwrap_or(record.default_visibility_bits);
+        serde_json::json!({
+            "entry_uid": e.entry_uid,
+            "title": e.title,
+            "source_kind": e.source_kind,
+            "archived_at": e.archived_at,
+            "collection_visibility_bits": vis,
+        })
+    }).collect();
     Ok(Json(serde_json::json!({
         "collection_uid": record.collection_uid,
         "name": record.name,
         "slug": record.slug,
         "default_visibility_bits": record.default_visibility_bits,
         "created_at": record.created_at,
-        "entries": entries,
+        "entries": entries_json,
     })))
 }
 
@@ -1038,6 +1074,40 @@ async fn list_entry_collections_handler(
     match archive::get_entry_collections(&conn, &entry_uid)? {
         Some(memberships) => Ok(Json(memberships)),
         None => Err(ApiError::not_found("entry not found")),
+    }
+}
+
+async fn patch_collection_handler(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((archive_id, coll_uid)): Path<(String, String)>,
+    Json(body): Json<PatchCollectionBody>,
+) -> Result<StatusCode, ApiError> {
+    auth.require_role(ROLE_USER)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let name_ref: Option<&str> = body.name.as_deref();
+    let updated = database::update_collection(&conn, &coll_uid, name_ref, body.default_visibility_bits)?;
+    if updated {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("collection not found"))
+    }
+}
+
+async fn delete_collection_handler(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((archive_id, coll_uid)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    auth.require_role(ROLE_USER)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let deleted = database::delete_collection(&conn, &coll_uid)?;
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("collection not found"))
     }
 }
 
