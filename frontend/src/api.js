@@ -112,6 +112,62 @@ export async function fetchMe() {
   return r.json();
 }
 
+// ── Profile & settings helpers ───────────────────────────────────────────────
+
+export async function updateProfile(displayName) {
+  const res = await fetch('/api/auth/me', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ display_name: displayName }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+}
+
+export async function changePassword(currentPassword, newPassword) {
+  const res = await fetch('/api/auth/me', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+  });
+  if (!res.ok) {
+    let msg = await res.text();
+    try { msg = JSON.parse(msg).error ?? msg; } catch {}
+    throw new Error(msg);
+  }
+}
+
+export async function listTokens() {
+  return getJson('/api/auth/tokens');
+}
+
+export async function createToken(name) {
+  const res = await fetch('/api/auth/tokens', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function deleteToken(tokenUid) {
+  const res = await fetch(`/api/auth/tokens/${tokenUid}`, { method: 'DELETE' });
+  if (!res.ok) throw new Error(await res.text());
+}
+
+export async function getInstanceSettings() {
+  return getJson('/api/admin/instance-settings');
+}
+
+export async function updateInstanceSettings(patch) {
+  const res = await fetch('/api/admin/instance-settings', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) throw new Error(await res.text());
+}
+
 // ── Admin helpers ─────────────────────────────────────────────────────────────
 
 export async function listAdminUsers() {
