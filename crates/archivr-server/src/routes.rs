@@ -1,4 +1,4 @@
-// ── Security Boundary ────────────────────────────────────────────────────────
+// ── Security Boundary ──────────────────────────────────────────────────────────────────
 // All routes are currently trusted-local: no authentication or authorization
 // middleware is applied. The server is designed to bind on 127.0.0.1 only.
 //
@@ -40,6 +40,7 @@ use crate::registry::{MountedArchive, ServerRegistry};
 #[derive(Clone)]
 pub struct AppState {
     registry: Arc<ServerRegistry>,
+    pub auth_db_path: Arc<std::path::PathBuf>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -48,9 +49,10 @@ pub struct EntrySearchParams {
     pub tag: Option<String>,
 }
 
-pub fn app(registry: ServerRegistry) -> Router {
+pub fn app(registry: ServerRegistry, auth_db_path: std::path::PathBuf) -> Router {
     let state = AppState {
         registry: Arc::new(registry),
+        auth_db_path: Arc::new(auth_db_path),
     };
     let static_dir = static_dir();
 
@@ -192,6 +194,7 @@ async fn serve_entry_favicon(
         .unwrap()
         .into_response())
 }
+
 async fn serve_blob(
     State(state): State<AppState>,
     Path((archive_id, sha256)): Path<(String, String)>,
@@ -387,8 +390,100 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
+    fn make_test_app() -> (Router, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.sqlite");
+        // Seed owner so setup_guard passes in normal tests
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "test_hash_not_real").unwrap();
+        }
+        let registry = ServerRegistry { archives: vec![], bind: None, auth_db_path: None };
+        (app(registry, auth_path), dir)
+    }
+
+    fn make_setup_test_app() -> (Router, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.sqlite");
+        // NO owner seeded - for testing setup-required behavior
+        let registry = ServerRegistry { archives: vec![], bind: None, auth_db_path: None };
+        (app(registry, auth_path), dir)
+    }
+
+    fn make_test_registry(dir: &tempfile::TempDir) -> (ServerRegistry, std::path::PathBuf, std::path::PathBuf) {
+        let paths = archivr_core::archive::initialize_archive(
+            dir.path(),
+            &dir.path().join("store"),
+            "test",
+            false,
+        ).unwrap();
+        let auth_path = dir.path().join("auth.sqlite");
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
+        let registry = ServerRegistry {
+            archives: vec![MountedArchive {
+                id: "test".to_string(),
+                label: "Test".to_string(),
+                archive_path: paths.archive_path.clone(),
+            }],
+            bind: None,
+            auth_db_path: None,
+        };
+        (registry, paths.archive_path, auth_path)
+    }
+
+    fn make_test_entry(archive_path: &std::path::Path) -> archivr_core::database::ArchivedEntry {
+        let conn = database::open_or_initialize(archive_path).unwrap();
+        let user_id = database::ensure_default_user(&conn).unwrap();
+        let run = database::create_archive_run(&conn, user_id, 1).unwrap();
+        let si = database::upsert_source_identity(
+            &conn, "web", "page", None,
+            Some("https://example.com/test"),
+            "https://example.com/test",
+        )
+        .unwrap();
+        database::create_archived_entry(
+            &conn,
+            &database::NewEntry {
+                source_identity_id: si,
+                archive_run_id: run.id,
+                parent_entry_id: None,
+                root_entry_id: None,
+                created_by_user_id: user_id,
+                owned_by_user_id: user_id,
+                source_kind: "web".to_string(),
+                entity_kind: "page".to_string(),
+                title: Some("Test Entry".to_string()),
+                visibility: "private".to_string(),
+                representation_kind: "html".to_string(),
+                source_metadata_json: "{}".to_string(),
+                display_metadata_json: None,
+            },
+        )
+        .unwrap()
+    }
+
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn json_body(payload: &serde_json::Value) -> Body {
+        Body::from(serde_json::to_vec(payload).unwrap())
+    }
+
     #[tokio::test]
     async fn archives_endpoint_lists_mounted_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.sqlite");
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
         let registry = ServerRegistry {
             archives: vec![MountedArchive {
                 id: "personal".to_string(),
@@ -396,8 +491,9 @@ mod tests {
                 archive_path: std::path::PathBuf::from("/tmp/personal/.archivr"),
             }],
             bind: None,
+            auth_db_path: None,
         };
-        let response = app(registry)
+        let response = app(registry, auth_path)
             .oneshot(
                 Request::builder()
                     .uri("/api/archives")
@@ -412,7 +508,8 @@ mod tests {
 
     #[tokio::test]
     async fn missing_archive_returns_404() {
-        let response = app(ServerRegistry::default())
+        let (test_app, _dir) = make_test_app();
+        let response = test_app
             .oneshot(
                 Request::builder()
                     .uri("/api/archives/missing/entries")
@@ -427,7 +524,8 @@ mod tests {
 
     #[tokio::test]
     async fn artifact_missing_archive_returns_404() {
-        let response = app(ServerRegistry::default())
+        let (test_app, _dir) = make_test_app();
+        let response = test_app
             .oneshot(
                 Request::builder()
                     .uri("/api/archives/nope/entries/entry_abc/artifacts/0")
@@ -450,6 +548,11 @@ mod tests {
         )
         .unwrap();
         let archive_path = dir.path().join(".archivr");
+        let auth_path = dir.path().join("auth.sqlite");
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
         let registry = ServerRegistry {
             archives: vec![MountedArchive {
                 id: "test".to_string(),
@@ -457,8 +560,9 @@ mod tests {
                 archive_path,
             }],
             bind: None,
+            auth_db_path: None,
         };
-        let response = app(registry)
+        let response = app(registry, auth_path)
             .oneshot(
                 Request::builder()
                     .uri("/api/archives/test/entries/entry_doesnotexist/artifacts/0")
@@ -481,6 +585,11 @@ mod tests {
         )
         .unwrap();
         let archive_path = dir.path().join(".archivr");
+        let auth_path = dir.path().join("auth.sqlite");
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
         let registry = ServerRegistry {
             archives: vec![MountedArchive {
                 id: "test".to_string(),
@@ -488,8 +597,9 @@ mod tests {
                 archive_path,
             }],
             bind: None,
+            auth_db_path: None,
         };
-        let response = app(registry)
+        let response = app(registry, auth_path)
             .oneshot(
                 Request::builder()
                     .uri("/api/archives/test/entries/entry_doesnotexist/artifacts/99")
@@ -574,6 +684,11 @@ mod tests {
         .unwrap();
         drop(conn); // release before the HTTP handler opens the same db file
 
+        let auth_path = dir.path().join("auth.sqlite");
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
         let registry = ServerRegistry {
             archives: vec![MountedArchive {
                 id: "test".to_string(),
@@ -581,12 +696,13 @@ mod tests {
                 archive_path: paths.archive_path.clone(),
             }],
             bind: None,
+            auth_db_path: None,
         };
         let uri = format!(
             "/api/archives/test/entries/{}/artifacts/0",
             entry.entry_uid
         );
-        let response = app(registry)
+        let response = app(registry, auth_path)
             .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -595,7 +711,8 @@ mod tests {
 
     #[tokio::test]
     async fn search_missing_archive_returns_404() {
-        let response = app(ServerRegistry::default())
+        let (test_app, _dir) = make_test_app();
+        let response = test_app
             .oneshot(
                 Request::builder()
                     .uri("/api/archives/nope/entries/search?q=anything")
@@ -610,23 +727,8 @@ mod tests {
     #[tokio::test]
     async fn search_empty_q_returns_ok() {
         let dir = tempfile::tempdir().unwrap();
-        archivr_core::archive::initialize_archive(
-            dir.path(),
-            &dir.path().join("store"),
-            "test",
-            false,
-        )
-        .unwrap();
-        let archive_path = dir.path().join(".archivr");
-        let registry = ServerRegistry {
-            archives: vec![MountedArchive {
-                id: "test".to_string(),
-                label: "Test".to_string(),
-                archive_path,
-            }],
-            bind: None,
-        };
-        let response = app(registry)
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let response = app(registry, auth_path)
             .oneshot(
                 Request::builder()
                     .uri("/api/archives/test/entries/search")
@@ -641,23 +743,8 @@ mod tests {
     #[tokio::test]
     async fn search_unknown_prefix_returns_400() {
         let dir = tempfile::tempdir().unwrap();
-        archivr_core::archive::initialize_archive(
-            dir.path(),
-            &dir.path().join("store"),
-            "test",
-            false,
-        )
-        .unwrap();
-        let archive_path = dir.path().join(".archivr");
-        let registry = ServerRegistry {
-            archives: vec![MountedArchive {
-                id: "test".to_string(),
-                label: "Test".to_string(),
-                archive_path,
-            }],
-            bind: None,
-        };
-        let response = app(registry)
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let response = app(registry, auth_path)
             .oneshot(
                 Request::builder()
                     .uri("/api/archives/test/entries/search?q=unknownprefix%3Aval")
@@ -669,74 +756,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    // ---- helpers ----
-
-    fn make_test_registry(dir: &tempfile::TempDir) -> (ServerRegistry, std::path::PathBuf) {
-        let paths = archivr_core::archive::initialize_archive(
-            dir.path(),
-            &dir.path().join("store"),
-            "test",
-            false,
-        )
-        .unwrap();
-        let registry = ServerRegistry {
-            archives: vec![MountedArchive {
-                id: "test".to_string(),
-                label: "Test".to_string(),
-                archive_path: paths.archive_path.clone(),
-            }],
-            bind: None,
-        };
-        (registry, paths.archive_path)
-    }
-
-    fn make_test_entry(archive_path: &std::path::Path) -> archivr_core::database::ArchivedEntry {
-        let conn = database::open_or_initialize(archive_path).unwrap();
-        let user_id = database::ensure_default_user(&conn).unwrap();
-        let run = database::create_archive_run(&conn, user_id, 1).unwrap();
-        let si = database::upsert_source_identity(
-            &conn, "web", "page", None,
-            Some("https://example.com/test"),
-            "https://example.com/test",
-        )
-        .unwrap();
-        database::create_archived_entry(
-            &conn,
-            &database::NewEntry {
-                source_identity_id: si,
-                archive_run_id: run.id,
-                parent_entry_id: None,
-                root_entry_id: None,
-                created_by_user_id: user_id,
-                owned_by_user_id: user_id,
-                source_kind: "web".to_string(),
-                entity_kind: "page".to_string(),
-                title: Some("Test Entry".to_string()),
-                visibility: "private".to_string(),
-                representation_kind: "html".to_string(),
-                source_metadata_json: "{}".to_string(),
-                display_metadata_json: None,
-            },
-        )
-        .unwrap()
-    }
-
-    async fn body_json(response: axum::response::Response) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        serde_json::from_slice(&bytes).unwrap()
-    }
-
-    fn json_body(payload: &serde_json::Value) -> Body {
-        Body::from(serde_json::to_vec(payload).unwrap())
-    }
-
     // ---- tag route tests ----
 
     #[tokio::test]
     async fn test_list_tags_unknown_archive() {
-        let response = app(ServerRegistry::default())
+        let (test_app, _dir) = make_test_app();
+        let response = test_app
             .oneshot(
                 Request::builder()
                     .uri("/api/archives/ghost/tags")
@@ -750,7 +775,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_tag_unknown_archive() {
-        let response = app(ServerRegistry::default())
+        let (test_app, _dir) = make_test_app();
+        let response = test_app
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -767,8 +793,8 @@ mod tests {
     #[tokio::test]
     async fn test_create_tag_empty_path() {
         let dir = tempfile::tempdir().unwrap();
-        let (registry, _) = make_test_registry(&dir);
-        let response = app(registry)
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let response = app(registry, auth_path)
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -785,9 +811,9 @@ mod tests {
     #[tokio::test]
     async fn test_tag_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let (registry, _) = make_test_registry(&dir);
+        let (registry, _, auth_path) = make_test_registry(&dir);
 
-        let create_response = app(registry.clone())
+        let create_response = app(registry.clone(), auth_path.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -800,7 +826,7 @@ mod tests {
             .unwrap();
         assert_eq!(create_response.status(), StatusCode::CREATED);
 
-        let list_response = app(registry.clone())
+        let list_response = app(registry.clone(), auth_path.clone())
             .oneshot(
                 Request::builder()
                     .uri("/api/archives/test/tags")
@@ -823,13 +849,13 @@ mod tests {
     #[tokio::test]
     async fn test_entry_tag_assign_and_remove() {
         let dir = tempfile::tempdir().unwrap();
-        let (registry, archive_path) = make_test_registry(&dir);
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
         let entry = make_test_entry(&archive_path);
         let entry_uid = entry.entry_uid.clone();
         let entry_tags_uri = format!("/api/archives/test/entries/{entry_uid}/tags");
 
         // Assign tag
-        let assign_response = app(registry.clone())
+        let assign_response = app(registry.clone(), auth_path.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -845,7 +871,7 @@ mod tests {
         let tag_uid = assigned_tag["tag_uid"].as_str().unwrap().to_string();
 
         // List entry tags — should contain the assigned tag
-        let list_response = app(registry.clone())
+        let list_response = app(registry.clone(), auth_path.clone())
             .oneshot(
                 Request::builder()
                     .uri(&entry_tags_uri)
@@ -860,7 +886,7 @@ mod tests {
 
         // Remove tag
         let delete_uri = format!("{entry_tags_uri}/{tag_uid}");
-        let delete_response = app(registry.clone())
+        let delete_response = app(registry.clone(), auth_path.clone())
             .oneshot(
                 Request::builder()
                     .method("DELETE")
@@ -873,7 +899,7 @@ mod tests {
         assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
 
         // List entry tags again — should be empty
-        let list2_response = app(registry.clone())
+        let list2_response = app(registry.clone(), auth_path.clone())
             .oneshot(
                 Request::builder()
                     .uri(&entry_tags_uri)
@@ -890,12 +916,12 @@ mod tests {
     #[tokio::test]
     async fn test_search_with_tag_param() {
         let dir = tempfile::tempdir().unwrap();
-        let (registry, archive_path) = make_test_registry(&dir);
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
         let entry = make_test_entry(&archive_path);
         let entry_uid = entry.entry_uid.clone();
 
         // Assign /science tag to entry
-        let assign_resp = app(registry.clone())
+        let assign_resp = app(registry.clone(), auth_path.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -909,7 +935,7 @@ mod tests {
         assert_eq!(assign_resp.status(), StatusCode::CREATED, "assign tag should return 201");
 
         // Search with ?tag=/science — entry should appear
-        let response = app(registry.clone())
+        let response = app(registry.clone(), auth_path.clone())
             .oneshot(
                 Request::builder()
                     .uri("/api/archives/test/entries/search?tag=%2Fscience")
@@ -928,7 +954,7 @@ mod tests {
         );
 
         // Search with ?tag=/art — should return empty
-        let response2 = app(registry.clone())
+        let response2 = app(registry.clone(), auth_path.clone())
             .oneshot(
                 Request::builder()
                     .uri("/api/archives/test/entries/search?tag=%2Fart")
@@ -948,8 +974,8 @@ mod tests {
     #[tokio::test]
     async fn test_list_entry_tags_unknown_entry() {
         let dir = tempfile::tempdir().unwrap();
-        let (registry, _) = make_test_registry(&dir);
-        let response = app(registry)
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let response = app(registry, auth_path)
             .oneshot(
                 Request::builder()
                     .uri("/api/archives/test/entries/ghost_uid/tags")
@@ -964,8 +990,8 @@ mod tests {
     #[tokio::test]
     async fn test_assign_entry_tag_unknown_entry() {
         let dir = tempfile::tempdir().unwrap();
-        let (registry, _) = make_test_registry(&dir);
-        let response = app(registry)
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let response = app(registry, auth_path)
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -982,10 +1008,10 @@ mod tests {
     #[tokio::test]
     async fn test_assign_entry_tag_empty_tag_path() {
         let dir = tempfile::tempdir().unwrap();
-        let (registry, archive_path) = make_test_registry(&dir);
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
         let entry = make_test_entry(&archive_path);
         let entry_uid = entry.entry_uid.clone();
-        let response = app(registry)
+        let response = app(registry, auth_path)
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1002,8 +1028,8 @@ mod tests {
     #[tokio::test]
     async fn test_remove_entry_tag_unknown_entry() {
         let dir = tempfile::tempdir().unwrap();
-        let (registry, _) = make_test_registry(&dir);
-        let response = app(registry)
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let response = app(registry, auth_path)
             .oneshot(
                 Request::builder()
                     .method("DELETE")
@@ -1018,7 +1044,8 @@ mod tests {
 
     #[tokio::test]
     async fn capture_rejects_empty_locator() {
-        let response = app(ServerRegistry::default())
+        let (test_app, _dir) = make_test_app();
+        let response = test_app
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1034,7 +1061,8 @@ mod tests {
 
     #[tokio::test]
     async fn capture_rejects_unknown_archive() {
-        let response = app(ServerRegistry::default())
+        let (test_app, _dir) = make_test_app();
+        let response = test_app
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1059,6 +1087,11 @@ mod tests {
         )
         .unwrap();
         let archive_path = dir.path().join(".archivr");
+        let auth_path = dir.path().join("auth.sqlite");
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
         let registry = ServerRegistry {
             archives: vec![MountedArchive {
                 id: "test".to_string(),
@@ -1066,8 +1099,9 @@ mod tests {
                 archive_path,
             }],
             bind: None,
+            auth_db_path: None,
         };
-        let response = app(registry)
+        let response = app(registry, auth_path)
             .oneshot(
                 Request::builder()
                     .uri("/api/archives/test/blobs/0000000000000000000000000000000000000000000000000000000000000000")
