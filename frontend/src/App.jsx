@@ -9,6 +9,7 @@ import EntriesView from './components/EntriesView'
 import RunsView from './components/RunsView'
 import AdminView from './components/AdminView'
 import TagsView from './components/TagsView'
+import CollectionsView from './components/CollectionsView'
 import ContextRail from './components/ContextRail'
 
 export const AuthContext = createContext(null);
@@ -212,6 +213,9 @@ export default function App() {
                 onTagFilterSet={handleTagFilterSet}
                 onViewChange={handleViewChange}
               />
+            )}
+            {view === 'collections' && (
+              <CollectionsView archiveId={archiveId} />
             )}
           </div>
           <ContextRail

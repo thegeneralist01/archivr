@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef } from 'react'
-import { fetchEntryDetail, fetchEntryTags, assignTag, removeTag } from '../api'
+import { fetchEntryDetail, fetchEntryTags, assignTag, removeTag, listEntryCollections } from '../api'
 import { formatTimestamp, formatBytes, valueText } from '../utils'
 
 export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, tagNodes, onTagsRefresh }) {
   const [detail, setDetail] = useState(null)
   const [tags, setTags] = useState([])
   const [assignInput, setAssignInput] = useState('')
+  const [entryCollections, setEntryCollections] = useState([])
   const [assignError, setAssignError] = useState('')
   const selectSeqRef = useRef(0)
 
@@ -13,6 +14,7 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
     if (!selectedEntry || !archiveId) {
       setDetail(null)
       setTags([])
+      setEntryCollections([])
       return
     }
     const seq = ++selectSeqRef.current
@@ -21,10 +23,12 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
     Promise.all([
       fetchEntryDetail(archiveId, selectedEntry.entry_uid),
       fetchEntryTags(archiveId, selectedEntry.entry_uid),
-    ]).then(([det, tgs]) => {
+      listEntryCollections(archiveId, selectedEntry.entry_uid),
+    ]).then(([det, tgs, ecs]) => {
       if (seq !== selectSeqRef.current) return
       setDetail(det)
       setTags(tgs)
+      setEntryCollections(ecs)
     }).catch(() => {})
   }, [selectedEntry, archiveId])
 
@@ -156,6 +160,19 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
               </div>
             )}
           </div>
+          {selectedEntry && entryCollections.length > 0 && (
+            <div className="rail-section">
+              <div className="rail-section-heading">Collections</div>
+              {entryCollections.map(c => (
+                <div key={c.collection_uid} className="rail-item">
+                  <span className="rail-label">{c.collection_uid}</span>:{' '}
+                  <span className="muted">
+                    {{ 0: 'Private', 1: 'Public', 2: 'Users only', 3: 'Public' }[c.visibility_bits] ?? `bits:${c.visibility_bits}`}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
         </>
       )}
     </aside>
