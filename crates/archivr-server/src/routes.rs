@@ -1,26 +1,21 @@
 // ── Security Boundary ──────────────────────────────────────────────────────────────────
-// All routes are currently trusted-local: no authentication or authorization
-// middleware is applied. The server is designed to bind on 127.0.0.1 only.
+// setup_guard middleware returns 503 for all non-auth routes until POST /api/auth/setup
+// creates the owner account.
 //
-// Route classification (for when middleware is added later):
-//
-//   STATIC  — safe to expose publicly: GET / and static /assets/*
-//   READ    — safe to expose read-only: GET /health
-//                                       GET /api/archives
-//                                       GET /api/archives/:id/entries
-//                                       GET /api/archives/:id/entries/search
-//                                       GET /api/archives/:id/entries/:uid
-//                                       GET /api/archives/:id/entries/:uid/artifacts/:idx
-//                                       GET /api/archives/:id/runs
-//                                       GET /api/archives/:id/tags
-//   ADMIN   — requires auth if ever public: GET /api/admin/archives
-//   WRITE   — requires auth if ever public: POST /api/archives/:id/captures
-//                                           POST /api/archives/:id/tags
-//                                           PUT  /api/archives/:id/tags/:tag_id
-//                                           DELETE /api/archives/:id/tags/:tag_id
-//
-// Do not add middleware here until the auth model is chosen. See docs/README.md.
-// ─────────────────────────────────────────────────────────────────────────────
+// Route protection tiers:
+//   STATIC      — no auth: GET /, GET /assets/*
+//   PUBLIC_READ — no auth (visibility filtering deferred to Track 6):
+//                   GET /api/archives, GET /api/archives/:id/entries, etc.
+//   AUTH        — requires login (ROLE_USER bit):
+//                   POST /api/archives/:id/captures
+//                   POST /api/archives/:id/tags
+//                   POST/DELETE /api/archives/:id/entries/:uid/tags
+//   ADMIN       — requires ROLE_ADMIN: (future)
+//   OWNER       — requires ROLE_OWNER: (future)
+//   AUTH_SELF   — own resources, require_auth() only:
+//                   GET/POST/DELETE /api/auth/tokens
+//                   POST /api/auth/logout, GET /api/auth/me
+// ────────────────────────────────────────────────────────────────────────────
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -29,6 +24,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, Request, State},
     http::StatusCode,
+    middleware::Next,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
@@ -50,6 +46,31 @@ pub struct AppState {
 pub struct EntrySearchParams {
     pub q: Option<String>,
     pub tag: Option<String>,
+}
+
+/// Tower middleware: returns 503 on all non-exempt routes if setup hasn't been completed.
+async fn setup_guard(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let path = req.uri().path().to_owned();
+    let exempt = path.starts_with("/api/auth/")
+        || path.starts_with("/assets")
+        || path == "/"
+        || path == "/health";
+    if !exempt {
+        if let Ok(conn) = database::open_auth_db(&state.auth_db_path) {
+            if matches!(database::ensure_owner_exists(&conn), Ok(false)) {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(serde_json::json!({ "error": "setup_required" })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    next.run(req).await
 }
 
 pub fn app(registry: ServerRegistry, auth_db_path: std::path::PathBuf) -> Router {
@@ -91,8 +112,13 @@ pub fn app(registry: ServerRegistry, auth_db_path: std::path::PathBuf) -> Router
             "/api/archives/:archive_id/entries/:entry_uid/tags/:tag_uid",
             delete(remove_entry_tag_handler),
         )
+        .route("/api/auth/setup",  axum::routing::get(auth_setup_status).post(auth_setup))
+        .route("/api/auth/login",  axum::routing::post(auth_login))
+        .route("/api/auth/logout", axum::routing::post(auth_logout))
+        .route("/api/auth/me",     axum::routing::get(auth_me))
         .nest_service("/assets", ServeDir::new(static_dir.join("assets")))
         .fallback_service(ServeFile::new(static_dir.join("index.html")))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), setup_guard))
         .with_state(state)
 }
 
@@ -310,6 +336,18 @@ struct CaptureBody {
     locator: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct LoginBody {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SetupBody {
+    username: String,
+    password: String,
+}
+
 async fn capture_handler(
     State(state): State<AppState>,
     Path(archive_id): Path<String>,
@@ -324,6 +362,112 @@ async fn capture_handler(
     let result = capture::perform_capture(&archive_paths, &body.locator, Some(&archive_id))
         .map_err(ApiError::from)?;
     Ok(Json(result))
+}
+
+async fn auth_setup_status(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    let required = !database::ensure_owner_exists(&conn)?;
+    Ok(Json(serde_json::json!({ "setup_required": required })))
+}
+
+async fn auth_setup(
+    State(state): State<AppState>,
+    Json(body): Json<SetupBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    if database::ensure_owner_exists(&conn)? {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: "already_configured".to_string(),
+        });
+    }
+    if body.username.trim().is_empty() || body.password.len() < 8 {
+        return Err(ApiError::bad_request("username required and password must be at least 8 characters"));
+    }
+    let hash = auth::hash_password(&body.password).map_err(ApiError::from)?;
+    database::create_owner(&conn, &body.username, &hash)?;
+    let user = database::get_user_by_username(&conn, &body.username)?
+        .ok_or_else(|| ApiError::internal("user not found after creation"))?;
+    Ok((StatusCode::CREATED, Json(serde_json::json!({
+        "user_uid": user.user_uid,
+        "username": user.username,
+    }))))
+}
+
+async fn auth_login(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<LoginBody>,
+) -> Result<(StatusCode, axum::http::HeaderMap, Json<serde_json::Value>), ApiError> {
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    let user = database::get_user_by_username(&conn, &body.username)?
+        .filter(|u| u.status == "active")
+        .ok_or_else(|| ApiError::unauthorized("invalid_credentials"))?;
+    if !auth::verify_password(&body.password, &user.password_hash)
+        .map_err(ApiError::from)?
+    {
+        return Err(ApiError::unauthorized("invalid_credentials"));
+    }
+    let role_bits = database::compute_role_bits(&conn, user.id)?;
+    let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok());
+    let session_uid = database::create_session(&conn, user.id, role_bits, user_agent)?;
+
+    let secure = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == "https")
+        .unwrap_or(false);
+    let cookie_value = format!(
+        "session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000{}",
+        session_uid,
+        if secure { "; Secure" } else { "" }
+    );
+    let mut resp_headers = axum::http::HeaderMap::new();
+    resp_headers.insert(
+        axum::http::header::SET_COOKIE,
+        cookie_value.parse().map_err(|_| ApiError::internal("cookie error"))?,
+    );
+
+    Ok((StatusCode::OK, resp_headers, Json(serde_json::json!({
+        "user_uid": user.user_uid,
+        "username": user.username,
+        "role_bits": role_bits,
+    }))))
+}
+
+async fn auth_logout(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<(StatusCode, axum::http::HeaderMap), ApiError> {
+    if let Some(cookie) = jar.get("session") {
+        let conn = database::open_auth_db(&state.auth_db_path)?;
+        database::delete_session(&conn, cookie.value())?;
+    }
+    let mut resp_headers = axum::http::HeaderMap::new();
+    resp_headers.insert(
+        axum::http::header::SET_COOKIE,
+        "session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+            .parse()
+            .unwrap(),
+    );
+    Ok((StatusCode::NO_CONTENT, resp_headers))
+}
+
+async fn auth_me(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (user_id, role_bits) = auth_user.require_auth()?;
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    let username: String = conn
+        .query_row("SELECT username FROM users WHERE id = ?1", [user_id], |r| r.get(0))
+        .map_err(|e| ApiError::from(anyhow::anyhow!("db error: {e}")))?;
+    Ok(Json(serde_json::json!({
+        "role_bits": role_bits,
+        "username": username,
+    })))
 }
 
 fn mounted_archive<'a>(
@@ -1123,6 +1267,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn setup_required_before_owner_created() {
+        let (test_app, _dir) = make_setup_test_app();
+        let response = test_app
+            .oneshot(Request::builder().uri("/api/auth/setup").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["setup_required"], true);
+    }
+
+    #[tokio::test]
+    async fn setup_post_returns_409_on_repeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.sqlite");
+        // Seed an owner directly so the second POST hits CONFLICT
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "owner", "dummy").unwrap();
+        }
+        let registry = ServerRegistry { archives: vec![], bind: None, auth_db_path: None };
+        let second_app = app(registry, auth_path);
+        let r2 = second_app
+            .oneshot(Request::builder().method("POST").uri("/api/auth/setup")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"owner2","password":"hunter2!"}"#))
+                .unwrap())
+            .await.unwrap();
+        assert_eq!(r2.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn login_wrong_password_returns_401() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.sqlite");
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            let hash = crate::auth::hash_password("correct_password").unwrap();
+            archivr_core::database::create_owner(&conn, "owner", &hash).unwrap();
+        }
+        let registry = ServerRegistry { archives: vec![], bind: None, auth_db_path: None };
+        let response = app(registry, auth_path)
+            .oneshot(Request::builder().method("POST").uri("/api/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"owner","password":"wrong"}"#))
+                .unwrap())
+            .await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
 }
