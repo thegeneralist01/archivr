@@ -101,10 +101,20 @@ guest=1, user=2, admin=4, owner=8. All tests green.
 
 ---
 
-### 5. User management
+### ~~5. User management~~ ✅ Done
 
-**What:** Registration flow, custom role creation, admin user panel, banning users.
-Depends on Track 4.
+**Implemented:** `crates/archivr-core/src/database.rs`: `UserSummary` and `RoleRecord` structs;
+10 new pub functions (`invalidate_user_sessions`, `get_user_id_by_uid`, `list_users`,
+`get_user_by_uid`, `create_user`, `set_user_status`, `assign_role`, `remove_role`, `list_roles`,
+`create_custom_role`). `crates/archivr-server/src/routes.rs`: 5 admin routes
+(`GET|POST /api/admin/users`, `PATCH /api/admin/users/:uid/status`,
+`POST|DELETE /api/admin/users/:uid/roles`, `GET|POST /api/admin/roles`); 7 handler functions;
+request body structs. `frontend/src/api.js`: 7 admin helpers (`listAdminUsers`,
+`createAdminUser`, `setUserStatus`, `assignRole`, `removeRole`, `listRoles`, `createRole`).
+`frontend/src/components/AdminView.jsx`: two-tab admin panel (Users / Roles) with ban/unban,
+create user form, create custom role form. Role bitmask: guest=1, user=2, admin=4, owner=8;
+custom roles get bit_position≥4. Ban invalidates all sessions. Only-owner guard on role removal.
+169 tests green.
 
 ---
 
@@ -186,19 +196,12 @@ and a corresponding downloader module. Consider `rclone` as a shell-out strategy
 
 ## What to Do First
 
-Tracks 1, 2, and 4 are complete. Track 3 (async capture jobs) is the next priority.
+Tracks 1, 2, 3, 4, and 5 are complete. Track 6 (permissions & visibility) is the next priority.
 
 Open the next thread with:
 
 ```text
-Read ARCHIVR-MENTAL-MODEL.md and NEXT.md. I want to implement Track 3: async capture jobs.
-Create a task-level implementation plan first, then wait for approval.
-```
-
-For Track 5 (user management), begin only after Track 4 is verified in production:
-
-```text
-Read ARCHIVR-MENTAL-MODEL.md and NEXT.md. I want to implement Track 5: user management
-(registration flow, custom roles, admin panel). Create a task-level implementation plan
-first, then wait for approval.
+Read ARCHIVR-MENTAL-MODEL.md and NEXT.md. I want to implement Track 6: permissions and
+visibility — the collection model. Create a task-level implementation plan first, then wait
+for approval.
 ```
