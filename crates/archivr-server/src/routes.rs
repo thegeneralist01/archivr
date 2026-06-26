@@ -122,6 +122,11 @@ pub fn app(registry: ServerRegistry, auth_db_path: std::path::PathBuf) -> Router
         .route("/api/auth/me",     axum::routing::get(auth_me))
         .route("/api/auth/tokens", axum::routing::get(list_tokens).post(create_token))
         .route("/api/auth/tokens/:token_uid", axum::routing::delete(delete_token))
+        .route("/api/admin/users", get(admin_list_users).post(admin_create_user))
+        .route("/api/admin/users/:uid/status", axum::routing::patch(admin_set_user_status))
+        .route("/api/admin/users/:uid/roles", axum::routing::post(admin_assign_role))
+        .route("/api/admin/users/:uid/roles/:role_slug", axum::routing::delete(admin_remove_role))
+        .route("/api/admin/roles", get(admin_list_roles).post(admin_create_role))
         .nest_service("/assets", ServeDir::new(static_dir.join("assets")))
         .fallback_service(ServeFile::new(static_dir.join("index.html")))
         .layer(axum::middleware::from_fn_with_state(state.clone(), setup_guard))
@@ -588,6 +593,109 @@ async fn delete_token(
     } else {
         Err(ApiError::not_found("token not found"))
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AdminCreateUserBody { username: String, password: String, email: Option<String> }
+
+#[derive(Debug, serde::Deserialize)]
+struct AdminSetStatusBody { status: String }
+
+#[derive(Debug, serde::Deserialize)]
+struct AdminAssignRoleBody { role_slug: String }
+
+#[derive(Debug, serde::Deserialize)]
+struct AdminCreateRoleBody { slug: String, name: String }
+
+async fn admin_list_users(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+) -> Result<Json<Vec<database::UserSummary>>, ApiError> {
+    auth_user.require_role(ROLE_ADMIN)?;
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    Ok(Json(database::list_users(&conn)?))
+}
+
+async fn admin_create_user(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Json(body): Json<AdminCreateUserBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    auth_user.require_role(ROLE_ADMIN)?;
+    let (caller_id, _) = auth_user.require_auth()?;
+    if body.username.trim().is_empty() || body.password.len() < 8 {
+        return Err(ApiError::bad_request("username required, password >= 8 chars"));
+    }
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    let hash = auth::hash_password(&body.password).map_err(ApiError::from)?;
+    let uid = database::create_user(&conn, &body.username, body.email.as_deref(), &hash, caller_id)?;
+    Ok((StatusCode::CREATED, Json(serde_json::json!({ "user_uid": uid, "username": body.username }))))
+}
+
+async fn admin_set_user_status(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(uid): Path<String>,
+    Json(body): Json<AdminSetStatusBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    auth_user.require_role(ROLE_ADMIN)?;
+    if body.status != "active" && body.status != "disabled" {
+        return Err(ApiError::bad_request("status must be 'active' or 'disabled'"));
+    }
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    if !database::set_user_status(&conn, &uid, &body.status)? {
+        return Err(ApiError::not_found("user not found"));
+    }
+    Ok(Json(serde_json::json!({ "user_uid": uid, "status": body.status })))
+}
+
+async fn admin_assign_role(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(uid): Path<String>,
+    Json(body): Json<AdminAssignRoleBody>,
+) -> Result<StatusCode, ApiError> {
+    auth_user.require_role(ROLE_ADMIN)?;
+    let (caller_id, _) = auth_user.require_auth()?;
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    let target_id = database::get_user_id_by_uid(&conn, &uid)?
+        .ok_or_else(|| ApiError::not_found("user not found"))?;
+    database::assign_role(&conn, target_id, &body.role_slug, caller_id)?;
+    Ok(StatusCode::OK)
+}
+
+async fn admin_remove_role(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((uid, role_slug)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    auth_user.require_role(ROLE_ADMIN)?;
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    let target_id = database::get_user_id_by_uid(&conn, &uid)?
+        .ok_or_else(|| ApiError::not_found("user not found"))?;
+    database::remove_role(&conn, target_id, &role_slug)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn admin_list_roles(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+) -> Result<Json<Vec<database::RoleRecord>>, ApiError> {
+    auth_user.require_role(ROLE_ADMIN)?;
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    Ok(Json(database::list_roles(&conn)?))
+}
+
+async fn admin_create_role(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Json(body): Json<AdminCreateRoleBody>,
+) -> Result<(StatusCode, Json<database::RoleRecord>), ApiError> {
+    auth_user.require_role(ROLE_ADMIN)?;
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    let role = database::create_custom_role(&conn, &body.slug, &body.name)
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(role)))
 }
 
 fn mounted_archive<'a>(
@@ -1506,5 +1614,27 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["job_uid"].as_str().is_some(), "response must have job_uid");
         assert_eq!(json["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn admin_users_requires_admin_role() {
+        let (test_app, _dir) = make_test_app();
+        let response = test_app.oneshot(
+            Request::builder().uri("/api/admin/users").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_list_users_returns_ok_for_admin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path).oneshot(
+            Request::builder().uri("/api/admin/users")
+                .header("cookie", &session_cookie)
+                .body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
