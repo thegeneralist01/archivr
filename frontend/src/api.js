@@ -112,6 +112,62 @@ export async function fetchMe() {
   return r.json();
 }
 
+// ── Admin helpers ─────────────────────────────────────────────────────────────
+
+export async function listAdminUsers() {
+  return getJson('/api/admin/users');
+}
+
+export async function createAdminUser(username, password, email) {
+  const res = await fetch('/api/admin/users', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password, email: email || undefined }),
+  });
+  if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || `HTTP ${res.status}`); }
+  return res.json();
+}
+
+export async function setUserStatus(userUid, status) {
+  const res = await fetch(`/api/admin/users/${userUid}/status`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status }),
+  });
+  if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || `HTTP ${res.status}`); }
+  return res.json();
+}
+
+export async function assignRole(userUid, roleSlug) {
+  const res = await fetch(`/api/admin/users/${userUid}/roles`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role_slug: roleSlug }),
+  });
+  if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || `HTTP ${res.status}`); }
+}
+
+export async function removeRole(userUid, roleSlug) {
+  const res = await fetch(`/api/admin/users/${userUid}/roles/${encodeURIComponent(roleSlug)}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok && res.status !== 204) { const b = await res.json().catch(() => ({})); throw new Error(b.error || `HTTP ${res.status}`); }
+}
+
+export async function listRoles() {
+  return getJson('/api/admin/roles');
+}
+
+export async function createRole(slug, name) {
+  const res = await fetch('/api/admin/roles', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ slug, name }),
+  });
+  if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || `HTTP ${res.status}`); }
+  return res.json();
+}
+
 // ── 401 interceptor ───────────────────────────────────────────────────────────
 const _origFetch = window.fetch;
 window.fetch = async (...args) => {
