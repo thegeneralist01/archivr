@@ -136,11 +136,20 @@ Depends on Track 5.
 
 ---
 
-### 7. Settings
+### ~~7. Settings~~ ✅ Done
 
-**What:** Account profile page (display name, password change). Instance settings UI
-(open registration toggle, default visibility). API token management UI.
-Depends on Track 5.
+**Implemented:** `database.rs`: `display_name TEXT` column migration (ALTER TABLE, idempotent);
+`InstanceSettings` struct; 6 new pub fns (`get_instance_settings`, `update_instance_settings`,
+`update_user_display_name`, `update_user_password`, `get_user_password_hash`,
+`get_user_display_name`). `routes.rs`: `PATCH /api/auth/me` (display name update + current-password-
+verified password change); `GET|PATCH /api/admin/instance-settings` (ROLE_ADMIN);
+`auth_me` now returns `display_name`. `frontend/src/api.js`: 7 new helpers (`updateProfile`,
+`changePassword`, `listTokens`, `createToken`, `deleteToken`, `getInstanceSettings`,
+`updateInstanceSettings`). `frontend/src/components/SettingsView.jsx`: tabbed settings page
+(Profile — display name + password change; API Tokens — create/list/revoke with one-time reveal;
+Instance — public index, public content, open registration toggles + default visibility select).
+`Topbar.jsx`: settings nav button; user-menu shows display_name ?? username.
+`App.jsx`: renders SettingsView for `view === 'settings'`. 176 tests green. Depends on Track 5.
 
 ---
 
