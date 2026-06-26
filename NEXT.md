@@ -83,7 +83,57 @@ A proper queue (channel + worker task) can replace it later without changing the
 
 ---
 
-### 4. Cloud backup — S3-compatible
+### ~~4. Auth foundation — session + role + setup~~ ✅ Done
+
+**Implemented:** `crates/archivr-server/src/auth.rs` (new; `AuthUser` extractor, Argon2id password
+hashing, token generation, role bit constants). `crates/archivr-core/src/database.rs`:
+`initialize_auth_schema` (roles, user_roles, sessions, api_tokens, instance_settings tables);
+`open_auth_db` (separate server-level auth SQLite); `create_owner`, `compute_role_bits`,
+`create_session`, `get_session`, `create_api_token`, `get_user_for_token` and related helpers.
+`crates/archivr-server/src/routes.rs`: `AppState` gains `auth_db_path`; `setup_guard` middleware
+returns 503 until owner created; `POST /api/auth/login`, `POST /api/auth/logout`,
+`GET /api/auth/me`, `GET|POST /api/auth/setup`, `GET|POST|DELETE /api/auth/tokens` endpoints;
+WRITE routes (captures, tags) guarded by `ROLE_USER`. `crates/archivr-server/src/main.rs`:
+computes auth DB path from config directory; session cleanup background task.
+Frontend: `LoginPage.jsx`, `SetupPage.jsx`, `AuthContext` in `App.jsx`, user menu in `Topbar.jsx`.
+`docs/specs/2026-06-25-auth-foundation-design.md` has the full design. Roles use a bitmask:
+guest=1, user=2, admin=4, owner=8. All tests green.
+
+---
+
+### 5. User management
+
+**What:** Registration flow, custom role creation, admin user panel, banning users.
+Depends on Track 4.
+
+---
+
+### 6. Permissions & visibility — collection model
+
+**What:** Replace `archived_entries.visibility` with a `collections` + `collection_entries`
+model where visibility is a role-bitmask per entry-in-collection. Enforce visibility on all
+API queries. Collection UI (create, set visibility, add entries).
+Depends on Track 5.
+
+---
+
+### 7. Settings
+
+**What:** Account profile page (display name, password change). Instance settings UI
+(open registration toggle, default visibility). API token management UI.
+Depends on Track 5.
+
+---
+
+### 8. Collections UI
+
+**What:** Full collection management — create, rename, delete, add/remove entries,
+set per-entry visibility within a collection, make collections public.
+Depends on Tracks 5–6.
+
+---
+
+### 9. Cloud backup — S3-compatible
 
 **What:** A command or scheduled operation that syncs the archive store to an S3-compatible
 bucket (AWS S3, Cloudflare R2, Backblaze B2). Incremental: only uploads blobs not already
@@ -123,7 +173,7 @@ region = "us-east-1"
 
 ---
 
-### 5. Cloud storage archiving (Google Drive, Dropbox, OneDrive)
+### 10. Cloud storage archiving (Google Drive, Dropbox, OneDrive)
 
 Deferred. Each requires per-service OAuth, API clients, and download logic. Implement after
 Tracks 1–4 are stable.
@@ -136,18 +186,19 @@ and a corresponding downloader module. Consider `rclone` as a shell-out strategy
 
 ## What to Do First
 
+Tracks 1, 2, and 4 are complete. Track 3 (async capture jobs) is the next priority.
+
 Open the next thread with:
 
 ```text
-Read ARCHIVR-MENTAL-MODEL.md and NEXT.md. I want to implement Track 1: generic URL capture
-(plain file download over HTTP/S). Create a task-level implementation plan first, then wait
-for approval.
+Read ARCHIVR-MENTAL-MODEL.md and NEXT.md. I want to implement Track 3: async capture jobs.
+Create a task-level implementation plan first, then wait for approval.
 ```
 
-For Track 2:
+For Track 5 (user management), begin only after Track 4 is verified in production:
 
 ```text
-Read ARCHIVR-MENTAL-MODEL.md and NEXT.md. I want to implement Track 2: web page archiving
-via monolith. Start by deciding the URL classification strategy (head-first vs. extension
-heuristic vs. user prefix), then write the implementation plan.
+Read ARCHIVR-MENTAL-MODEL.md and NEXT.md. I want to implement Track 5: user management
+(registration flow, custom roles, admin panel). Create a task-level implementation plan
+first, then wait for approval.
 ```
