@@ -26,15 +26,16 @@ use axum::{
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
 };
 use tower_http::services::{ServeDir, ServeFile};
 use tower::ServiceExt;
 
 use crate::registry::{MountedArchive, ServerRegistry};
 use crate::auth;
-pub use crate::auth::{AuthUser, ROLE_ADMIN, ROLE_OWNER, ROLE_USER};
+pub use crate::auth::{AuthUser, ROLE_ADMIN, ROLE_GUEST, ROLE_OWNER, ROLE_USER};
 use axum_extra::extract::CookieJar;
+use rusqlite::OptionalExtension;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -127,6 +128,17 @@ pub fn app(registry: ServerRegistry, auth_db_path: std::path::PathBuf) -> Router
         .route("/api/admin/users/:uid/roles", axum::routing::post(admin_assign_role))
         .route("/api/admin/users/:uid/roles/:role_slug", axum::routing::delete(admin_remove_role))
         .route("/api/admin/roles", get(admin_list_roles).post(admin_create_role))
+        .route("/api/archives/:archive_id/collections",
+            get(list_collections_handler).post(create_collection_handler))
+        .route("/api/archives/:archive_id/collections/:coll_uid",
+            get(get_collection_handler))
+        .route("/api/archives/:archive_id/collections/:coll_uid/entries",
+            post(add_entry_to_collection_handler))
+        .route("/api/archives/:archive_id/collections/:coll_uid/entries/:entry_uid",
+            delete(remove_entry_from_collection_handler)
+            .patch(update_entry_visibility_handler))
+        .route("/api/archives/:archive_id/entries/:entry_uid/collections",
+            get(list_entry_collections_handler))
         .nest_service("/assets", ServeDir::new(static_dir.join("assets")))
         .fallback_service(ServeFile::new(static_dir.join("index.html")))
         .layer(axum::middleware::from_fn_with_state(state.clone(), setup_guard))
@@ -145,15 +157,18 @@ async fn list_archives(State(state): State<AppState>) -> Json<Vec<MountedArchive
 
 async fn list_entries(
     State(state): State<AppState>,
+    auth: AuthUser,
     Path(archive_id): Path<String>,
 ) -> Result<Json<Vec<archive::EntrySummary>>, ApiError> {
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
-    Ok(Json(archive::list_root_entries(&conn)?))
+    let caller_bits = auth_to_caller_bits(&auth);
+    Ok(Json(archive::list_root_entries(&conn, caller_bits)?))
 }
 
 async fn search_entries_handler(
     State(state): State<AppState>,
+    auth: AuthUser,
     Path(archive_id): Path<String>,
     Query(params): Query<EntrySearchParams>,
 ) -> Result<Json<Vec<archive::EntrySummary>>, ApiError> {
@@ -165,6 +180,7 @@ async fn search_entries_handler(
     if let Some(tag) = params.tag {
         search_query.tag = Some(tag);
     }
+    search_query.caller_bits = auth_to_caller_bits(&auth);
     Ok(Json(archive::search_entries(&conn, &search_query)?))
 }
 
@@ -276,6 +292,28 @@ struct CreateTagBody {
 #[derive(Debug, serde::Deserialize)]
 struct AssignTagBody {
     tag_path: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CreateCollectionBody {
+    name: String,
+    slug: String,
+    #[serde(default = "default_user_visibility")]
+    default_visibility_bits: u32,
+}
+
+fn default_user_visibility() -> u32 { 2 }
+
+#[derive(Debug, serde::Deserialize)]
+struct AddEntryBody {
+    entry_uid: String,
+    #[serde(default = "default_user_visibility")]
+    visibility_bits: u32,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UpdateVisibilityBody {
+    visibility_bits: u32,
 }
 
 async fn list_tags(
@@ -698,6 +736,13 @@ async fn admin_create_role(
     Ok((StatusCode::CREATED, Json(role)))
 }
 
+fn auth_to_caller_bits(auth: &AuthUser) -> u32 {
+    match auth {
+        AuthUser::Authenticated { role_bits, .. } => *role_bits,
+        AuthUser::Guest => ROLE_GUEST,
+    }
+}
+
 fn mounted_archive<'a>(
     state: &'a AppState,
     archive_id: &str,
@@ -764,6 +809,156 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = serde_json::json!({ "error": self.message });
         (self.status, axum::Json(body)).into_response()
+    }
+}
+
+// ── Collection handlers ────────────────────────────────────────────────────────
+
+async fn list_collections_handler(
+    State(state): State<AppState>,
+    Path(archive_id): Path<String>,
+) -> Result<Json<Vec<archive::CollectionSummary>>, ApiError> {
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    Ok(Json(archive::list_collections(&conn)?))
+}
+
+async fn create_collection_handler(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(archive_id): Path<String>,
+    Json(body): Json<CreateCollectionBody>,
+) -> Result<(StatusCode, Json<archive::CollectionSummary>), ApiError> {
+    auth.require_role(ROLE_USER)?;
+    if body.name.trim().is_empty() {
+        return Err(ApiError::bad_request("collection name must not be empty"));
+    }
+    if body.slug.trim().is_empty() || body.slug.starts_with('_') {
+        return Err(ApiError::bad_request("collection slug must not be empty or start with underscore"));
+    }
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let record = database::create_collection(&conn, &body.name, &body.slug, body.default_visibility_bits)
+        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+    Ok((StatusCode::CREATED, Json(archive::CollectionSummary {
+        collection_uid: record.collection_uid,
+        name: record.name,
+        slug: record.slug,
+        default_visibility_bits: record.default_visibility_bits,
+        created_at: record.created_at,
+    })))
+}
+
+async fn get_collection_handler(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((archive_id, coll_uid)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let record = database::get_collection_by_uid(&conn, &coll_uid)?
+        .ok_or(ApiError::not_found("collection not found"))?;
+    let caller_bits = auth_to_caller_bits(&auth);
+    let entries = archive::list_entries_for_collection(&conn, record.id, caller_bits)?;
+    Ok(Json(serde_json::json!({
+        "collection_uid": record.collection_uid,
+        "name": record.name,
+        "slug": record.slug,
+        "default_visibility_bits": record.default_visibility_bits,
+        "created_at": record.created_at,
+        "entries": entries,
+    })))
+}
+
+async fn add_entry_to_collection_handler(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((archive_id, coll_uid)): Path<(String, String)>,
+    Json(body): Json<AddEntryBody>,
+) -> Result<StatusCode, ApiError> {
+    auth.require_role(ROLE_USER)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let coll = database::get_collection_by_uid(&conn, &coll_uid)?
+        .ok_or(ApiError::not_found("collection not found"))?;
+    if coll.slug == "_default_" {
+        return Err(ApiError::bad_request("cannot manually add entries to the default collection"));
+    }
+    let entry_id: i64 = conn
+        .query_row(
+            "SELECT id FROM archived_entries WHERE entry_uid = ?1",
+            [body.entry_uid.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(ApiError::not_found("entry not found"))?;
+    database::add_entry_to_collection(&conn, coll.id, entry_id, body.visibility_bits)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_entry_from_collection_handler(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((archive_id, coll_uid, entry_uid)): Path<(String, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    auth.require_role(ROLE_USER)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let coll = database::get_collection_by_uid(&conn, &coll_uid)?
+        .ok_or(ApiError::not_found("collection not found"))?;
+    if coll.slug == "_default_" {
+        return Err(ApiError::bad_request("cannot manually remove entries from the default collection"));
+    }
+    let entry_id: i64 = conn
+        .query_row(
+            "SELECT id FROM archived_entries WHERE entry_uid = ?1",
+            [entry_uid.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(ApiError::not_found("entry not found"))?;
+    if database::remove_entry_from_collection(&conn, coll.id, entry_id)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("entry not in collection"))
+    }
+}
+
+async fn update_entry_visibility_handler(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((archive_id, coll_uid, entry_uid)): Path<(String, String, String)>,
+    Json(body): Json<UpdateVisibilityBody>,
+) -> Result<StatusCode, ApiError> {
+    auth.require_role(ROLE_USER)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let coll = database::get_collection_by_uid(&conn, &coll_uid)?
+        .ok_or(ApiError::not_found("collection not found"))?;
+    let entry_id: i64 = conn
+        .query_row(
+            "SELECT id FROM archived_entries WHERE entry_uid = ?1",
+            [entry_uid.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(ApiError::not_found("entry not found"))?;
+    if database::update_collection_entry_visibility(&conn, coll.id, entry_id, body.visibility_bits)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("entry not in collection"))
+    }
+}
+
+async fn list_entry_collections_handler(
+    State(state): State<AppState>,
+    Path((archive_id, entry_uid)): Path<(String, String)>,
+) -> Result<Json<Vec<archive::EntryCollectionMembership>>, ApiError> {
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    match archive::get_entry_collections(&conn, &entry_uid)? {
+        Some(memberships) => Ok(Json(memberships)),
+        None => Err(ApiError::not_found("entry not found")),
     }
 }
 
