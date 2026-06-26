@@ -350,6 +350,74 @@ pub fn open_auth_db(auth_db_path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Returns true if an owner account exists.
+pub fn ensure_owner_exists(conn: &Connection) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM user_roles ur
+         JOIN roles r ON r.id = ur.role_id
+         WHERE r.slug = 'owner'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Creates a user and assigns all roles from `user` up to `owner` (cumulative).
+/// `password_hash` must already be hashed by the caller.
+pub fn create_owner(conn: &Connection, username: &str, password_hash: &str) -> Result<i64> {
+    let user_uid = public_id("usr");
+    conn.execute(
+        "INSERT INTO users (user_uid, username, email, password_hash, status, role, created_at)
+         VALUES (?1, ?2, NULL, ?3, 'active', 'admin', ?4)",
+        params![user_uid, username, password_hash, now_timestamp()],
+    )?;
+    let user_id = conn.last_insert_rowid();
+    for slug in &["user", "admin", "owner"] {
+        let role_id: i64 = conn.query_row(
+            "SELECT id FROM roles WHERE slug = ?1",
+            [slug],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO user_roles (user_id, role_id, assigned_at)
+             VALUES (?1, ?2, ?3)",
+            params![user_id, role_id, now_timestamp()],
+        )?;
+    }
+    Ok(user_id)
+}
+
+pub fn get_user_by_username(conn: &Connection, username: &str) -> Result<Option<AuthUserRecord>> {
+    conn.query_row(
+        "SELECT id, user_uid, username, password_hash, status FROM users WHERE username = ?1",
+        [username],
+        |row| {
+            Ok(AuthUserRecord {
+                id: row.get(0)?,
+                user_uid: row.get(1)?,
+                username: row.get(2)?,
+                password_hash: row.get(3)?,
+                status: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Computes role_bits = ROLE_GUEST (1) | OR(assigned role bit values).
+pub fn compute_role_bits(conn: &Connection, user_id: i64) -> Result<u32> {
+    let mut stmt = conn.prepare(
+        "SELECT (1 << r.bit_position) FROM user_roles ur
+         JOIN roles r ON r.id = ur.role_id
+         WHERE ur.user_id = ?1",
+    )?;
+    let bits: u32 = stmt
+        .query_map([user_id], |row| row.get::<_, i64>(0))?
+        .try_fold(1u32, |acc, val| val.map(|v| acc | v as u32))?;
+    Ok(bits)
+}
+
 pub fn ensure_default_user(conn: &Connection) -> Result<i64> {
     if let Some(id) = conn
         .query_row(
@@ -1289,5 +1357,38 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         initialize_auth_schema(&conn).unwrap();
         initialize_auth_schema(&conn).unwrap();
+    }
+
+    fn make_auth_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_auth_schema(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn ensure_owner_exists_returns_false_when_no_owner() {
+        let conn = make_auth_conn();
+        assert!(!ensure_owner_exists(&conn).unwrap());
+    }
+
+    #[test]
+    fn create_owner_then_ensure_returns_true() {
+        let conn = make_auth_conn();
+        create_owner(&conn, "alice", "hashed_pw").unwrap();
+        assert!(ensure_owner_exists(&conn).unwrap());
+    }
+
+    #[test]
+    fn create_owner_assigns_cumulative_roles() {
+        let conn = make_auth_conn();
+        let user_id = create_owner(&conn, "alice", "hashed_pw").unwrap();
+        let bits = compute_role_bits(&conn, user_id).unwrap();
+        assert_eq!(bits, 15u32);
+    }
+
+    #[test]
+    fn get_user_by_username_returns_none_for_unknown() {
+        let conn = make_auth_conn();
+        assert!(get_user_by_username(&conn, "nobody").unwrap().is_none());
     }
 }
