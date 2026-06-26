@@ -1,16 +1,21 @@
 import { useRef, useEffect, useState } from 'react'
-import { submitCapture } from '../api'
+import { submitCapture, pollCaptureJob } from '../api'
 
 export default function CaptureDialog({ open, archiveId, onClose, onCaptured }) {
   const dialogRef = useRef(null)
   const [locator, setLocator] = useState('')
   const [error, setError] = useState(null)
   const [busy, setBusy] = useState(false)
+  const [jobStatus, setJobStatus] = useState(null) // null | 'running' | 'completed' | 'failed'
+  const pollRef = useRef(null)
 
   useEffect(() => {
     const dialog = dialogRef.current
     if (!dialog) return
-    const handleClose = () => onClose()
+    const handleClose = () => {
+      clearInterval(pollRef.current)
+      onClose()
+    }
     dialog.addEventListener('close', handleClose)
     return () => dialog.removeEventListener('close', handleClose)
   }, [onClose])
@@ -21,6 +26,9 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured }) 
     if (open) {
       setLocator('')
       setError(null)
+      setJobStatus(null)
+      setBusy(false)
+      clearInterval(pollRef.current)
       if (!dialog.open) dialog.showModal()
     } else {
       if (dialog.open) dialog.close()
@@ -31,15 +39,45 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured }) 
     if (!locator.trim()) { setError('Enter a locator.'); return }
     setBusy(true)
     setError(null)
+    setJobStatus(null)
     try {
-      await submitCapture(archiveId, locator.trim())
-      dialogRef.current?.close()
-      onCaptured()
+      const job = await submitCapture(archiveId, locator.trim())
+      setJobStatus('running')
+      pollRef.current = setInterval(async () => {
+        try {
+          const updated = await pollCaptureJob(archiveId, job.job_uid)
+          if (updated.status === 'completed') {
+            clearInterval(pollRef.current)
+            pollRef.current = null
+            setBusy(false)
+            setJobStatus('completed')
+            dialogRef.current?.close()
+            onCaptured()
+          } else if (updated.status === 'failed') {
+            clearInterval(pollRef.current)
+            pollRef.current = null
+            setBusy(false)
+            setJobStatus('failed')
+            setError(updated.error_text || 'Capture failed.')
+          }
+          // pending / running: keep polling
+        } catch (pollErr) {
+          clearInterval(pollRef.current)
+          pollRef.current = null
+          setBusy(false)
+          setError(pollErr.message)
+        }
+      }, 500)
     } catch (e) {
       setError(e.message)
-    } finally {
       setBusy(false)
     }
+  }
+
+  function buttonLabel() {
+    if (!busy) return 'Capture'
+    if (jobStatus === 'running') return 'Running\u2026'
+    return 'Capturing\u2026'
   }
 
   return (
@@ -56,7 +94,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured }) 
         <div className="capture-actions">
           <button type="button" className="capture-cancel" onClick={() => dialogRef.current?.close()}>Cancel</button>
           <button type="button" className="capture-submit" onClick={handleSubmit} disabled={busy}>
-            {busy ? 'Capturing\u2026' : 'Capture'}
+            {buttonLabel()}
           </button>
         </div>
       </div>

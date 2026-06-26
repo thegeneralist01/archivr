@@ -26,6 +26,17 @@ async fn main() -> Result<()> {
 
     let app = routes::app(registry.clone(), auth_db_path.clone());
 
+    // On startup, mark any jobs that were 'running' when the server last stopped as 'failed'.
+    for archive in &registry.archives {
+        if let Ok(conn) = archivr_core::database::open_or_initialize(&archive.archive_path) {
+            match archivr_core::database::fail_stalled_capture_jobs(&conn) {
+                Ok(n) if n > 0 => eprintln!("info: marked {n} stalled capture job(s) as failed in '{}'", archive.id),
+                Err(e) => eprintln!("warn: stalled job cleanup failed for '{}': {e:#}", archive.id),
+                _ => {}
+            }
+        }
+    }
+
     // Spawn session cleanup: runs at startup and every 24h.
     let cleanup_auth_path = auth_db_path.clone();
     tokio::spawn(async move {
