@@ -1913,4 +1913,114 @@ mod tests {
         ).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn auth_me_returns_display_name_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path).oneshot(
+            Request::builder().uri("/api/auth/me")
+                .header("cookie", &session_cookie)
+                .body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("display_name").is_some(), "auth/me must include display_name field");
+        assert!(json.get("username").is_some());
+    }
+
+    #[tokio::test]
+    async fn patch_me_updates_display_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path).oneshot(
+            Request::builder().method("PATCH").uri("/api/auth/me")
+                .header("content-type", "application/json")
+                .header("cookie", &session_cookie)
+                .body(Body::from(r#"{"display_name":"Test Owner"}"#))
+                .unwrap()
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn patch_me_requires_auth() {
+        let (test_app, _dir) = make_test_app();
+        let response = test_app.oneshot(
+            Request::builder().method("PATCH").uri("/api/auth/me")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"display_name":"anon"}"#))
+                .unwrap()
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn patch_me_rejects_wrong_current_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        // Set a real password hash on the owner
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            let hash = crate::auth::hash_password("real_password").unwrap();
+            let user_id: i64 = conn.query_row(
+                "SELECT id FROM users WHERE username = 'testowner'", [], |r| r.get(0)
+            ).unwrap();
+            archivr_core::database::update_user_password(&conn, user_id, &hash).unwrap();
+        }
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path).oneshot(
+            Request::builder().method("PATCH").uri("/api/auth/me")
+                .header("content-type", "application/json")
+                .header("cookie", &session_cookie)
+                .body(Body::from(r#"{"current_password":"wrong","new_password":"newpass"}"#))
+                .unwrap()
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn instance_settings_requires_admin() {
+        let (test_app, _dir) = make_test_app();
+        let response = test_app.oneshot(
+            Request::builder().uri("/api/admin/instance-settings")
+                .body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn instance_settings_get_returns_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path).oneshot(
+            Request::builder().uri("/api/admin/instance-settings")
+                .header("cookie", &session_cookie)
+                .body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["public_index_enabled"], false);
+        assert_eq!(json["open_registration_enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn instance_settings_patch_updates_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path).oneshot(
+            Request::builder().method("PATCH").uri("/api/admin/instance-settings")
+                .header("content-type", "application/json")
+                .header("cookie", &session_cookie)
+                .body(Body::from(r#"{"open_registration_enabled":true}"#))
+                .unwrap()
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
 }
