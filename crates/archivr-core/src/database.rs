@@ -418,6 +418,145 @@ pub fn compute_role_bits(conn: &Connection, user_id: i64) -> Result<u32> {
     Ok(bits)
 }
 
+/// Returns a new session_uid (UUID).
+pub fn create_session(
+    conn: &Connection,
+    user_id: i64,
+    role_bits: u32,
+    user_agent: Option<&str>,
+) -> Result<String> {
+    let session_uid = public_id("sess");
+    let now = now_timestamp();
+    let expires_at = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::days(30))
+        .unwrap()
+        .format("%Y-%m-%dT%H-%M-%S%.3f")
+        .to_string();
+    conn.execute(
+        "INSERT INTO sessions (session_uid, user_id, role_bits, created_at, last_seen_at, expires_at, user_agent)
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6)",
+        params![session_uid, user_id, role_bits as i64, now, expires_at, user_agent],
+    )?;
+    Ok(session_uid)
+}
+
+/// Returns session if it exists, the user is active, and it has not expired.
+pub fn get_session(conn: &Connection, session_uid: &str) -> Result<Option<SessionRecord>> {
+    let now = now_timestamp();
+    conn.query_row(
+        "SELECT s.user_id, s.role_bits, s.last_seen_at, s.session_uid
+         FROM sessions s
+         JOIN users u ON u.id = s.user_id
+         WHERE s.session_uid = ?1
+           AND u.status = 'active'
+           AND s.expires_at > ?2",
+        params![session_uid, now],
+        |row| {
+            Ok(SessionRecord {
+                user_id: row.get(0)?,
+                role_bits: row.get::<_, i64>(1)? as u32,
+                last_seen_at: row.get(2)?,
+                session_uid: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn delete_session(conn: &Connection, session_uid: &str) -> Result<()> {
+    conn.execute("DELETE FROM sessions WHERE session_uid = ?1", [session_uid])?;
+    Ok(())
+}
+
+/// Updates last_seen_at and extends expires_at by 30 days.
+pub fn touch_session(conn: &Connection, session_uid: &str) -> Result<()> {
+    let now = now_timestamp();
+    let new_expires = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::days(30))
+        .unwrap()
+        .format("%Y-%m-%dT%H-%M-%S%.3f")
+        .to_string();
+    conn.execute(
+        "UPDATE sessions SET last_seen_at = ?1, expires_at = ?2 WHERE session_uid = ?3",
+        params![now, new_expires, session_uid],
+    )?;
+    Ok(())
+}
+
+pub fn delete_expired_sessions(conn: &Connection) -> Result<usize> {
+    let now = now_timestamp();
+    let n = conn.execute("DELETE FROM sessions WHERE expires_at <= ?1", [now])?;
+    Ok(n)
+}
+
+/// Creates an API token. `token_hash` is SHA3-256 hex of the raw token.
+pub fn create_api_token(
+    conn: &Connection,
+    user_id: i64,
+    token_hash: &str,
+    name: &str,
+) -> Result<String> {
+    let token_uid = public_id("tok");
+    conn.execute(
+        "INSERT INTO api_tokens (token_uid, user_id, token_hash, name, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![token_uid, user_id, token_hash, name, now_timestamp()],
+    )?;
+    Ok(token_uid)
+}
+
+/// Returns the user_id for a given token hash, if the token is valid and user is active.
+pub fn get_user_for_token(conn: &Connection, token_hash: &str) -> Result<Option<i64>> {
+    let now = now_timestamp();
+    conn.query_row(
+        "SELECT t.user_id FROM api_tokens t
+         JOIN users u ON u.id = t.user_id
+         WHERE t.token_hash = ?1
+           AND u.status = 'active'
+           AND (t.expires_at IS NULL OR t.expires_at > ?2)",
+        params![token_hash, now],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn touch_token(conn: &Connection, token_uid: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE api_tokens SET last_used_at = ?1 WHERE token_uid = ?2",
+        params![now_timestamp(), token_uid],
+    )?;
+    Ok(())
+}
+
+/// Returns true if the token was found and deleted (user_id must match).
+pub fn delete_api_token(conn: &Connection, token_uid: &str, user_id: i64) -> Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM api_tokens WHERE token_uid = ?1 AND user_id = ?2",
+        params![token_uid, user_id],
+    )?;
+    Ok(n > 0)
+}
+
+pub fn list_user_tokens(conn: &Connection, user_id: i64) -> Result<Vec<ApiTokenRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT token_uid, name, created_at, last_used_at
+         FROM api_tokens WHERE user_id = ?1 ORDER BY created_at DESC",
+    )?;
+    let records = stmt
+        .query_map([user_id], |row| {
+            Ok(ApiTokenRecord {
+                token_uid: row.get(0)?,
+                name: row.get(1)?,
+                created_at: row.get(2)?,
+                last_used_at: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(records)
+}
+
 pub fn ensure_default_user(conn: &Connection) -> Result<i64> {
     if let Some(id) = conn
         .query_row(
@@ -1390,5 +1529,45 @@ mod tests {
     fn get_user_by_username_returns_none_for_unknown() {
         let conn = make_auth_conn();
         assert!(get_user_by_username(&conn, "nobody").unwrap().is_none());
+    }
+
+    #[test]
+    fn create_and_get_session() {
+        let conn = make_auth_conn();
+        let user_id = create_owner(&conn, "alice", "pw").unwrap();
+        let uid = create_session(&conn, user_id, 15, None).unwrap();
+        let sess = get_session(&conn, &uid).unwrap().unwrap();
+        assert_eq!(sess.user_id, user_id);
+        assert_eq!(sess.role_bits, 15);
+    }
+
+    #[test]
+    fn get_session_returns_none_for_unknown() {
+        let conn = make_auth_conn();
+        assert!(get_session(&conn, "nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_session_removes_it() {
+        let conn = make_auth_conn();
+        let user_id = create_owner(&conn, "alice", "pw").unwrap();
+        let uid = create_session(&conn, user_id, 15, None).unwrap();
+        delete_session(&conn, &uid).unwrap();
+        assert!(get_session(&conn, &uid).unwrap().is_none());
+    }
+
+    #[test]
+    fn token_hash_round_trips() {
+        let conn = make_auth_conn();
+        let user_id = create_owner(&conn, "alice", "pw").unwrap();
+        create_api_token(&conn, user_id, "hash_abc", "My Token").unwrap();
+        let found_id = get_user_for_token(&conn, "hash_abc").unwrap();
+        assert_eq!(found_id, Some(user_id));
+    }
+
+    #[test]
+    fn get_user_for_token_returns_none_for_unknown() {
+        let conn = make_auth_conn();
+        assert!(get_user_for_token(&conn, "unknown").unwrap().is_none());
     }
 }
