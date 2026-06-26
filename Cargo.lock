@@ -131,6 +131,7 @@ dependencies = [
  "base64",
  "chrono",
  "rand",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
