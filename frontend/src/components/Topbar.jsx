@@ -1,4 +1,18 @@
+import { useContext, useState } from 'react';
+import { AuthContext } from '../App.jsx';
+import { logout as apiLogout } from '../api.js';
+
 export default function Topbar({ archives, archiveId, onArchiveChange, view, onViewChange, onCaptureClick }) {
+  const { currentUser, setCurrentUser } = useContext(AuthContext) ?? {};
+  const [loggingOut, setLoggingOut] = useState(false);
+
+  async function handleLogout() {
+    setLoggingOut(true);
+    await apiLogout();
+    setCurrentUser(null);
+    window.location.reload();
+  }
+
   return (
     <header className="topbar">
       <div className="brand">Archivr</div>
@@ -15,6 +29,14 @@ export default function Topbar({ archives, archiveId, onArchiveChange, view, onV
         ))}
       </nav>
       <button className="capture-button" onClick={onCaptureClick}>+ Capture</button>
+      {currentUser && (
+        <div className="user-menu">
+          <span className="username">{currentUser.username}</span>
+          <button onClick={handleLogout} disabled={loggingOut} className="logout-btn">
+            {loggingOut ? 'Logging out\u2026' : 'Log out'}
+          </button>
+        </div>
+      )}
     </header>
-  )
+  );
 }
