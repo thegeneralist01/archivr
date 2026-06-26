@@ -285,6 +285,20 @@ export async function listEntryCollections(archiveId, entryUid) {
   return getJson(`/api/archives/${archiveId}/entries/${entryUid}/collections`);
 }
 
+export async function updateCollection(archiveId, collUid, patch) {
+  const res = await fetch(`/api/archives/${archiveId}/collections/${collUid}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  })
+  if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error ?? res.statusText) }
+}
+
+export async function deleteCollection(archiveId, collUid) {
+  const res = await fetch(`/api/archives/${archiveId}/collections/${collUid}`, { method: 'DELETE' })
+  if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error ?? res.statusText) }
+}
+
 // ── 401 interceptor ───────────────────────────────────────────────────────────
 const _origFetch = window.fetch;
 window.fetch = async (...args) => {
