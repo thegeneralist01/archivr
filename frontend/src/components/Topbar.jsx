@@ -21,7 +21,7 @@ export default function Topbar({ archives, archiveId, onArchiveChange, view, onV
         {archives.map(a => <option key={a.id} value={a.id}>{a.label}</option>)}
       </select>
       <nav className="nav" aria-label="Primary">
-        {['archive', 'runs', 'admin', 'tags', 'collections'].map(name => (
+        {['archive', 'runs', 'admin', 'tags', 'collections', 'settings'].map(name => (
           <button key={name} className={`nav-link${view === name ? ' is-active' : ''}`}
             onClick={() => onViewChange(name)}>
             {name.charAt(0).toUpperCase() + name.slice(1)}
@@ -31,7 +31,8 @@ export default function Topbar({ archives, archiveId, onArchiveChange, view, onV
       <button className="capture-button" onClick={onCaptureClick}>+ Capture</button>
       {currentUser && (
         <div className="user-menu">
-          <span className="username">{currentUser.username}</span>
+          <span className="username">{currentUser.display_name || currentUser.username}</span>
+          <button className="nav-link" onClick={() => onViewChange('settings')} style={{ color: '#d7cdbf', fontSize: 13 }}>Settings</button>
           <button onClick={handleLogout} disabled={loggingOut} className="logout-btn">
             {loggingOut ? 'Logging out\u2026' : 'Log out'}
           </button>

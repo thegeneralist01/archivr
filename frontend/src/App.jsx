@@ -10,6 +10,7 @@ import RunsView from './components/RunsView'
 import AdminView from './components/AdminView'
 import TagsView from './components/TagsView'
 import CollectionsView from './components/CollectionsView'
+import SettingsView from './components/SettingsView'
 import ContextRail from './components/ContextRail'
 
 export const AuthContext = createContext(null);
@@ -216,6 +217,9 @@ export default function App() {
             )}
             {view === 'collections' && (
               <CollectionsView archiveId={archiveId} />
+            )}
+            {view === 'settings' && (
+              <SettingsView />
             )}
           </div>
           <ContextRail
