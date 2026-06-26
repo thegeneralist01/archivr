@@ -14,7 +14,9 @@
 //   OWNER       — requires ROLE_OWNER: (future)
 //   AUTH_SELF   — own resources, require_auth() only:
 //                   GET/POST/DELETE /api/auth/tokens
-//                   POST /api/auth/logout, GET /api/auth/me
+//                   POST /api/auth/logout, GET/PATCH /api/auth/me
+//   SETTINGS    — instance settings, require ROLE_ADMIN:
+//                   GET/PATCH /api/admin/instance-settings
 // ────────────────────────────────────────────────────────────────────────────
 
 use std::{path::PathBuf, sync::Arc};
@@ -120,7 +122,7 @@ pub fn app(registry: ServerRegistry, auth_db_path: std::path::PathBuf) -> Router
         .route("/api/auth/setup",  axum::routing::get(auth_setup_status).post(auth_setup))
         .route("/api/auth/login",  axum::routing::post(auth_login))
         .route("/api/auth/logout", axum::routing::post(auth_logout))
-        .route("/api/auth/me",     axum::routing::get(auth_me))
+        .route("/api/auth/me",     axum::routing::get(auth_me).patch(patch_me))
         .route("/api/auth/tokens", axum::routing::get(list_tokens).post(create_token))
         .route("/api/auth/tokens/:token_uid", axum::routing::delete(delete_token))
         .route("/api/admin/users", get(admin_list_users).post(admin_create_user))
@@ -128,6 +130,8 @@ pub fn app(registry: ServerRegistry, auth_db_path: std::path::PathBuf) -> Router
         .route("/api/admin/users/:uid/roles", axum::routing::post(admin_assign_role))
         .route("/api/admin/users/:uid/roles/:role_slug", axum::routing::delete(admin_remove_role))
         .route("/api/admin/roles", get(admin_list_roles).post(admin_create_role))
+        .route("/api/admin/instance-settings",
+            get(get_instance_settings_handler).patch(update_instance_settings_handler))
         .route("/api/archives/:archive_id/collections",
             get(list_collections_handler).post(create_collection_handler))
         .route("/api/archives/:archive_id/collections/:coll_uid",
@@ -581,13 +585,73 @@ async fn auth_me(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (user_id, role_bits) = auth_user.require_auth()?;
     let conn = database::open_auth_db(&state.auth_db_path)?;
-    let username: String = conn
-        .query_row("SELECT username FROM users WHERE id = ?1", [user_id], |r| r.get(0))
+    let (username, display_name): (String, Option<String>) = conn
+        .query_row(
+            "SELECT username, display_name FROM users WHERE id = ?1",
+            [user_id],
+            |r| Ok((r.get(0)?, r.get(1)?))
+        )
         .map_err(|e| ApiError::from(anyhow::anyhow!("db error: {e}")))?;
     Ok(Json(serde_json::json!({
         "role_bits": role_bits,
         "username": username,
+        "display_name": display_name,
     })))
+}
+
+async fn patch_me(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Json(body): Json<UpdateProfileBody>,
+) -> Result<StatusCode, ApiError> {
+    let (user_id, _) = auth_user.require_auth()?;
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+
+    if let Some(ref new_pw) = body.new_password {
+        if new_pw.trim().is_empty() {
+            return Err(ApiError::bad_request("new_password must not be blank"));
+        }
+        let current_pw = body.current_password.as_deref().unwrap_or("");
+        let hash = database::get_user_password_hash(&conn, user_id)?
+            .ok_or_else(|| ApiError::not_found("user not found"))?;
+        if !auth::verify_password(current_pw, &hash).map_err(ApiError::from)? {
+            return Err(ApiError::unauthorized("current password is incorrect"));
+        }
+        let new_hash = auth::hash_password(new_pw).map_err(ApiError::from)?;
+        database::update_user_password(&conn, user_id, &new_hash)?;
+    }
+
+    if let Some(ref dn) = body.display_name {
+        let v: Option<&str> = if dn.trim().is_empty() { None } else { Some(dn.as_str()) };
+        database::update_user_display_name(&conn, user_id, v)?;
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_instance_settings_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+) -> Result<Json<database::InstanceSettings>, ApiError> {
+    auth_user.require_role(ROLE_ADMIN)?;
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    Ok(Json(database::get_instance_settings(&conn)?))
+}
+
+async fn update_instance_settings_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Json(body): Json<UpdateInstanceSettingsBody>,
+) -> Result<StatusCode, ApiError> {
+    auth_user.require_role(ROLE_ADMIN)?;
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    let mut settings = database::get_instance_settings(&conn)?;
+    if let Some(v) = body.public_index_enabled { settings.public_index_enabled = v; }
+    if let Some(v) = body.public_entry_content_enabled { settings.public_entry_content_enabled = v; }
+    if let Some(v) = body.open_registration_enabled { settings.open_registration_enabled = v; }
+    if let Some(v) = body.default_entry_visibility { settings.default_entry_visibility = v; }
+    database::update_instance_settings(&conn, &settings)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn create_token(
@@ -644,6 +708,21 @@ struct AdminAssignRoleBody { role_slug: String }
 
 #[derive(Debug, serde::Deserialize)]
 struct AdminCreateRoleBody { slug: String, name: String }
+
+#[derive(Debug, serde::Deserialize)]
+struct UpdateProfileBody {
+    display_name: Option<String>,
+    current_password: Option<String>,
+    new_password: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UpdateInstanceSettingsBody {
+    public_index_enabled: Option<bool>,
+    public_entry_content_enabled: Option<bool>,
+    open_registration_enabled: Option<bool>,
+    default_entry_visibility: Option<u32>,
+}
 
 async fn admin_list_users(
     State(state): State<AppState>,
