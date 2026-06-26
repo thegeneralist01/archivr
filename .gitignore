@@ -5,9 +5,6 @@
 !docs/
 !docs/LICENSE
 !docs/README*
-!docs/superpowers/
-!docs/superpowers/**
-
 !crates
 !crates/**
 
