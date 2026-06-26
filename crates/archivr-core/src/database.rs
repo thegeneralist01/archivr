@@ -109,6 +109,27 @@ pub struct CaptureJobRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UserSummary {
+    pub user_uid: String,
+    pub username: String,
+    pub email: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub role_slugs: Vec<String>,
+    pub role_bits: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RoleRecord {
+    pub role_uid: String,
+    pub slug: String,
+    pub name: String,
+    pub level: i64,
+    pub bit_position: i64,
+    pub is_builtin: bool,
+}
+
 pub fn database_path(archive_path: &Path) -> PathBuf {
     archive_path.join(DATABASE_FILE_NAME)
 }
@@ -575,6 +596,225 @@ pub fn list_user_tokens(conn: &Connection, user_id: i64) -> Result<Vec<ApiTokenR
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(records)
+}
+
+/// Deletes all sessions for a user. Called on ban or role change.
+pub fn invalidate_user_sessions(conn: &Connection, user_id: i64) -> Result<usize> {
+    let n = conn.execute("DELETE FROM sessions WHERE user_id = ?1", [user_id])?;
+    Ok(n)
+}
+
+/// Returns the integer id for a user_uid, or None if not found.
+pub fn get_user_id_by_uid(conn: &Connection, user_uid: &str) -> Result<Option<i64>> {
+    conn.query_row("SELECT id FROM users WHERE user_uid = ?1", [user_uid], |r| r.get(0))
+        .optional()
+        .map_err(Into::into)
+}
+
+/// Lists all users with their assigned roles and computed role_bits.
+pub fn list_users(conn: &Connection) -> Result<Vec<UserSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, user_uid, username, email, status, created_at FROM users ORDER BY created_at ASC",
+    )?;
+    let rows: Vec<(i64, String, String, Option<String>, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+        .collect::<Result<_, _>>()?;
+
+    rows.into_iter()
+        .map(|(id, user_uid, username, email, status, created_at)| {
+            let role_bits = compute_role_bits(conn, id)?;
+            let mut rs = conn.prepare(
+                "SELECT r.slug FROM user_roles ur JOIN roles r ON r.id = ur.role_id
+                 WHERE ur.user_id = ?1 ORDER BY r.level, r.bit_position",
+            )?;
+            let role_slugs: Vec<String> =
+                rs.query_map([id], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            Ok(UserSummary { user_uid, username, email, status, created_at, role_slugs, role_bits })
+        })
+        .collect()
+}
+
+/// Gets a single user by user_uid with roles and role_bits.
+pub fn get_user_by_uid(conn: &Connection, user_uid: &str) -> Result<Option<UserSummary>> {
+    let row = conn
+        .query_row(
+            "SELECT id, user_uid, username, email, status, created_at FROM users WHERE user_uid = ?1",
+            [user_uid],
+            |r| Ok((r.get::<_, i64>(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .optional()?;
+    match row {
+        None => Ok(None),
+        Some((id, user_uid, username, email, status, created_at)) => {
+            let role_bits = compute_role_bits(conn, id)?;
+            let mut rs = conn.prepare(
+                "SELECT r.slug FROM user_roles ur JOIN roles r ON r.id = ur.role_id
+                 WHERE ur.user_id = ?1 ORDER BY r.level, r.bit_position",
+            )?;
+            let role_slugs: Vec<String> =
+                rs.query_map([id], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            Ok(Some(UserSummary { user_uid, username, email, status, created_at, role_slugs, role_bits }))
+        }
+    }
+}
+
+/// Creates a new user (admin-created account) and assigns the 'user' role.
+/// Returns the new user_uid.
+pub fn create_user(
+    conn: &Connection,
+    username: &str,
+    email: Option<&str>,
+    password_hash: &str,
+    created_by_user_id: i64,
+) -> Result<String> {
+    let user_uid = public_id("usr");
+    conn.execute(
+        "INSERT INTO users (user_uid, username, email, password_hash, status, role, created_at)
+         VALUES (?1, ?2, ?3, ?4, 'active', 'user', ?5)",
+        params![user_uid, username, email, password_hash, now_timestamp()],
+    )?;
+    let user_id = conn.last_insert_rowid();
+    let role_id: i64 = conn.query_row(
+        "SELECT id FROM roles WHERE slug = 'user'",
+        [],
+        |r| r.get(0),
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO user_roles (user_id, role_id, assigned_at, assigned_by_user_id)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![user_id, role_id, now_timestamp(), created_by_user_id],
+    )?;
+    Ok(user_uid)
+}
+
+/// Sets a user's status ('active' | 'disabled'). Invalidates sessions when disabling.
+/// Returns true if the user was found.
+pub fn set_user_status(conn: &Connection, user_uid: &str, status: &str) -> Result<bool> {
+    if status == "disabled" {
+        let id: Option<i64> = conn
+            .query_row("SELECT id FROM users WHERE user_uid = ?1", [user_uid], |r| r.get(0))
+            .optional()?;
+        if let Some(id) = id {
+            invalidate_user_sessions(conn, id)?;
+        }
+    }
+    let n = conn.execute(
+        "UPDATE users SET status = ?1 WHERE user_uid = ?2",
+        params![status, user_uid],
+    )?;
+    Ok(n > 0)
+}
+
+/// Assigns a role to a user (cumulative: also ensures 'user' for any non-guest role,
+/// and 'admin' for 'owner'). Invalidates the user's sessions so changes take effect on re-login.
+pub fn assign_role(
+    conn: &Connection,
+    target_user_id: i64,
+    role_slug: &str,
+    assigned_by_user_id: i64,
+) -> Result<()> {
+    let role_id: i64 = conn
+        .query_row("SELECT id FROM roles WHERE slug = ?1", [role_slug], |r| r.get(0))
+        .map_err(|_| anyhow::anyhow!("role '{}' not found", role_slug))?;
+    conn.execute(
+        "INSERT OR IGNORE INTO user_roles (user_id, role_id, assigned_at, assigned_by_user_id)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![target_user_id, role_id, now_timestamp(), assigned_by_user_id],
+    )?;
+    // Cumulative: ensure 'user' whenever any non-guest role is assigned
+    if role_slug != "user" && role_slug != "guest" {
+        let uid: i64 = conn.query_row("SELECT id FROM roles WHERE slug = 'user'", [], |r| r.get(0))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO user_roles (user_id, role_id, assigned_at, assigned_by_user_id)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![target_user_id, uid, now_timestamp(), assigned_by_user_id],
+        )?;
+    }
+    // Also ensure 'admin' when assigning 'owner'
+    if role_slug == "owner" {
+        let aid: i64 = conn.query_row("SELECT id FROM roles WHERE slug = 'admin'", [], |r| r.get(0))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO user_roles (user_id, role_id, assigned_at, assigned_by_user_id)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![target_user_id, aid, now_timestamp(), assigned_by_user_id],
+        )?;
+    }
+    invalidate_user_sessions(conn, target_user_id)?;
+    Ok(())
+}
+
+/// Removes a role from a user. Guards: can't remove the only owner's 'owner' role.
+/// Invalidates the user's sessions.
+pub fn remove_role(conn: &Connection, target_user_id: i64, role_slug: &str) -> Result<()> {
+    if role_slug == "owner" {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE r.slug = 'owner'",
+            [],
+            |r| r.get(0),
+        )?;
+        if count <= 1 {
+            anyhow::bail!("cannot remove the last owner");
+        }
+    }
+    let role_id: i64 = conn
+        .query_row("SELECT id FROM roles WHERE slug = ?1", [role_slug], |r| r.get(0))
+        .map_err(|_| anyhow::anyhow!("role '{}' not found", role_slug))?;
+    conn.execute(
+        "DELETE FROM user_roles WHERE user_id = ?1 AND role_id = ?2",
+        params![target_user_id, role_id],
+    )?;
+    invalidate_user_sessions(conn, target_user_id)?;
+    Ok(())
+}
+
+/// Lists all roles ordered by level then bit_position.
+pub fn list_roles(conn: &Connection) -> Result<Vec<RoleRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT role_uid, slug, name, level, bit_position, is_builtin FROM roles
+         ORDER BY level, bit_position",
+    )?;
+    stmt.query_map([], |r| {
+        Ok(RoleRecord {
+            role_uid: r.get(0)?,
+            slug: r.get(1)?,
+            name: r.get(2)?,
+            level: r.get(3)?,
+            bit_position: r.get(4)?,
+            is_builtin: r.get::<_, i64>(5)? != 0,
+        })
+    })?
+    .collect::<Result<_, _>>()
+    .map_err(Into::into)
+}
+
+/// Creates a new custom role (level=2, bit_position = max existing + 1, min 4).
+/// Returns the created RoleRecord.
+pub fn create_custom_role(conn: &Connection, slug: &str, name: &str) -> Result<RoleRecord> {
+    if slug.is_empty() || !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        anyhow::bail!("role slug must be non-empty and contain only ASCII letters, digits, or hyphens");
+    }
+    let next_bit: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(bit_position) + 1, 4) FROM roles WHERE bit_position >= 4",
+        [],
+        |r| r.get(0),
+    )?;
+    if next_bit >= 32 {
+        anyhow::bail!("maximum number of custom roles reached");
+    }
+    let role_uid = public_id("role");
+    conn.execute(
+        "INSERT INTO roles (role_uid, slug, name, level, bit_position, is_builtin)
+         VALUES (?1, ?2, ?3, 2, ?4, 0)",
+        params![role_uid, slug, name, next_bit],
+    )?;
+    Ok(RoleRecord {
+        role_uid,
+        slug: slug.to_string(),
+        name: name.to_string(),
+        level: 2,
+        bit_position: next_bit,
+        is_builtin: false,
+    })
 }
 
 pub fn ensure_default_user(conn: &Connection) -> Result<i64> {
@@ -1687,5 +1927,64 @@ mod tests {
         let job = get_capture_job(&conn, &uid).unwrap().unwrap();
         assert_eq!(job.status, "failed");
         assert!(job.error_text.as_deref().unwrap().contains("interrupted"));
+    }
+
+    fn make_auth_conn_for_mgmt() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_auth_schema(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn user_create_and_list() {
+        let conn = make_auth_conn_for_mgmt();
+        let owner_id = create_owner(&conn, "owner", "hash").unwrap();
+        let uid = create_user(&conn, "alice", Some("alice@example.com"), "hash2", owner_id).unwrap();
+        let users = list_users(&conn).unwrap();
+        assert_eq!(users.len(), 2);
+        let alice = users.iter().find(|u| u.username == "alice").unwrap();
+        assert_eq!(alice.user_uid, uid);
+        assert_eq!(alice.status, "active");
+        assert!(alice.role_slugs.contains(&"user".to_string()));
+    }
+
+    #[test]
+    fn set_status_disables_user_and_kills_sessions() {
+        let conn = make_auth_conn_for_mgmt();
+        let owner_id = create_owner(&conn, "owner", "hash").unwrap();
+        let uid = create_user(&conn, "bob", None, "hash", owner_id).unwrap();
+        let bob_id: i64 = conn.query_row("SELECT id FROM users WHERE user_uid = ?1", [&uid], |r| r.get(0)).unwrap();
+        create_session(&conn, bob_id, 3, None).unwrap();
+        set_user_status(&conn, &uid, "disabled").unwrap();
+        let sess_count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions WHERE user_id = ?1", [bob_id], |r| r.get(0)).unwrap();
+        assert_eq!(sess_count, 0, "sessions should be cleared on disable");
+        let u = get_user_by_uid(&conn, &uid).unwrap().unwrap();
+        assert_eq!(u.status, "disabled");
+    }
+
+    #[test]
+    fn assign_and_remove_role() {
+        let conn = make_auth_conn_for_mgmt();
+        let owner_id = create_owner(&conn, "owner", "hash").unwrap();
+        let uid = create_user(&conn, "carol", None, "hash", owner_id).unwrap();
+        let carol_id = get_user_id_by_uid(&conn, &uid).unwrap().unwrap();
+        let bits_before = compute_role_bits(&conn, carol_id).unwrap();
+        assign_role(&conn, carol_id, "admin", owner_id).unwrap();
+        let bits_after = compute_role_bits(&conn, carol_id).unwrap();
+        assert!(bits_after & 4 != 0, "admin bit should be set");
+        assert!(bits_after > bits_before);
+        remove_role(&conn, carol_id, "admin").unwrap();
+        let bits_final = compute_role_bits(&conn, carol_id).unwrap();
+        assert!(bits_final & 4 == 0, "admin bit should be cleared");
+    }
+
+    #[test]
+    fn custom_role_gets_next_bit_position() {
+        let conn = make_auth_conn_for_mgmt();
+        let r1 = create_custom_role(&conn, "moderator", "Moderator").unwrap();
+        assert_eq!(r1.bit_position, 4);
+        let r2 = create_custom_role(&conn, "helper", "Helper").unwrap();
+        assert_eq!(r2.bit_position, 5);
+        assert_eq!(r2.level, 2);
     }
 }
