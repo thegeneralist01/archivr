@@ -1,3 +1,4 @@
+mod auth;
 mod registry;
 mod routes;
 
@@ -12,10 +13,34 @@ async fn main() -> Result<()> {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("archivr-server.toml"));
-    let registry = registry::load_registry(&config_path)?;
-    let app = routes::app(registry.clone());
 
-    // Bind address priority: ARCHIVR_BIND env var > TOML bind field > default loopback.
+    let registry = registry::load_registry(&config_path)?;
+
+    // Auth DB lives next to the config file unless overridden in the TOML.
+    let auth_db_path = registry.auth_db_path.clone().unwrap_or_else(|| {
+        config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("archivr-auth.sqlite")
+    });
+
+    let app = routes::app(registry.clone(), auth_db_path.clone());
+
+    // Spawn session cleanup: runs at startup and every 24h.
+    let cleanup_auth_path = auth_db_path.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Ok(conn) = archivr_core::database::open_auth_db(&cleanup_auth_path) {
+                match archivr_core::database::delete_expired_sessions(&conn) {
+                    Ok(n) if n > 0 => eprintln!("info: cleaned up {n} expired sessions"),
+                    Err(e) => eprintln!("warn: session cleanup failed: {e:#}"),
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(24 * 60 * 60)).await;
+        }
+    });
+
     let bind_str = std::env::var("ARCHIVR_BIND")
         .ok()
         .or_else(|| registry.bind.clone())
@@ -24,15 +49,6 @@ async fn main() -> Result<()> {
     let addr: SocketAddr = bind_str
         .parse()
         .with_context(|| format!("invalid bind address: {bind_str}"))?;
-
-    // Warn when the server is reachable beyond localhost — it has no authentication.
-    if !addr.ip().is_loopback() {
-        eprintln!(
-            "warn: archivr-server is bound to {addr} — \
-             this server has no authentication. \
-             Only expose it on a trusted network."
-        );
-    }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("archivr-server listening on http://{addr}");

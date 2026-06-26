@@ -29,3 +29,6 @@ tower-http = { version = "0.6.2", features = ["fs", "trace"] }
 uuid = { version = "1.18.1", features = ["v4"] }
 reqwest = { version = "0.12", features = ["blocking"] }
 base64 = "0.22"
+argon2 = { version = "0.5", features = ["std"] }
+rand = { version = "0.8", features = ["std"] }
+axum-extra = { version = "0.9", features = ["cookie"] }

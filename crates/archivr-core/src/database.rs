@@ -73,6 +73,31 @@ pub struct TagRecord {
     pub full_path: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct AuthUserRecord {
+    pub id: i64,
+    pub user_uid: String,
+    pub username: String,
+    pub password_hash: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionRecord {
+    pub user_id: i64,
+    pub role_bits: u32,
+    pub last_seen_at: String,
+    pub session_uid: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ApiTokenRecord {
+    pub token_uid: String,
+    pub name: String,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+}
+
 pub fn database_path(archive_path: &Path) -> PathBuf {
     archive_path.join(DATABASE_FILE_NAME)
 }
@@ -228,6 +253,306 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         "#,
     )?;
     Ok(())
+}
+
+pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS roles (
+            id           INTEGER PRIMARY KEY,
+            role_uid     TEXT NOT NULL UNIQUE,
+            slug         TEXT NOT NULL UNIQUE,
+            name         TEXT NOT NULL,
+            level        INTEGER NOT NULL,
+            bit_position INTEGER NOT NULL UNIQUE,
+            is_builtin   INTEGER NOT NULL DEFAULT 0 CHECK (is_builtin IN (0, 1))
+        );
+
+        INSERT OR IGNORE INTO roles (role_uid, slug, name, level, bit_position, is_builtin) VALUES
+            ('role-guest', 'guest', 'Guest',  0, 0, 1),
+            ('role-user',  'user',  'User',   1, 1, 1),
+            ('role-admin', 'admin', 'Admin',  3, 2, 1),
+            ('role-owner', 'owner', 'Owner',  4, 3, 1);
+
+        CREATE TABLE IF NOT EXISTS user_roles (
+            user_id             INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            role_id             INTEGER NOT NULL REFERENCES roles(id),
+            assigned_at         TEXT NOT NULL,
+            assigned_by_user_id INTEGER REFERENCES users(id),
+            PRIMARY KEY (user_id, role_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS sessions (
+            id           INTEGER PRIMARY KEY,
+            session_uid  TEXT NOT NULL UNIQUE,
+            user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            role_bits    INTEGER NOT NULL,
+            created_at   TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            expires_at   TEXT NOT NULL,
+            user_agent   TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
+
+        CREATE TABLE IF NOT EXISTS api_tokens (
+            id           INTEGER PRIMARY KEY,
+            token_uid    TEXT NOT NULL UNIQUE,
+            user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            token_hash   TEXT NOT NULL UNIQUE,
+            name         TEXT NOT NULL,
+            created_at   TEXT NOT NULL,
+            last_used_at TEXT,
+            expires_at   TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_api_tokens_user_id ON api_tokens(user_id);
+
+        CREATE TABLE IF NOT EXISTS instance_settings (
+            id                                 INTEGER PRIMARY KEY CHECK (id = 1),
+            public_index_enabled               INTEGER NOT NULL DEFAULT 0 CHECK (public_index_enabled IN (0, 1)),
+            public_entry_content_enabled       INTEGER NOT NULL DEFAULT 0 CHECK (public_entry_content_enabled IN (0, 1)),
+            public_archive_submission_enabled  INTEGER NOT NULL DEFAULT 0 CHECK (public_archive_submission_enabled IN (0, 1)),
+            default_entry_visibility           INTEGER NOT NULL DEFAULT 2
+        );
+
+        INSERT OR IGNORE INTO instance_settings
+            (id, public_index_enabled, public_entry_content_enabled,
+             public_archive_submission_enabled, default_entry_visibility)
+        VALUES (1, 0, 0, 0, 2);
+
+        CREATE TABLE IF NOT EXISTS users (
+            id            INTEGER PRIMARY KEY,
+            user_uid      TEXT NOT NULL UNIQUE,
+            username      TEXT NOT NULL UNIQUE,
+            email         TEXT UNIQUE,
+            password_hash TEXT NOT NULL,
+            status        TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
+            role          TEXT NOT NULL CHECK (role IN ('admin', 'user')),
+            created_at    TEXT NOT NULL,
+            last_login_at TEXT
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+pub fn open_auth_db(auth_db_path: &Path) -> Result<Connection> {
+    if let Some(parent) = auth_db_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create auth DB directory {}", parent.display())
+        })?;
+    }
+    let conn = Connection::open(auth_db_path).with_context(|| {
+        format!("failed to open auth database at {}", auth_db_path.display())
+    })?;
+    initialize_auth_schema(&conn)?;
+    Ok(conn)
+}
+
+/// Returns true if an owner account exists.
+pub fn ensure_owner_exists(conn: &Connection) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM user_roles ur
+         JOIN roles r ON r.id = ur.role_id
+         WHERE r.slug = 'owner'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Creates a user and assigns all roles from `user` up to `owner` (cumulative).
+/// `password_hash` must already be hashed by the caller.
+pub fn create_owner(conn: &Connection, username: &str, password_hash: &str) -> Result<i64> {
+    let user_uid = public_id("usr");
+    conn.execute(
+        "INSERT INTO users (user_uid, username, email, password_hash, status, role, created_at)
+         VALUES (?1, ?2, NULL, ?3, 'active', 'admin', ?4)",
+        params![user_uid, username, password_hash, now_timestamp()],
+    )?;
+    let user_id = conn.last_insert_rowid();
+    for slug in &["user", "admin", "owner"] {
+        let role_id: i64 = conn.query_row(
+            "SELECT id FROM roles WHERE slug = ?1",
+            [slug],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO user_roles (user_id, role_id, assigned_at)
+             VALUES (?1, ?2, ?3)",
+            params![user_id, role_id, now_timestamp()],
+        )?;
+    }
+    Ok(user_id)
+}
+
+pub fn get_user_by_username(conn: &Connection, username: &str) -> Result<Option<AuthUserRecord>> {
+    conn.query_row(
+        "SELECT id, user_uid, username, password_hash, status FROM users WHERE username = ?1",
+        [username],
+        |row| {
+            Ok(AuthUserRecord {
+                id: row.get(0)?,
+                user_uid: row.get(1)?,
+                username: row.get(2)?,
+                password_hash: row.get(3)?,
+                status: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Computes role_bits = ROLE_GUEST (1) | OR(assigned role bit values).
+pub fn compute_role_bits(conn: &Connection, user_id: i64) -> Result<u32> {
+    let mut stmt = conn.prepare(
+        "SELECT (1 << r.bit_position) FROM user_roles ur
+         JOIN roles r ON r.id = ur.role_id
+         WHERE ur.user_id = ?1",
+    )?;
+    let bits: u32 = stmt
+        .query_map([user_id], |row| row.get::<_, i64>(0))?
+        .try_fold(1u32, |acc, val| val.map(|v| acc | v as u32))?;
+    Ok(bits)
+}
+
+/// Returns a new session_uid (UUID).
+pub fn create_session(
+    conn: &Connection,
+    user_id: i64,
+    role_bits: u32,
+    user_agent: Option<&str>,
+) -> Result<String> {
+    let session_uid = public_id("sess");
+    let now = now_timestamp();
+    let expires_at = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::days(30))
+        .unwrap()
+        .to_rfc3339();
+    conn.execute(
+        "INSERT INTO sessions (session_uid, user_id, role_bits, created_at, last_seen_at, expires_at, user_agent)
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6)",
+        params![session_uid, user_id, role_bits as i64, now, expires_at, user_agent],
+    )?;
+    Ok(session_uid)
+}
+
+/// Returns session if it exists, the user is active, and it has not expired.
+pub fn get_session(conn: &Connection, session_uid: &str) -> Result<Option<SessionRecord>> {
+    let now = now_timestamp();
+    conn.query_row(
+        "SELECT s.user_id, s.role_bits, s.last_seen_at, s.session_uid
+         FROM sessions s
+         JOIN users u ON u.id = s.user_id
+         WHERE s.session_uid = ?1
+           AND u.status = 'active'
+           AND s.expires_at > ?2",
+        params![session_uid, now],
+        |row| {
+            Ok(SessionRecord {
+                user_id: row.get(0)?,
+                role_bits: row.get::<_, i64>(1)? as u32,
+                last_seen_at: row.get(2)?,
+                session_uid: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn delete_session(conn: &Connection, session_uid: &str) -> Result<()> {
+    conn.execute("DELETE FROM sessions WHERE session_uid = ?1", [session_uid])?;
+    Ok(())
+}
+
+/// Updates last_seen_at and extends expires_at by 30 days.
+pub fn touch_session(conn: &Connection, session_uid: &str) -> Result<()> {
+    let now = now_timestamp();
+    let new_expires = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::days(30))
+        .unwrap()
+        .to_rfc3339();
+    conn.execute(
+        "UPDATE sessions SET last_seen_at = ?1, expires_at = ?2 WHERE session_uid = ?3",
+        params![now, new_expires, session_uid],
+    )?;
+    Ok(())
+}
+
+pub fn delete_expired_sessions(conn: &Connection) -> Result<usize> {
+    let now = now_timestamp();
+    let n = conn.execute("DELETE FROM sessions WHERE expires_at <= ?1", [now])?;
+    Ok(n)
+}
+
+/// Creates an API token. `token_hash` is SHA3-256 hex of the raw token.
+pub fn create_api_token(
+    conn: &Connection,
+    user_id: i64,
+    token_hash: &str,
+    name: &str,
+) -> Result<String> {
+    let token_uid = public_id("tok");
+    conn.execute(
+        "INSERT INTO api_tokens (token_uid, user_id, token_hash, name, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![token_uid, user_id, token_hash, name, now_timestamp()],
+    )?;
+    Ok(token_uid)
+}
+
+/// Returns the user_id for a given token hash, if the token is valid and user is active.
+pub fn get_user_for_token(conn: &Connection, token_hash: &str) -> Result<Option<i64>> {
+    let now = now_timestamp();
+    conn.query_row(
+        "SELECT t.user_id FROM api_tokens t
+         JOIN users u ON u.id = t.user_id
+         WHERE t.token_hash = ?1
+           AND u.status = 'active'
+           AND (t.expires_at IS NULL OR t.expires_at > ?2)",
+        params![token_hash, now],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn touch_token(conn: &Connection, token_uid: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE api_tokens SET last_used_at = ?1 WHERE token_uid = ?2",
+        params![now_timestamp(), token_uid],
+    )?;
+    Ok(())
+}
+
+/// Returns true if the token was found and deleted (user_id must match).
+pub fn delete_api_token(conn: &Connection, token_uid: &str, user_id: i64) -> Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM api_tokens WHERE token_uid = ?1 AND user_id = ?2",
+        params![token_uid, user_id],
+    )?;
+    Ok(n > 0)
+}
+
+pub fn list_user_tokens(conn: &Connection, user_id: i64) -> Result<Vec<ApiTokenRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT token_uid, name, created_at, last_used_at
+         FROM api_tokens WHERE user_id = ?1 ORDER BY created_at DESC",
+    )?;
+    let records = stmt
+        .query_map([user_id], |row| {
+            Ok(ApiTokenRecord {
+                token_uid: row.get(0)?,
+                name: row.get(1)?,
+                created_at: row.get(2)?,
+                last_used_at: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(records)
 }
 
 pub fn ensure_default_user(conn: &Connection) -> Result<i64> {
@@ -1148,5 +1473,99 @@ mod tests {
         let conn = conn();
         let result = get_blob_by_sha256(&conn, "0000000000000000000000000000000000000000000000000000000000000000").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn auth_schema_seeds_builtin_roles() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_auth_schema(&conn).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM roles WHERE is_builtin = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 4);
+        let owner_bits: i64 = conn
+            .query_row("SELECT bit_position FROM roles WHERE slug = 'owner'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(owner_bits, 3);
+    }
+
+    #[test]
+    fn auth_schema_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_auth_schema(&conn).unwrap();
+        initialize_auth_schema(&conn).unwrap();
+    }
+
+    fn make_auth_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_auth_schema(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn ensure_owner_exists_returns_false_when_no_owner() {
+        let conn = make_auth_conn();
+        assert!(!ensure_owner_exists(&conn).unwrap());
+    }
+
+    #[test]
+    fn create_owner_then_ensure_returns_true() {
+        let conn = make_auth_conn();
+        create_owner(&conn, "alice", "hashed_pw").unwrap();
+        assert!(ensure_owner_exists(&conn).unwrap());
+    }
+
+    #[test]
+    fn create_owner_assigns_cumulative_roles() {
+        let conn = make_auth_conn();
+        let user_id = create_owner(&conn, "alice", "hashed_pw").unwrap();
+        let bits = compute_role_bits(&conn, user_id).unwrap();
+        assert_eq!(bits, 15u32);
+    }
+
+    #[test]
+    fn get_user_by_username_returns_none_for_unknown() {
+        let conn = make_auth_conn();
+        assert!(get_user_by_username(&conn, "nobody").unwrap().is_none());
+    }
+
+    #[test]
+    fn create_and_get_session() {
+        let conn = make_auth_conn();
+        let user_id = create_owner(&conn, "alice", "pw").unwrap();
+        let uid = create_session(&conn, user_id, 15, None).unwrap();
+        let sess = get_session(&conn, &uid).unwrap().unwrap();
+        assert_eq!(sess.user_id, user_id);
+        assert_eq!(sess.role_bits, 15);
+    }
+
+    #[test]
+    fn get_session_returns_none_for_unknown() {
+        let conn = make_auth_conn();
+        assert!(get_session(&conn, "nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_session_removes_it() {
+        let conn = make_auth_conn();
+        let user_id = create_owner(&conn, "alice", "pw").unwrap();
+        let uid = create_session(&conn, user_id, 15, None).unwrap();
+        delete_session(&conn, &uid).unwrap();
+        assert!(get_session(&conn, &uid).unwrap().is_none());
+    }
+
+    #[test]
+    fn token_hash_round_trips() {
+        let conn = make_auth_conn();
+        let user_id = create_owner(&conn, "alice", "pw").unwrap();
+        create_api_token(&conn, user_id, "hash_abc", "My Token").unwrap();
+        let found_id = get_user_for_token(&conn, "hash_abc").unwrap();
+        assert_eq!(found_id, Some(user_id));
+    }
+
+    #[test]
+    fn get_user_for_token_returns_none_for_unknown() {
+        let conn = make_auth_conn();
+        assert!(get_user_for_token(&conn, "unknown").unwrap().is_none());
     }
 }
