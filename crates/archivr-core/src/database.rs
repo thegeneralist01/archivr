@@ -130,6 +130,16 @@ pub struct RoleRecord {
     pub is_builtin: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CollectionRecord {
+    pub id: i64,
+    pub collection_uid: String,
+    pub name: String,
+    pub slug: String,
+    pub default_visibility_bits: u32,
+    pub created_at: String,
+}
+
 pub fn database_path(archive_path: &Path) -> PathBuf {
     archive_path.join(DATABASE_FILE_NAME)
 }
@@ -293,6 +303,43 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_entry_artifacts_blob_id ON entry_artifacts(blob_id);
         CREATE INDEX IF NOT EXISTS idx_tags_parent_tag_id ON tags(parent_tag_id);
         CREATE INDEX IF NOT EXISTS idx_entry_tag_assignments_tag_id ON entry_tag_assignments(tag_id);
+
+        CREATE TABLE IF NOT EXISTS collections (
+            id                      INTEGER PRIMARY KEY,
+            collection_uid          TEXT NOT NULL UNIQUE,
+            name                    TEXT NOT NULL,
+            slug                    TEXT NOT NULL UNIQUE,
+            default_visibility_bits INTEGER NOT NULL DEFAULT 2,
+            created_at              TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS collection_entries (
+            collection_id   INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+            entry_id        INTEGER NOT NULL REFERENCES archived_entries(id) ON DELETE CASCADE,
+            visibility_bits INTEGER NOT NULL DEFAULT 2,
+            added_at        TEXT NOT NULL,
+            PRIMARY KEY (collection_id, entry_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_collection_entries_entry_id ON collection_entries(entry_id);
+        CREATE INDEX IF NOT EXISTS idx_collection_entries_collection_id ON collection_entries(collection_id);
+
+        -- Seed default collection (idempotent)
+        INSERT OR IGNORE INTO collections (collection_uid, name, slug, default_visibility_bits, created_at)
+        VALUES ('coll_default', 'All Entries', '_default_', 2, datetime('now'));
+
+        -- Migrate existing entries to default collection (idempotent)
+        INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, visibility_bits, added_at)
+        SELECT
+            (SELECT id FROM collections WHERE slug = '_default_'),
+            ae.id,
+            CASE ae.visibility
+                WHEN 'public'   THEN 3
+                WHEN 'unlisted' THEN 2
+                ELSE            0
+            END,
+            ae.archived_at
+        FROM archived_entries ae;
         "#,
     )?;
     Ok(())
@@ -1146,6 +1193,11 @@ pub fn create_archived_entry(conn: &Connection, entry: &NewEntry) -> Result<Arch
         )?;
     }
 
+    // Auto-enroll in the default collection with appropriate visibility_bits.
+    let default_coll_id = ensure_default_collection(conn)?;
+    let vbits = visibility_to_bits(&entry.visibility);
+    add_entry_to_collection(conn, default_coll_id, id, vbits)?;
+
     Ok(ArchivedEntry {
         id,
         entry_uid,
@@ -1394,6 +1446,166 @@ fn refresh_run_counters(conn: &Connection, run_id: i64) -> Result<()> {
         [run_id],
     )?;
     Ok(())
+}
+
+/// Maps legacy visibility strings to collection_entries.visibility_bits.
+/// 'public'→3 (guest|user), 'unlisted'→2 (user only), 'private'→0 (nobody).
+pub fn visibility_to_bits(visibility: &str) -> u32 {
+    match visibility {
+        "public" => 3,
+        "unlisted" => 2,
+        _ => 0,
+    }
+}
+
+/// Returns the id of the '_default_' collection, creating it if absent.
+pub fn ensure_default_collection(conn: &Connection) -> Result<i64> {
+    let now = now_timestamp();
+    conn.execute(
+        "INSERT OR IGNORE INTO collections (collection_uid, name, slug, default_visibility_bits, created_at) \
+         VALUES ('coll_default', 'All Entries', '_default_', 2, ?1)",
+        [&now],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM collections WHERE slug = '_default_'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(id)
+}
+
+/// Creates a new collection. Returns the created record.
+pub fn create_collection(
+    conn: &Connection,
+    name: &str,
+    slug: &str,
+    default_visibility_bits: u32,
+) -> Result<CollectionRecord> {
+    if slug.is_empty() || slug.starts_with('_') {
+        anyhow::bail!("collection slug must be non-empty and not start with underscore");
+    }
+    let collection_uid = public_id("coll");
+    let now = now_timestamp();
+    conn.execute(
+        "INSERT INTO collections (collection_uid, name, slug, default_visibility_bits, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![collection_uid, name, slug, default_visibility_bits as i64, now],
+    )?;
+    let id = conn.last_insert_rowid();
+    Ok(CollectionRecord {
+        id,
+        collection_uid,
+        name: name.to_string(),
+        slug: slug.to_string(),
+        default_visibility_bits,
+        created_at: now,
+    })
+}
+
+/// Lists all collections ordered by creation date.
+pub fn list_collections(conn: &Connection) -> Result<Vec<CollectionRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, collection_uid, name, slug, default_visibility_bits, created_at \
+         FROM collections ORDER BY created_at ASC",
+    )?;
+    stmt.query_map([], |row| {
+        Ok(CollectionRecord {
+            id: row.get(0)?,
+            collection_uid: row.get(1)?,
+            name: row.get(2)?,
+            slug: row.get(3)?,
+            default_visibility_bits: row.get::<_, i64>(4)? as u32,
+            created_at: row.get(5)?,
+        })
+    })?
+    .collect::<Result<_, _>>()
+    .map_err(Into::into)
+}
+
+/// Returns a collection by its uid, or None if not found.
+pub fn get_collection_by_uid(
+    conn: &Connection,
+    uid: &str,
+) -> Result<Option<CollectionRecord>> {
+    conn.query_row(
+        "SELECT id, collection_uid, name, slug, default_visibility_bits, created_at \
+         FROM collections WHERE collection_uid = ?1",
+        [uid],
+        |row| {
+            Ok(CollectionRecord {
+                id: row.get(0)?,
+                collection_uid: row.get(1)?,
+                name: row.get(2)?,
+                slug: row.get(3)?,
+                default_visibility_bits: row.get::<_, i64>(4)? as u32,
+                created_at: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Adds an entry to a collection with given visibility_bits. Idempotent (INSERT OR IGNORE).
+pub fn add_entry_to_collection(
+    conn: &Connection,
+    collection_id: i64,
+    entry_id: i64,
+    visibility_bits: u32,
+) -> Result<()> {
+    let now = now_timestamp();
+    conn.execute(
+        "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, visibility_bits, added_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![collection_id, entry_id, visibility_bits as i64, now],
+    )?;
+    Ok(())
+}
+
+/// Updates the visibility_bits of an entry in a collection. Returns true if updated.
+pub fn update_collection_entry_visibility(
+    conn: &Connection,
+    collection_id: i64,
+    entry_id: i64,
+    visibility_bits: u32,
+) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE collection_entries SET visibility_bits = ?1 \
+         WHERE collection_id = ?2 AND entry_id = ?3",
+        params![visibility_bits as i64, collection_id, entry_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Removes an entry from a collection. Returns true if removed.
+pub fn remove_entry_from_collection(
+    conn: &Connection,
+    collection_id: i64,
+    entry_id: i64,
+) -> Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM collection_entries WHERE collection_id = ?1 AND entry_id = ?2",
+        params![collection_id, entry_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// Returns (collection_id, collection_uid, visibility_bits) for all collections containing an entry.
+pub fn get_entry_collection_memberships(
+    conn: &Connection,
+    entry_id: i64,
+) -> Result<Vec<(i64, String, u32)>> {
+    let mut stmt = conn.prepare(
+        "SELECT ce.collection_id, c.collection_uid, ce.visibility_bits \
+         FROM collection_entries ce \
+         JOIN collections c ON c.id = ce.collection_id \
+         WHERE ce.entry_id = ?1",
+    )?;
+    stmt.query_map([entry_id], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? as u32))
+    })?
+    .collect::<Result<_, _>>()
+    .map_err(Into::into)
 }
 
 fn run_id_for_item(conn: &Connection, item_id: i64) -> Result<i64> {

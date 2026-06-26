@@ -168,6 +168,67 @@ export async function createRole(slug, name) {
   return res.json();
 }
 
+// ── Collection helpers ─────────────────────────────────────────────────────
+
+export async function listCollections(archiveId) {
+  return getJson(`/api/archives/${archiveId}/collections`);
+}
+
+export async function createCollection(archiveId, name, slug, defaultVisibilityBits = 2) {
+  const res = await fetch(`/api/archives/${archiveId}/collections`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name, slug, default_visibility_bits: defaultVisibilityBits }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || res.statusText);
+  }
+  return res.json();
+}
+
+export async function getCollection(archiveId, collUid) {
+  return getJson(`/api/archives/${archiveId}/collections/${collUid}`);
+}
+
+export async function addEntryToCollection(archiveId, collUid, entryUid, visibilityBits = 2) {
+  const res = await fetch(`/api/archives/${archiveId}/collections/${collUid}/entries`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ entry_uid: entryUid, visibility_bits: visibilityBits }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || res.statusText);
+  }
+}
+
+export async function removeEntryFromCollection(archiveId, collUid, entryUid) {
+  const res = await fetch(`/api/archives/${archiveId}/collections/${collUid}/entries/${entryUid}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || res.statusText);
+  }
+}
+
+export async function updateEntryVisibility(archiveId, collUid, entryUid, visibilityBits) {
+  const res = await fetch(`/api/archives/${archiveId}/collections/${collUid}/entries/${entryUid}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ visibility_bits: visibilityBits }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || res.statusText);
+  }
+}
+
+export async function listEntryCollections(archiveId, entryUid) {
+  return getJson(`/api/archives/${archiveId}/entries/${entryUid}/collections`);
+}
+
 // ── 401 interceptor ───────────────────────────────────────────────────────────
 const _origFetch = window.fetch;
 window.fetch = async (...args) => {

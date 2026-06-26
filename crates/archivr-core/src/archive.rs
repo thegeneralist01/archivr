@@ -85,6 +85,15 @@ pub struct TagNode {
     pub children: Vec<TagNode>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CollectionSummary {
+    pub collection_uid: String,
+    pub name: String,
+    pub slug: String,
+    pub default_visibility_bits: u32,
+    pub created_at: String,
+}
+
 pub fn find_archive_path_from(start: &Path) -> Result<Option<PathBuf>> {
     let mut dir = start.to_path_buf();
     loop {
@@ -184,7 +193,7 @@ pub fn initialize_store_directories(store_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn list_root_entries(conn: &rusqlite::Connection) -> Result<Vec<EntrySummary>> {
+pub fn list_root_entries(conn: &rusqlite::Connection, caller_bits: u32) -> Result<Vec<EntrySummary>> {
     let mut stmt = conn.prepare(
         "SELECT
             e.entry_uid,
@@ -203,12 +212,20 @@ pub fn list_root_entries(conn: &rusqlite::Connection) -> Result<Vec<EntrySummary
          LEFT JOIN entry_artifacts ea ON ea.entry_id = e.id
          LEFT JOIN blobs b ON b.id = ea.blob_id
          WHERE e.parent_entry_id IS NULL
+         AND (
+             CAST(?1 AS INTEGER) & 12 != 0
+             OR EXISTS (
+                 SELECT 1 FROM collection_entries ce
+                 WHERE ce.entry_id = e.id
+                   AND ce.visibility_bits & CAST(?1 AS INTEGER) != 0
+             )
+         )
          GROUP BY e.id
          ORDER BY e.archived_at DESC, e.id DESC",
     )?;
 
     let entries = stmt
-        .query_map([], |row| {
+        .query_map([caller_bits as i64], |row| {
             Ok(EntrySummary {
                 entry_uid: row.get(0)?,
                 archived_at: row.get(1)?,
@@ -252,7 +269,7 @@ pub fn get_entry_detail(
         return Ok(None);
     };
 
-    let summary = list_root_entries(conn)?
+    let summary = list_root_entries(conn, u32::MAX)?
         .into_iter()
         .find(|entry| entry.entry_uid == entry_uid)
         .context("entry disappeared while loading detail")?;
@@ -325,6 +342,95 @@ pub fn get_capture_job(
     }))
 }
 
+/// Lists all collections in the archive.
+pub fn list_collections(conn: &rusqlite::Connection) -> Result<Vec<CollectionSummary>> {
+    let records = database::list_collections(conn)?;
+    Ok(records
+        .into_iter()
+        .map(|r| CollectionSummary {
+            collection_uid: r.collection_uid,
+            name: r.name,
+            slug: r.slug,
+            default_visibility_bits: r.default_visibility_bits,
+            created_at: r.created_at,
+        })
+        .collect())
+}
+
+/// Represents an entry's membership in a collection with its visibility bits.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EntryCollectionMembership {
+    pub collection_uid: String,
+    pub visibility_bits: u32,
+}
+
+/// Returns collection memberships for the given entry_uid.
+/// Returns Ok(None) if the entry_uid does not exist.
+pub fn get_entry_collections(
+    conn: &rusqlite::Connection,
+    entry_uid: &str,
+) -> Result<Option<Vec<EntryCollectionMembership>>> {
+    let Some(entry_id) = conn
+        .query_row(
+            "SELECT id FROM archived_entries WHERE entry_uid = ?1",
+            [entry_uid],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let memberships = database::get_entry_collection_memberships(conn, entry_id)?;
+    Ok(Some(
+        memberships
+            .into_iter()
+            .map(|(_, uid, bits)| EntryCollectionMembership {
+                collection_uid: uid,
+                visibility_bits: bits,
+            })
+            .collect(),
+    ))
+}
+
+/// Returns entries belonging to a collection, filtered by caller_bits visibility.
+/// Caller with admin/owner bits (4|8) sees all entries regardless of visibility_bits.
+pub fn list_entries_for_collection(
+    conn: &rusqlite::Connection,
+    collection_id: i64,
+    caller_bits: u32,
+) -> Result<Vec<EntrySummary>> {
+    let sql = format!(
+        "{} {} \
+         JOIN collection_entries ce ON ce.entry_id = e.id \
+         WHERE ce.collection_id = ?1 \
+         AND (CAST(?2 AS INTEGER) & 12 != 0 \
+              OR (ce.visibility_bits & CAST(?2 AS INTEGER)) != 0) \
+         GROUP BY e.id \
+         ORDER BY e.archived_at DESC, e.id DESC",
+        ENTRY_SELECT_COLS,
+        ENTRY_FROM_JOINS,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let entries = stmt
+        .query_map([collection_id, caller_bits as i64], |row| {
+            Ok(EntrySummary {
+                entry_uid: row.get(0)?,
+                archived_at: row.get(1)?,
+                source_kind: row.get(2)?,
+                entity_kind: row.get(3)?,
+                title: row.get(4)?,
+                visibility: row.get(5)?,
+                original_url: row.get(6)?,
+                artifact_count: row.get(7)?,
+                total_artifact_bytes: row.get(8)?,
+                parent_entry_uid: row.get(9)?,
+                has_favicon: row.get::<_, i64>(10)? != 0,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(entries)
+}
+
 /// Resolves an artifact to its absolute on-disk path under `store_path`.
 ///
 /// `artifact.relpath` is a store-relative path (e.g. `raw/a/b/abc.pdf`).
@@ -350,7 +456,7 @@ pub fn resolve_artifact_path(
     Ok(canonical_artifact)
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SearchEntriesQuery {
     /// Free-text term: LIKE-matched against title, canonical_url, entry_uid, source_kind, entity_kind, visibility
     pub q: Option<String>,
@@ -368,6 +474,25 @@ pub struct SearchEntriesQuery {
     pub before: Option<String>,
     /// Tag full_path filter; includes all entries (root + child) matching the tag subtree
     pub tag: Option<String>,
+    /// Role bits of the caller for visibility filtering. Admins (bits 4/8) bypass all filters.
+    /// Pass `u32::MAX` internally to bypass all visibility. Pass 0 for unauthenticated guests only.
+    pub caller_bits: u32,
+}
+
+impl Default for SearchEntriesQuery {
+    fn default() -> Self {
+        Self {
+            q: None,
+            source_kind: None,
+            entity_kind: None,
+            url: None,
+            title: None,
+            after: None,
+            before: None,
+            tag: None,
+            caller_bits: u32::MAX,
+        }
+    }
 }
 
 /// Parses a raw search string into a [`SearchEntriesQuery`].
@@ -497,6 +622,15 @@ pub fn search_entries(
         sql.push_str(&format!(" AND e.archived_at < ?{n}"));
         params.push(b.clone());
     }
+
+    // Visibility filter
+    let n = params.len() + 1;
+    sql.push_str(&format!(
+        " AND (CAST(?{n} AS INTEGER) & 12 != 0 \
+         OR EXISTS (SELECT 1 FROM collection_entries ce \
+         WHERE ce.entry_id = e.id AND ce.visibility_bits & CAST(?{n} AS INTEGER) != 0))"
+    ));
+    params.push(query.caller_bits.to_string());
 
     sql.push_str(" GROUP BY e.id ORDER BY e.archived_at DESC, e.id DESC");
 
@@ -849,7 +983,7 @@ mod tests {
         database::complete_archive_run_item(&conn, item.id, entry.id).unwrap();
         database::finish_archive_run(&conn, run.id).unwrap();
 
-        let entries = list_root_entries(&conn).unwrap();
+        let entries = list_root_entries(&conn, u32::MAX).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].title.as_deref(), Some("Saved Article"));
         assert_eq!(entries[0].artifact_count, 1);
@@ -1020,7 +1154,7 @@ mod tests {
     #[test]
     fn search_empty_query_returns_all_root_entries() {
         let conn = make_test_db_with_entries();
-        let all = list_root_entries(&conn).unwrap();
+        let all = list_root_entries(&conn, u32::MAX).unwrap();
         let searched = search_entries(&conn, &SearchEntriesQuery::default()).unwrap();
         assert_eq!(all.len(), searched.len());
     }
