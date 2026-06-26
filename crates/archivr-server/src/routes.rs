@@ -36,6 +36,9 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower::ServiceExt;
 
 use crate::registry::{MountedArchive, ServerRegistry};
+use crate::auth;
+pub use crate::auth::{AuthUser, ROLE_ADMIN, ROLE_OWNER, ROLE_USER};
+use axum_extra::extract::CookieJar;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -362,6 +365,14 @@ impl ApiError {
             message: message.to_string(),
         }
     }
+
+    pub fn unauthorized(message: &str) -> Self {
+        Self { status: StatusCode::UNAUTHORIZED, message: message.to_string() }
+    }
+
+    pub fn forbidden(message: &str) -> Self {
+        Self { status: StatusCode::FORBIDDEN, message: message.to_string() }
+    }
 }
 
 impl<E> From<E> for ApiError
@@ -379,7 +390,8 @@ where
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, self.message).into_response()
+        let body = serde_json::json!({ "error": self.message });
+        (self.status, axum::Json(body)).into_response()
     }
 }
 
