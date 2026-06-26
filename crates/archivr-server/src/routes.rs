@@ -1531,11 +1531,12 @@ mod tests {
             .unwrap();
         assert_eq!(assign_resp.status(), StatusCode::CREATED, "assign tag should return 201");
 
-        // Search with ?tag=/science — entry should appear
+        // Search with ?tag=/science — entry should appear (requires auth since entry is private)
         let response = app(registry.clone(), auth_path.clone())
             .oneshot(
                 Request::builder()
                     .uri("/api/archives/test/entries/search?tag=%2Fscience")
+                    .header("cookie", &session_cookie)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1555,6 +1556,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/archives/test/entries/search?tag=%2Fart")
+                    .header("cookie", &session_cookie)
                     .body(Body::empty())
                     .unwrap(),
             )
