@@ -280,9 +280,11 @@ async fn list_tags(
 
 async fn create_tag_handler(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     Path(archive_id): Path<String>,
     Json(body): Json<CreateTagBody>,
 ) -> Result<(StatusCode, Json<archive::Tag>), ApiError> {
+    auth_user.require_role(ROLE_USER)?;
     if body.path.trim().is_empty() {
         return Err(ApiError::bad_request("tag path must not be empty"));
     }
@@ -306,9 +308,11 @@ async fn list_entry_tags(
 
 async fn assign_entry_tag_handler(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     Path((archive_id, entry_uid)): Path<(String, String)>,
     Json(body): Json<AssignTagBody>,
 ) -> Result<(StatusCode, Json<archive::Tag>), ApiError> {
+    auth_user.require_role(ROLE_USER)?;
     if body.tag_path.trim().is_empty() {
         return Err(ApiError::bad_request("tag_path must not be empty"));
     }
@@ -322,8 +326,10 @@ async fn assign_entry_tag_handler(
 
 async fn remove_entry_tag_handler(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     Path((archive_id, entry_uid, tag_uid)): Path<(String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
+    auth_user.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     if archive::remove_entry_tag(&conn, &entry_uid, &tag_uid)? {
@@ -357,9 +363,11 @@ struct CreateTokenBody {
 
 async fn capture_handler(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     Path(archive_id): Path<String>,
     Json(body): Json<CaptureBody>,
 ) -> Result<Json<capture::CaptureResult>, ApiError> {
+    auth_user.require_role(ROLE_USER)?;
     if body.locator.trim().is_empty() {
         return Err(ApiError::bad_request("locator must not be empty"));
     }
@@ -1262,7 +1270,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED); // auth fires before validation
     }
 
     #[tokio::test]
@@ -1279,7 +1287,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED); // auth fires before archive lookup
     }
 
     #[tokio::test]
@@ -1377,6 +1385,19 @@ mod tests {
             .oneshot(Request::builder().method("POST").uri("/api/auth/tokens")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"name":"my token"}"#))
+                .unwrap())
+            .await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn capture_returns_401_for_unauthenticated() {
+        let (test_app, _dir) = make_test_app();
+        let response = test_app
+            .oneshot(Request::builder().method("POST")
+                .uri("/api/archives/test/captures")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"locator":"https://example.com"}"#))
                 .unwrap())
             .await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
