@@ -61,6 +61,17 @@ pub struct RunSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CaptureJobSummary {
+    pub job_uid: String,
+    pub archive_id: String,
+    pub run_uid: Option<String>,
+    pub status: String,
+    pub error_text: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Tag {
     pub tag_uid: String,
     pub name: String,
@@ -297,6 +308,21 @@ pub fn list_runs(conn: &rusqlite::Connection) -> Result<Vec<RunSummary>> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     Ok(runs)
+}
+
+pub fn get_capture_job(
+    conn: &rusqlite::Connection,
+    job_uid: &str,
+) -> Result<Option<CaptureJobSummary>> {
+    Ok(database::get_capture_job(conn, job_uid)?.map(|r| CaptureJobSummary {
+        job_uid: r.job_uid,
+        archive_id: r.archive_id,
+        run_uid: r.run_uid,
+        status: r.status,
+        error_text: r.error_text,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+    }))
 }
 
 /// Resolves an artifact to its absolute on-disk path under `store_path`.

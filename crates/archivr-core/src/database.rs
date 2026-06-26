@@ -98,6 +98,17 @@ pub struct ApiTokenRecord {
     pub last_used_at: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CaptureJobRecord {
+    pub job_uid: String,
+    pub archive_id: String,
+    pub run_uid: Option<String>,
+    pub status: String,
+    pub error_text: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 pub fn database_path(archive_path: &Path) -> PathBuf {
     archive_path.join(DATABASE_FILE_NAME)
 }
@@ -240,6 +251,17 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             PRIMARY KEY (entry_id, tag_id)
         );
 
+        CREATE TABLE IF NOT EXISTS capture_jobs (
+            id          INTEGER PRIMARY KEY,
+            job_uid     TEXT NOT NULL UNIQUE,
+            archive_id  TEXT NOT NULL,
+            run_uid     TEXT,
+            status      TEXT NOT NULL CHECK (status IN ('pending','running','completed','failed')) DEFAULT 'pending',
+            error_text  TEXT,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_capture_jobs_status ON capture_jobs(status);
         CREATE INDEX IF NOT EXISTS idx_archive_run_items_run_id ON archive_run_items(run_id);
         CREATE INDEX IF NOT EXISTS idx_archived_entries_source_identity_id ON archived_entries(source_identity_id);
         CREATE INDEX IF NOT EXISTS idx_archived_entries_created_by_user_id ON archived_entries(created_by_user_id);
@@ -580,6 +602,71 @@ pub fn ensure_default_user(conn: &Connection) -> Result<i64> {
     )?;
 
     Ok(conn.last_insert_rowid())
+}
+
+/// Creates a pending capture job. Returns the new `job_uid`.
+pub fn create_capture_job(conn: &Connection, archive_id: &str) -> Result<String> {
+    let job_uid = public_id("job");
+    let now = now_timestamp();
+    conn.execute(
+        "INSERT INTO capture_jobs (job_uid, archive_id, run_uid, status, error_text, created_at, updated_at)
+         VALUES (?1, ?2, NULL, 'pending', NULL, ?3, ?3)",
+        rusqlite::params![job_uid, archive_id, now],
+    )?;
+    Ok(job_uid)
+}
+
+/// Updates the status (and optionally run_uid / error_text) of a capture job.
+pub fn update_capture_job_status(
+    conn: &Connection,
+    job_uid: &str,
+    status: &str,
+    run_uid: Option<&str>,
+    error_text: Option<&str>,
+) -> Result<()> {
+    let now = now_timestamp();
+    conn.execute(
+        "UPDATE capture_jobs SET status = ?1, run_uid = COALESCE(?2, run_uid),
+         error_text = ?3, updated_at = ?4 WHERE job_uid = ?5",
+        rusqlite::params![status, run_uid, error_text, now, job_uid],
+    )?;
+    Ok(())
+}
+
+/// Returns a capture job by uid.
+pub fn get_capture_job(conn: &Connection, job_uid: &str) -> Result<Option<CaptureJobRecord>> {
+    conn.query_row(
+        "SELECT job_uid, archive_id, run_uid, status, error_text, created_at, updated_at
+         FROM capture_jobs WHERE job_uid = ?1",
+        [job_uid],
+        |row| {
+            Ok(CaptureJobRecord {
+                job_uid: row.get(0)?,
+                archive_id: row.get(1)?,
+                run_uid: row.get(2)?,
+                status: row.get(3)?,
+                error_text: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Marks all 'running' capture jobs as 'failed' with a restart message.
+/// Called at server startup to clean up jobs interrupted by a previous shutdown.
+pub fn fail_stalled_capture_jobs(conn: &Connection) -> Result<usize> {
+    let now = now_timestamp();
+    let n = conn.execute(
+        "UPDATE capture_jobs SET status = 'failed',
+         error_text = 'interrupted by server restart',
+         updated_at = ?1
+         WHERE status = 'running'",
+        [now],
+    )?;
+    Ok(n)
 }
 
 pub fn create_archive_run(
@@ -1567,5 +1654,38 @@ mod tests {
     fn get_user_for_token_returns_none_for_unknown() {
         let conn = make_auth_conn();
         assert!(get_user_for_token(&conn, "unknown").unwrap().is_none());
+    }
+
+    #[test]
+    fn capture_job_create_and_get() {
+        let conn = conn();
+        let job_uid = create_capture_job(&conn, "personal").unwrap();
+        let job = get_capture_job(&conn, &job_uid).unwrap().unwrap();
+        assert_eq!(job.status, "pending");
+        assert_eq!(job.archive_id, "personal");
+        assert!(job.run_uid.is_none());
+    }
+
+    #[test]
+    fn capture_job_status_transitions() {
+        let conn = conn();
+        let job_uid = create_capture_job(&conn, "test").unwrap();
+        update_capture_job_status(&conn, &job_uid, "running", None, None).unwrap();
+        update_capture_job_status(&conn, &job_uid, "completed", Some("run_abc"), None).unwrap();
+        let job = get_capture_job(&conn, &job_uid).unwrap().unwrap();
+        assert_eq!(job.status, "completed");
+        assert_eq!(job.run_uid.as_deref(), Some("run_abc"));
+    }
+
+    #[test]
+    fn fail_stalled_jobs_on_restart() {
+        let conn = conn();
+        let uid = create_capture_job(&conn, "test").unwrap();
+        update_capture_job_status(&conn, &uid, "running", None, None).unwrap();
+        let n = fail_stalled_capture_jobs(&conn).unwrap();
+        assert_eq!(n, 1);
+        let job = get_capture_job(&conn, &uid).unwrap().unwrap();
+        assert_eq!(job.status, "failed");
+        assert!(job.error_text.as_deref().unwrap().contains("interrupted"));
     }
 }

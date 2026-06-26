@@ -103,6 +103,10 @@ pub fn app(registry: ServerRegistry, auth_db_path: std::path::PathBuf) -> Router
         )
         .route("/api/archives/:archive_id/runs", get(list_runs))
         .route("/api/archives/:archive_id/captures", post(capture_handler))
+        .route(
+            "/api/archives/:archive_id/capture_jobs/:job_uid",
+            get(get_capture_job_handler),
+        )
         .route("/api/archives/:archive_id/tags", get(list_tags).post(create_tag_handler))
         .route(
             "/api/archives/:archive_id/entries/:entry_uid/tags",
@@ -366,7 +370,7 @@ async fn capture_handler(
     auth_user: AuthUser,
     Path(archive_id): Path<String>,
     Json(body): Json<CaptureBody>,
-) -> Result<Json<capture::CaptureResult>, ApiError> {
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     auth_user.require_role(ROLE_USER)?;
     if body.locator.trim().is_empty() {
         return Err(ApiError::bad_request("locator must not be empty"));
@@ -374,9 +378,67 @@ async fn capture_handler(
     let mounted = mounted_archive(&state, &archive_id)?;
     let archive_paths = archive::read_archive_paths(&mounted.archive_path)
         .map_err(ApiError::from)?;
-    let result = capture::perform_capture(&archive_paths, &body.locator, Some(&archive_id))
-        .map_err(ApiError::from)?;
-    Ok(Json(result))
+
+    // Create job record in the archive DB.
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let job_uid = database::create_capture_job(&conn, &archive_id)?;
+    drop(conn);
+
+    // Spawn background capture.
+    let locator = body.locator.trim().to_string();
+    let archive_path = mounted.archive_path.clone();
+    let job_uid_bg = job_uid.clone();
+    let archive_id_bg = archive_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = match database::open_or_initialize(&archive_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("warn: capture job {job_uid_bg}: db open failed: {e:#}");
+                return;
+            }
+        };
+        database::update_capture_job_status(&conn, &job_uid_bg, "running", None, None).ok();
+        match capture::perform_capture(&archive_paths, &locator, Some(&archive_id_bg)) {
+            Ok(result) => {
+                database::update_capture_job_status(
+                    &conn,
+                    &job_uid_bg,
+                    "completed",
+                    Some(&result.run_uid),
+                    None,
+                )
+                .ok();
+            }
+            Err(e) => {
+                database::update_capture_job_status(
+                    &conn,
+                    &job_uid_bg,
+                    "failed",
+                    None,
+                    Some(&format!("{e:#}")),
+                )
+                .ok();
+            }
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "job_uid": job_uid, "status": "pending" })),
+    ))
+}
+
+async fn get_capture_job_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((archive_id, job_uid)): Path<(String, String)>,
+) -> Result<Json<archive::CaptureJobSummary>, ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    archive::get_capture_job(&conn, &job_uid)?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("capture job not found"))
 }
 
 async fn auth_setup_status(
@@ -1421,4 +1483,28 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+
+    #[tokio::test]
+    async fn capture_post_returns_accepted_with_job_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(r#"{"locator":"local:/nonexistent"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["job_uid"].as_str().is_some(), "response must have job_uid");
+        assert_eq!(json["status"], "pending");
+    }
 }
