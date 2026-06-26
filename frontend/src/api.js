@@ -64,9 +64,14 @@ export async function submitCapture(archiveId, locator) {
     body: JSON.stringify({ locator }),
   });
   if (!res.ok) {
-    const msg = await res.text();
-    throw new Error(msg || `HTTP ${res.status}`);
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `HTTP ${res.status}`);
   }
+  return res.json(); // { job_uid, status: "pending" }
+}
+
+export async function pollCaptureJob(archiveId, jobUid) {
+  return getJson(`/api/archives/${archiveId}/capture_jobs/${jobUid}`);
 }
 
 // ── Auth helpers ─────────────────────────────────────────────────────────────
