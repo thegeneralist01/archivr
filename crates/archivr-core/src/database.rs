@@ -130,6 +130,14 @@ pub struct RoleRecord {
     pub is_builtin: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InstanceSettings {
+    pub public_index_enabled: bool,
+    pub public_entry_content_enabled: bool,
+    pub open_registration_enabled: bool,  // maps to public_archive_submission_enabled column
+    pub default_entry_visibility: u32,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CollectionRecord {
     pub id: i64,
@@ -417,6 +425,7 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
             username      TEXT NOT NULL UNIQUE,
             email         TEXT UNIQUE,
             password_hash TEXT NOT NULL,
+            display_name  TEXT,
             status        TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
             role          TEXT NOT NULL CHECK (role IN ('admin', 'user')),
             created_at    TEXT NOT NULL,
@@ -424,6 +433,9 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    // Add display_name column to users if not present (idempotent migration)
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN display_name TEXT", []);
+
     Ok(())
 }
 
@@ -643,6 +655,78 @@ pub fn list_user_tokens(conn: &Connection, user_id: i64) -> Result<Vec<ApiTokenR
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(records)
+}
+
+pub fn get_instance_settings(conn: &Connection) -> Result<InstanceSettings> {
+    conn.query_row(
+        "SELECT public_index_enabled, public_entry_content_enabled,
+                public_archive_submission_enabled, default_entry_visibility
+         FROM instance_settings WHERE id = 1",
+        [],
+        |row| {
+            Ok(InstanceSettings {
+                public_index_enabled: row.get::<_, i64>(0)? != 0,
+                public_entry_content_enabled: row.get::<_, i64>(1)? != 0,
+                open_registration_enabled: row.get::<_, i64>(2)? != 0,
+                default_entry_visibility: row.get::<_, i64>(3)? as u32,
+            })
+        },
+    )
+    .map_err(Into::into)
+}
+
+pub fn update_instance_settings(conn: &Connection, settings: &InstanceSettings) -> Result<()> {
+    conn.execute(
+        "UPDATE instance_settings
+         SET public_index_enabled = ?1,
+             public_entry_content_enabled = ?2,
+             public_archive_submission_enabled = ?3,
+             default_entry_visibility = ?4
+         WHERE id = 1",
+        params![
+            settings.public_index_enabled as i64,
+            settings.public_entry_content_enabled as i64,
+            settings.open_registration_enabled as i64,
+            settings.default_entry_visibility as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_user_password_hash(conn: &Connection, user_id: i64) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT password_hash FROM users WHERE id = ?1",
+        [user_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn update_user_password(conn: &Connection, user_id: i64, new_hash: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE users SET password_hash = ?1 WHERE id = ?2",
+        params![new_hash, user_id],
+    )?;
+    Ok(())
+}
+
+pub fn update_user_display_name(conn: &Connection, user_id: i64, display_name: Option<&str>) -> Result<()> {
+    conn.execute(
+        "UPDATE users SET display_name = ?1 WHERE id = ?2",
+        params![display_name, user_id],
+    )?;
+    Ok(())
+}
+
+pub fn get_user_display_name(conn: &Connection, user_id: i64) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT display_name FROM users WHERE id = ?1",
+        [user_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 /// Deletes all sessions for a user. Called on ban or role change.
