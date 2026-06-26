@@ -16,10 +16,13 @@ pub struct MountedArchive {
 pub struct ServerRegistry {
     #[serde(default)]
     pub archives: Vec<MountedArchive>,
-    /// Optional bind address for the server. Defaults to `127.0.0.1:8080`.
-    /// Set this to `0.0.0.0:8080` only on trusted networks — the server has no authentication.
+    /// Optional bind address. Defaults to `127.0.0.1:8080`.
     #[serde(default)]
     pub bind: Option<String>,
+    /// Path to the server-level auth database.
+    /// Defaults to `archivr-auth.sqlite` in the same directory as the config file.
+    #[serde(default)]
+    pub auth_db_path: Option<std::path::PathBuf>,
 }
 
 pub fn load_registry(path: &Path) -> Result<ServerRegistry> {
@@ -43,19 +46,16 @@ pub fn save_registry(path: &Path, registry: &ServerRegistry) -> Result<()> {
 }
 
 pub fn validate_registry(registry: &ServerRegistry) -> Result<()> {
-    let mut ids = std::collections::HashSet::new();
+    let mut seen_ids = std::collections::HashSet::new();
     for archive in &registry.archives {
         if archive.id.trim().is_empty() {
             bail!("archive id must not be empty");
         }
-        if !ids.insert(archive.id.as_str()) {
+        if !seen_ids.insert(archive.id.clone()) {
             bail!("duplicate archive id: {}", archive.id);
         }
-        if !archive.archive_path.ends_with(".archivr") {
-            bail!(
-                "mounted archive path must point at a .archivr directory: {}",
-                archive.archive_path.display()
-            );
+        if archive.label.trim().is_empty() {
+            bail!("archive label must not be empty for id={}", archive.id);
         }
     }
     Ok(())
@@ -84,6 +84,7 @@ mod tests {
                 archive_path: archive_path.clone(),
             }],
             bind: None,
+            auth_db_path: None,
         };
         let path = temp.path().join("server.toml");
         save_registry(&path, &registry).unwrap();
@@ -109,6 +110,7 @@ mod tests {
                 },
             ],
             bind: None,
+            auth_db_path: None,
         };
 
         let err = validate_registry(&registry).unwrap_err().to_string();
@@ -136,6 +138,7 @@ mod tests {
         let registry = ServerRegistry {
             archives: vec![],
             bind: Some("0.0.0.0:8080".to_string()),
+            auth_db_path: None,
         };
         // validate_registry does not reject non-loopback bind — that's main's concern.
         assert!(validate_registry(&registry).is_ok());
