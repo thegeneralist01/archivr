@@ -430,8 +430,7 @@ pub fn create_session(
     let expires_at = chrono::Utc::now()
         .checked_add_signed(chrono::Duration::days(30))
         .unwrap()
-        .format("%Y-%m-%dT%H-%M-%S%.3f")
-        .to_string();
+        .to_rfc3339();
     conn.execute(
         "INSERT INTO sessions (session_uid, user_id, role_bits, created_at, last_seen_at, expires_at, user_agent)
          VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6)",
@@ -475,8 +474,7 @@ pub fn touch_session(conn: &Connection, session_uid: &str) -> Result<()> {
     let new_expires = chrono::Utc::now()
         .checked_add_signed(chrono::Duration::days(30))
         .unwrap()
-        .format("%Y-%m-%dT%H-%M-%S%.3f")
-        .to_string();
+        .to_rfc3339();
     conn.execute(
         "UPDATE sessions SET last_seen_at = ?1, expires_at = ?2 WHERE session_uid = ?3",
         params![now, new_expires, session_uid],

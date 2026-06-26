@@ -648,6 +648,18 @@ mod tests {
         (registry, paths.archive_path, auth_path)
     }
 
+    /// Creates a session for the seeded 'testowner' and returns the cookie string.
+    fn make_test_session(auth_path: &std::path::Path) -> String {
+        let conn = archivr_core::database::open_auth_db(auth_path).unwrap();
+        let user_id: i64 = conn
+            .query_row("SELECT id FROM users WHERE username = 'testowner'", [], |r| r.get(0))
+            .unwrap();
+        let role_bits = archivr_core::database::compute_role_bits(&conn, user_id).unwrap();
+        let sess_uid =
+            archivr_core::database::create_session(&conn, user_id, role_bits, None).unwrap();
+        format!("session={}", sess_uid)
+    }
+
     fn make_test_entry(archive_path: &std::path::Path) -> archivr_core::database::ArchivedEntry {
         let conn = database::open_or_initialize(archive_path).unwrap();
         let user_id = database::ensure_default_user(&conn).unwrap();
@@ -1001,7 +1013,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED); // auth fires before archive lookup
     }
 
     #[tokio::test]
@@ -1019,13 +1031,14 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED); // auth fires before validation
     }
 
     #[tokio::test]
     async fn test_tag_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
 
         let create_response = app(registry.clone(), auth_path.clone())
             .oneshot(
@@ -1033,13 +1046,13 @@ mod tests {
                     .method("POST")
                     .uri("/api/archives/test/tags")
                     .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
                     .body(json_body(&serde_json::json!({"path": "/science"})))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(create_response.status(), StatusCode::CREATED);
-
         let list_response = app(registry.clone(), auth_path.clone())
             .oneshot(
                 Request::builder()
@@ -1067,6 +1080,7 @@ mod tests {
         let entry = make_test_entry(&archive_path);
         let entry_uid = entry.entry_uid.clone();
         let entry_tags_uri = format!("/api/archives/test/entries/{entry_uid}/tags");
+        let session_cookie = make_test_session(&auth_path);
 
         // Assign tag
         let assign_response = app(registry.clone(), auth_path.clone())
@@ -1075,6 +1089,7 @@ mod tests {
                     .method("POST")
                     .uri(&entry_tags_uri)
                     .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
                     .body(json_body(&serde_json::json!({"tag_path": "/science"})))
                     .unwrap(),
             )
@@ -1105,6 +1120,7 @@ mod tests {
                 Request::builder()
                     .method("DELETE")
                     .uri(&delete_uri)
+                    .header("cookie", &session_cookie)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1133,6 +1149,7 @@ mod tests {
         let (registry, archive_path, auth_path) = make_test_registry(&dir);
         let entry = make_test_entry(&archive_path);
         let entry_uid = entry.entry_uid.clone();
+        let session_cookie = make_test_session(&auth_path);
 
         // Assign /science tag to entry
         let assign_resp = app(registry.clone(), auth_path.clone())
@@ -1141,6 +1158,7 @@ mod tests {
                     .method("POST")
                     .uri(format!("/api/archives/test/entries/{entry_uid}/tags"))
                     .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
                     .body(json_body(&serde_json::json!({"tag_path": "/science"})))
                     .unwrap(),
             )
@@ -1216,7 +1234,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED); // auth fires before entry lookup
     }
 
     #[tokio::test]
@@ -1236,7 +1254,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED); // auth fires before validation
     }
 
     #[tokio::test]
@@ -1253,7 +1271,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED); // auth fires before entry lookup
     }
 
     #[tokio::test]
