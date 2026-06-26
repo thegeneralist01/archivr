@@ -118,11 +118,20 @@ custom roles get bit_position≥4. Ban invalidates all sessions. Only-owner guar
 
 ---
 
-### 6. Permissions & visibility — collection model
+### ~~6. Permissions & visibility — collection model~~ ✅ Done
 
-**What:** Replace `archived_entries.visibility` with a `collections` + `collection_entries`
-model where visibility is a role-bitmask per entry-in-collection. Enforce visibility on all
-API queries. Collection UI (create, set visibility, add entries).
+**Implemented:** `database.rs`: `collections` + `collection_entries` tables; seed default collection ('All Entries');
+migration inserts existing entries into default collection with `visibility_bits` derived from legacy `visibility` string
+(`'public'`→3, `'unlisted'`→2, `'private'`→0). 8 new pub functions (`ensure_default_collection`, `create_collection`,
+`list_collections`, `get_collection_by_uid`, `add_entry_to_collection`, `update_collection_entry_visibility`,
+`remove_entry_from_collection`, `get_entry_collection_memberships`). `create_archived_entry` auto-enrolls new entries
+into the default collection. `archive.rs`: `list_root_entries` + `search_entries` accept `caller_bits: u32` and enforce
+collection visibility (`admin/owner bypass`; others filtered by `visibility_bits & caller_bits`). `list_entries_for_collection`,
+`get_entry_collections`, `EntryCollectionMembership` added. `routes.rs`: read routes extract auth and pass caller_bits;
+5 collection-entry route groups (`GET|POST /api/archives/:id/collections`, `GET /api/archives/:id/collections/:uid`,
+`POST|DELETE|PATCH /api/archives/:id/collections/:uid/entries(/:entry_uid)`,
+`GET /api/archives/:id/entries/:uid/collections`). Frontend: `CollectionsView.jsx` (list + detail + create form);
+`collections` nav item in Topbar; entry collection memberships + visibility shown in ContextRail. 169 tests green.
 Depends on Track 5.
 
 ---
@@ -196,12 +205,12 @@ and a corresponding downloader module. Consider `rclone` as a shell-out strategy
 
 ## What to Do First
 
-Tracks 1, 2, 3, 4, and 5 are complete. Track 6 (permissions & visibility) is the next priority.
+Tracks 1, 2, 3, 4, 5, and 6 are complete. Track 7 (settings) is the next priority.
 
 Open the next thread with:
 
 ```text
-Read ARCHIVR-MENTAL-MODEL.md and NEXT.md. I want to implement Track 6: permissions and
-visibility — the collection model. Create a task-level implementation plan first, then wait
-for approval.
+Read ARCHIVR-MENTAL-MODEL.md and NEXT.md. I want to implement Track 7: settings —
+account profile, password change, instance settings UI, API token management.
+Create a task-level implementation plan first, then wait for approval.
 ```
