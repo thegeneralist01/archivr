@@ -73,6 +73,7 @@
               cargoLock
               nativeBuildInputs
               ;
+            buildInputs = [ pkgs.openssl ];
             cargoBuildFlags = [
               "-p"
               "archivr-cli"
@@ -90,6 +91,7 @@
               cargoLock
               nativeBuildInputs
               ;
+            buildInputs = [ pkgs.openssl ];
             cargoBuildFlags = [
               "-p"
               "archivr-server"
