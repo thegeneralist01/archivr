@@ -23,3 +23,10 @@
 !frontend/**
 frontend/node_modules/
 frontend/node_modules/**
+frontend/result
+frontend/result/**
+frontend/dist/
+frontend/dist/**
+.DS_Store
+frontend/storybook-static/
+frontend/storybook-static/**

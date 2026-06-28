@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [react()],
   build: {
     outDir: "../crates/archivr-server/static",
-    emptyOutDir: false,
+    emptyOutDir: true,
     assetsDir: "assets",
   },
 });

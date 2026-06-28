@@ -192,7 +192,7 @@ export default function CollectionsView({ archiveId }) {
           {collections.map(c => (
             <button
               key={c.collection_uid}
-              className={`coll-row${selectedUid === c.collection_uid ? ' is-active' : ''}`}
+              className={`coll-sidebar-row${selectedUid === c.collection_uid ? ' is-active' : ''}`}
               onClick={() => setSelectedUid(c.collection_uid)}
             >
               <span className="coll-row-name">{c.name}</span>

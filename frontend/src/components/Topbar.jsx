@@ -16,10 +16,12 @@ export default function Topbar({ archives, archiveId, onArchiveChange, view, onV
   return (
     <header className="topbar">
       <div className="brand">Archivr</div>
-      <select className="archive-switcher" aria-label="Select archive"
-        value={archiveId ?? ''} onChange={e => onArchiveChange(e.target.value)}>
-        {archives.map(a => <option key={a.id} value={a.id}>{a.label}</option>)}
-      </select>
+      <div className="switcher">
+        <select aria-label="Select archive"
+          value={archiveId ?? ''} onChange={e => onArchiveChange(e.target.value)}>
+          {archives.map(a => <option key={a.id} value={a.id}>{a.label}</option>)}
+        </select>
+      </div>
       <nav className="nav" aria-label="Primary">
         {['archive', 'runs', 'admin', 'tags', 'collections', 'settings'].map(name => (
           <button key={name} className={`nav-link${view === name ? ' is-active' : ''}`}

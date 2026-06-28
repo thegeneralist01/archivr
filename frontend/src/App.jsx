@@ -172,23 +172,32 @@ export default function App() {
         <main className="app-shell">
           <div className="workspace">
             {view === 'archive' && (
-              <div className="search-row">
-                <input
-                  className="search-input"
-                  type="search"
-                  aria-label="Search archive"
-                  aria-busy={searchBusy}
-                  value={searchQuery}
-                  onChange={e => setSearchQuery(e.target.value)}
-                />
-                <div className="result-count">
-                  {resultCount}
+              <div className="toolbar">
+                <div className="search-field">
+                  <span className="ico" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                      <circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/>
+                    </svg>
+                  </span>
+                  <input
+                    className="search-input"
+                    type="search"
+                    aria-label="Search archive"
+                    aria-busy={searchBusy}
+                    placeholder="Search titles, URLs, types, tags…"
+                    value={searchQuery}
+                    onChange={e => setSearchQuery(e.target.value)}
+                  />
+                  <span className="kbd">⌘K</span>
+                </div>
+                <span className="result-count">
+                  {resultCount && <><b>{resultCount.split(' ')[0]}</b>{' '}{resultCount.split(' ').slice(1).join(' ')}</>}
                   {tagFilter && (
                     <button className="tag-filter-badge" onClick={handleClearTagFilter}>
                       × {tagFilter}
                     </button>
                   )}
-                </div>
+                </span>
               </div>
             )}
             {view === 'archive' && (
