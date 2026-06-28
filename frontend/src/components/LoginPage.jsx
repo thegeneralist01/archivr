@@ -23,32 +23,41 @@ export default function LoginPage({ onLogin }) {
 
   return (
     <div className="login-page">
-      <h1>Archivr</h1>
-      <form onSubmit={handleSubmit}>
-        <label>
-          Username
-          <input
-            type="text"
-            value={username}
-            onChange={e => setUsername(e.target.value)}
-            autoFocus
-            required
-          />
-        </label>
-        <label>
-          Password
-          <input
-            type="password"
-            value={password}
-            onChange={e => setPassword(e.target.value)}
-            required
-          />
-        </label>
-        {error && <p className="error">{error}</p>}
-        <button type="submit" disabled={loading}>
-          {loading ? 'Logging in\u2026' : 'Log in'}
-        </button>
-      </form>
+      <div className="login-card">
+        <h1 className="login-brand">Archivr</h1>
+        <p className="login-tagline">Sign in to your archive</p>
+        <form onSubmit={handleSubmit}>
+          <div className="login-field">
+            <label className="login-label" htmlFor="login-username">Username</label>
+            <input
+              className="login-input"
+              id="login-username"
+              type="text"
+              value={username}
+              onChange={e => setUsername(e.target.value)}
+              autoFocus
+              required
+              autoComplete="username"
+            />
+          </div>
+          <div className="login-field">
+            <label className="login-label" htmlFor="login-password">Password</label>
+            <input
+              className="login-input"
+              id="login-password"
+              type="password"
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              required
+              autoComplete="current-password"
+            />
+          </div>
+          {error && <p className="login-error">{error}</p>}
+          <button className="login-submit" type="submit" disabled={loading}>
+            {loading ? 'Signing in\u2026' : 'Sign in'}
+          </button>
+        </form>
+      </div>
     </div>
   );
 }

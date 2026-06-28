@@ -70,7 +70,7 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
     ['Added',      formatTimestamp(detail.summary.archived_at)],
     ['Source',     detail.summary.source_kind],
     ['Type',       detail.summary.entity_kind],
-    ['Visibility', detail.summary.visibility],
+    ['Visibility', VIS_LABEL[detail.summary.visibility] ?? detail.summary.visibility],
     ['Root',       detail.structured_root_relpath],
   ] : []
 
@@ -158,7 +158,7 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
               </div>
             )}
             {assignError && (
-              <p style={{ color: 'var(--accent)', fontSize: 13, margin: '0 0 8px' }}>{assignError}</p>
+              <p className="form-msg form-msg--err" style={{ margin: '0 0 8px' }}>{assignError}</p>
             )}
             <div className="tag-input-wrap">
               <span className="hash">/</span>

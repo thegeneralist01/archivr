@@ -33,9 +33,8 @@ export default function Topbar({ archives, archiveId, onArchiveChange, view, onV
       <button className="capture-button" onClick={onCaptureClick}>+ Capture</button>
       {currentUser && (
         <div className="user-menu">
-          <span className="username">{currentUser.display_name || currentUser.username}</span>
-          <button className="nav-link" onClick={() => onViewChange('settings')} style={{ color: '#d7cdbf', fontSize: 13 }}>Settings</button>
-          <button onClick={handleLogout} disabled={loggingOut} className="logout-btn">
+          <span className="user-name">{currentUser.display_name || currentUser.username}</span>
+          <button className="logout-btn" onClick={handleLogout} disabled={loggingOut}>
             {loggingOut ? 'Logging out\u2026' : 'Log out'}
           </button>
         </div>

@@ -32,42 +32,53 @@ export default function SetupPage({ onComplete }) {
 
   return (
     <div className="setup-page">
-      <h1>Welcome to Archivr</h1>
-      <p>Create your owner account to get started.</p>
-      <form onSubmit={handleSubmit}>
-        <label>
-          Username
-          <input
-            type="text"
-            value={username}
-            onChange={e => setUsername(e.target.value)}
-            autoFocus
-            required
-          />
-        </label>
-        <label>
-          Password
-          <input
-            type="password"
-            value={password}
-            onChange={e => setPassword(e.target.value)}
-            required
-          />
-        </label>
-        <label>
-          Confirm password
-          <input
-            type="password"
-            value={confirm}
-            onChange={e => setConfirm(e.target.value)}
-            required
-          />
-        </label>
-        {error && <p className="error">{error}</p>}
-        <button type="submit" disabled={loading}>
-          {loading ? 'Creating account\u2026' : 'Create account'}
-        </button>
-      </form>
+      <div className="setup-card">
+        <h1 className="setup-brand">Archivr</h1>
+        <p className="setup-tagline">Create your owner account to get started.</p>
+        <form onSubmit={handleSubmit}>
+          <div className="setup-field">
+            <label className="setup-label" htmlFor="setup-username">Username</label>
+            <input
+              className="setup-input"
+              id="setup-username"
+              type="text"
+              value={username}
+              onChange={e => setUsername(e.target.value)}
+              autoFocus
+              required
+              autoComplete="username"
+            />
+          </div>
+          <div className="setup-field">
+            <label className="setup-label" htmlFor="setup-password">Password</label>
+            <input
+              className="setup-input"
+              id="setup-password"
+              type="password"
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              required
+              autoComplete="new-password"
+            />
+          </div>
+          <div className="setup-field">
+            <label className="setup-label" htmlFor="setup-confirm">Confirm password</label>
+            <input
+              className="setup-input"
+              id="setup-confirm"
+              type="password"
+              value={confirm}
+              onChange={e => setConfirm(e.target.value)}
+              required
+              autoComplete="new-password"
+            />
+          </div>
+          {error && <p className="setup-error">{error}</p>}
+          <button className="setup-submit" type="submit" disabled={loading}>
+            {loading ? 'Creating account\u2026' : 'Create account'}
+          </button>
+        </form>
+      </div>
     </div>
   );
 }

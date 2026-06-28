@@ -31,8 +31,14 @@ export default function TagsView({ tagNodes, tagFilter, onTagFilterSet, onViewCh
   return (
     <section id="tags-view" className="view is-active">
       <div className="tag-tree">
+        <div className="tag-tree-header">
+          <span className="tag-tree-title">Tags</span>
+          {tagFilter && (
+            <span className="tag-tree-active">Filtering: {tagFilter}</span>
+          )}
+        </div>
         {tagNodes.length === 0 ? (
-          <div>No tags yet.</div>
+          <p className="muted" style={{ padding: '8px 0' }}>No tags yet.</p>
         ) : (
           <ul className="tag-tree-list">
             {tagNodes.map(node => (

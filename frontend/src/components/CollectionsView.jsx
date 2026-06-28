@@ -324,40 +324,43 @@ export default function CollectionsView({ archiveId }) {
       </div>
 
       {/* Create form */}
-      <details className="coll-create-details" style={{ marginTop: '1.5rem' }}>
-        <summary style={{ cursor: 'pointer', fontWeight: 600 }}>Create collection</summary>
-        <form onSubmit={handleCreate} style={{ marginTop: '0.75rem', display: 'flex', flexDirection: 'column', gap: '0.5rem', maxWidth: 400 }}>
-          <label>
-            Name
+      <details className="coll-create-details">
+        <summary>+ Create collection</summary>
+        <form className="coll-create-form" onSubmit={handleCreate}>
+          <div className="form-field">
+            <label className="form-label" htmlFor="coll-name">Name</label>
             <input
               className="capture-input"
+              id="coll-name"
               type="text"
               value={newName}
               onChange={e => { setNewName(e.target.value); if (!newSlug) setNewSlug(e.target.value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')) }}
               placeholder="My Collection"
               required
             />
-          </label>
-          <label>
-            Slug
+          </div>
+          <div className="form-field">
+            <label className="form-label" htmlFor="coll-slug">Slug</label>
             <input
               className="capture-input"
+              id="coll-slug"
               type="text"
               value={newSlug}
               onChange={e => setNewSlug(e.target.value)}
               placeholder="my-collection"
               required
             />
-          </label>
-          <label>
-            Default visibility
-            <select className="capture-input" style={{ height: 42 }} value={newVis} onChange={e => setNewVis(Number(e.target.value))}>
+          </div>
+          <div className="form-field">
+            <label className="form-label" htmlFor="coll-vis">Default visibility</label>
+            <select className="capture-input" id="coll-vis" style={{ height: 42 }}
+              value={newVis} onChange={e => setNewVis(Number(e.target.value))}>
               {VIS_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
             </select>
-          </label>
+          </div>
           {createError && <div className="collections-error">{createError}</div>}
-          <button className="capture-submit" type="submit" disabled={creating} style={{ alignSelf: 'flex-start', padding: '8px 20px' }}>
-            {creating ? 'Creating…' : 'Create'}
+          <button className="btn-primary" type="submit" disabled={creating}>
+            {creating ? 'Creating\u2026' : 'Create collection'}
           </button>
         </form>
       </details>

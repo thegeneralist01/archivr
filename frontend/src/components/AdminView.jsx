@@ -114,13 +114,13 @@ export default function AdminView({ archives }) {
     <section id="admin-view" className="view admin-view is-active">
       <h1>Admin</h1>
 
-      <div className="admin-tabs">
-        <button className={`admin-tab${tab === 'users' ? ' is-active' : ''}`} onClick={() => setTab('users')}>Users</button>
-        <button className={`admin-tab${tab === 'roles' ? ' is-active' : ''}`} onClick={() => setTab('roles')}>Roles</button>
-        <button className={`admin-tab${tab === 'archives' ? ' is-active' : ''}`} onClick={() => setTab('archives')}>Archives</button>
+      <div className="view-tabs">
+        <button className={`view-tab${tab === 'users' ? ' is-active' : ''}`} onClick={() => setTab('users')}>Users</button>
+        <button className={`view-tab${tab === 'roles' ? ' is-active' : ''}`} onClick={() => setTab('roles')}>Roles</button>
+        <button className={`view-tab${tab === 'archives' ? ' is-active' : ''}`} onClick={() => setTab('archives')}>Archives</button>
       </div>
 
-      {error && <div className="capture-error">{error}</div>}
+      {error && <div className="form-msg form-msg--err">{error}</div>}
 
       {tab === 'users' && (
         <div className="admin-section">
@@ -156,9 +156,9 @@ export default function AdminView({ archives }) {
               value={newPassword} onChange={e => setNewPassword(e.target.value)} required />
             <input className="admin-input" type="email" placeholder="Email (optional)"
               value={newEmail} onChange={e => setNewEmail(e.target.value)} />
-            {createError && <div className="capture-error">{createError}</div>}
-            <button className="capture-submit" type="submit" disabled={creating}>
-              {creating ? 'Creating…' : 'Create User'}
+            {createError && <div className="form-msg form-msg--err">{createError}</div>}
+            <button className="btn-primary" type="submit" disabled={creating}>
+              {creating ? 'Creating\u2026' : 'Create User'}
             </button>
           </form>
         </div>
@@ -192,9 +192,9 @@ export default function AdminView({ archives }) {
               onChange={e => setNewRoleSlug(e.target.value)} required />
             <input className="admin-input" placeholder="Display Name (e.g. Moderator)"
               value={newRoleName} onChange={e => setNewRoleName(e.target.value)} required />
-            {roleCreateError && <div className="capture-error">{roleCreateError}</div>}
-            <button className="capture-submit" type="submit" disabled={creatingRole}>
-              {creatingRole ? 'Creating…' : 'Create Role'}
+            {roleCreateError && <div className="form-msg form-msg--err">{roleCreateError}</div>}
+            <button className="btn-primary" type="submit" disabled={creatingRole}>
+              {creatingRole ? 'Creating\u2026' : 'Create Role'}
             </button>
           </form>
         </div>
