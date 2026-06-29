@@ -21,7 +21,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -31,7 +31,7 @@ use parking_lot::Mutex;
 use archivr_core::{archive, capture, database};
 use axum::{
     Json, Router,
-    extract::{Path, Query, Request, State},
+    extract::{ConnectInfo, Path, Query, Request, State},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -165,12 +165,39 @@ async fn login_rate_limit(
 }
 
 fn extract_client_ip(req: &Request) -> IpAddr {
-    req.headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(IpAddr::from([127, 0, 0, 1]))
+    // Attempt to read the real peer address injected by
+    // `into_make_service_with_connect_info` in main.rs.
+    let peer_ip: Option<IpAddr> = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
+
+    match peer_ip {
+        // Peer is a loopback address → the connection came from a local
+        // reverse proxy (nginx/caddy on the same host). Trust the first
+        // address in X-Forwarded-For as the real client IP.
+        Some(peer) if peer.is_loopback() => req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(peer),
+
+        // Peer is a real address → use it directly; ignoring X-Forwarded-For
+        // prevents header-spoofing attacks.
+        Some(peer) => peer,
+
+        // No ConnectInfo present (unit tests using .oneshot() without a real
+        // socket). Fall back to XFF for test compatibility.
+        None => req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(IpAddr::from([127, 0, 0, 1])),
+    }
 }
 
 /// Build the Axum router from a pre-constructed `AppState`.

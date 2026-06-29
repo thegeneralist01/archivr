@@ -6,10 +6,13 @@
 let
   cfg = config.services.archivr-server;
 
+  # Derived bind string from separate address + port options.
+  bindStr = "${cfg.listenAddress}:${toString cfg.port}";
+
   # Generate the TOML registry file from NixOS options.
   # The auth DB is pinned to the StateDirectory so it survives upgrades.
   configFile = pkgs.writeText "archivr-server.toml" ''
-    bind = "${cfg.bind}"
+    bind = "${bindStr}"
     auth_db_path = "/var/lib/archivr-server/archivr-auth.sqlite"
 
     ${lib.concatMapStrings (a: ''
@@ -32,15 +35,22 @@ in
       description = "The archivr-server package to use.";
     };
 
-    bind = lib.mkOption {
+    listenAddress = lib.mkOption {
       type = lib.types.str;
-      default = "127.0.0.1:8080";
-      example = "0.0.0.0:8080";
+      default = "127.0.0.1";
+      example = "0.0.0.0";
       description = ''
-        Address and port to listen on. Defaults to loopback only.
-        Binding to a non-loopback address exposes the server on the network;
-        put a reverse proxy with TLS and authentication in front before doing so.
+        IP address to listen on. Defaults to loopback only (127.0.0.1).
+        Set to {code}`0.0.0.0` (or a specific interface address) to expose
+        the server on the network. Always put a reverse proxy with TLS
+        in front before doing this.
       '';
+    };
+
+    port = lib.mkOption {
+      type = lib.types.port;
+      default = 8080;
+      description = "TCP port to listen on.";
     };
 
     archives = lib.mkOption {
@@ -59,7 +69,9 @@ in
           path = lib.mkOption {
             type = lib.types.str;
             example = "/srv/archivr/personal/.archivr";
-            description = "Absolute path to the .archivr directory created by {command}`archivr init`.";
+            description = ''Absolute path to the .archivr directory created by {command}`archivr init`.
+              The parent directory (which also contains the {file}`store/` blob directory)
+              is whitelisted for read-write access under systemd hardening.'';
           };
         };
       });
@@ -92,9 +104,10 @@ in
       type = lib.types.bool;
       default = false;
       description = ''
-        Open the firewall TCP port derived from
-        {option}`services.archivr-server.bind`. Only meaningful when binding
-        to a non-loopback address.
+        Open the firewall TCP port specified by
+        {option}`services.archivr-server.port`. Only meaningful when
+        {option}`services.archivr-server.listenAddress` is set to a
+        non-loopback address.
       '';
     };
   };
@@ -134,11 +147,14 @@ in
         RestartSec = "5s";
 
         # Hardening — make the entire FS read-only except for the state
-        # directory and the mounted archive directories.
+        # directory and the parent directory of each mounted archive.
+        # Each archive_path is an .archivr dir; its sibling store/ dir (where
+        # capture artifacts are written) lives at the same level. Whitelisting
+        # the parent covers both without over-permissioning.
         NoNewPrivileges = true;
         PrivateTmp = true;
         ProtectSystem = "strict";
-        ReadWritePaths = [ "/var/lib/archivr-server" ] ++ (map (a: a.path) cfg.archives);
+        ReadWritePaths = [ "/var/lib/archivr-server" ] ++ (map (a: builtins.dirOf a.path) cfg.archives);
         RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
         LockPersonality = true;
         RestrictNamespaces = true;
@@ -148,9 +164,7 @@ in
     };
 
     networking.firewall = lib.mkIf cfg.openFirewall {
-      allowedTCPPorts = [
-        (lib.toInt (lib.last (lib.splitString ":" cfg.bind)))
-      ];
+      allowedTCPPorts = [ cfg.port ];
     };
   };
 }

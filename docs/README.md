@@ -154,7 +154,8 @@ enable the service:
         {
           services.archivr-server = {
             enable = true;
-            bind = "127.0.0.1:8080";   # loopback only; put nginx/caddy in front for TLS
+            # listenAddress defaults to "127.0.0.1" (loopback only)
+            # port defaults to 8080
             archives = [
               { id = "personal"; label = "Personal"; path = "/srv/archivr/personal/.archivr"; }
               { id = "work";     label = "Work";     path = "/srv/archivr/work/.archivr"; }
@@ -180,7 +181,8 @@ Only needed when binding to a non-loopback address:
 
 ```nix
 services.archivr-server = {
-  bind = "0.0.0.0:8080";
+  listenAddress = "0.0.0.0";
+  port = 8080;            # explicit, though 8080 is the default
   openFirewall = true;
 };
 ```
