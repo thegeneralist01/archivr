@@ -16,11 +16,12 @@
   inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
 
   outputs =
-    { nixpkgs, ... }:
+    { nixpkgs, self, ... }:
     let
       lib = nixpkgs.lib;
       systems = [
         "x86_64-linux"
+        "aarch64-linux"
         "aarch64-darwin"
       ];
     in
@@ -170,6 +171,11 @@
           archivr-server-unwrapped = archivr_server_unwrapped;
         }
       );
+
+      nixosModules = {
+        archivr-server = import ./modules/nixos/archivr-server.nix { inherit self; };
+        default = self.nixosModules.archivr-server;
+      };
 
       devShells = lib.genAttrs systems (
         system:
