@@ -137,6 +137,60 @@ Auth and session handling will be designed when remote or public hosting becomes
 - X/Twitter Tweet content scrape: [Tweet and Thread shorthands](#supported-shorthand-inputs). (These are saved as JSON files in `raw_tweets/`)
 - Instagram, Facebook, TikTok, Reddit, Snapchat: direct URLs or platform-prefixed shorthand passed through to `yt-dlp`
 
+### Hosting on NixOS
+
+The flake exposes a `nixosModules.default` output. Add it to your system flake and
+enable the service:
+
+```nix
+# flake.nix (your system flake)
+{
+  inputs.archivr.url = "github:thegeneralist/archivr";
+
+  outputs = { nixpkgs, archivr, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      modules = [
+        archivr.nixosModules.default
+        {
+          services.archivr-server = {
+            enable = true;
+            # listenAddress defaults to "127.0.0.1" (loopback only)
+            # port defaults to 8080
+            archives = [
+              { id = "personal"; label = "Personal"; path = "/srv/archivr/personal/.archivr"; }
+              { id = "work";     label = "Work";     path = "/srv/archivr/work/.archivr"; }
+            ];
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+The module:
+- Creates an `archivr` system user and group.
+- Generates the TOML config from your options and stores the auth database under
+  `/var/lib/archivr-server/` (persists across upgrades).
+- Runs under a hardened systemd unit (`ProtectSystem = strict`, `NoNewPrivileges`,
+  `PrivateTmp`, etc.). Archive directories are whitelisted for read-write access.
+- Restarts automatically on failure.
+
+**`openFirewall`** — set to `true` to open the TCP port derived from `bind`.
+Only needed when binding to a non-loopback address:
+
+```nix
+services.archivr-server = {
+  listenAddress = "0.0.0.0";
+  port = 8080;            # explicit, though 8080 is the default
+  openFirewall = true;
+};
+```
+
+**Archive directories** must be readable and writable by the `archivr` user.
+Initialise them with `archivr init` first, then `chown -R archivr:archivr /srv/archivr`.
+
+
 ### Supported Shorthand Inputs
 
 - YouTube video/short media:

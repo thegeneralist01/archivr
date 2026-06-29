@@ -19,6 +19,9 @@
 !ARCHIVR-MENTAL-MODEL.md
 !NEXT.md
 
+!modules/
+!modules/**
+
 !frontend/
 !frontend/**
 frontend/node_modules/

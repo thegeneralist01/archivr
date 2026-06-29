@@ -70,8 +70,10 @@ export default function App() {
     }
   }, [])
 
-  // Mount: load archives, pick first, then parallel load
+  // Load archives once authenticated (re-runs when authState changes so
+  // it triggers correctly after first login or a session refresh).
   useEffect(() => {
+    if (authState !== 'authenticated') return
     fetchArchives().then(list => {
       setArchives(list)
       if (list.length > 0) {
@@ -79,7 +81,7 @@ export default function App() {
         setArchiveId(first)
       }
     })
-  }, [])
+  }, [authState])
 
   // Archive change: parallel load entries + runs + tags
   useEffect(() => {
