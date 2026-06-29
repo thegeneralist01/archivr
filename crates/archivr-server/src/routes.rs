@@ -174,13 +174,15 @@ fn extract_client_ip(req: &Request) -> IpAddr {
 
     match peer_ip {
         // Peer is a loopback address → the connection came from a local
-        // reverse proxy (nginx/caddy on the same host). Trust the first
-        // address in X-Forwarded-For as the real client IP.
+        // reverse proxy (nginx/caddy on the same host). Trust the last
+        // address in X-Forwarded-For as the real client IP — the last entry
+        // is always appended by the trusted proxy, even if the client sent a
+        // spoofed value earlier in the chain.
         Some(peer) if peer.is_loopback() => req
             .headers()
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next())
+            .and_then(|s| s.split(',').last())
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(peer),
 

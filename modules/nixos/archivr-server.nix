@@ -6,8 +6,16 @@
 let
   cfg = config.services.archivr-server;
 
+  # Escape characters that would break TOML double-quoted strings.
+  escapeTOML = s: builtins.replaceStrings [ "\\" "\"" ] [ "\\\\" "\\\"" ] s;
+
   # Derived bind string from separate address + port options.
-  bindStr = "${cfg.listenAddress}:${toString cfg.port}";
+  # IPv6 addresses contain ":" and must be wrapped in brackets per RFC 2732.
+  bindStr =
+    let hasColon = builtins.match ".*:.*" cfg.listenAddress != null;
+    in if hasColon
+       then "[${cfg.listenAddress}]:${toString cfg.port}"
+       else "${cfg.listenAddress}:${toString cfg.port}";
 
   # Generate the TOML registry file from NixOS options.
   # The auth DB is pinned to the StateDirectory so it survives upgrades.
@@ -17,9 +25,9 @@ let
 
     ${lib.concatMapStrings (a: ''
       [[archives]]
-      id = "${a.id}"
-      label = "${a.label}"
-      archive_path = "${a.path}"
+      id = "${escapeTOML a.id}"
+      label = "${escapeTOML a.label}"
+      archive_path = "${escapeTOML a.path}"
 
     '') cfg.archives}
   '';
@@ -72,6 +80,16 @@ in
             description = ''Absolute path to the .archivr directory created by {command}`archivr init`.
               The parent directory (which also contains the {file}`store/` blob directory)
               is whitelisted for read-write access under systemd hardening.'';
+          };
+          storePath = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = ''
+              Absolute path to the store directory for this archive. Only needed
+              when the archive was initialised with a custom store path outside
+              the default sibling {file}`store/` location. When null (the default),
+              the parent of {option}`path` already covers the standard layout.
+            '';
           };
         };
       });
@@ -154,10 +172,12 @@ in
         NoNewPrivileges = true;
         PrivateTmp = true;
         ProtectSystem = "strict";
-        ReadWritePaths = [ "/var/lib/archivr-server" ] ++ (map (a: builtins.dirOf a.path) cfg.archives);
+        ReadWritePaths =
+          [ "/var/lib/archivr-server" ]
+          ++ (map (a: builtins.dirOf a.path) cfg.archives)
+          ++ (lib.concatMap (a: lib.optional (a.storePath != null) a.storePath) cfg.archives);
         RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
         LockPersonality = true;
-        RestrictNamespaces = true;
         RestrictSUIDSGID = true;
         RemoveIPC = true;
       };
