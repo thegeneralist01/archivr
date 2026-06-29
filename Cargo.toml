@@ -32,3 +32,4 @@ base64 = "0.22"
 argon2 = { version = "0.5", features = ["std"] }
 rand = { version = "0.8", features = ["std"] }
 axum-extra = { version = "0.9", features = ["cookie"] }
+parking_lot = "0.12"

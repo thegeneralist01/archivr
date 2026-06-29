@@ -19,7 +19,14 @@
 //                   GET/PATCH /api/admin/instance-settings
 // ────────────────────────────────────────────────────────────────────────────
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    net::IpAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use parking_lot::Mutex;
 
 use archivr_core::{archive, capture, database};
 use axum::{
@@ -39,10 +46,14 @@ pub use crate::auth::{AuthUser, ROLE_ADMIN, ROLE_GUEST, ROLE_OWNER, ROLE_USER};
 use axum_extra::extract::CookieJar;
 use rusqlite::OptionalExtension;
 
+const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
+const LOGIN_MAX_ATTEMPTS: usize = 5;
+
 #[derive(Clone)]
 pub struct AppState {
     registry: Arc<ServerRegistry>,
     pub auth_db_path: Arc<std::path::PathBuf>,
+    pub login_attempts: Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -112,11 +123,59 @@ async fn security_headers(req: Request, next: Next) -> Response {
     response
 }
 
-pub fn app(registry: ServerRegistry, auth_db_path: std::path::PathBuf) -> Router {
-    let state = AppState {
-        registry: Arc::new(registry),
-        auth_db_path: Arc::new(auth_db_path),
+async fn login_rate_limit(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if req.method() != axum::http::Method::POST || req.uri().path() != "/api/auth/login" {
+        return next.run(req).await;
+    }
+    let ip = extract_client_ip(&req);
+    let retry_after = {
+        let mut map = state.login_attempts.lock();
+        let attempts = map.entry(ip).or_default();
+        let now = Instant::now();
+        attempts.retain(|t| now.duration_since(*t) < LOGIN_WINDOW);
+        if attempts.len() >= LOGIN_MAX_ATTEMPTS {
+            let oldest = *attempts.front().unwrap();
+            let elapsed = now.duration_since(oldest).as_secs() as i64;
+            let secs = (LOGIN_WINDOW.as_secs() as i64 - elapsed).max(1);
+            Some(secs)
+        } else {
+            attempts.push_back(now);
+            None
+        }
     };
+    if let Some(secs) = retry_after {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_str(&secs.to_string()).unwrap(),
+            )],
+            axum::Json(serde_json::json!({
+                "error": "rate_limited",
+                "retry_after_secs": secs,
+            })),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+fn extract_client_ip(req: &Request) -> IpAddr {
+    req.headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(IpAddr::from([127, 0, 0, 1]))
+}
+
+/// Build the Axum router from a pre-constructed `AppState`.
+/// Use this in tests that need to share state across multiple `oneshot` calls.
+pub fn app_with_state(state: AppState) -> Router {
     let static_dir = static_dir();
 
     Router::new()
@@ -166,26 +225,49 @@ pub fn app(registry: ServerRegistry, auth_db_path: std::path::PathBuf) -> Router
         .route("/api/admin/users/:uid/roles", axum::routing::post(admin_assign_role))
         .route("/api/admin/users/:uid/roles/:role_slug", axum::routing::delete(admin_remove_role))
         .route("/api/admin/roles", get(admin_list_roles).post(admin_create_role))
-        .route("/api/admin/instance-settings",
-            get(get_instance_settings_handler).patch(update_instance_settings_handler))
-        .route("/api/archives/:archive_id/collections",
-            get(list_collections_handler).post(create_collection_handler))
-        .route("/api/archives/:archive_id/collections/:coll_uid",
+        .route(
+            "/api/admin/instance-settings",
+            get(get_instance_settings_handler).patch(update_instance_settings_handler),
+        )
+        .route(
+            "/api/archives/:archive_id/collections",
+            get(list_collections_handler).post(create_collection_handler),
+        )
+        .route(
+            "/api/archives/:archive_id/collections/:coll_uid",
             get(get_collection_handler)
-            .patch(patch_collection_handler)
-            .delete(delete_collection_handler))
-        .route("/api/archives/:archive_id/collections/:coll_uid/entries",
-            post(add_entry_to_collection_handler))
-        .route("/api/archives/:archive_id/collections/:coll_uid/entries/:entry_uid",
+                .patch(patch_collection_handler)
+                .delete(delete_collection_handler),
+        )
+        .route(
+            "/api/archives/:archive_id/collections/:coll_uid/entries",
+            post(add_entry_to_collection_handler),
+        )
+        .route(
+            "/api/archives/:archive_id/collections/:coll_uid/entries/:entry_uid",
             delete(remove_entry_from_collection_handler)
-            .patch(update_entry_visibility_handler))
-        .route("/api/archives/:archive_id/entries/:entry_uid/collections",
-            get(list_entry_collections_handler))
+                .patch(update_entry_visibility_handler),
+        )
+        .route(
+            "/api/archives/:archive_id/entries/:entry_uid/collections",
+            get(list_entry_collections_handler),
+        )
         .nest_service("/assets", ServeDir::new(static_dir.join("assets")))
         .fallback_service(ServeFile::new(static_dir.join("index.html")))
         .layer(axum::middleware::from_fn_with_state(state.clone(), setup_guard))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), login_rate_limit))
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+/// Build the Axum router, constructing `AppState` from the given registry and auth DB path.
+pub fn app(registry: ServerRegistry, auth_db_path: std::path::PathBuf) -> Router {
+    let state = AppState {
+        registry: Arc::new(registry),
+        auth_db_path: Arc::new(auth_db_path),
+        login_attempts: Arc::new(Mutex::new(HashMap::new())),
+    };
+    app_with_state(state)
 }
 
 fn static_dir() -> PathBuf {
@@ -2183,6 +2265,93 @@ mod tests {
         assert!(response.headers().get("referrer-policy").is_some());
         assert!(response.headers().get("content-security-policy").is_some());
         assert!(response.headers().get("permissions-policy").is_some());
+    }
+
+    #[tokio::test]
+    async fn login_rate_limit_blocks_after_max_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.sqlite");
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
+        let state = AppState {
+            registry: Arc::new(ServerRegistry {
+                archives: vec![],
+                bind: None,
+                auth_db_path: None,
+            }),
+            auth_db_path: Arc::new(auth_path),
+            login_attempts: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let bad_creds = serde_json::json!({ "username": "nobody", "password": "wrong" });
+        for _ in 0..LOGIN_MAX_ATTEMPTS {
+            let resp = app_with_state(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/auth/login")
+                        .header("content-type", "application/json")
+                        .header("x-forwarded-for", "10.0.0.1")
+                        .body(json_body(&bad_creds))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "attempt within limit should reach handler");
+        }
+        let resp = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", "10.0.0.1")
+                    .body(json_body(&bad_creds))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "attempt over limit must be 429");
+        assert!(resp.headers().contains_key("retry-after"), "429 must carry Retry-After header");
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "rate_limited");
+        assert!(body["retry_after_secs"].as_i64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn login_rate_limit_does_not_affect_other_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.sqlite");
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
+        let state = AppState {
+            registry: Arc::new(ServerRegistry { archives: vec![], bind: None, auth_db_path: None }),
+            auth_db_path: Arc::new(auth_path),
+            login_attempts: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let bad_creds = serde_json::json!({ "username": "x", "password": "y" });
+        for _ in 0..LOGIN_MAX_ATTEMPTS {
+            app_with_state(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/auth/login")
+                        .header("content-type", "application/json")
+                        .header("x-forwarded-for", "10.0.0.2")
+                        .body(json_body(&bad_creds))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let resp = app_with_state(state)
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "/health must be unaffected");
     }
 
 }
