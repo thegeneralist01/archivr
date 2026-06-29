@@ -285,6 +285,7 @@ async fn list_entries(
     auth: AuthUser,
     Path(archive_id): Path<String>,
 ) -> Result<Json<Vec<archive::EntrySummary>>, ApiError> {
+    auth.require_auth()?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let caller_bits = auth_to_caller_bits(&auth);
@@ -297,6 +298,7 @@ async fn search_entries_handler(
     Path(archive_id): Path<String>,
     Query(params): Query<EntrySearchParams>,
 ) -> Result<Json<Vec<archive::EntrySummary>>, ApiError> {
+    auth.require_auth()?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let raw = params.q.as_deref().unwrap_or("");
@@ -1379,17 +1381,14 @@ mod tests {
 
     #[tokio::test]
     async fn missing_archive_returns_404() {
-        let (test_app, _dir) = make_test_app();
-        let response = test_app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/archives/missing/entries")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.sqlite");
+        { let conn = archivr_core::database::open_auth_db(&auth_path).unwrap(); archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap(); }
+        let session_cookie = make_test_session(&auth_path);
+        let registry = ServerRegistry { archives: vec![], bind: None, auth_db_path: None };
+        let response = app(registry, auth_path)
+            .oneshot(Request::builder().uri("/api/archives/missing/entries").header("cookie", &session_cookie).body(Body::empty()).unwrap())
+            .await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -1585,16 +1584,14 @@ mod tests {
 
     #[tokio::test]
     async fn search_missing_archive_returns_404() {
-        let (test_app, _dir) = make_test_app();
-        let response = test_app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/archives/nope/entries/search?q=anything")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.sqlite");
+        { let conn = archivr_core::database::open_auth_db(&auth_path).unwrap(); archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap(); }
+        let session_cookie = make_test_session(&auth_path);
+        let registry = ServerRegistry { archives: vec![], bind: None, auth_db_path: None };
+        let response = app(registry, auth_path)
+            .oneshot(Request::builder().uri("/api/archives/nope/entries/search?q=anything").header("cookie", &session_cookie).body(Body::empty()).unwrap())
+            .await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -1602,15 +1599,10 @@ mod tests {
     async fn search_empty_q_returns_ok() {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
         let response = app(registry, auth_path)
-            .oneshot(
-                Request::builder()
-                    .uri("/api/archives/test/entries/search")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+            .oneshot(Request::builder().uri("/api/archives/test/entries/search").header("cookie", &session_cookie).body(Body::empty()).unwrap())
+            .await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -1618,15 +1610,10 @@ mod tests {
     async fn search_unknown_prefix_returns_400() {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
         let response = app(registry, auth_path)
-            .oneshot(
-                Request::builder()
-                    .uri("/api/archives/test/entries/search?q=unknownprefix%3Aval")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+            .oneshot(Request::builder().uri("/api/archives/test/entries/search?q=unknownprefix%3Aval").header("cookie", &session_cookie).body(Body::empty()).unwrap())
+            .await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -2669,6 +2656,50 @@ mod tests {
         let uri = format!("/api/archives/test/collections/{coll_uid}");
         let response = app(registry, auth_path)
             .oneshot(Request::builder().uri(&uri).header("cookie", &session_cookie).body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ── Task 2: list_entries / search_entries auth enforcement ───────────────
+
+    #[tokio::test]
+    async fn list_entries_requires_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let response = app(registry, auth_path)
+            .oneshot(Request::builder().uri("/api/archives/test/entries").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn list_entries_with_auth_returns_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path)
+            .oneshot(Request::builder().uri("/api/archives/test/entries").header("cookie", &session_cookie).body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn search_entries_requires_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let response = app(registry, auth_path)
+            .oneshot(Request::builder().uri("/api/archives/test/entries/search").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn search_entries_with_auth_returns_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path)
+            .oneshot(Request::builder().uri("/api/archives/test/entries/search").header("cookie", &session_cookie).body(Body::empty()).unwrap())
             .await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
