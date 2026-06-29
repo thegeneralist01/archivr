@@ -76,6 +76,42 @@ async fn setup_guard(
     next.run(req).await
 }
 
+/// Tower middleware: injects HTTP security response headers on every response.
+/// HSTS is intentionally omitted — that belongs at the reverse-proxy layer.
+async fn security_headers(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::HeaderName::from_static("x-content-type-options"),
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        axum::http::header::HeaderName::from_static("x-frame-options"),
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        axum::http::header::HeaderName::from_static("referrer-policy"),
+        axum::http::HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    headers.insert(
+        axum::http::header::HeaderName::from_static("content-security-policy"),
+        axum::http::HeaderValue::from_static(
+            "default-src 'self'; \
+             script-src 'self'; \
+             style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data: blob:; \
+             font-src 'self'; \
+             connect-src 'self'; \
+             frame-ancestors 'none'",
+        ),
+    );
+    headers.insert(
+        axum::http::header::HeaderName::from_static("permissions-policy"),
+        axum::http::HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
+    response
+}
+
 pub fn app(registry: ServerRegistry, auth_db_path: std::path::PathBuf) -> Router {
     let state = AppState {
         registry: Arc::new(registry),
@@ -148,6 +184,7 @@ pub fn app(registry: ServerRegistry, auth_db_path: std::path::PathBuf) -> Router
         .nest_service("/assets", ServeDir::new(static_dir.join("assets")))
         .fallback_service(ServeFile::new(static_dir.join("index.html")))
         .layer(axum::middleware::from_fn_with_state(state.clone(), setup_guard))
+        .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
 }
 
@@ -2093,4 +2130,59 @@ mod tests {
         ).await.unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
+    #[tokio::test]
+    async fn security_headers_present_on_success_response() {
+        let (test_app, _dir) = make_test_app();
+        let response = test_app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers().get("x-frame-options").unwrap(),
+            "DENY"
+        );
+        assert_eq!(
+            response.headers().get("referrer-policy").unwrap(),
+            "strict-origin-when-cross-origin"
+        );
+        assert!(
+            response.headers().get("content-security-policy").is_some(),
+            "content-security-policy header must be present"
+        );
+        assert!(
+            response.headers().get("permissions-policy").is_some(),
+            "permissions-policy header must be present"
+        );
+    }
+
+    #[tokio::test]
+    async fn security_headers_present_on_error_response() {
+        let (test_app, _dir) = make_test_app();
+        let response = test_app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/nosucharchive/entries")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("x-content-type-options").is_some());
+        assert!(response.headers().get("x-frame-options").is_some());
+        assert!(response.headers().get("referrer-policy").is_some());
+        assert!(response.headers().get("content-security-policy").is_some());
+        assert!(response.headers().get("permissions-policy").is_some());
+    }
+
 }
