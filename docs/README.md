@@ -209,7 +209,7 @@ A `Dockerfile` and `docker-compose.yml` are provided for self-hosting without Ni
    The image includes the `archivr` CLI for this purpose:
 
    ```sh
-   docker compose run --rm archivr archivr init /data/archives/main --name "Main Archive"
+   docker compose run --rm archivr archivr init /data/archives/main /data/archives/main/.archivr/store --name "Main Archive"
    ```
 
    This creates `/data/archives/main/.archivr/` with the metadata the server requires.
@@ -300,6 +300,11 @@ dependencies (Chromium, Node.js, Python) land in the final layer.
 - `ARCHIVR_CHROME`
   - Optional.
   - Overrides the Chromium/Chrome executable passed to `single-file` via `--browser-executable-path`. Set automatically by the Nix wrapper and the Docker image. Default: `chromium`.
+- `ARCHIVR_CHROME_ARGS`
+  - Optional.
+  - Space-separated extra flags appended to Chromium's `--browser-args`. The Docker
+    image sets this to `--no-sandbox` because Chromium refuses to run as root without
+    it. Leave unset when running natively (Nix, Linux desktop).
 - `ARCHIVR_TWITTER_CREDENTIALS_FILE`
   - Required for tweet/thread scraping inputs such as `tweet:ID` and `x:thread:ID`.
   - Must point to a cookies file for the vendored scraper.

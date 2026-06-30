@@ -1,0 +1,9 @@
+# Exclude runtime config and data directories from the Docker build context.
+# The config/ directory may contain secrets (e.g. twitter-cookies.txt) that are
+# only needed at runtime via a volume mount — they must never reach the builder.
+config/
+docker/
+
+# Development and VCS noise
+.git/
+.gitignore

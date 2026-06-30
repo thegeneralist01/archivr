@@ -44,18 +44,24 @@ FROM debian:bookworm-slim
 
 # Runtime dependencies:
 #   chromium              used by single-file-cli for full-page archiving
-#   nodejs + npm          runtime for single-file-cli
+#   nodejs (20+)          runtime for single-file-cli (requires Node >=20; Debian
+#                         bookworm ships 18, so we install from the NodeSource repo)
+#   ffmpeg                required by yt-dlp to merge separate audio/video streams
+#                         (e.g. YouTube bestvideo+bestaudio format selection)
 #   python3 + pip + venv  twitter scraper
-#   ca-certificates       outbound HTTPS from the server
+#   ca-certificates       outbound HTTPS from the server and NodeSource HTTPS
 #   libssl3               OpenSSL linked by the Rust binary
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends \
     chromium \
     nodejs \
-    npm \
+    ffmpeg \
     python3 \
     python3-pip \
     python3-venv \
-    ca-certificates \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -88,10 +94,13 @@ ENV ARCHIVR_STATIC_DIR=/usr/share/archivr-server/static \
     ARCHIVR_SINGLE_FILE=/usr/local/bin/single-file \
     ARCHIVR_TWEET_PYTHON=/opt/archivr-venv/bin/python3 \
     ARCHIVR_TWEET_SCRAPER=/usr/local/lib/archivr/scrape_user_tweet_contents.py \
-    ARCHIVR_YT_DLP=/opt/archivr-venv/bin/yt-dlp
+    ARCHIVR_YT_DLP=/opt/archivr-venv/bin/yt-dlp \
+    ARCHIVR_CHROME_ARGS=--no-sandbox
 
 EXPOSE 8080
 
 # Expects the TOML config at /config/archivr-server.toml (mount a volume).
 # Copy docker/config.example.toml as a starting point.
-ENTRYPOINT ["archivr-server", "/config/archivr-server.toml"]
+# Using CMD (not ENTRYPOINT) so `docker compose run archivr archivr init …`
+# can override the whole command for first-time archive initialisation.
+CMD ["archivr-server", "/config/archivr-server.toml"]
