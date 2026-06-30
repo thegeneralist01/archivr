@@ -7,3 +7,9 @@ docker/
 # Development and VCS noise
 .git/
 .gitignore
+
+# Generated build outputs — can be 1.4G (target/) and 243M (node_modules/)
+# after a local dev build; exclude them to keep the build context small.
+target/
+frontend/node_modules/
+frontend/dist/
