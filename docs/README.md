@@ -205,11 +205,16 @@ A `Dockerfile` and `docker-compose.yml` are provided for self-hosting without Ni
    # edit config/archivr-server.toml — set archive id, label, and archive_path
    ```
 
-2. Create the archive directory on the persistent data volume before the first start:
+2. Initialize each archive on the persistent data volume before the first start.
+   The image includes the `archivr` CLI for this purpose:
 
    ```sh
-   docker compose run --rm archivr mkdir -p /data/archives/main
+   docker compose run --rm archivr archivr init /data/archives/main --name "Main Archive"
    ```
+
+   This creates `/data/archives/main/.archivr/` with the metadata the server requires.
+   A bare `mkdir` is not enough — the server reads `name` and `store_path` files that
+   only `archivr init` writes.
 
 3. Start the server:
 
@@ -224,7 +229,12 @@ A `Dockerfile` and `docker-compose.yml` are provided for self-hosting without Ni
 | Mount | Purpose |
 |-------|---------|
 | `./config` (read-only) | Directory containing `archivr-server.toml` |
-| `archivr-data` named volume | Auth database and archive directories |
+| `archivr-data` named volume | Auth database (`/data/archivr-auth.sqlite`) and archive directories |
+
+> **Important:** `auth_db_path` must be set explicitly in `archivr-server.toml` to a
+> path on the writable data volume (e.g. `/data/archivr-auth.sqlite`). If left unset,
+> the server defaults to writing the auth database next to the config file — which is
+> on the read-only `/config` mount and will fail. The example config sets this correctly.
 
 **Twitter/X archiving**
 

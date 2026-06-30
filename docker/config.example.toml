@@ -1,0 +1,32 @@
+# archivr-server.toml — example configuration for Docker deployment.
+#
+# Copy this file to ./config/archivr-server.toml (next to docker-compose.yml),
+# edit it to suit your setup, then run:
+#
+#   docker compose up -d
+#
+# The bind address defaults to 127.0.0.1:8080. When running under Docker,
+# set ARCHIVR_BIND=0.0.0.0:8080 in the environment (docker-compose.yml does
+# this already) — the env var takes precedence over the value below.
+
+# bind = "0.0.0.0:8080"
+
+# Path to the server-level authentication database.
+# Must be on a persistent volume so it survives container restarts.
+auth_db_path = "/data/archivr-auth.sqlite"
+
+# Define one or more archives.
+# archive_path must point to the .archivr directory created by `archivr init`,
+# on the persistent data volume (/data by default).
+# Initialize each archive before starting the server (see Docker quickstart step 2).
+
+[[archives]]
+id = "main"
+label = "Main Archive"
+archive_path = "/data/archives/main/.archivr"
+
+# Add more archives as needed:
+# [[archives]]
+# id = "videos"
+# label = "Videos"
+# archive_path = "/data/archives/videos/.archivr"

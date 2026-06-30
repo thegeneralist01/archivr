@@ -1,0 +1,23 @@
+services:
+  archivr:
+    build: .
+    image: archivr-server:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Listen on all interfaces inside the container so the port mapping works.
+      ARCHIVR_BIND: "0.0.0.0:8080"
+      # Uncomment and set this to enable Twitter/X archiving.
+      # The file must be accessible inside the container (e.g. in the config volume).
+      # ARCHIVR_TWITTER_CREDENTIALS_FILE: /config/twitter-cookies.txt
+    volumes:
+      # Mount a directory containing archivr-server.toml as read-only config.
+      # Copy docker/config.example.toml to ./config/archivr-server.toml to start.
+      - ./config:/config:ro
+      # Persistent volume for the auth database and archive directories.
+      # The paths inside must match archive_path values in your TOML config.
+      - archivr-data:/data
+
+volumes:
+  archivr-data:
