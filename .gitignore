@@ -19,6 +19,12 @@
 !ARCHIVR-MENTAL-MODEL.md
 !NEXT.md
 
+!Dockerfile
+!.dockerignore
+!docker-compose.yml
+!docker/
+!docker/**
+
 !modules/
 !modules/**
 

@@ -68,18 +68,30 @@ fn save_with(
     // without a writable user-data-dir. Using a subdirectory of temp_dir
     // keeps it isolated and it gets cleaned up with the rest of the temp dir.
     let chrome_data_dir = temp_dir.join("chrome-data");
-    let browser_args = format!(
-        "[\"--disable-web-security\",\"--user-data-dir={}\"]",
-        chrome_data_dir.display()
-    );
+    // Build the browser-args JSON array. Start with the flags always required,
+    // then append any extra flags from ARCHIVR_CHROME_ARGS (space-separated).
+    // Docker containers running as root need "--no-sandbox" here because
+    // Chromium refuses to start as root without it.
+    let mut chrome_flags = vec![
+        "--disable-web-security".to_string(),
+        format!("--user-data-dir={}", chrome_data_dir.display()),
+    ];
+    if let Ok(extra) = std::env::var("ARCHIVR_CHROME_ARGS") {
+        chrome_flags.extend(extra.split_whitespace().filter(|s| !s.is_empty()).map(str::to_string));
+    }
+    let quoted: Vec<String> = chrome_flags
+        .iter()
+        .map(|f| format!("\"{}\"", f.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    let browser_args = format!("[{}]", quoted.join(","));
 
     let out = Command::new(single_file)
         .arg(url)
         .arg(&out_file)
         .arg(format!("--browser-executable-path={chrome}"))
         .arg("--browser-headless")
-        .arg("--browser-wait-until=networkidle2")
-        // Extra delay after networkidle2: Cloudflare Fonts injects @font-face
+        .arg("--browser-wait-until=networkAlmostIdle")
+        // Extra delay after networkAlmostIdle: Cloudflare Fonts injects @font-face
         // CSS after HTML parse, so the font hook needs more time to see it.
         .arg("--browser-wait-delay=2000")
         // Realistic UA: some origins block headless Chrome's default UA string.

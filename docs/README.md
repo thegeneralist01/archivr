@@ -191,6 +191,69 @@ services.archivr-server = {
 Initialise them with `archivr init` first, then `chown -R archivr:archivr /srv/archivr`.
 
 
+### Hosting with Docker
+
+A `Dockerfile` and `docker-compose.yml` are provided for self-hosting without Nix.
+
+**Quickstart**
+
+1. Copy the example config and edit it:
+
+   ```sh
+   mkdir config
+   cp docker/config.example.toml config/archivr-server.toml
+   # edit config/archivr-server.toml — set archive id, label, and archive_path
+   ```
+
+2. Initialize each archive on the persistent data volume before the first start.
+   The image includes the `archivr` CLI for this purpose:
+
+   ```sh
+   docker compose run --rm archivr archivr init /data/archives/main /data/archives/main/.archivr/store --name "Main Archive"
+   ```
+
+   This creates `/data/archives/main/.archivr/` with the metadata the server requires.
+   A bare `mkdir` is not enough — the server reads `name` and `store_path` files that
+   only `archivr init` writes.
+
+3. Start the server:
+
+   ```sh
+   docker compose up -d
+   ```
+
+   Then open `http://localhost:8080`.
+
+**Volumes**
+
+| Mount | Purpose |
+|-------|---------|
+| `./config` (read-only) | Directory containing `archivr-server.toml` |
+| `archivr-data` named volume | Auth database (`/data/archivr-auth.sqlite`) and archive directories |
+
+> **Important:** `auth_db_path` must be set explicitly in `archivr-server.toml` to a
+> path on the writable data volume (e.g. `/data/archivr-auth.sqlite`). If left unset,
+> the server defaults to writing the auth database next to the config file — which is
+> on the read-only `/config` mount and will fail. The example config sets this correctly.
+
+**Twitter/X archiving**
+
+Supply a cookies file inside the config volume and set `ARCHIVR_TWITTER_CREDENTIALS_FILE` in `docker-compose.yml`:
+
+```yaml
+environment:
+  ARCHIVR_TWITTER_CREDENTIALS_FILE: /config/twitter-cookies.txt
+```
+
+**Building the image locally**
+
+```sh
+docker build -t archivr-server .
+```
+
+The image compiles the Rust binary in a separate build stage so only the runtime
+dependencies (Chromium, Node.js, Python) land in the final layer.
+
 ### Supported Shorthand Inputs
 
 - YouTube video/short media:
@@ -219,15 +282,29 @@ Initialise them with `archivr init` first, then `chown -R archivr:archivr /srv/a
 
 ### Environment Variables
 
+- `ARCHIVR_BIND`
+  - Optional.
+  - Overrides the bind address from the TOML config. Useful in Docker where you need
+    `0.0.0.0:8080` without editing the config file. Default: `127.0.0.1:8080`.
+- `ARCHIVR_STATIC_DIR`
+  - Optional.
+  - Path to the directory of pre-built frontend assets served by the web UI.
+    Set automatically by the Nix wrapper and the Docker image. When running from
+    source with `cargo run`, falls back to `crates/archivr-server/static`.
 - `ARCHIVR_YT_DLP`
   - Optional.
   - Overrides the `yt-dlp` binary used for YouTube, X media posts, Instagram, Facebook, TikTok, Reddit, and Snapchat downloads.
 - `ARCHIVR_SINGLE_FILE`
   - Optional.
-  - Overrides the `single-file` binary used for web page archiving. When installed through Nix, this is set automatically to the Nixpkgs `single-file-cli` binary.
+  - Overrides the `single-file` binary used for web page archiving. Set automatically by the Nix wrapper and the Docker image.
 - `ARCHIVR_CHROME`
   - Optional.
-  - Overrides the Chromium/Chrome executable passed to `single-file` via `--browser-executable-path`. When installed through Nix, this is set automatically to the Nixpkgs `chromium` binary. Default: `chromium`.
+  - Overrides the Chromium/Chrome executable passed to `single-file` via `--browser-executable-path`. Set automatically by the Nix wrapper and the Docker image. Default: `chromium`.
+- `ARCHIVR_CHROME_ARGS`
+  - Optional.
+  - Space-separated extra flags appended to Chromium's `--browser-args`. The Docker
+    image sets this to `--no-sandbox` because Chromium refuses to run as root without
+    it. Leave unset when running natively (Nix, Linux desktop).
 - `ARCHIVR_TWITTER_CREDENTIALS_FILE`
   - Required for tweet/thread scraping inputs such as `tweet:ID` and `x:thread:ID`.
   - Must point to a cookies file for the vendored scraper.
