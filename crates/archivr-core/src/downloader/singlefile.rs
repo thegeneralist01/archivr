@@ -90,8 +90,8 @@ fn save_with(
         .arg(&out_file)
         .arg(format!("--browser-executable-path={chrome}"))
         .arg("--browser-headless")
-        .arg("--browser-wait-until=networkAlmostIdle")
-        // Extra delay after networkAlmostIdle: Cloudflare Fonts injects @font-face
+        .arg("--browser-wait-until=networkidle2")
+        // Extra delay after networkidle2: Cloudflare Fonts injects @font-face
         // CSS after HTML parse, so the font hook needs more time to see it.
         .arg("--browser-wait-delay=2000")
         // Realistic UA: some origins block headless Chrome's default UA string.
