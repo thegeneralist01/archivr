@@ -15,6 +15,22 @@ import ContextRail from './components/ContextRail'
 
 export const AuthContext = createContext(null);
 
+const VIEWS = ['archive','runs','admin','tags','collections','settings']
+const SETTINGS_TABS = ['profile','tokens','instance']
+
+function parseLocation() {
+  const parts = window.location.pathname.split('/').filter(Boolean)
+  const view = VIEWS.includes(parts[0]) ? parts[0] : 'archive'
+  const settingsTab = (view === 'settings' && SETTINGS_TABS.includes(parts[1])) ? parts[1] : 'profile'
+  return { view, settingsTab }
+}
+
+function locationPath(view, settingsTab) {
+  if (view === 'archive') return '/'
+  if (view === 'settings') return `/settings/${settingsTab}`
+  return `/${view}`
+}
+
 export default function App() {
   const [authState, setAuthState] = useState('loading');
   const [currentUser, setCurrentUser] = useState(null);
@@ -36,13 +52,25 @@ export default function App() {
     return () => window.removeEventListener('auth:expired', handler);
   }, []);
 
+  // Sync URL → state on back/forward
+  useEffect(() => {
+    const handler = () => {
+      const { view, settingsTab } = parseLocation()
+      setView(view)
+      setSettingsTab(settingsTab)
+    }
+    window.addEventListener('popstate', handler)
+    return () => window.removeEventListener('popstate', handler)
+  }, [])
+
   const [archives, setArchives] = useState([])
   const [archiveId, setArchiveId] = useState(null)
   const [entries, setEntries] = useState([])
   const [selectedEntryUid, setSelectedEntryUid] = useState(null)
   const [selectedEntry, setSelectedEntry] = useState(null)
   const [tagFilter, setTagFilter] = useState(null)
-  const [view, setView] = useState('archive')
+  const [view, setView] = useState(() => parseLocation().view)
+  const [settingsTab, setSettingsTab] = useState(() => parseLocation().settingsTab)
   const [searchQuery, setSearchQuery] = useState('')
   const [resultCount, setResultCount] = useState('')
   const [searchBusy, setSearchBusy] = useState(false)
@@ -105,10 +133,12 @@ export default function App() {
     return () => clearTimeout(timer)
   }, [searchQuery, archiveId]) // tagFilter handled separately below
 
-  // Tag filter change: switch to archive view, reload
+  // Tag filter applied: switch to archive view and reload.
+  // Only reset view when tagFilter is non-null; archive change alone (tagFilter=null)
+  // must not stomp the URL-initialised view on first load.
   useEffect(() => {
     if (archiveId === null) return
-    setView('archive')
+    if (tagFilter !== null) setView('archive')
     loadEntries(archiveId, searchQuery, tagFilter)
   }, [tagFilter, archiveId]) // intentional: searchQuery excluded to avoid double-fire
 
@@ -122,6 +152,14 @@ export default function App() {
       fetchTags(archiveId).then(setTagNodes)
     }
   }, [archiveId])
+
+  // Sync view + settingsTab → URL
+  useEffect(() => {
+    const path = locationPath(view, settingsTab)
+    if (window.location.pathname !== path) {
+      history.pushState(null, '', path)
+    }
+  }, [view, settingsTab])
 
   const selectEntry = useCallback((entry) => {
     setSelectedEntryUid(entry ? entry.entry_uid : null)
@@ -230,7 +268,7 @@ export default function App() {
               <CollectionsView archiveId={archiveId} />
             )}
             {view === 'settings' && (
-              <SettingsView />
+              <SettingsView tab={settingsTab} onTabChange={setSettingsTab} />
             )}
           </div>
           <ContextRail
