@@ -8,10 +8,9 @@ import {
 
 const ROLE_ADMIN = 4
 
-export default function SettingsView() {
+export default function SettingsView({ tab, onTabChange }) {
   const { currentUser, setCurrentUser } = useContext(AuthContext) ?? {}
   const isAdmin = currentUser && ((currentUser.role_bits & ROLE_ADMIN) !== 0)
-  const [tab, setTab] = useState('profile')
 
   const tabs = ['profile', 'tokens', ...(isAdmin ? ['instance'] : [])]
   const tabLabels = { profile: 'Profile', tokens: 'API Tokens', instance: 'Instance' }
@@ -23,7 +22,7 @@ export default function SettingsView() {
         {tabs.map(t => (
           <button key={t}
             className={`view-tab${tab === t ? ' is-active' : ''}`}
-            onClick={() => setTab(t)}>
+            onClick={() => onTabChange(t)}>
             {tabLabels[t]}
           </button>
         ))}
