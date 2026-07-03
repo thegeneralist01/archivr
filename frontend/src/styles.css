@@ -673,6 +673,56 @@ select {
 .tag-node-btn:hover { text-decoration: underline; }
 .tag-node-btn.is-active { font-weight: 600; color: var(--ink); }
 
+/* tag-node-row: flex row containing the name button + delete × */
+.tag-node-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.tag-node-row .tag-node-btn {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: auto;
+}
+/* constrain the edit pencil so it doesn't inherit unconstrained SVG dimensions */
+.tag-node-btn .edit-icon {
+  width: 0.75em;
+  height: 0.75em;
+  flex-shrink: 0;
+  vertical-align: -0.1em;
+  opacity: 0.35;
+}
+.tag-node-btn:hover .edit-icon { opacity: 0.65; }
+/* delete × button next to tag name — small, unobtrusive */
+.tag-node-delete {
+  flex-shrink: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted-2);
+  cursor: pointer;
+  padding: 0 3px;
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0;
+}
+.tag-node-row:hover .tag-node-delete { opacity: 1; }
+.tag-node-delete:hover { color: var(--accent); }
+/* rename input inside the tag list */
+.tag-rename-input {
+  font-size: 13px;
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 2px 5px;
+  border: 1px solid var(--accent);
+  border-radius: var(--r);
+  background: var(--field);
+  color: var(--ink);
+  outline: none;
+}
+
 /* ── Collections page (sidebar layout) ──────────────────────────────────── */
 .collections-view {
   padding: 24px;

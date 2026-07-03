@@ -12,6 +12,7 @@ import TagsView from './components/TagsView'
 import CollectionsView from './components/CollectionsView'
 import SettingsView from './components/SettingsView'
 import ContextRail from './components/ContextRail'
+import { displayPath } from './utils'
 
 export const AuthContext = createContext(null);
 
@@ -80,6 +81,8 @@ export default function App() {
     const saved = sessionStorage.getItem('captureDialogOpen')
     return saved === 'true'
   })
+
+  const humanizeTags = currentUser?.humanize_slugs ?? false;
 
   // Persist captureDialogOpen to sessionStorage
   useEffect(() => {
@@ -186,6 +189,20 @@ export default function App() {
     if (archiveId) fetchTags(archiveId).then(setTagNodes)
   }, [archiveId])
 
+  const handleTagRenamed = useCallback((oldFullPath, newFullPath) => {
+    if (tagFilter === oldFullPath) {
+      setTagFilter(newFullPath);
+    } else if (tagFilter?.startsWith(oldFullPath + '/')) {
+      setTagFilter(newFullPath + tagFilter.slice(oldFullPath.length));
+    }
+  }, [tagFilter]);
+
+  const handleTagDeleted = useCallback((deletedFullPath) => {
+    if (tagFilter === deletedFullPath || tagFilter?.startsWith(deletedFullPath + '/')) {
+      setTagFilter(null);
+    }
+  }, [tagFilter]);
+
   const handleEntryTitleChange = useCallback((entryUid, newTitle) => {
     setEntries(prev => prev.map(e =>
       e.entry_uid === entryUid ? { ...e, title: newTitle } : e
@@ -251,7 +268,7 @@ export default function App() {
                   {resultCount && <><b>{resultCount.split(' ')[0]}</b>{' '}{resultCount.split(' ').slice(1).join(' ')}</>}
                   {tagFilter && (
                     <button className="tag-filter-badge" onClick={handleClearTagFilter}>
-                      × {tagFilter}
+                      × {humanizeTags ? displayPath(tagFilter) : tagFilter}
                     </button>
                   )}
                 </span>
@@ -275,10 +292,15 @@ export default function App() {
             {view === 'admin' && <AdminView archives={archives} />}
             {view === 'tags' && (
               <TagsView
+                archiveId={archiveId}
                 tagNodes={tagNodes}
                 tagFilter={tagFilter}
                 onTagFilterSet={handleTagFilterSet}
                 onViewChange={handleViewChange}
+                onTagRenamed={handleTagRenamed}
+                onTagDeleted={handleTagDeleted}
+                onTagsRefresh={handleTagsRefresh}
+                humanizeTags={humanizeTags}
               />
             )}
             {view === 'collections' && (
@@ -295,6 +317,7 @@ export default function App() {
             tagNodes={tagNodes}
             onTagsRefresh={handleTagsRefresh}
             onEntryTitleChange={handleEntryTitleChange}
+            humanizeTags={humanizeTags}
           />
         </main>
         <CaptureDialog
