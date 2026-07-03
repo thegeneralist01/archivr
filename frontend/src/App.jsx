@@ -186,6 +186,20 @@ export default function App() {
     if (archiveId) fetchTags(archiveId).then(setTagNodes)
   }, [archiveId])
 
+  const handleTagRenamed = useCallback((oldFullPath, newFullPath) => {
+    if (tagFilter === oldFullPath) {
+      setTagFilter(newFullPath);
+    } else if (tagFilter?.startsWith(oldFullPath + '/')) {
+      setTagFilter(newFullPath + tagFilter.slice(oldFullPath.length));
+    }
+  }, [tagFilter]);
+
+  const handleTagDeleted = useCallback((deletedFullPath) => {
+    if (tagFilter === deletedFullPath || tagFilter?.startsWith(deletedFullPath + '/')) {
+      setTagFilter(null);
+    }
+  }, [tagFilter]);
+
   const handleEntryTitleChange = useCallback((entryUid, newTitle) => {
     setEntries(prev => prev.map(e =>
       e.entry_uid === entryUid ? { ...e, title: newTitle } : e
@@ -275,10 +289,14 @@ export default function App() {
             {view === 'admin' && <AdminView archives={archives} />}
             {view === 'tags' && (
               <TagsView
+                archiveId={archiveId}
                 tagNodes={tagNodes}
                 tagFilter={tagFilter}
                 onTagFilterSet={handleTagFilterSet}
                 onViewChange={handleViewChange}
+                onTagRenamed={handleTagRenamed}
+                onTagDeleted={handleTagDeleted}
+                onTagsRefresh={handleTagsRefresh}
               />
             )}
             {view === 'collections' && (

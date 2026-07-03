@@ -4,6 +4,17 @@ import { formatTimestamp, formatBytes, valueText, sourceIconSvg } from '../utils
 
 const VIS_LABEL = { 0: 'Private', 1: 'Public', 2: 'Users only', 3: 'Public' }
 
+// Humanize each slash-segment of a full_path for display, matching the tree's name field.
+// e.g. "/x/natural-science" → "/X/Natural Science"
+function displayPath(fullPath) {
+  return fullPath
+    .split('/')
+    .map(seg => seg
+      ? seg.split('-').map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(' ')
+      : '')
+    .join('/');
+}
+
 const ExternalIcon = () => (
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
     <path d="M7 17 17 7M9 7h8v8"/>
@@ -190,7 +201,7 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
               <div className="tags-wrap">
                 {tags.map(tag => (
                   <span key={tag.tag_uid} className="tag-pill" title={tag.full_path}>
-                    {tag.name}
+                    {displayPath(tag.full_path)}
                     <button
                       className="remove"
                       title={`Remove tag ${tag.full_path}`}

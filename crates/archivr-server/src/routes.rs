@@ -237,6 +237,10 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route("/api/archives/:archive_id/tags", get(list_tags).post(create_tag_handler))
         .route(
+            "/api/archives/:archive_id/tags/:tag_uid",
+            patch(patch_tag_handler).delete(delete_tag_handler),
+        )
+        .route(
             "/api/archives/:archive_id/entries/:entry_uid/tags",
             get(list_entry_tags).post(assign_entry_tag_handler),
         )
@@ -556,6 +560,41 @@ async fn remove_entry_tag_handler(
     }
 }
 
+async fn patch_tag_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((archive_id, tag_uid)): Path<(String, String)>,
+    Json(body): Json<PatchTagBody>,
+) -> Result<Json<archive::Tag>, ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    match database::rename_tag(&conn, &tag_uid, &body.name)? {
+        Some(record) => Ok(Json(archive::Tag {
+            tag_uid: record.tag_uid,
+            name: record.name,
+            slug: record.slug,
+            full_path: record.full_path,
+        })),
+        None => Err(ApiError::not_found("tag not found")),
+    }
+}
+
+async fn delete_tag_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((archive_id, tag_uid)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    if database::delete_tag(&conn, &tag_uid)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("tag not found"))
+    }
+}
+
 async fn patch_entry_handler(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -601,6 +640,11 @@ struct CreateTokenBody {
 #[derive(Debug, serde::Deserialize)]
 struct PatchEntryBody {
     title: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PatchTagBody {
+    name: String,
 }
 
 async fn capture_handler(

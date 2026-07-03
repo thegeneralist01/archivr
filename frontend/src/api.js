@@ -58,6 +58,27 @@ export async function removeTag(archiveId, entryUid, tagUid) {
   if (!resp.ok) throw new Error(`Remove failed (${resp.status})`);
 }
 
+export async function renameTag(archiveId, tagUid, name) {
+  const res = await fetch(
+    `/api/archives/${archiveId}/tags/${tagUid}`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    }
+  );
+  if (!res.ok) throw new Error(await res.text());
+  return res.json(); // returns the updated Tag: { tag_uid, name, slug, full_path }
+}
+
+export async function deleteTag(archiveId, tagUid) {
+  const res = await fetch(
+    `/api/archives/${archiveId}/tags/${tagUid}`,
+    { method: 'DELETE' }
+  );
+  if (!res.ok) throw new Error(await res.text());
+}
+
 export async function fetchRuns(archiveId) {
   return getJson(`/api/archives/${archiveId}/runs`);
 }

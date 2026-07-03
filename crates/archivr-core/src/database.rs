@@ -1639,6 +1639,113 @@ pub fn entry_count_for_tag_path(conn: &Connection, full_path: &str) -> Result<i6
     Ok(count)
 }
 
+pub fn rename_tag(
+    conn: &Connection,
+    tag_uid: &str,
+    new_segment: &str,
+) -> Result<Option<TagRecord>> {
+    // Slugify: spaces→hyphens, keep alphanumeric and hyphens (case preserved), collapse runs, strip edges.
+    let trimmed = new_segment.trim();
+    let hyphenated: String = trimmed.chars().map(|c| if c == ' ' { '-' } else { c }).collect();
+    let filtered: String = hyphenated
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-')
+        .collect();
+    let mut new_slug = String::new();
+    let mut prev_hyphen = false;
+    for c in filtered.chars() {
+        if c == '-' {
+            if !prev_hyphen {
+                new_slug.push(c);
+            }
+            prev_hyphen = true;
+        } else {
+            new_slug.push(c);
+            prev_hyphen = false;
+        }
+    }
+    let new_slug = new_slug.trim_matches('-').to_string();
+    if new_slug.is_empty() {
+        bail!("new segment slugifies to empty string");
+    }
+
+    // Fetch existing tag.
+    let tag = match get_tag_by_uid(conn, tag_uid)? {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    // Build new full_path by replacing the last segment.
+    let old_prefix = tag.full_path.clone();
+    let parent_prefix = match old_prefix.rfind('/') {
+        Some(idx) => &old_prefix[..idx],
+        None => "",
+    };
+    let new_full_path = format!("{}/{}", parent_prefix, new_slug);
+
+    // Collision check: bail if another tag already owns this path.
+    if let Some(existing) = get_tag_by_path(conn, &new_full_path)? {
+        if existing.tag_uid != tag_uid {
+            bail!("tag path already exists: {new_full_path}");
+        }
+    }
+
+    let new_name = humanize_slug(&new_slug);
+
+    // Transaction: update the tag row, then cascade path change to descendants.
+    let result = (|| -> Result<()> {
+        conn.execute_batch("BEGIN")?;
+        conn.execute(
+            "UPDATE tags SET name=?1, slug=?2, full_path=?3 WHERE tag_uid=?4",
+            params![new_name, new_slug, new_full_path, tag_uid],
+        )?;
+        let old_prefix_slash = format!("{}/", old_prefix);
+        let new_prefix_slash = format!("{}/", new_full_path);
+        // Use hierarchy (recursive CTE over parent_tag_id) instead of LIKE to avoid
+        // treating '_'/'%' in historical slugs as wildcards.
+        conn.execute(
+            "WITH RECURSIVE descendants(id) AS (\
+                SELECT id FROM tags WHERE parent_tag_id = ?1 \
+                UNION ALL \
+                SELECT t.id FROM tags t JOIN descendants d ON t.parent_tag_id = d.id \
+            ) \
+            UPDATE tags SET full_path = REPLACE(full_path, ?2, ?3) \
+            WHERE id IN (SELECT id FROM descendants)",
+            params![tag.id, old_prefix_slash, new_prefix_slash],
+        )?;
+        conn.execute_batch("COMMIT")?;
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e);
+    }
+
+    // Re-fetch the updated record.
+    get_tag_by_uid(conn, tag_uid)
+}
+
+/// Deletes a tag and its entire descendant subtree.
+///
+/// `entry_tag_assignments` rows are removed automatically via `ON DELETE CASCADE`.
+/// `parent_tag_id` has no cascade so a recursive CTE is used to collect the subtree
+/// before issuing a single DELETE.
+///
+/// Returns `Ok(true)` if anything was deleted, `Ok(false)` if `tag_uid` was not found.
+pub fn delete_tag(conn: &Connection, tag_uid: &str) -> Result<bool> {
+    let deleted = conn.execute(
+        "WITH RECURSIVE subtree(id) AS (
+             SELECT id FROM tags WHERE tag_uid = ?1
+             UNION ALL
+             SELECT t.id FROM tags t JOIN subtree s ON t.parent_tag_id = s.id
+         )
+         DELETE FROM tags WHERE id IN (SELECT id FROM subtree)",
+        [tag_uid],
+    )?;
+    Ok(deleted > 0)
+}
+
 fn refresh_run_counters(conn: &Connection, run_id: i64) -> Result<()> {
     conn.execute(
         "UPDATE archive_runs
@@ -2441,4 +2548,148 @@ mod tests {
         assert_eq!(r2.bit_position, 5);
         assert_eq!(r2.level, 2);
     }
+    // ── rename_tag / delete_tag ────────────────────────────────────────────
+
+    #[test]
+    fn rename_tag_unknown_uid_returns_none() {
+        let conn = conn();
+        let result = rename_tag(&conn, "tag_doesnotexist", "anything").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn rename_tag_updates_own_path_and_cascades_to_children() {
+        let conn = conn();
+        // Create /science → /science/cs → /science/cs/algorithms
+        let _ = create_tag_path(&conn, "science/cs/algorithms").unwrap();
+
+        let science = get_tag_by_path(&conn, "/science").unwrap().unwrap();
+        let cs      = get_tag_by_path(&conn, "/science/cs").unwrap().unwrap();
+        let algo    = get_tag_by_path(&conn, "/science/cs/algorithms").unwrap().unwrap();
+
+        // Rename "science" → "natural-science"
+        let updated = rename_tag(&conn, &science.tag_uid, "natural-science")
+            .unwrap()
+            .expect("should return updated tag");
+
+        assert_eq!(updated.slug,      "natural-science");
+        assert_eq!(updated.name,      "Natural Science");
+        assert_eq!(updated.full_path, "/natural-science");
+
+        // /science must no longer exist
+        assert!(get_tag_by_path(&conn, "/science").unwrap().is_none());
+
+        // /science/cs must have moved
+        assert!(get_tag_by_path(&conn, "/science/cs").unwrap().is_none());
+        let cs_new = get_tag_by_uid(&conn, &cs.tag_uid).unwrap().unwrap();
+        assert_eq!(cs_new.full_path, "/natural-science/cs");
+
+        // /science/cs/algorithms must have moved
+        assert!(get_tag_by_path(&conn, "/science/cs/algorithms").unwrap().is_none());
+        let algo_new = get_tag_by_uid(&conn, &algo.tag_uid).unwrap().unwrap();
+        assert_eq!(algo_new.full_path, "/natural-science/cs/algorithms");
+    }
+
+    #[test]
+    fn rename_tag_sibling_collision_returns_err() {
+        let conn = conn();
+        // Create /science and /natural-science as siblings
+        let _ = create_tag_path(&conn, "science").unwrap();
+        let _ = create_tag_path(&conn, "natural-science").unwrap();
+
+        let science = get_tag_by_path(&conn, "/science").unwrap().unwrap();
+
+        // Renaming /science → natural-science should collide
+        let result = rename_tag(&conn, &science.tag_uid, "natural-science");
+        assert!(result.is_err(), "expected collision error, got {:?}", result);
+    }
+
+    #[test]
+    fn rename_tag_to_same_name_is_noop() {
+        let conn = conn();
+        let _ = create_tag_path(&conn, "science").unwrap();
+        let science = get_tag_by_path(&conn, "/science").unwrap().unwrap();
+
+        // "Science" humanizes to the same slug; rename should succeed (no collision since same uid)
+        let updated = rename_tag(&conn, &science.tag_uid, "science")
+            .unwrap()
+            .expect("should return tag");
+        assert_eq!(updated.full_path, "/science");
+    }
+
+    #[test]
+    fn delete_tag_unknown_uid_returns_false() {
+        let conn = conn();
+        assert!(!delete_tag(&conn, "tag_doesnotexist").unwrap());
+    }
+
+    #[test]
+    fn delete_tag_removes_subtree_and_cascades_assignments() {
+        let conn = conn();
+        // Build /science/cs and /science/math
+        let cs_id   = create_tag_path(&conn, "science/cs").unwrap();
+        let math_id = create_tag_path(&conn, "science/math").unwrap();
+        let science = get_tag_by_path(&conn, "/science").unwrap().unwrap();
+
+        // Create an entry and assign it to /science/cs
+        let entry = create_entry_fixture(&conn, "private", None, None);
+        assign_entry_to_tag(&conn, entry.id, cs_id).unwrap();
+
+        // Verify assignment exists
+        let assigned_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entry_tag_assignments WHERE entry_id = ?1",
+                [entry.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(assigned_before, 1);
+
+        // Delete the /science subtree
+        assert!(delete_tag(&conn, &science.tag_uid).unwrap());
+
+        // All three tag rows must be gone
+        let tag_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tag_count, 0, "all tags in subtree should be deleted");
+
+        // Assignment must have been cascade-deleted
+        let assigned_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entry_tag_assignments WHERE entry_id = ?1",
+                [entry.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(assigned_after, 0, "assignment should be removed by cascade");
+
+        // Verify by uid too (subtree ids: science, cs, math)
+        assert!(get_tag_by_uid(&conn, &science.tag_uid).unwrap().is_none());
+        let cs_tag = conn
+            .query_row("SELECT tag_uid FROM tags WHERE id = ?1", [cs_id], |r| r.get::<_, String>(0))
+            .optional()
+            .unwrap();
+        assert!(cs_tag.is_none(), "/science/cs should be deleted");
+        let math_tag = conn
+            .query_row("SELECT tag_uid FROM tags WHERE id = ?1", [math_id], |r| r.get::<_, String>(0))
+            .optional()
+            .unwrap();
+        assert!(math_tag.is_none(), "/science/math should be deleted");
+    }
+
+    #[test]
+    fn rename_tag_slug_with_special_chars_is_stripped() {
+        let conn = conn();
+        let _ = create_tag_path(&conn, "science").unwrap();
+        let science = get_tag_by_path(&conn, "/science").unwrap().unwrap();
+
+        // Input with spaces and underscores — underscores stripped, spaces become hyphens, case preserved
+        let updated = rename_tag(&conn, &science.tag_uid, "Natural Science")
+            .unwrap()
+            .expect("should rename");
+        assert_eq!(updated.slug, "Natural-Science");
+        assert_eq!(updated.full_path, "/Natural-Science");
+    }
+
 }
