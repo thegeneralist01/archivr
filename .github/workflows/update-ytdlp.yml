@@ -1,0 +1,51 @@
+name: Update yt-dlp
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Every Monday at 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Get current yt-dlp version
+        id: before
+        run: |
+          rev=$(jq -r '.nodes.nixpkgs.locked.rev' flake.lock)
+          version=$(nix eval --raw "github:nixos/nixpkgs/${rev}#yt-dlp.version")
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Update nixpkgs
+        run: nix flake update nixpkgs
+
+      - name: Get new yt-dlp version
+        id: after
+        run: |
+          rev=$(jq -r '.nodes.nixpkgs.locked.rev' flake.lock)
+          version=$(nix eval --raw "github:nixos/nixpkgs/${rev}#yt-dlp.version")
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Open PR if yt-dlp was updated
+        if: steps.before.outputs.version != steps.after.outputs.version
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: auto/yt-dlp-update
+          delete-branch: true
+          commit-message: "chore: yt-dlp ${{ steps.before.outputs.version }} → ${{ steps.after.outputs.version }}"
+          title: "chore: yt-dlp ${{ steps.before.outputs.version }} → ${{ steps.after.outputs.version }}"
+          body: |
+            Automated `flake.lock` update. yt-dlp bumped from `${{ steps.before.outputs.version }}` to `${{ steps.after.outputs.version }}`.
+
+            Triggered by the weekly nixpkgs check.
+          labels: dependencies
