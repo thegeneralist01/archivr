@@ -39,7 +39,14 @@ export default function EntryRow({ entry, archiveId, isSelected, onSelect }) {
       <div className="col-type">
         <span className="type-pill">{valueText(entry.entity_kind)}</span>
       </div>
-      <div className="col-size">{formatBytes(entry.total_artifact_bytes)}</div>
+      <div className="col-size">
+        <span className="size-total">{formatBytes(entry.total_artifact_bytes)}</span>
+        {entry.cached_bytes > 0 && entry.total_artifact_bytes > 0 && (
+          <span className="size-cached-pct" title={`${formatBytes(entry.cached_bytes)} already on disk from an earlier entry`}>
+            {Math.round(entry.cached_bytes / entry.total_artifact_bytes * 100)}% cached
+          </span>
+        )}
+      </div>
       <div className="url-cell col-url">{valueText(entry.original_url)}</div>
     </div>
   );

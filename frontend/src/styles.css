@@ -310,7 +310,16 @@ select {
 .col-added { width: 162px; color: var(--muted); }
 .col-title { flex: 1 1 0; min-width: 0; overflow: hidden; display: flex; align-items: center; gap: 0.42em; }
 .col-type { width: 116px; }
-.col-size { width: 96px; }
+.col-size { width: 100px; display: flex; flex-direction: column; justify-content: center; gap: 1px; }
+.size-total { font-variant-numeric: tabular-nums; }
+.size-cached-pct {
+  font-size: 10px;
+  color: var(--muted);
+  opacity: 0.8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .col-url { flex: 0 0 30%; min-width: 0; overflow: hidden; }
 
 .entry-header-row > div:first-child,

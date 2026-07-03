@@ -251,7 +251,8 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             structured_root_relpath TEXT NOT NULL,
             representation_kind TEXT NOT NULL,
             source_metadata_json TEXT NOT NULL DEFAULT '{}',
-            display_metadata_json TEXT
+            display_metadata_json TEXT,
+            cached_bytes INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS blobs (
@@ -350,6 +351,38 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         FROM archived_entries ae;
         "#,
     )?;
+
+    // Migration: add cached_bytes column to existing databases.
+    // New databases already have it from the DDL above; the column check is
+    // the idiomatic SQLite way to run a migration exactly once.
+    let column_exists: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('archived_entries') WHERE name = 'cached_bytes'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? > 0;
+    if !column_exists {
+        conn.execute_batch(
+            "ALTER TABLE archived_entries ADD COLUMN cached_bytes INTEGER NOT NULL DEFAULT 0;
+             UPDATE archived_entries
+             SET cached_bytes = (
+                 SELECT COALESCE(SUM(b.byte_size), 0)
+                 FROM entry_artifacts ea
+                 JOIN blobs b ON b.id = ea.blob_id
+                 WHERE ea.entry_id = archived_entries.id
+                   AND ea.blob_id IS NOT NULL
+                   AND EXISTS (
+                       SELECT 1
+                       FROM entry_artifacts ea2
+                       JOIN archived_entries e2 ON e2.id = ea2.entry_id
+                       WHERE ea2.blob_id = ea.blob_id
+                         AND (e2.archived_at < archived_entries.archived_at
+                              OR (e2.archived_at = archived_entries.archived_at
+                                  AND e2.id < archived_entries.id))
+                   )
+             );",
+        )?;
+    }
+
     Ok(())
 }
 
@@ -1189,6 +1222,82 @@ pub fn upsert_source_identity(
         |row| row.get(0),
     )?;
     Ok(id)
+}
+
+/// Computes and stores `cached_bytes` for a single entry.
+///
+/// Must be called after all artifacts for the entry have been inserted so the
+/// correlated subquery sees the complete artifact set. Ordering by `archived_at`
+/// (tiebreak: `id`) matches the display ordering used in listings.
+pub fn refresh_entry_cached_bytes(conn: &Connection, entry_id: i64) -> Result<()> {
+    let cached: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(b.byte_size), 0)
+         FROM entry_artifacts ea
+         JOIN blobs b ON b.id = ea.blob_id
+         JOIN archived_entries e ON e.id = ea.entry_id
+         WHERE ea.entry_id = ?1
+           AND ea.blob_id IS NOT NULL
+           AND EXISTS (
+               SELECT 1
+               FROM entry_artifacts ea2
+               JOIN archived_entries e2 ON e2.id = ea2.entry_id
+               WHERE ea2.blob_id = ea.blob_id
+                 AND (e2.archived_at < e.archived_at
+                      OR (e2.archived_at = e.archived_at AND e2.id < ?1))
+           )",
+        [entry_id],
+        |row| row.get(0),
+    )?;
+    conn.execute(
+        "UPDATE archived_entries SET cached_bytes = ?1 WHERE id = ?2",
+        params![cached, entry_id],
+    )?;
+    Ok(())
+}
+
+/// Recomputes `cached_bytes` for entries that shared blobs with `entry_id` and
+/// were archived after it.
+///
+/// Must be called **before** the entry row is deleted so that the shared-blob
+/// lookup still works. The inner EXISTS deliberately excludes `entry_id` so each
+/// affected entry is recomputed as if that entry no longer exists.
+///
+/// Intended to be dispatched asynchronously: acknowledge the delete to the user
+/// first, then call this on a background thread.
+pub fn cascade_cached_bytes_after_delete(conn: &Connection, entry_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE archived_entries
+         SET cached_bytes = (
+             SELECT COALESCE(SUM(b.byte_size), 0)
+             FROM entry_artifacts ea
+             JOIN blobs b ON b.id = ea.blob_id
+             WHERE ea.entry_id = archived_entries.id
+               AND ea.blob_id IS NOT NULL
+               AND EXISTS (
+                   SELECT 1
+                   FROM entry_artifacts ea3
+                   JOIN archived_entries e3 ON e3.id = ea3.entry_id
+                   WHERE ea3.blob_id = ea.blob_id
+                     AND e3.id != ?1
+                     AND (e3.archived_at < archived_entries.archived_at
+                          OR (e3.archived_at = archived_entries.archived_at
+                              AND e3.id < archived_entries.id))
+               )
+         )
+         WHERE id IN (
+             SELECT DISTINCT ea2.entry_id
+             FROM entry_artifacts ea_del
+             JOIN entry_artifacts ea2   ON ea2.blob_id = ea_del.blob_id
+             JOIN archived_entries e_del ON e_del.id = ea_del.entry_id
+             JOIN archived_entries e2   ON e2.id = ea2.entry_id
+             WHERE ea_del.entry_id = ?1
+               AND ea2.entry_id != ?1
+               AND (e2.archived_at > e_del.archived_at
+                    OR (e2.archived_at = e_del.archived_at AND e2.id > ?1))
+         )",
+        [entry_id],
+    )?;
+    Ok(())
 }
 
 pub fn upsert_blob(conn: &Connection, blob: &BlobRecord) -> Result<i64> {
