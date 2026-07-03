@@ -752,6 +752,16 @@ pub fn update_user_display_name(conn: &Connection, user_id: i64, display_name: O
     Ok(())
 }
 
+/// Updates the user-visible title of an archived entry.
+/// Returns `Ok(true)` if a row was updated, `Ok(false)` if the entry_uid was not found.
+pub fn update_entry_title(conn: &Connection, entry_uid: &str, title: Option<&str>) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE archived_entries SET title = ?1 WHERE entry_uid = ?2",
+        params![title, entry_uid],
+    )?;
+    Ok(n > 0)
+}
+
 pub fn get_user_display_name(conn: &Connection, user_id: i64) -> Result<Option<String>> {
     conn.query_row(
         "SELECT display_name FROM users WHERE id = ?1",

@@ -178,6 +178,15 @@ export default function App() {
     if (archiveId) fetchTags(archiveId).then(setTagNodes)
   }, [archiveId])
 
+  const handleEntryTitleChange = useCallback((entryUid, newTitle) => {
+    setEntries(prev => prev.map(e =>
+      e.entry_uid === entryUid ? { ...e, title: newTitle } : e
+    ))
+    setSelectedEntry(prev =>
+      prev && prev.entry_uid === entryUid ? { ...prev, title: newTitle } : prev
+    )
+  }, [])
+
   const handleCaptureClick = useCallback(() => {
     setCaptureDialogOpen(true)
   }, [])
@@ -277,6 +286,7 @@ export default function App() {
             onTagFilterSet={handleTagFilterSet}
             tagNodes={tagNodes}
             onTagsRefresh={handleTagsRefresh}
+            onEntryTitleChange={handleEntryTitleChange}
           />
         </main>
         <CaptureDialog

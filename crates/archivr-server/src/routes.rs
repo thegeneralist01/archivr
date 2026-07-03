@@ -10,6 +10,7 @@
 //                   POST /api/archives/:id/captures
 //                   POST /api/archives/:id/tags
 //                   POST/DELETE /api/archives/:id/entries/:uid/tags
+//                   PATCH /api/archives/:id/entries/:uid
 //   ADMIN       — requires ROLE_ADMIN: (future)
 //   OWNER       — requires ROLE_OWNER: (future)
 //   AUTH_SELF   — own resources, require_auth() only:
@@ -214,7 +215,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/archives/:archive_id/entries/search", get(search_entries_handler))
         .route(
             "/api/archives/:archive_id/entries/:entry_uid",
-            get(entry_detail),
+            get(entry_detail).patch(patch_entry_handler),
         )
         .route(
             "/api/archives/:archive_id/entries/:entry_uid/artifacts/:artifact_index",
@@ -555,6 +556,26 @@ async fn remove_entry_tag_handler(
     }
 }
 
+async fn patch_entry_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((archive_id, entry_uid)): Path<(String, String)>,
+    Json(body): Json<PatchEntryBody>,
+) -> Result<StatusCode, ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let title = body.title.as_deref().map(|s| {
+        let t = s.trim();
+        if t.is_empty() { None } else { Some(t) }
+    }).flatten();
+    if database::update_entry_title(&conn, &entry_uid, title)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("entry not found"))
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct CaptureBody {
     locator: String,
@@ -575,6 +596,11 @@ struct SetupBody {
 #[derive(Debug, serde::Deserialize)]
 struct CreateTokenBody {
     name: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PatchEntryBody {
+    title: Option<String>,
 }
 
 async fn capture_handler(
@@ -2731,6 +2757,82 @@ mod tests {
             .oneshot(Request::builder().uri("/api/archives/test/entries/search").header("cookie", &session_cookie).body(Body::empty()).unwrap())
             .await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn patch_entry_title_requires_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/archives/test/entries/nonexistent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"title":"New Title"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn patch_entry_title_persists_and_reflects_in_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let entry = make_test_entry(&archive_path);
+
+        // PATCH the title
+        let response = app(registry.clone(), auth_path.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(&format!("/api/archives/test/entries/{}", entry.entry_uid))
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(r#"{"title":"Renamed Title"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // Verify via entry detail
+        let get_resp = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .uri(&format!("/api/archives/test/entries/{}", entry.entry_uid))
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        let json = body_json(get_resp).await;
+        assert_eq!(json["summary"]["title"], "Renamed Title");
+    }
+
+    #[tokio::test]
+    async fn patch_entry_title_returns_404_for_unknown_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/archives/test/entries/no-such-uid")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(r#"{"title":"Anything"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
 }
