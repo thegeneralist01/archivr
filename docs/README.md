@@ -2,11 +2,11 @@
 
 An open-source self-hosted archiving tool. Work in progress.
 
-## Milestones
-
-- [ ] Archiving
+- [x] Archiving
   - [x] Archiving media files from social media platforms
     - [x] YouTube Videos
+    - [x] YouTube Playlists
+    - [x] YouTube Channels
     - [x] Twitter Videos
     - [x] Instagram
     - [x] Facebook
@@ -27,14 +27,23 @@ An open-source self-hosted archiving tool. Work in progress.
     - [ ] Gmail
     - [ ] Outlook
     - [ ] Yahoo Mail
-- [ ] Management
-  - [ ] Deduplication
-  - [ ] Tagging system
-  - [ ] Search functionality
+- [x] Management
+  - [x] Deduplication
+  - [x] Tagging system
+  - [x] Search functionality
   - [ ] Categorization
-  - [ ] Metadata extraction and storage
-- [ ] User Interface
-  - [ ] Web-based UI
+  - [x] Metadata extraction and storage
+- [x] User Interface
+  - [x] Web-based UI
+    - [x] Authentication and login
+    - [x] Archive setup
+    - [x] Browse and view entries
+    - [x] Tag management and filtering
+    - [x] Search entries
+    - [x] View archive runs
+    - [x] Capture dialog
+    - [x] User settings and API tokens
+    - [x] Admin panel
 - [ ] Backup and Sync
   - [ ] Cloud backup (AWS S3, Google Cloud Storage)
   - [ ] Local backup
