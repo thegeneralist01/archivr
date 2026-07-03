@@ -30,7 +30,7 @@ export default function Topbar({ archives, archiveId, onArchiveChange, view, onV
           </button>
         ))}
       </nav>
-      <button className="capture-button" onClick={onCaptureClick}>+ Capture</button>
+      <button className="capture-button" onClick={onCaptureClick}>Capture</button>
       {currentUser && (
         <div className="user-menu">
           <span className="user-name">{currentUser.display_name || currentUser.username}</span>
