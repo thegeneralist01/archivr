@@ -1349,3 +1349,37 @@ select {
   }
   .entry-table { min-width: 860px; }
 }
+
+/* Inline title edit in ContextRail */
+.rail-title--editable {
+  cursor: pointer;
+}
+.rail-title--editable:hover {
+  opacity: 0.75;
+}
+.rail-title--editable .edit-icon {
+  display: inline-block;
+  width: 0.75em;
+  height: 0.75em;
+  margin-left: 0.35em;
+  vertical-align: middle;
+  opacity: 0;
+  transition: opacity 0.1s;
+  flex-shrink: 0;
+}
+.rail-title--editable:hover .edit-icon {
+  opacity: 0.5;
+}
+.rail-title-input {
+  width: 100%;
+  font: inherit;
+  font-size: inherit;
+  font-weight: 600;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid currentColor;
+  color: inherit;
+  padding: 0;
+  margin: 0 0 8px;
+  outline: none;
+}

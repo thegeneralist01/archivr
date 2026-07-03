@@ -25,6 +25,15 @@ export async function fetchEntryDetail(archiveId, entryUid) {
   return getJson(`/api/archives/${archiveId}/entries/${entryUid}`);
 }
 
+export async function updateEntryTitle(archiveId, entryUid, title) {
+  const res = await fetch(`/api/archives/${archiveId}/entries/${entryUid}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: title ?? null }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+}
+
 export async function fetchEntryTags(archiveId, entryUid) {
   return getJson(`/api/archives/${archiveId}/entries/${entryUid}/tags`);
 }

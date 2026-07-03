@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { fetchEntryDetail, fetchEntryTags, assignTag, removeTag, listEntryCollections } from '../api'
+import { fetchEntryDetail, fetchEntryTags, assignTag, removeTag, listEntryCollections, updateEntryTitle } from '../api'
 import { formatTimestamp, formatBytes, valueText, sourceIconSvg } from '../utils'
 
 const VIS_LABEL = { 0: 'Private', 1: 'Public', 2: 'Users only', 3: 'Public' }
@@ -10,13 +10,16 @@ const ExternalIcon = () => (
   </svg>
 )
 
-export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, tagNodes, onTagsRefresh }) {
+export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, tagNodes, onTagsRefresh, onEntryTitleChange }) {
   const [detail, setDetail] = useState(null)
   const [tags, setTags] = useState([])
   const [assignInput, setAssignInput] = useState('')
   const [entryCollections, setEntryCollections] = useState([])
   const [assignError, setAssignError] = useState('')
   const selectSeqRef = useRef(0)
+  const titleCancelRef = useRef(false)
+  const [editingTitle, setEditingTitle] = useState(false)
+  const [titleDraft, setTitleDraft] = useState('')
 
   useEffect(() => {
     if (!selectedEntry || !archiveId) {
@@ -25,6 +28,9 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
       setEntryCollections([])
       return
     }
+    setEditingTitle(false)
+    setTitleDraft('')
+    titleCancelRef.current = false
     const seq = ++selectSeqRef.current
     setDetail(null)
     setTags([])
@@ -39,6 +45,19 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
       setEntryCollections(ecs)
     }).catch(() => {})
   }, [selectedEntry, archiveId])
+
+  async function handleTitleSave() {
+    const newTitle = titleDraft.trim() || null
+    try {
+      await updateEntryTitle(archiveId, selectedEntry.entry_uid, newTitle)
+      setDetail(prev => prev ? { ...prev, summary: { ...prev.summary, title: newTitle } } : prev)
+      onEntryTitleChange?.(selectedEntry.entry_uid, newTitle)
+    } catch {
+      // silently revert
+    } finally {
+      setEditingTitle(false)
+    }
+  }
 
   async function handleAssignTag() {
     const path = assignInput.trim()
@@ -84,9 +103,33 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
         <p className="tags-empty">Loading…</p>
       ) : (
         <>
-          <h2 className="rail-title">
-            {valueText(detail.summary.title) || valueText(detail.summary.entry_uid)}
-          </h2>
+          {editingTitle ? (
+            <input
+              className="rail-title-input"
+              autoFocus
+              value={titleDraft}
+              onChange={e => setTitleDraft(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') e.currentTarget.blur()
+                if (e.key === 'Escape') { titleCancelRef.current = true; e.currentTarget.blur() }
+              }}
+              onBlur={() => { if (titleCancelRef.current) { setEditingTitle(false) } else { handleTitleSave() } titleCancelRef.current = false }}
+            />
+          ) : (
+            <h2
+              className="rail-title rail-title--editable"
+              title="Click to rename"
+              onClick={() => {
+                setTitleDraft(detail.summary.title ?? '')
+                setEditingTitle(true)
+              }}
+            >
+              {valueText(detail.summary.title) || valueText(detail.summary.entry_uid)}
+              <svg className="edit-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M11.5 2.5a1.5 1.5 0 0 1 2 2L5 13l-3 1 1-3 8.5-8.5z"/>
+              </svg>
+            </h2>
+          )}
 
           {detail.summary.original_url && (
             <a
