@@ -76,7 +76,15 @@ export default function App() {
   const [searchBusy, setSearchBusy] = useState(false)
   const [runs, setRuns] = useState([])
   const [tagNodes, setTagNodes] = useState([])
-  const [captureDialogOpen, setCaptureDialogOpen] = useState(false)
+  const [captureDialogOpen, setCaptureDialogOpen] = useState(() => {
+    const saved = sessionStorage.getItem('captureDialogOpen')
+    return saved === 'true'
+  })
+
+  // Persist captureDialogOpen to sessionStorage
+  useEffect(() => {
+    sessionStorage.setItem('captureDialogOpen', captureDialogOpen)
+  }, [captureDialogOpen])
 
   const loadEntries = useCallback(async (aid, q, tag) => {
     if (!aid) return
