@@ -35,8 +35,8 @@ pub fn download(path: String, store_path: &Path, timestamp: &String) -> Result<S
 /// Fetches metadata JSON for `path` via `yt-dlp --dump-json`.
 ///
 /// This is a simulate call — it does NOT download any media.
-/// Returns `None` silently if yt-dlp fails or produces no output,
-/// so callers can proceed with the download regardless.
+/// On failure (non-zero exit or no stdout), prints the captured stderr
+/// to stderr (for debugging) then returns `None` so callers can proceed.
 pub fn fetch_metadata(path: &str) -> Option<String> {
     let ytdlp = std::env::var("ARCHIVR_YT_DLP").unwrap_or_else(|_| "yt-dlp".to_string());
 
@@ -47,6 +47,8 @@ pub fn fetch_metadata(path: &str) -> Option<String> {
         .ok()?;
 
     if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eprintln!("yt-dlp --dump-json failed for {path} (status {:?}): {stderr}", out.status);
         return None;
     }
 
