@@ -977,6 +977,29 @@ pub fn perform_capture(
     // Sources, for which yt-dlp is needed
     let requested_locator = locator.to_string();
     let path = expand_shorthand_to_url(locator, &source);
+    // Fetch yt-dlp metadata before downloading — separate invocation
+    // because --dump-json is a simulate flag that suppresses the download.
+    let ytdlp_metadata_json: Option<String> = match source {
+        Source::YouTubeVideo
+        | Source::X
+        | Source::Instagram
+        | Source::Facebook
+        | Source::TikTok
+        | Source::Reddit
+        | Source::Snapchat => downloader::ytdlp::fetch_metadata(&path),
+        _ => None,
+    };
+
+    let local_filename_title: Option<String> = match source {
+        Source::Local => {
+            // path is a file:// URI; strip the scheme and take the last component.
+            let file_path = path.trim_start_matches("file://");
+            std::path::Path::new(file_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        }
+        _ => None,
+    };
 
     let hash = match source {
         Source::YouTubeVideo
@@ -1047,6 +1070,19 @@ pub fn perform_capture(
         let _ = fs::remove_dir_all(store_path.join("temp").join(&timestamp));
     }
 
+    let entry_title: Option<String> = if let Some(json) = &ytdlp_metadata_json {
+        let metadata = downloader::metadata::extract_from_ytdlp_json(json);
+        Some(generate_entry_title(source, &metadata))
+    } else if let Some(filename) = local_filename_title {
+        let metadata = PlatformMetadata {
+            title: Some(filename),
+            ..Default::default()
+        };
+        Some(generate_entry_title(source, &metadata))
+    } else {
+        None
+    };
+
     let media_entry = record_media_entry(
         &conn,
         store_path,
@@ -1059,7 +1095,7 @@ pub fn perform_capture(
         &hash,
         &file_extension,
         byte_size,
-        None,  // title — populated in a later task
+        entry_title,
     )?;
     database::refresh_entry_cached_bytes(&conn, media_entry.id)?;
     database::finish_archive_run(&conn, run.id)?;
