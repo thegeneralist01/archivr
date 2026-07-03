@@ -153,6 +153,15 @@ export async function updateProfile(displayName) {
   if (!res.ok) throw new Error(await res.text());
 }
 
+export async function patchMe(patch) {
+  const res = await fetch('/api/auth/me', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) throw new Error(await res.text());
+}
+
 export async function changePassword(currentPassword, newPassword) {
   const res = await fetch('/api/auth/me', {
     method: 'PATCH',

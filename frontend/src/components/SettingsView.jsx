@@ -1,7 +1,7 @@
 import { useState, useEffect, useContext, useCallback } from 'react'
 import { AuthContext } from '../App.jsx'
 import {
-  updateProfile, changePassword,
+  updateProfile, changePassword, patchMe,
   listTokens, createToken, deleteToken,
   getInstanceSettings, updateInstanceSettings,
 } from '../api.js'
@@ -93,6 +93,29 @@ function ProfileTab({ currentUser, setCurrentUser }) {
             {saving ? 'Saving\u2026' : 'Save'}
           </button>
         </form>
+      </div>
+
+      <div className="form-section">
+        <h2>Display Preferences</h2>
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={currentUser?.humanize_slugs ?? false}
+            onChange={async e => {
+              const checked = e.target.checked;
+              try {
+                await patchMe({ humanize_slugs: checked });
+                setCurrentUser(prev => ({ ...prev, humanize_slugs: checked }));
+              } catch {
+                // silently revert
+              }
+            }}
+          />
+          <span className="form-label" style={{ margin: 0 }}>Humanize tag display</span>
+        </label>
+        <p className="muted" style={{ fontSize: 13, margin: '4px 0 0' }}>
+          When on, tag paths show as "X / Articles" instead of "x/articles".
+        </p>
       </div>
 
       <div className="form-section">

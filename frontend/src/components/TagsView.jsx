@@ -1,7 +1,7 @@
 import { useState, useRef } from 'react';
 import { renameTag, deleteTag } from '../api';
 
-function TagNode({ node, archiveId, tagFilter, onTagFilterSet, onViewChange, onTagRenamed, onTagDeleted, onTagsRefresh }) {
+function TagNode({ node, archiveId, tagFilter, onTagFilterSet, onViewChange, onTagRenamed, onTagDeleted, onTagsRefresh, humanizeTags }) {
   const isActive = tagFilter === node.tag.full_path;
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
@@ -52,7 +52,7 @@ function TagNode({ node, archiveId, tagFilter, onTagFilterSet, onViewChange, onT
     }
   }
 
-  const childProps = { archiveId, tagFilter, onTagFilterSet, onViewChange, onTagRenamed, onTagDeleted, onTagsRefresh };
+  const childProps = { archiveId, tagFilter, onTagFilterSet, onViewChange, onTagRenamed, onTagDeleted, onTagsRefresh, humanizeTags };
 
   return (
     <li>
@@ -83,7 +83,7 @@ function TagNode({ node, archiveId, tagFilter, onTagFilterSet, onViewChange, onT
             onClick={handleFilterClick}
             onDoubleClick={startEdit}
           >
-            {node.tag.name}
+            {humanizeTags ? node.tag.name : node.tag.slug}
             <svg
               className="edit-icon"
               viewBox="0 0 16 16"
@@ -119,7 +119,7 @@ function TagNode({ node, archiveId, tagFilter, onTagFilterSet, onViewChange, onT
   );
 }
 
-export default function TagsView({ archiveId, tagNodes, tagFilter, onTagFilterSet, onViewChange, onTagRenamed, onTagDeleted, onTagsRefresh }) {
+export default function TagsView({ archiveId, tagNodes, tagFilter, onTagFilterSet, onViewChange, onTagRenamed, onTagDeleted, onTagsRefresh, humanizeTags }) {
   return (
     <section id="tags-view" className="view is-active">
       <div className="tag-tree">
@@ -142,6 +142,7 @@ export default function TagsView({ archiveId, tagNodes, tagFilter, onTagFilterSe
                 onTagRenamed={onTagRenamed}
                 onTagDeleted={onTagDeleted}
                 onTagsRefresh={onTagsRefresh}
+                humanizeTags={humanizeTags}
               />
             ))}
           </ul>

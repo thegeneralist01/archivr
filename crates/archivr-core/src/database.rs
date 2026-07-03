@@ -468,6 +468,11 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
     )?;
     // Add display_name column to users if not present (idempotent migration)
     let _ = conn.execute("ALTER TABLE users ADD COLUMN display_name TEXT", []);
+    // Add humanize_slugs column to users if not present (idempotent migration)
+    let _ = conn.execute(
+        "ALTER TABLE users ADD COLUMN humanize_slugs INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
 
     Ok(())
 }
@@ -748,6 +753,14 @@ pub fn update_user_display_name(conn: &Connection, user_id: i64, display_name: O
     conn.execute(
         "UPDATE users SET display_name = ?1 WHERE id = ?2",
         params![display_name, user_id],
+    )?;
+    Ok(())
+}
+
+pub fn update_user_humanize_slugs(conn: &Connection, user_id: i64, value: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE users SET humanize_slugs = ?1 WHERE id = ?2",
+        params![value as i64, user_id],
     )?;
     Ok(())
 }

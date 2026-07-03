@@ -12,6 +12,7 @@ import TagsView from './components/TagsView'
 import CollectionsView from './components/CollectionsView'
 import SettingsView from './components/SettingsView'
 import ContextRail from './components/ContextRail'
+import { displayPath } from './utils'
 
 export const AuthContext = createContext(null);
 
@@ -80,6 +81,8 @@ export default function App() {
     const saved = sessionStorage.getItem('captureDialogOpen')
     return saved === 'true'
   })
+
+  const humanizeTags = currentUser?.humanize_slugs ?? false;
 
   // Persist captureDialogOpen to sessionStorage
   useEffect(() => {
@@ -265,7 +268,7 @@ export default function App() {
                   {resultCount && <><b>{resultCount.split(' ')[0]}</b>{' '}{resultCount.split(' ').slice(1).join(' ')}</>}
                   {tagFilter && (
                     <button className="tag-filter-badge" onClick={handleClearTagFilter}>
-                      × {tagFilter}
+                      × {humanizeTags ? displayPath(tagFilter) : tagFilter}
                     </button>
                   )}
                 </span>
@@ -297,6 +300,7 @@ export default function App() {
                 onTagRenamed={handleTagRenamed}
                 onTagDeleted={handleTagDeleted}
                 onTagsRefresh={handleTagsRefresh}
+                humanizeTags={humanizeTags}
               />
             )}
             {view === 'collections' && (
@@ -313,6 +317,7 @@ export default function App() {
             tagNodes={tagNodes}
             onTagsRefresh={handleTagsRefresh}
             onEntryTitleChange={handleEntryTitleChange}
+            humanizeTags={humanizeTags}
           />
         </main>
         <CaptureDialog

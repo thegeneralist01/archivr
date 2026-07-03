@@ -820,17 +820,19 @@ async fn auth_me(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (user_id, role_bits) = auth_user.require_auth()?;
     let conn = database::open_auth_db(&state.auth_db_path)?;
-    let (username, display_name): (String, Option<String>) = conn
+    let (username, display_name, humanize_slugs_int): (String, Option<String>, i64) = conn
         .query_row(
-            "SELECT username, display_name FROM users WHERE id = ?1",
+            "SELECT username, display_name, COALESCE(humanize_slugs, 0) FROM users WHERE id = ?1",
             [user_id],
-            |r| Ok((r.get(0)?, r.get(1)?))
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         )
         .map_err(|e| ApiError::from(anyhow::anyhow!("db error: {e}")))?;
+    let humanize_slugs = humanize_slugs_int != 0;
     Ok(Json(serde_json::json!({
         "role_bits": role_bits,
         "username": username,
         "display_name": display_name,
+        "humanize_slugs": humanize_slugs,
     })))
 }
 
@@ -859,6 +861,10 @@ async fn patch_me(
     if let Some(ref dn) = body.display_name {
         let v: Option<&str> = if dn.trim().is_empty() { None } else { Some(dn.as_str()) };
         database::update_user_display_name(&conn, user_id, v)?;
+    }
+
+    if let Some(hs) = body.humanize_slugs {
+        database::update_user_humanize_slugs(&conn, user_id, hs)?;
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -949,6 +955,7 @@ struct UpdateProfileBody {
     display_name: Option<String>,
     current_password: Option<String>,
     new_password: Option<String>,
+    humanize_slugs: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2877,6 +2884,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn auth_me_returns_humanize_slugs_false_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/me")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(
+            json["humanize_slugs"], false,
+            "humanize_slugs must default to false for new users"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_me_humanize_slugs_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.sqlite");
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
+        let state = AppState {
+            registry: Arc::new(ServerRegistry { archives: vec![], bind: None, auth_db_path: None }),
+            auth_db_path: Arc::new(auth_path.clone()),
+            login_attempts: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let session_cookie = make_test_session(&auth_path);
+
+        // PATCH humanize_slugs = true
+        let patch_resp = app_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/auth/me")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(r#"{"humanize_slugs":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(patch_resp.status(), StatusCode::NO_CONTENT);
+
+        // GET /api/auth/me — must now return humanize_slugs: true
+        let get_resp = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/me")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        let json = body_json(get_resp).await;
+        assert_eq!(
+            json["humanize_slugs"], true,
+            "humanize_slugs must be true after PATCH"
+        );
     }
 
 }

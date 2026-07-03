@@ -38,3 +38,19 @@ export const SOURCE_ICONS = {
 export function sourceIconSvg(kind) {
   return SOURCE_ICONS[kind] ?? SOURCE_ICONS.other;
 }
+
+// Humanize each slash-segment of a stored full_path for display.
+// Matches the backend humanize_slug convention: capitalize first char of each
+// hyphen-part, replace hyphens with spaces.
+// e.g. "/x/natural-science" → "/X/Natural Science"
+// Used only for rendered label text; never mutate state/API values with this.
+export function displayPath(fullPath) {
+  return fullPath
+    .split('/')
+    .map(seg =>
+      seg
+        ? seg.split('-').map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(' ')
+        : ''
+    )
+    .join('/');
+}
