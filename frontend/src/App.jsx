@@ -241,7 +241,7 @@ export default function App() {
               </div>
             )}
             {view === 'archive' && (
-              <EntriesView
+            <EntriesView
                 entries={entries}
                 selectedEntryUid={selectedEntryUid}
                 onSelectEntry={selectEntry}

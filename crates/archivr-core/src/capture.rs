@@ -751,7 +751,7 @@ pub fn perform_capture(
                     let _ = fs::remove_dir_all(store_path.join("temp").join(&timestamp));
                 }
 
-                record_media_entry(
+                let entry = record_media_entry(
                     &conn,
                     store_path,
                     user_id,
@@ -765,6 +765,7 @@ pub fn perform_capture(
                     byte_size,
                     title_hint,
                 )?;
+                database::refresh_entry_cached_bytes(&conn, entry.id)?;
                 database::finish_archive_run(&conn, run.id)?;
                 return Ok(CaptureResult {
                     run_uid: run.run_uid.clone(),
@@ -904,6 +905,9 @@ pub fn perform_capture(
                     }
                 }
 
+                // 7. Store how many bytes this entry gets "for free" from earlier entries.
+                database::refresh_entry_cached_bytes(&conn, entry.id)?;
+
                 database::finish_archive_run(&conn, run.id)?;
                 return Ok(CaptureResult {
                     run_uid: run.run_uid.clone(),
@@ -942,7 +946,7 @@ pub fn perform_capture(
             &timestamp,
         ) {
             Ok(_) => {
-                record_tweet_entry(
+                let tweet_entry = record_tweet_entry(
                     &conn,
                     store_path,
                     user_id,
@@ -952,6 +956,7 @@ pub fn perform_capture(
                     source,
                     &tweet_id,
                 )?;
+                database::refresh_entry_cached_bytes(&conn, tweet_entry.id)?;
                 database::finish_archive_run(&conn, run.id)?;
                 return Ok(CaptureResult {
                     run_uid: run.run_uid.clone(),
@@ -1042,7 +1047,7 @@ pub fn perform_capture(
         let _ = fs::remove_dir_all(store_path.join("temp").join(&timestamp));
     }
 
-    record_media_entry(
+    let media_entry = record_media_entry(
         &conn,
         store_path,
         user_id,
@@ -1056,6 +1061,7 @@ pub fn perform_capture(
         byte_size,
         None,  // title — populated in a later task
     )?;
+    database::refresh_entry_cached_bytes(&conn, media_entry.id)?;
     database::finish_archive_run(&conn, run.id)?;
 
     Ok(CaptureResult {
