@@ -23,7 +23,7 @@ export default function Topbar({ archives, archiveId, onArchiveChange, view, onV
         </select>
       </div>
       <nav className="nav" aria-label="Primary">
-        {['archive', 'runs', 'admin', 'tags', 'collections', 'settings'].map(name => (
+        {['archive', 'tags', 'collections', 'runs', 'admin', 'settings'].map(name => (
           <button key={name} className={`nav-link${view === name ? ' is-active' : ''}`}
             onClick={() => onViewChange(name)}>
             {name.charAt(0).toUpperCase() + name.slice(1)}

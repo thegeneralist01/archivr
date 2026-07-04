@@ -16,7 +16,7 @@ import { displayPath } from './utils'
 
 export const AuthContext = createContext(null);
 
-const VIEWS = ['archive','runs','admin','tags','collections','settings']
+const VIEWS = ['archive','tags','collections','runs','admin','settings']
 const SETTINGS_TABS = ['profile','tokens','instance']
 
 function parseLocation() {
