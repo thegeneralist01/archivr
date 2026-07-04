@@ -1309,7 +1309,7 @@ select {
 }
 .run-status--completed { background: #d8eddf; color: #235c35; border: 1px solid #b4d9be; }
 .run-status--failed { background: #f5ddd8; color: #8d3f30; border: 1px solid #e0b8b0; }
-.run-status--running { background: #dde8f5; color: #245f72; border: 1px solid #b8cde0; }
+.run-status--in-progress { background: #fdefd8; color: #8a4f10; border: 1px solid #f0cfa0; }
 
 /* ── Token created banner ────────────────────────────────────────────────── */
 .token-banner {

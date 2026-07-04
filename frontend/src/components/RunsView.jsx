@@ -13,9 +13,10 @@ function fmtDate(iso) {
 function StatusBadge({ status }) {
   const cls = status === 'completed' ? 'run-status--completed'
     : status === 'failed' ? 'run-status--failed'
-    : status === 'running' ? 'run-status--running'
+    : status === 'in_progress' ? 'run-status--in-progress'
     : '';
-  return <span className={`run-status ${cls}`}>{status || '—'}</span>;
+  const label = status ? status.replace(/_/g, ' ') : '—';
+  return <span className={`run-status ${cls}`}>{label}</span>;
 }
 
 export default function RunsView({ runs }) {
