@@ -215,7 +215,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/archives/:archive_id/entries/search", get(search_entries_handler))
         .route(
             "/api/archives/:archive_id/entries/:entry_uid",
-            get(entry_detail).patch(patch_entry_handler),
+            get(entry_detail).patch(patch_entry_handler).delete(delete_entry_handler),
         )
         .route(
             "/api/archives/:archive_id/entries/:entry_uid/artifacts/:artifact_index",
@@ -609,6 +609,25 @@ async fn patch_entry_handler(
         if t.is_empty() { None } else { Some(t) }
     }).flatten();
     if database::update_entry_title(&conn, &entry_uid, title)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("entry not found"))
+    }
+}
+
+async fn delete_entry_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((archive_id, entry_uid)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let mut conn = database::open_or_initialize(&mounted.archive_path)?;
+    // Transaction: if any step fails (cascade update, FK null, or delete), nothing is committed.
+    let tx = conn.transaction()?;
+    let found = database::delete_entry(&tx, &entry_uid)?;
+    tx.commit()?;
+    if found {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found("entry not found"))
@@ -2956,6 +2975,74 @@ mod tests {
             json["humanize_slugs"], true,
             "humanize_slugs must be true after PATCH"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_entry_returns_204_and_entry_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+        let entry = make_test_entry(&archive_path);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/archives/test/entries/{}", entry.entry_uid))
+                    .header("cookie", &session)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        // Confirm the row is actually gone from the DB.
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM archived_entries WHERE entry_uid = ?1",
+                [&entry.entry_uid],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(exists.is_none(), "entry row should be deleted");
+    }
+
+    #[tokio::test]
+    async fn delete_entry_returns_404_for_missing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _archive_path, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/archives/test/entries/entry_doesnotexist")
+                    .header("cookie", &session)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_entry_requires_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/archives/test/entries/{}", entry.entry_uid))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
 }

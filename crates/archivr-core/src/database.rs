@@ -1323,6 +1323,128 @@ pub fn cascade_cached_bytes_after_delete(conn: &Connection, entry_id: i64) -> Re
     Ok(())
 }
 
+/// Recalculates `cached_bytes` for every entry that shares a blob with any member of
+/// `subtree_ids` and was archived after that member, treating the whole subtree as absent.
+///
+/// Unlike `cascade_cached_bytes_after_delete` (single-entry), this excludes **all** subtree IDs
+/// from the EXISTS check in one SQL pass, so sibling entries don't falsely count each other as
+/// "still there" during the recalculation.
+///
+/// Must be called before any subtree rows are deleted so the `entry_artifacts` JOIN resolves.
+fn cascade_cached_bytes_after_subtree_delete(
+    conn: &Connection,
+    subtree_ids: &[i64],
+) -> Result<()> {
+    if subtree_ids.is_empty() {
+        return Ok(());
+    }
+    // Build ?1,?2,…,?N — positional params can be re-referenced multiple times in one statement.
+    let ph: String = (1..=subtree_ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "UPDATE archived_entries
+         SET cached_bytes = (
+             SELECT COALESCE(SUM(b.byte_size), 0)
+             FROM entry_artifacts ea
+             JOIN blobs b ON b.id = ea.blob_id
+             WHERE ea.entry_id = archived_entries.id
+               AND ea.blob_id IS NOT NULL
+               AND EXISTS (
+                   SELECT 1
+                   FROM entry_artifacts ea3
+                   JOIN archived_entries e3 ON e3.id = ea3.entry_id
+                   WHERE ea3.blob_id = ea.blob_id
+                     AND e3.id NOT IN ({ph})
+                     AND (e3.archived_at < archived_entries.archived_at
+                          OR (e3.archived_at = archived_entries.archived_at
+                              AND e3.id < archived_entries.id))
+               )
+         )
+         WHERE id NOT IN ({ph})
+           AND id IN (
+               SELECT DISTINCT ea2.entry_id
+               FROM entry_artifacts ea_sub
+               JOIN entry_artifacts ea2  ON ea2.blob_id  = ea_sub.blob_id
+               JOIN archived_entries e_sub ON e_sub.id   = ea_sub.entry_id
+               JOIN archived_entries e2    ON e2.id      = ea2.entry_id
+               WHERE ea_sub.entry_id IN ({ph})
+                 AND ea2.entry_id NOT IN ({ph})
+                 AND (e2.archived_at > e_sub.archived_at
+                      OR (e2.archived_at = e_sub.archived_at
+                          AND e2.id > e_sub.id))
+           )"
+    );
+    conn.execute(&sql, rusqlite::params_from_iter(subtree_ids.iter()))?;
+    Ok(())
+}
+
+/// Deletes an entry and every descendant in its tree (identified by `root_entry_id = entry_id`).
+///
+/// Call order matters:
+/// 1. Collect all subtree IDs while the rows still exist.
+/// 2. Run `cascade_cached_bytes_after_subtree_delete` in one SQL pass that excludes the entire
+///    subtree — necessary so sibling blobs don't falsely satisfy the EXISTS check for each other.
+/// 3. NULL `archive_run_items.produced_entry_id` for every subtree entry (FK has no ON DELETE
+///    action; would otherwise block with `PRAGMA foreign_keys = ON`).
+/// 4. Delete children before root (self-referential `parent_entry_id` FK has no cascade).
+/// 5. Delete the root entry; CASCADE handles `entry_artifacts`, `entry_tag_assignments`,
+///    and `collection_entries` automatically.
+///
+/// Returns `Ok(false)` if no entry with `entry_uid` was found; `Ok(true)` otherwise.
+/// Wrap in a transaction at the call site for atomicity.
+pub fn delete_entry(conn: &Connection, entry_uid: &str) -> Result<bool> {
+    let entry_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM archived_entries WHERE entry_uid = ?1",
+            [entry_uid],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    let entry_id = match entry_id {
+        Some(id) => id,
+        None => return Ok(false),
+    };
+
+    // Collect the full subtree while rows still exist.
+    let subtree_ids: Vec<i64> = {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM archived_entries WHERE root_entry_id = ?1",
+        )?;
+        stmt.query_map([entry_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+
+    // One-pass set-aware cascade: recalculate cached_bytes for all external entries that
+    // shared blobs with any subtree member, excluding every subtree ID simultaneously.
+    cascade_cached_bytes_after_subtree_delete(conn, &subtree_ids)?;
+
+    // Null the FK that has no ON DELETE action (covers root and all descendants).
+    conn.execute(
+        "UPDATE archive_run_items SET produced_entry_id = NULL
+         WHERE produced_entry_id IN (
+             SELECT id FROM archived_entries WHERE root_entry_id = ?1
+         )",
+        [entry_id],
+    )?;
+
+    // Children first — self-referential parent_entry_id FK has no cascade.
+    conn.execute(
+        "DELETE FROM archived_entries WHERE root_entry_id = ?1 AND id != ?1",
+        [entry_id],
+    )?;
+
+    // Root entry: CASCADE handles entry_artifacts, entry_tag_assignments, collection_entries.
+    conn.execute(
+        "DELETE FROM archived_entries WHERE id = ?1",
+        [entry_id],
+    )?;
+
+    Ok(true)
+}
+
 pub fn upsert_blob(conn: &Connection, blob: &BlobRecord) -> Result<i64> {
     conn.execute(
         "INSERT OR IGNORE INTO blobs (
@@ -2703,6 +2825,110 @@ mod tests {
             .expect("should rename");
         assert_eq!(updated.slug, "Natural-Science");
         assert_eq!(updated.full_path, "/Natural-Science");
+    }
+
+    // ── delete_entry tests ────────────────────────────────────────────────────
+
+    /// Helper: attach a shared blob to an entry and return the blob id.
+    fn attach_blob(conn: &Connection, entry_id: i64, sha256: &str, byte_size: i64) -> i64 {
+        let blob = BlobRecord {
+            sha256: sha256.to_string(),
+            byte_size,
+            mime_type: None,
+            extension: None,
+            raw_relpath: format!("raw/{sha256}"),
+        };
+        let blob_id = upsert_blob(conn, &blob).unwrap();
+        add_entry_artifact(conn, &NewArtifact {
+            entry_id,
+            artifact_role: "main".to_string(),
+            storage_area: "raw".to_string(),
+            relpath: format!("raw/{sha256}"),
+            blob_id: Some(blob_id),
+            logical_path: None,
+            metadata_json: None,
+        }).unwrap();
+        blob_id
+    }
+
+    #[test]
+    fn delete_entry_returns_false_for_unknown_uid() {
+        let conn = conn();
+        assert!(!delete_entry(&conn, "entry_doesnotexist").unwrap());
+    }
+
+    #[test]
+    fn delete_entry_removes_root_and_child_rows() {
+        let conn = conn();
+        let root = create_entry_fixture(&conn, "private", None, None);
+        let child = create_entry_fixture(&conn, "private", Some(root.id), Some(root.id));
+
+        delete_entry(&conn, &root.entry_uid).unwrap();
+
+        let root_gone: Option<i64> = conn
+            .query_row("SELECT id FROM archived_entries WHERE id = ?1", [root.id], |r| r.get(0))
+            .optional().unwrap();
+        let child_gone: Option<i64> = conn
+            .query_row("SELECT id FROM archived_entries WHERE id = ?1", [child.id], |r| r.get(0))
+            .optional().unwrap();
+        assert!(root_gone.is_none(), "root should be gone");
+        assert!(child_gone.is_none(), "child should be gone");
+    }
+
+    #[test]
+    fn delete_entry_nulls_run_item_produced_entry_id() {
+        let conn = conn();
+        let user_id = ensure_default_user(&conn).unwrap();
+        let root = create_entry_fixture(&conn, "private", None, None);
+        let run = create_archive_run(&conn, user_id, 1).unwrap();
+        let item = create_archive_run_item(
+            &conn, run.id, None, 0, "https://example.com", None, "web", "page",
+        ).unwrap();
+        complete_archive_run_item(&conn, item.id, root.id).unwrap();
+
+        delete_entry(&conn, &root.entry_uid).unwrap();
+
+        let produced: Option<i64> = conn
+            .query_row(
+                "SELECT produced_entry_id FROM archive_run_items WHERE id = ?1",
+                [item.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(produced.is_none(), "produced_entry_id should be NULL after delete");
+    }
+
+    #[test]
+    fn delete_entry_recalculates_cached_bytes_for_external_entries() {
+        // Scenario: root (id=N) and child (id=N+1) both own blob X (100 bytes).
+        // External (id=N+2, higher → newer by tiebreaker) also uses blob X.
+        // Before delete: external.cached_bytes = 100 (blob owned by root).
+        // After delete_entry(root): external.cached_bytes = 0 (no older entry remains).
+        let conn = conn();
+
+        let root = create_entry_fixture(&conn, "private", None, None);
+        let child = create_entry_fixture(&conn, "private", Some(root.id), Some(root.id));
+        let external = create_entry_fixture(&conn, "private", None, None);
+
+        // Attach the same blob to all three.
+        attach_blob(&conn, root.id, "blobx", 100);
+        attach_blob(&conn, child.id, "blobx", 100);
+        attach_blob(&conn, external.id, "blobx", 100);
+
+        // Compute external.cached_bytes before delete — root and child are older by id.
+        refresh_entry_cached_bytes(&conn, external.id).unwrap();
+        let before: i64 = conn
+            .query_row("SELECT cached_bytes FROM archived_entries WHERE id = ?1", [external.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 100, "external should see blob as cached before delete");
+
+        delete_entry(&conn, &root.entry_uid).unwrap();
+
+        // external must still exist but with cached_bytes = 0.
+        let after: i64 = conn
+            .query_row("SELECT cached_bytes FROM archived_entries WHERE id = ?1", [external.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 0, "cached_bytes must be 0 after whole subtree is deleted");
     }
 
 }

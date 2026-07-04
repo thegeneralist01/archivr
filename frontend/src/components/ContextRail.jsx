@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { fetchEntryDetail, fetchEntryTags, assignTag, removeTag, listEntryCollections, updateEntryTitle } from '../api'
+import { fetchEntryDetail, fetchEntryTags, assignTag, removeTag, listEntryCollections, updateEntryTitle, deleteEntry } from '../api'
 import { formatTimestamp, formatBytes, valueText, sourceIconSvg, displayPath } from '../utils'
 
 const VIS_LABEL = { 0: 'Private', 1: 'Public', 2: 'Users only', 3: 'Public' }
@@ -11,7 +11,7 @@ const ExternalIcon = () => (
   </svg>
 )
 
-export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, tagNodes, onTagsRefresh, onEntryTitleChange, humanizeTags }) {
+export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, tagNodes, onTagsRefresh, onEntryTitleChange, onEntryDeleted, humanizeTags }) {
   const [detail, setDetail] = useState(null)
   const [tags, setTags] = useState([])
   const [assignInput, setAssignInput] = useState('')
@@ -83,6 +83,17 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
       onTagsRefresh()
     } catch {
       // silently ignore
+    }
+  }
+
+  async function handleDeleteEntry() {
+    if (!selectedEntry || !archiveId) return
+    if (!window.confirm('Delete this entry? This cannot be undone.')) return
+    try {
+      await deleteEntry(archiveId, selectedEntry.entry_uid)
+      onEntryDeleted?.(selectedEntry.entry_uid)
+    } catch {
+      // silently ignore — entry stays selected if delete failed
     }
   }
 
@@ -232,6 +243,12 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
               ))}
             </div>
           )}
+
+          <div className="rail-delete-zone">
+            <button className="rail-delete-btn" onClick={handleDeleteEntry}>
+              Delete entry
+            </button>
+          </div>
         </>
       )}
     </aside>

@@ -212,6 +212,12 @@ export default function App() {
     )
   }, [])
 
+  const handleEntryDeleted = useCallback((entryUid) => {
+    setEntries(prev => prev.filter(e => e.entry_uid !== entryUid))
+    setSelectedEntry(prev => prev?.entry_uid === entryUid ? null : prev)
+    setSelectedEntryUid(prev => prev === entryUid ? null : prev)
+  }, [])
+
   const handleCaptureClick = useCallback(() => {
     setCaptureDialogOpen(true)
   }, [])
@@ -317,6 +323,7 @@ export default function App() {
             tagNodes={tagNodes}
             onTagsRefresh={handleTagsRefresh}
             onEntryTitleChange={handleEntryTitleChange}
+            onEntryDeleted={handleEntryDeleted}
             humanizeTags={humanizeTags}
           />
         </main>

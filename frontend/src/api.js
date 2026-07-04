@@ -58,6 +58,14 @@ export async function removeTag(archiveId, entryUid, tagUid) {
   if (!resp.ok) throw new Error(`Remove failed (${resp.status})`);
 }
 
+export async function deleteEntry(archiveId, entryUid) {
+  const resp = await fetch(
+    `/api/archives/${archiveId}/entries/${entryUid}`,
+    { method: 'DELETE' }
+  );
+  if (!resp.ok) throw new Error(`Delete failed (${resp.status})`);
+}
+
 export async function renameTag(archiveId, tagUid, name) {
   const res = await fetch(
     `/api/archives/${archiveId}/tags/${tagUid}`,
