@@ -95,17 +95,25 @@ export async function fetchTags(archiveId) {
   return getJson(`/api/archives/${archiveId}/tags`);
 }
 
-export async function submitCapture(archiveId, locator) {
+export async function submitCapture(archiveId, locator, quality = null) {
+  const payload = { locator }
+  if (quality && quality !== 'best') payload.quality = quality
   const res = await fetch(`/api/archives/${archiveId}/captures`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ locator }),
+    body: JSON.stringify(payload),
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.error || `HTTP ${res.status}`);
   }
   return res.json(); // { job_uid, status: "pending" }
+}
+
+// Returns { has_video: bool, qualities: string[] } e.g. { has_video: true, qualities: ["1080p","720p","480p"] }
+// Throws on network error; returns { has_video: false, qualities: [] } on non-video locators.
+export async function probeCapture(archiveId, locator) {
+  return getJson(`/api/archives/${archiveId}/captures/probe?locator=${encodeURIComponent(locator)}`);
 }
 
 export async function pollCaptureJob(archiveId, jobUid) {

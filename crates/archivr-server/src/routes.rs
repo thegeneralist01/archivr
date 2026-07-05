@@ -29,7 +29,7 @@ use std::{
 };
 use parking_lot::Mutex;
 
-use archivr_core::{archive, capture, database};
+use archivr_core::{archive, capture, database, downloader};
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Path, Query, Request, State},
@@ -231,6 +231,7 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route("/api/archives/:archive_id/runs", get(list_runs))
         .route("/api/archives/:archive_id/captures", post(capture_handler))
+        .route("/api/archives/:archive_id/captures/probe", get(probe_handler))
         .route(
             "/api/archives/:archive_id/capture_jobs/:job_uid",
             get(get_capture_job_handler),
@@ -637,6 +638,14 @@ async fn delete_entry_handler(
 #[derive(Debug, serde::Deserialize)]
 struct CaptureBody {
     locator: String,
+    /// Optional quality cap for yt-dlp sources: `"best"` or any `"NNNp"` string
+    /// (e.g. `"1080p"`, `"720p"`, `"2160p"`). Absent or `"best"` → highest available.
+    quality: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ProbeQuery {
+    locator: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -676,6 +685,18 @@ async fn capture_handler(
     if body.locator.trim().is_empty() {
         return Err(ApiError::bad_request("locator must not be empty"));
     }
+    if let Some(q) = &body.quality {
+        let valid = q == "best"
+            || q == "audio"
+            || q.strip_suffix('p')
+                .and_then(|n| n.parse::<u32>().ok())
+                .is_some();
+        if !valid {
+            return Err(ApiError::bad_request(
+                "invalid quality: must be \"best\", \"audio\", or a height string like \"1080p\"",
+            ));
+        }
+    }
     let mounted = mounted_archive(&state, &archive_id)?;
     let archive_paths = archive::read_archive_paths(&mounted.archive_path)
         .map_err(ApiError::from)?;
@@ -687,6 +708,7 @@ async fn capture_handler(
 
     // Spawn background capture.
     let locator = body.locator.trim().to_string();
+    let quality = body.quality.clone();
     let archive_path = mounted.archive_path.clone();
     let job_uid_bg = job_uid.clone();
     let archive_id_bg = archive_id.clone();
@@ -699,7 +721,7 @@ async fn capture_handler(
             }
         };
         database::update_capture_job_status(&conn, &job_uid_bg, "running", None, None).ok();
-        match capture::perform_capture(&archive_paths, &locator, Some(&archive_id_bg)) {
+        match capture::perform_capture(&archive_paths, &locator, Some(&archive_id_bg), quality.as_deref()) {
             Ok(result) => {
                 database::update_capture_job_status(
                     &conn,
@@ -740,6 +762,64 @@ async fn get_capture_job_handler(
     archive::get_capture_job(&conn, &job_uid)?
         .map(Json)
         .ok_or_else(|| ApiError::not_found("capture job not found"))
+}
+
+/// `GET /api/archives/:id/captures/probe?locator=<url>`
+///
+/// Runs `yt-dlp --dump-json` (behind `spawn_blocking`) and returns the video
+/// heights actually available at the given locator.
+///
+/// Response shapes:
+/// - Locator is not a yt-dlp source (tweet, webpage, local, …):
+///   `{ "has_video": false, "qualities": [] }` — 200
+/// - yt-dlp ran and found no video tracks (e.g. tweet URL with no media):
+///   `{ "has_video": false, "qualities": [] }` — 200
+/// - yt-dlp ran and found video tracks:
+///   `{ "has_video": true, "qualities": ["1080p", "720p", …] }` — 200
+/// - yt-dlp itself failed (non-zero exit, network error, rate-limit, …):
+///   502 — caller should treat this as "probe inconclusive", not "no video"
+async fn probe_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(archive_id): Path<String>,
+    Query(params): Query<ProbeQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    let locator = params.locator.trim().to_string();
+    if locator.is_empty() {
+        return Err(ApiError::bad_request("locator must not be empty"));
+    }
+    // Verify the archive exists but don't need the paths for probing.
+    let _ = mounted_archive(&state, &archive_id)?;
+
+    // Resolve to a yt-dlp URL; return empty result immediately for non-video sources.
+    let Some(ytdlp_url) = capture::locator_to_ytdlp_url(&locator) else {
+        return Ok(Json(serde_json::json!({ "has_video": false, "has_audio": false, "qualities": [] })));
+    };
+
+    // fetch_metadata shells out and can take several seconds — keep the async runtime free.
+    // Returns None when yt-dlp exits non-zero (transient error, rate-limit, unsupported
+    // extractor, etc.). That is distinct from "yt-dlp ran fine but found no video": we
+    // return 502 so the frontend treats it as inconclusive rather than showing
+    // "No video detected" for a URL that may well be downloadable.
+    let maybe_result = tokio::task::spawn_blocking(move || {
+        downloader::ytdlp::fetch_metadata(&ytdlp_url)
+            .map(|json| downloader::ytdlp::probe_result(&json))
+    })
+    .await
+    .map_err(|_| ApiError::internal("probe task panicked"))?;
+
+    let result = maybe_result.ok_or_else(|| ApiError {
+        status: StatusCode::BAD_GATEWAY,
+        message: "yt-dlp metadata fetch failed".to_string(),
+    })?;
+
+    let qualities: Vec<String> = result.video_heights.iter().map(|h| format!("{h}p")).collect();
+    Ok(Json(serde_json::json!({
+        "has_video": !qualities.is_empty(),
+        "qualities": qualities,
+        "has_audio": result.has_audio,
+    })))
 }
 
 async fn auth_setup_status(
@@ -2204,6 +2284,93 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["job_uid"].as_str().is_some(), "response must have job_uid");
         assert_eq!(json["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn capture_with_valid_quality_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(r#"{"locator":"local:/nonexistent","quality":"720p"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["job_uid"].as_str().is_some(), "response must have job_uid");
+        assert_eq!(json["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn capture_with_invalid_quality_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(r#"{"locator":"local:/nonexistent","quality":"4K"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().is_some_and(|e| e.contains("invalid quality")));
+    }
+
+    #[tokio::test]
+    async fn probe_requires_auth() {
+        let (test_app, _dir) = make_test_app();
+        let response = test_app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/captures/probe?locator=local%3A%2Fnonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn probe_non_video_locator_returns_has_video_false() {
+        // local:/nonexistent is not a yt-dlp source — the handler returns
+        // immediately without spawning yt-dlp, so this is fast and deterministic.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/captures/probe?locator=local%3A%2Fnonexistent")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["has_video"], false);
+        assert_eq!(json["qualities"], serde_json::json!([]));
+        assert_eq!(json["has_audio"], false);
     }
 
     #[tokio::test]

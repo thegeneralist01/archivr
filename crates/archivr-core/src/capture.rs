@@ -331,6 +331,26 @@ fn determine_source(path: &str) -> Source {
     Source::Other
 }
 
+/// Resolves `locator` to the canonical URL that yt-dlp should receive, or
+/// returns `None` if the locator does not map to a yt-dlp-downloadable source
+/// (e.g. tweet/thread shorthands, web pages, local files, playlists/channels).
+///
+/// Use this to gate the probe endpoint: only call `fetch_metadata` when this
+/// returns `Some`.
+pub fn locator_to_ytdlp_url(locator: &str) -> Option<String> {
+    let source = determine_source(locator);
+    match source {
+        Source::YouTubeVideo
+        | Source::X
+        | Source::Instagram
+        | Source::Facebook
+        | Source::TikTok
+        | Source::Reddit
+        | Source::Snapchat => Some(expand_shorthand_to_url(locator, &source)),
+        _ => None,
+    }
+}
+
 fn hash_exists(hash: &str, file_extension: &str, store_path: &Path) -> Result<bool> {
     let path = store_path.join(raw_relative_path_from_hash(hash, file_extension)?);
     Ok(path.exists())
@@ -425,20 +445,6 @@ fn local_file_extension(path: &str) -> String {
     Path::new(path.trim_start_matches("file://"))
         .extension()
         .map_or(String::new(), |ext| format!(".{}", ext.to_string_lossy()))
-}
-
-fn media_file_extension(source: Source, path: &str) -> String {
-    match source {
-        Source::YouTubeVideo
-        | Source::X
-        | Source::Instagram
-        | Source::Facebook
-        | Source::TikTok
-        | Source::Reddit
-        | Source::Snapchat => ".mp4".to_string(),
-        Source::Local => local_file_extension(path),
-        _ => String::new(),
-    }
 }
 
 fn tweet_id_from_archive_path(path: &str) -> Option<String> {
@@ -677,6 +683,7 @@ pub fn perform_capture(
     archive_paths: &ArchivePaths,
     locator: &str,
     archive_id: Option<&str>,
+    quality: Option<&str>,
 ) -> Result<CaptureResult> {
     // Append a UUID so parallel captures starting in the same millisecond
     // never collide on the staging directory or file names.
@@ -1015,7 +1022,7 @@ pub fn perform_capture(
         _ => None,
     };
 
-    let hash = match source {
+    let (hash, file_extension) = match source {
         Source::YouTubeVideo
         | Source::X
         | Source::Instagram
@@ -1023,8 +1030,8 @@ pub fn perform_capture(
         | Source::TikTok
         | Source::Reddit
         | Source::Snapchat => {
-            match downloader::ytdlp::download(path.clone(), store_path, &timestamp) {
-                Ok(h) => h,
+            match downloader::ytdlp::download(path.clone(), store_path, &timestamp, quality) {
+                Ok(result) => result,
                 Err(e) => {
                     return Err(fail_run(
                         &conn,
@@ -1037,7 +1044,7 @@ pub fn perform_capture(
         }
         Source::Local => {
             match downloader::local::save(path.clone(), store_path, &timestamp) {
-                Ok(h) => h,
+                Ok(h) => (h, local_file_extension(&path)),
                 Err(e) => {
                     return Err(fail_run(
                         &conn,
@@ -1058,8 +1065,6 @@ pub fn perform_capture(
         }
         _ => unreachable!(),
     };
-
-    let file_extension = media_file_extension(source, &path);
     let temp_file = store_path
         .join("temp")
         .join(&timestamp)

@@ -1,10 +1,65 @@
 import { useRef, useEffect, useState } from 'react'
-import { submitCapture, pollCaptureJob } from '../api'
+import { submitCapture, pollCaptureJob, probeCapture } from '../api'
 
 let nextItemId = 1
 
+// Returns true only for locators that determine_source() routes to yt-dlp download.
+// Mirrors the exact conditions in capture.rs — playlist/channel shorthands are excluded
+// (they return an "not yet implemented" error), as are tweet/thread shorthands.
+function isVideoSource(locator) {
+  const l = locator.trim()
+  const ll = l.toLowerCase()
+
+  // yt: / youtube: shorthands — video/short/shorts only; playlist and channel are unsupported
+  for (const scheme of ['yt:', 'youtube:']) {
+    if (ll.startsWith(scheme)) {
+      const after = ll.slice(scheme.length)
+      return after.startsWith('video/') || after.startsWith('short/') || after.startsWith('shorts/')
+    }
+  }
+
+  // x: / twitter: / tweet: shorthands — only x:media:ID routes to yt-dlp (Source::X)
+  for (const scheme of ['x:', 'twitter:', 'tweet:']) {
+    if (ll.startsWith(scheme)) {
+      return ll.slice(scheme.length).startsWith('media:')
+    }
+  }
+
+  // Other platform shorthands — all go to yt-dlp
+  if (ll.startsWith('instagram:') || ll.startsWith('facebook:') ||
+      ll.startsWith('tiktok:') || ll.startsWith('reddit:') ||
+      ll.startsWith('snapchat:')) return true
+
+  // HTTP/HTTPS URLs — match the same regexes and prefix checks as determine_source
+  if (ll.startsWith('http://') || ll.startsWith('https://')) {
+    // YouTube video (watch, youtu.be, shorts) — not playlist or channel
+    if (/^https?:\/\/(?:www\.)?(?:youtu\.be\/[0-9A-Za-z_-]+|youtube\.com\/watch\?v=[0-9A-Za-z_-]+|youtube\.com\/shorts\/[0-9A-Za-z_-]+)/.test(l)) return true
+    // x.com → Source::X → yt-dlp (note: twitter.com URLs fall through to Source::Url, not yt-dlp)
+    if (ll.startsWith('https://x.com/') || ll.startsWith('http://x.com/')) return true
+    // Instagram
+    if (/^https?:\/\/(?:www\.)?instagram\.com\//.test(ll)) return true
+    // Facebook + fb.watch
+    if (/^https?:\/\/(?:www\.)?facebook\.com\//.test(ll) || ll.startsWith('https://fb.watch/') || ll.startsWith('http://fb.watch/')) return true
+    // TikTok
+    if (/^https?:\/\/(?:www\.)?tiktok\.com\//.test(ll)) return true
+    // Reddit + redd.it
+    if (/^https?:\/\/(?:www\.)?reddit\.com\//.test(ll) || ll.startsWith('https://redd.it/') || ll.startsWith('http://redd.it/')) return true
+    // Snapchat
+    if (/^https?:\/\/(?:www\.)?snapchat\.com\//.test(ll)) return true
+  }
+
+  return false
+}
+
 function makeItem(locator = '') {
-  return { id: nextItemId++, locator, status: 'idle', error: null, jobUid: null, archiveId: null }
+  return {
+    id: nextItemId++, locator, quality: 'best',
+    // probe: tracks yt-dlp metadata fetch for the locator
+    probeState: 'idle',    // 'idle' | 'probing' | 'done'
+    probeQualities: null,  // null | string[] when done, e.g. ["1080p","720p","480p"]
+    probeHasAudio: false,  // true when probe confirms at least one audio track
+    status: 'idle', error: null, jobUid: null, archiveId: null,
+  }
 }
 
 function hasActiveJobs(items) {
@@ -16,6 +71,11 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   const isFirstRenderRef = useRef(true)
   // jobUid → intervalId; survives dialog close since component stays mounted
   const pollIntervals = useRef(new Map())
+  // itemId → debounce timeoutId for probe calls
+  const probeTimers = useRef(new Map())
+  // stable ref so probe callbacks always see the current archiveId
+  const archiveIdRef = useRef(archiveId)
+  useEffect(() => { archiveIdRef.current = archiveId }, [archiveId])
 
   // Stable refs so polling callbacks always use the latest prop values
   const onCapturedRef = useRef(onCaptured)
@@ -63,7 +123,11 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   useEffect(() => {
     const dialog = dialogRef.current
     if (!dialog) return
-    const handler = () => onClose()
+    const handler = () => {
+      probeTimers.current.forEach(id => clearTimeout(id))
+      probeTimers.current.clear()
+      onClose()
+    }
     dialog.addEventListener('close', handler)
     return () => dialog.removeEventListener('close', handler)
   }, [onClose])
@@ -79,13 +143,18 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
       isFirstRenderRef.current = false
       if (!dialog.open) dialog.showModal()
     } else {
+      probeTimers.current.forEach(id => clearTimeout(id))
+      probeTimers.current.clear()
       if (dialog.open) dialog.close()
     }
   }, [open]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Clear all intervals on unmount (component teardown)
+  // Clear all intervals and probe timers on unmount (component teardown)
   useEffect(() => {
-    return () => pollIntervals.current.forEach(id => clearInterval(id))
+    return () => {
+      pollIntervals.current.forEach(id => clearInterval(id))
+      probeTimers.current.forEach(id => clearTimeout(id))
+    }
   }, [])
 
   function startPolling(itemId, jobUid, locator, aid) {
@@ -132,9 +201,10 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     if (!item.locator.trim()) return
     const aid = archiveId // capture at submit time
     const loc = item.locator.trim()
+    const qual = item.quality || 'best'
     setItems(prev => prev.map(it => it.id === item.id ? { ...it, status: 'submitting', error: null } : it))
     try {
-      const job = await submitCapture(aid, loc)
+      const job = await submitCapture(aid, loc, qual)
       setItems(prev => prev.map(it =>
         it.id === item.id ? { ...it, status: 'running', jobUid: job.job_uid, archiveId: aid } : it
       ))
@@ -156,6 +226,8 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   }
 
   function removeRow(id) {
+    clearTimeout(probeTimers.current.get(id))
+    probeTimers.current.delete(id)
     setItems(prev => {
       const next = prev.filter(it => it.id !== id)
       return next.length === 0 ? [makeItem()] : next
@@ -169,7 +241,44 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   }
 
   function updateLocator(id, val) {
-    setItems(prev => prev.map(it => it.id === id ? { ...it, locator: val } : it))
+    // Cancel any in-flight debounce and immediately clear stale probe results.
+    // This prevents old qualities from being visible (and submittable) while
+    // the 600ms debounce is pending for the new URL.
+    clearTimeout(probeTimers.current.get(id))
+    setItems(prev => prev.map(it =>
+      it.id === id
+        ? { ...it, locator: val, probeState: 'idle', probeQualities: null, probeHasAudio: false, quality: 'best' }
+        : it
+    ))
+
+    if (!isVideoSource(val)) return
+
+    // Schedule a fresh probe after the user stops typing
+    const timer = setTimeout(async () => {
+      probeTimers.current.delete(id)
+      setItems(prev => prev.map(it => it.id === id ? { ...it, probeState: 'probing' } : it))
+      try {
+        const result = await probeCapture(archiveIdRef.current, val.trim())
+        setItems(prev => prev.map(it => {
+          if (it.id !== id || it.locator !== val) return it // stale — locator changed again
+          const qualities = result.qualities ?? []
+          const hasAudio = result.has_audio ?? false
+          // Audio-only source: no video heights but audio confirmed — force audio mode
+          const quality = (qualities.length === 0 && hasAudio) ? 'audio' : 'best'
+          return { ...it, probeState: 'done', probeQualities: qualities, probeHasAudio: hasAudio, quality }
+        }))
+      } catch {
+        // Probe failed (network error, etc.) — clear silently; user can still submit
+        setItems(prev => prev.map(it =>
+          it.id === id ? { ...it, probeState: 'idle', probeQualities: null } : it
+        ))
+      }
+    }, 600)
+    probeTimers.current.set(id, timer)
+  }
+
+  function updateQuality(id, val) {
+    setItems(prev => prev.map(it => it.id === id ? { ...it, quality: val } : it))
   }
 
   const pendingCount = items.filter(it => it.status === 'idle' && it.locator.trim()).length
@@ -199,6 +308,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
               item={item}
               autoFocus={idx === items.length - 1 && item.status === 'idle'}
               onLocatorChange={val => updateLocator(item.id, val)}
+              onQualityChange={val => updateQuality(item.id, val)}
               onRemove={() => removeRow(item.id)}
               onReset={() => resetRow(item.id)}
               onSubmit={handleArchive}
@@ -231,7 +341,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   )
 }
 
-function CaptureRow({ item, autoFocus, onLocatorChange, onRemove, onReset, onSubmit }) {
+function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemove, onReset, onSubmit }) {
   const inputRef = useRef(null)
   const isActive = item.status === 'submitting' || item.status === 'running'
 
@@ -240,6 +350,49 @@ function CaptureRow({ item, autoFocus, onLocatorChange, onRemove, onReset, onSub
       inputRef.current?.focus()
     }
   }, [autoFocus]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Quality control shown right of the input (hidden when active or completed)
+  const qualityEl = (() => {
+    if (item.status === 'completed' || isActive) return null
+    if (!isVideoSource(item.locator)) return null
+    if (item.probeState === 'probing') {
+      return <span className="capture-quality-probing" aria-label="Checking available qualities">…</span>
+    }
+    if (item.probeState === 'done') {
+      const qualities = item.probeQualities ?? []
+      const hasAudio = item.probeHasAudio ?? false
+      if (qualities.length === 0 && !hasAudio) {
+        return <span className="capture-quality-hint">No media detected</span>
+      }
+      if (qualities.length === 0 && hasAudio) {
+        // Audio-only source: no video tracks, only audio available.
+        // Don't offer "Best quality" — it would request a video format and fail.
+        return (
+          <select
+            className="capture-quality"
+            value="audio"
+            onChange={e => onQualityChange(e.target.value)}
+            aria-label="Video quality"
+          >
+            <option value="audio">Audio only</option>
+          </select>
+        )
+      }
+      return (
+        <select
+          className="capture-quality"
+          value={item.quality || 'best'}
+          onChange={e => onQualityChange(e.target.value)}
+          aria-label="Video quality"
+        >
+          <option value="best">Best quality</option>
+          {qualities.map(q => <option key={q} value={q}>{q}</option>)}
+          {hasAudio && <option value="audio">Audio only</option>}
+        </select>
+      )
+    }
+    return null // probeState === 'idle', debounce not yet fired
+  })()
 
   return (
     <div className={`capture-row capture-row--${item.status}`}>
@@ -257,6 +410,7 @@ function CaptureRow({ item, autoFocus, onLocatorChange, onRemove, onReset, onSub
           autoComplete="off"
           spellCheck={false}
         />
+        {qualityEl}
         {item.status === 'failed' && (
           <button type="button" className="capture-row-action" onClick={onReset} title="Retry">
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">

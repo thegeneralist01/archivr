@@ -63,7 +63,7 @@ fn main() -> Result<()> {
                 }
             };
             let archive_paths = archive::read_archive_paths(&archive_path)?;
-            let result = archivr_core::capture::perform_capture(&archive_paths, path, None)?;
+            let result = archivr_core::capture::perform_capture(&archive_paths, path, None, None)?;
             println!("Archived: run {}", result.run_uid);
             Ok(())
         }
