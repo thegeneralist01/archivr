@@ -1,3 +1,5 @@
+import { useState } from 'react'
+
 function fmtDate(iso) {
   if (!iso) return '—';
   try {
@@ -20,6 +22,12 @@ function StatusBadge({ status }) {
 }
 
 export default function RunsView({ runs }) {
+  const [expanded, setExpanded] = useState(null) // run_uid of the expanded row
+
+  function toggle(uid) {
+    setExpanded(prev => prev === uid ? null : uid)
+  }
+
   return (
     <section id="runs-view" className="view is-active">
       <table className="entry-table">
@@ -34,16 +42,43 @@ export default function RunsView({ runs }) {
         </thead>
         <tbody>
           {runs.length === 0 ? (
-            <tr><td colSpan={5} style={{ color: 'var(--muted)', padding: '24px 16px', textAlign: 'center' }}>No runs yet.</td></tr>
-          ) : runs.map((run, i) => (
-            <tr key={i}>
-              <td>{fmtDate(run.started_at)}</td>
-              <td><StatusBadge status={run.status} /></td>
-              <td>{run.requested_count ?? '—'}</td>
-              <td>{run.completed_count ?? '—'}</td>
-              <td>{run.failed_count ?? '—'}</td>
+            <tr>
+              <td colSpan={5} style={{ color: 'var(--muted)', padding: '24px 16px', textAlign: 'center' }}>
+                No runs yet.
+              </td>
             </tr>
-          ))}
+          ) : runs.map(run => {
+            const hasError = run.status === 'failed' && run.error_summary
+            const isExpanded = expanded === run.run_uid
+            return [
+              <tr
+                key={run.run_uid}
+                className={hasError ? 'run-row run-row--failed' : 'run-row'}
+                onClick={hasError ? () => toggle(run.run_uid) : undefined}
+                title={hasError ? (isExpanded ? 'Click to hide error' : 'Click to view error') : undefined}
+              >
+                <td>{fmtDate(run.started_at)}</td>
+                <td>
+                  <StatusBadge status={run.status} />
+                  {hasError && (
+                    <span className="run-expand-hint" aria-hidden="true">
+                      {isExpanded ? '▴' : '▾'}
+                    </span>
+                  )}
+                </td>
+                <td>{run.requested_count ?? '—'}</td>
+                <td>{run.completed_count ?? '—'}</td>
+                <td>{run.failed_count ?? '—'}</td>
+              </tr>,
+              hasError && isExpanded && (
+                <tr key={`${run.run_uid}-detail`} className="run-error-row">
+                  <td colSpan={5}>
+                    <pre className="run-error-detail">{run.error_summary}</pre>
+                  </td>
+                </tr>
+              ),
+            ]
+          })}
         </tbody>
       </table>
     </section>

@@ -557,8 +557,7 @@ select {
   border: 1px solid var(--line);
   background: var(--paper);
   padding: 0;
-  min-width: 360px;
-  max-width: 520px;
+  width: min(540px, calc(100vw - 32px));
   border-radius: var(--r3);
   box-shadow: 0 20px 60px rgba(20, 29, 24, 0.28);
 }
@@ -569,7 +568,7 @@ select {
   padding: 28px;
 }
 .capture-dialog-title {
-  margin: 0 0 16px;
+  margin: 0;
   font-size: 22px;
   font-family: var(--display);
   font-weight: 600;
@@ -633,6 +632,233 @@ select {
 }
 .capture-submit:hover { opacity: 0.85; }
 .capture-submit:disabled { opacity: 0.45; cursor: default; }
+
+/* ── Capture dialog: header + multi-row ─────────────────────────────────── */
+.capture-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+.capture-dialog-close {
+  flex-shrink: 0;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  color: var(--muted);
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r);
+  padding: 0;
+}
+.capture-dialog-close svg { width: 14px; height: 14px; }
+.capture-dialog-close:hover { background: var(--paper-2); color: var(--ink); }
+
+.capture-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.capture-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.capture-row-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* No bottom-margin on inputs inside rows; gap handles spacing */
+.capture-row-main .capture-input { margin-bottom: 0; }
+
+/* Status dot */
+.cap-dot {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+.cap-dot--idle   { background: var(--paper-2); }
+.cap-dot--running { background: #fdefd8; color: #8a4f10; }
+.cap-dot--ok     { background: #d8eddf; color: #235c35; }
+.cap-dot--err    { background: #f5ddd8; color: #8d3f30; }
+
+/* Spinner inside the running dot */
+.cap-spinner {
+  display: block;
+  width: 10px;
+  height: 10px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: cap-spin 0.7s linear infinite;
+}
+@keyframes cap-spin { to { transform: rotate(360deg); } }
+
+/* Per-row action buttons (remove / retry) */
+.capture-row-action {
+  flex-shrink: 0;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  color: var(--muted);
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r);
+  padding: 0;
+}
+.capture-row-action svg { width: 12px; height: 12px; }
+.capture-row-action:hover { color: var(--accent); background: var(--paper-2); }
+.capture-row-remove:hover { color: var(--accent); }
+
+/* Inline error under a failed row */
+.capture-row-error {
+  margin: 0;
+  padding-left: 28px; /* align past the status dot */
+  font-size: 12px;
+  color: var(--accent);
+  line-height: 1.45;
+}
+
+/* Add-another button */
+.capture-add-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  background: none;
+  border: 1px dashed var(--line);
+  border-radius: var(--r);
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 7px 12px;
+  margin-top: 4px;
+  margin-bottom: 18px;
+  transition: border-color .15s, color .15s, background .15s;
+}
+.capture-add-row svg { width: 13px; height: 13px; flex-shrink: 0; }
+.capture-add-row:hover { border-color: var(--accent-2); color: var(--ink); background: var(--paper-2); }
+
+/* ── Toast stack ─────────────────────────────────────────────────────────── */
+.toast-stack {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 9000;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 340px;
+  max-width: calc(100vw - 32px);
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: var(--r2);
+  box-shadow: 0 6px 24px rgba(20, 29, 24, 0.18), 0 1px 4px rgba(20, 29, 24, 0.1);
+  overflow: hidden;
+  animation: toast-slide-in 0.22s cubic-bezier(.22,.68,0,1.2);
+}
+@keyframes toast-slide-in {
+  from { opacity: 0; transform: translateY(10px) scale(0.97); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+.toast--error { border-left: 3px solid var(--accent); }
+
+.toast-top {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 12px 12px 14px;
+}
+.toast-icon {
+  flex-shrink: 0;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accent);
+  margin-top: 2px;
+}
+.toast-body {
+  flex: 1;
+  min-width: 0;
+}
+.toast-headline {
+  display: block;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--ink);
+  line-height: 1.3;
+}
+.toast-locator {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.toast-btns {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.toast-view-btn {
+  background: none;
+  border: 1px solid var(--line);
+  color: var(--link);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 3px 9px;
+  border-radius: var(--r);
+  white-space: nowrap;
+}
+.toast-view-btn:hover { background: var(--paper-2); border-color: var(--link); }
+.toast-dismiss {
+  background: none;
+  border: 0;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 20px;
+  line-height: 1;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r);
+  padding: 0;
+}
+.toast-dismiss:hover { color: var(--ink); background: var(--paper-2); }
+.toast-error-detail {
+  margin: 0;
+  padding: 10px 14px 12px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--muted);
+  background: var(--paper-2);
+  border-top: 1px solid var(--line);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+}
 
 /* ── Utility ─────────────────────────────────────────────────────────────── */
 .muted { color: var(--muted); }
@@ -1310,6 +1536,32 @@ select {
 .run-status--completed { background: #d8eddf; color: #235c35; border: 1px solid #b4d9be; }
 .run-status--failed { background: #f5ddd8; color: #8d3f30; border: 1px solid #e0b8b0; }
 .run-status--in-progress { background: #fdefd8; color: #8a4f10; border: 1px solid #f0cfa0; }
+
+/* Clickable failed run rows and expandable error detail */
+.run-row--failed { cursor: pointer; }
+.run-row--failed:hover td { background: #fdf0ed !important; }
+.run-expand-hint {
+  margin-left: 6px;
+  font-size: 10px;
+  color: var(--accent);
+  vertical-align: middle;
+}
+.run-error-row td {
+  padding: 0 !important;
+  background: var(--paper-2) !important;
+}
+.run-error-detail {
+  margin: 0;
+  padding: 10px 16px 12px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow-y: auto;
+}
 
 /* ── Token created banner ────────────────────────────────────────────────── */
 .token-banner {

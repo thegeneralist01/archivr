@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Local;
+use uuid::Uuid;
 use serde_json::json;
 use std::{
     collections::HashSet,
@@ -677,7 +678,13 @@ pub fn perform_capture(
     locator: &str,
     archive_id: Option<&str>,
 ) -> Result<CaptureResult> {
-    let timestamp = Local::now().format("%Y-%m-%dT%H-%M-%S%.3f").to_string();
+    // Append a UUID so parallel captures starting in the same millisecond
+    // never collide on the staging directory or file names.
+    let timestamp = format!(
+        "{}-{}",
+        Local::now().format("%Y-%m-%dT%H-%M-%S%.3f"),
+        Uuid::new_v4().simple(),
+    );
     let store_path = &archive_paths.store_path;
 
     let conn = database::open_or_initialize(&archive_paths.archive_path)?;
@@ -685,24 +692,31 @@ pub fn perform_capture(
 
     let mut source = determine_source(locator);
 
-    // For generic http/https URLs, probe Content-Type to distinguish a plain
-    // file download from an HTML page that needs single-file archiving.
-    // The probe runs before creating DB records so source_kind is set correctly.
-    //
-    // Note: probe failures return early without a DB run record. This is
-    // intentional — a failed network probe means we haven't started archiving
-    // and there is nothing meaningful to record.
+    // Create the run record before probing so every attempt — including
+    // probe failures — is visible in /runs with a proper status and error.
+    let run = database::create_archive_run(&conn, user_id, 1)?;
+
+    // For generic http/https URLs, probe Content-Type to decide whether to
+    // treat the URL as a raw file download or an HTML page for SingleFile.
     if source == Source::Url {
         match downloader::http::probe_url_kind(locator) {
             Ok(downloader::http::UrlKind::Html) => source = Source::WebPage,
             Ok(downloader::http::UrlKind::File) => {}
-            Err(e) => return Err(anyhow::anyhow!("Failed to probe URL: {e}")),
+            Err(e) => {
+                // Record a failed item using the pre-probe source_kind so
+                // failed_count increments and the item carries error_text.
+                let (probe_sk, probe_ek, _) = source_metadata(Source::Url);
+                let item = database::create_archive_run_item(
+                    &conn, run.id, None, 0, locator, None, probe_sk, probe_ek,
+                )?;
+                let msg = format!("Failed to probe URL: {e}");
+                return Err(fail_run(&conn, &run, &item, &msg));
+            }
         }
     }
 
     let (source_kind, entity_kind, _) = source_metadata(source);
 
-    let run = database::create_archive_run(&conn, user_id, 1)?;
     let item = database::create_archive_run_item(
         &conn,
         run.id,

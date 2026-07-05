@@ -13,6 +13,7 @@ import CollectionsView from './components/CollectionsView'
 import SettingsView from './components/SettingsView'
 import ContextRail from './components/ContextRail'
 import { displayPath } from './utils'
+import ToastStack from './components/ToastStack'
 
 export const AuthContext = createContext(null);
 
@@ -81,6 +82,9 @@ export default function App() {
     const saved = sessionStorage.getItem('captureDialogOpen')
     return saved === 'true'
   })
+
+  const [toasts, setToasts] = useState([])
+  const toastIdRef = useRef(0)
 
   const humanizeTags = currentUser?.humanize_slugs ?? false;
 
@@ -234,6 +238,15 @@ export default function App() {
     ])
   }, [archiveId, searchQuery, tagFilter, loadEntries])
 
+  const handleToast = useCallback((errorText, locator) => {
+    const id = ++toastIdRef.current
+    setToasts(prev => [...prev, { id, errorText, locator }])
+  }, [])
+
+  const handleDismissToast = useCallback((id) => {
+    setToasts(prev => prev.filter(t => t.id !== id))
+  }, [])
+
   if (authState === 'loading') return <div className="auth-loading">Loading\u2026</div>;
   if (authState === 'setup')   return <SetupPage onComplete={() => setAuthState('login')} />;
   if (authState === 'login')   return <LoginPage onLogin={user => { setCurrentUser(user); setAuthState('authenticated'); }} />;
@@ -332,7 +345,9 @@ export default function App() {
           archiveId={archiveId}
           onClose={handleCaptureClose}
           onCaptured={handleCaptured}
+          onToast={handleToast}
         />
+        <ToastStack toasts={toasts} onDismiss={handleDismissToast} />
       </>
     </AuthContext.Provider>
   )
