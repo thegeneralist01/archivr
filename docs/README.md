@@ -314,6 +314,9 @@ dependencies (Chromium, Node.js, Python) land in the final layer.
   - Space-separated extra flags appended to Chromium's `--browser-args`. The Docker
     image sets this to `--no-sandbox` because Chromium refuses to run as root without
     it. Leave unset when running natively (Nix, Linux desktop).
+    A `--window-size=1920,1080` is always passed to provide a realistic desktop
+    viewport (so responsive @media rules and styles are evaluated and preserved
+    correctly). Supply your own `--window-size=...` here to override.
 - `ARCHIVR_TWITTER_CREDENTIALS_FILE`
   - Required for tweet/thread scraping inputs such as `tweet:ID` and `x:thread:ID`.
   - Must point to a cookies file for the vendored scraper.

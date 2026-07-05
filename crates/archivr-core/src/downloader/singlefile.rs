@@ -72,9 +72,16 @@ fn save_with(
     // then append any extra flags from ARCHIVR_CHROME_ARGS (space-separated).
     // Docker containers running as root need "--no-sandbox" here because
     // Chromium refuses to start as root without it.
+    //
+    // --window-size is set to a realistic desktop viewport so that
+    // --remove-alternative-medias=false and --remove-unused-styles=false
+    // actually preserve responsive @media rules and styles that only match
+    // at normal screen widths (headless Chromium defaults to a small viewport
+    // that would otherwise defeat the preservation flags).
     let mut chrome_flags = vec![
         "--disable-web-security".to_string(),
         format!("--user-data-dir={}", chrome_data_dir.display()),
+        "--window-size=1920,1080".to_string(),
     ];
     if let Ok(extra) = std::env::var("ARCHIVR_CHROME_ARGS") {
         chrome_flags.extend(extra.split_whitespace().filter(|s| !s.is_empty()).map(str::to_string));
