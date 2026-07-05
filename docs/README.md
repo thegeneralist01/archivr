@@ -146,6 +146,35 @@ Auth and session handling will be designed when remote or public hosting becomes
 - X/Twitter Tweet content scrape: [Tweet and Thread shorthands](#supported-shorthand-inputs). (These are saved as JSON files in `raw_tweets/`)
 - Instagram, Facebook, TikTok, Reddit, Snapchat: direct URLs or platform-prefixed shorthand passed through to `yt-dlp`
 
+#### Video quality and audio-only downloads
+
+When capturing via the web UI, entering a URL for a yt-dlp-backed source (YouTube, Instagram, TikTok, Facebook, Reddit, Snapchat, X media) triggers a metadata probe via `GET /api/archives/:id/captures/probe`. The quality selector then shows only the heights actually available in that video plus **Best quality** (default). An **Audio only** option is appended whenever the probe confirms an audio track exists. UI behaviour by probe outcome:
+
+| `qualities` | `has_audio` | UI shows |
+|---|---|---|
+| `["1080p", "720p", …]` | `true` | Best / heights / Audio only |
+| `["1080p", …]` | `false` | Best / heights |
+| `[]` | `true` | Audio only (pre-selected, no Best option) |
+| `[]` | `false` | "No media detected" |
+| probe fails (502) | — | picker hidden, capture still submittable |
+
+The `POST /api/archives/:id/captures` endpoint accepts an optional `quality` field: `"best"`, `"audio"`, or any `"NNNp"` height string:
+
+```json
+{ "locator": "https://www.youtube.com/watch?v=...", "quality": "720p" }
+{ "locator": "https://www.youtube.com/watch?v=...", "quality": "audio" }
+```
+
+`"audio"` selects the most efficient native audio track without transcoding: Opus/WebM is preferred (smallest at equivalent quality), then AAC/M4A, then whatever yt-dlp considers best. The saved file's extension matches the native format (`.webm` for Opus, `.m4a` for AAC, etc.) — no ffmpeg re-encode, no size inflation. Any `"NNNp"` height is accepted; the server builds the yt-dlp format selector with an unconditional `/best` fallback so the download succeeds even if the exact height is unavailable. Omitting `quality` or passing `"best"` downloads at the highest available quality. Anything else is rejected with HTTP 400.
+
+The probe endpoint (`GET /api/archives/:id/captures/probe?locator=…`) requires auth and returns 200 with:
+```json
+{ "has_video": true,  "has_audio": true,  "qualities": ["1080p", "720p", "480p"] }
+{ "has_video": false, "has_audio": true,  "qualities": [] }
+{ "has_video": false, "has_audio": false, "qualities": [] }
+```
+`has_video: false, has_audio: false` means yt-dlp found no downloadable tracks (e.g. a tweet with no media). A 502 means yt-dlp itself failed (transient network error, rate-limit, unsupported extractor) — treat as inconclusive, not "no media."
+
 ### Hosting on NixOS
 
 The flake exposes a `nixosModules.default` output. Add it to your system flake and
