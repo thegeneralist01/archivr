@@ -287,6 +287,10 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/archives/:archive_id/entries/:entry_uid/collections",
             get(list_entry_collections_handler),
         )
+        .route(
+            "/api/archives/:archive_id/blob-cleanup",
+            get(blob_cleanup_scan_handler).delete(blob_cleanup_delete_handler),
+        )
         .nest_service("/assets", ServeDir::new(static_dir.join("assets")))
         .fallback_service(ServeFile::new(static_dir.join("index.html")))
         .layer(axum::middleware::from_fn_with_state(state.clone(), setup_guard))
@@ -994,6 +998,150 @@ async fn update_instance_settings_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ── Blob / orphan cleanup ─────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct BlobCleanupScanResponse {
+    orphaned_blob_rows: usize,
+    deletable_files: usize,
+    total_bytes: u64,
+}
+
+/// GET /api/archives/:archive_id/blob-cleanup
+/// Returns stats on orphaned blob DB rows and unreferenced raw files.
+/// Returns 409 if any capture job is pending or running.
+async fn blob_cleanup_scan_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(archive_id): Path<String>,
+) -> Result<Json<BlobCleanupScanResponse>, ApiError> {
+    auth_user.require_role(ROLE_ADMIN)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let paths = archive::read_archive_paths(&mounted.archive_path)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+
+    if database::has_active_capture_jobs(&conn)? {
+        return Err(ApiError::conflict(
+            "captures are in progress; wait for them to finish before scanning",
+        ));
+    }
+
+    let referenced = database::all_referenced_file_relpaths(&conn)?;
+    let orphaned_blob_rows = database::list_orphaned_blob_rows(&conn)?.len();
+    let orphaned_files = collect_orphaned_disk_files(&paths.store_path, &referenced)
+        .map_err(|e| ApiError::internal(&format!("disk scan failed: {e:#}")))?;
+    let total_bytes: u64 = orphaned_files.iter().map(|(_, sz)| sz).sum();
+
+    Ok(Json(BlobCleanupScanResponse {
+        orphaned_blob_rows,
+        deletable_files: orphaned_files.len(),
+        total_bytes,
+    }))
+}
+
+/// DELETE /api/archives/:archive_id/blob-cleanup
+/// Deletes orphaned blob DB rows and unreferenced raw files.
+/// Re-checks for active captures immediately before executing to close the TOCTOU window.
+async fn blob_cleanup_delete_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(archive_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    auth_user.require_role(ROLE_ADMIN)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let paths = archive::read_archive_paths(&mounted.archive_path)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+
+    // Re-check immediately before acting (closes the TOCTOU gap between scan and delete).
+    if database::has_active_capture_jobs(&conn)? {
+        return Err(ApiError::conflict(
+            "captures are in progress; wait for them to finish before cleaning up",
+        ));
+    }
+
+    // Collect the set of protected relpaths and the files to delete BEFORE mutating the DB.
+    // This ensures the referenced set is consistent with the rows we're about to remove.
+    let referenced = database::all_referenced_file_relpaths(&conn)?;
+    let files_to_delete = collect_orphaned_disk_files(&paths.store_path, &referenced)
+        .map_err(|e| ApiError::internal(&format!("disk scan failed: {e:#}")))?;
+
+    // Second guard: re-check after the disk walk, which can be slow.
+    // A capture that started during the walk may have moved files into raw/ before
+    // writing its DB rows; those files would appear orphaned but must not be deleted.
+    if database::has_active_capture_jobs(&conn)? {
+        return Err(ApiError::conflict(
+            "a capture started during the scan; retry after all captures finish",
+        ));
+    }
+
+
+    // Delete orphaned blob rows from the database.
+    let deleted_blob_rows = database::delete_orphaned_blob_rows(&conn)?;
+
+    // Delete the unreferenced disk files.
+    let mut freed_bytes: u64 = 0;
+    let mut deleted_files: usize = 0;
+    let mut errors: Vec<String> = Vec::new();
+    for (path, size) in &files_to_delete {
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                freed_bytes += *size;
+                deleted_files += 1;
+            }
+            Err(e) => errors.push(format!("{}: {e}", path.display())),
+        }
+    }
+
+    eprintln!(
+        "info: blob cleanup for '{}': {} blob rows, {} files deleted, {} bytes freed, {} errors",
+        archive_id, deleted_blob_rows, deleted_files, freed_bytes, errors.len()
+    );
+
+    Ok(Json(serde_json::json!({
+        "deleted_blob_rows": deleted_blob_rows,
+        "deleted_files": deleted_files,
+        "freed_bytes": freed_bytes,
+        "errors": errors,
+    })))
+}
+
+/// Walk `raw/` and `raw_tweets/` under `store_path` and return every file whose
+/// relpath (relative to `store_path`, forward-slash separated) is absent from
+/// `referenced`.  Each entry is `(absolute_path, byte_size)`.
+fn collect_orphaned_disk_files(
+    store_path: &std::path::Path,
+    referenced: &std::collections::HashSet<String>,
+) -> anyhow::Result<Vec<(std::path::PathBuf, u64)>> {
+    let mut result = Vec::new();
+    for subdir in &["raw", "raw_tweets"] {
+        let dir = store_path.join(subdir);
+        if !dir.exists() {
+            continue;
+        }
+        let mut stack = vec![dir];
+        while let Some(current) = stack.pop() {
+            for entry in std::fs::read_dir(&current)? {
+                let entry = entry?;
+                let path = entry.path();
+                let ft = entry.file_type()?;
+                if ft.is_dir() {
+                    stack.push(path);
+                } else if ft.is_file() {
+                    if let Ok(rel) = path.strip_prefix(store_path) {
+                        // Normalise to forward slashes (relevant on Windows if ever deployed there).
+                        let relpath = rel.to_string_lossy().replace('\\', "/");
+                        if !referenced.contains(&relpath) {
+                            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                            result.push((path, size));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
 async fn create_token(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -1209,6 +1357,10 @@ impl ApiError {
 
     pub fn forbidden(message: &str) -> Self {
         Self { status: StatusCode::FORBIDDEN, message: message.to_string() }
+    }
+
+    fn conflict(message: &str) -> Self {
+        Self { status: StatusCode::CONFLICT, message: message.to_string() }
     }
 }
 
@@ -3210,6 +3362,169 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Blob cleanup route tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn blob_cleanup_scan_requires_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/blob-cleanup")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn blob_cleanup_delete_requires_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/archives/test/blob-cleanup")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn blob_cleanup_scan_returns_409_when_capture_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+        {
+            let conn = database::open_or_initialize(&archive_path).unwrap();
+            database::create_capture_job(&conn, "test").unwrap();
+        }
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/blob-cleanup")
+                    .header("cookie", &session)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn blob_cleanup_delete_returns_409_when_capture_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+        {
+            let conn = database::open_or_initialize(&archive_path).unwrap();
+            database::create_capture_job(&conn, "test").unwrap();
+        }
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/archives/test/blob-cleanup")
+                    .header("cookie", &session)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn blob_cleanup_delete_removes_orphan_and_preserves_referenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("store");
+        let paths = archivr_core::archive::initialize_archive(
+            dir.path(), &store_path, "test", false,
+        ).unwrap();
+        let auth_path = dir.path().join("auth.sqlite");
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
+        let session = make_test_session(&auth_path);
+        let entry = make_test_entry(&paths.archive_path);
+
+        let live_relpath = "raw/l/i/live.bin";
+        let orphan_relpath = "raw/o/r/orphan.bin";
+        let extra_relpath = "raw/x/t/extra.bin"; // on disk only, no blob row
+
+        {
+            let conn = database::open_or_initialize(&paths.archive_path).unwrap();
+            // Referenced blob
+            let live_id = database::upsert_blob(&conn, &database::BlobRecord {
+                sha256: "aaaa1111bbbb2222cccc3333dddd4444aaaa1111bbbb2222cccc3333dddd4444".to_string(),
+                byte_size: 10, mime_type: None, extension: Some("bin".to_string()),
+                raw_relpath: live_relpath.to_string(),
+            }).unwrap();
+            database::add_entry_artifact(&conn, &database::NewArtifact {
+                entry_id: entry.id,
+                artifact_role: "main".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: live_relpath.to_string(),
+                blob_id: Some(live_id),
+                logical_path: None, metadata_json: None,
+            }).unwrap();
+            // Orphaned blob (no artifact references it)
+            database::upsert_blob(&conn, &database::BlobRecord {
+                sha256: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+                byte_size: 20, mime_type: None, extension: Some("bin".to_string()),
+                raw_relpath: orphan_relpath.to_string(),
+            }).unwrap();
+        }
+
+        // Write all three files to disk
+        for relpath in &[live_relpath, orphan_relpath, extra_relpath] {
+            let abs = store_path.join(relpath);
+            std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            std::fs::write(&abs, b"content").unwrap();
+        }
+
+        let registry = ServerRegistry {
+            archives: vec![MountedArchive {
+                id: "test".to_string(),
+                label: "Test".to_string(),
+                archive_path: paths.archive_path.clone(),
+            }],
+            bind: None,
+            auth_db_path: None,
+        };
+
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/archives/test/blob-cleanup")
+                    .header("cookie", &session)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["deleted_blob_rows"], 1, "one orphaned DB row removed");
+        assert_eq!(body["deleted_files"], 2, "orphan blob file and extra disk file removed");
+        assert!(body["errors"].as_array().unwrap().is_empty());
+
+        assert!(store_path.join(live_relpath).exists(), "referenced file must be preserved");
+        assert!(!store_path.join(orphan_relpath).exists(), "orphaned blob file must be deleted");
+        assert!(!store_path.join(extra_relpath).exists(), "extra disk-only file must be deleted");
     }
 
 }

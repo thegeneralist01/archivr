@@ -18,7 +18,7 @@ import ToastStack from './components/ToastStack'
 export const AuthContext = createContext(null);
 
 const VIEWS = ['archive','tags','collections','runs','admin','settings']
-const SETTINGS_TABS = ['profile','tokens','instance']
+const SETTINGS_TABS = ['profile','tokens','instance','storage']
 
 function parseLocation() {
   const parts = window.location.pathname.split('/').filter(Boolean)
@@ -326,7 +326,7 @@ export default function App() {
               <CollectionsView archiveId={archiveId} />
             )}
             {view === 'settings' && (
-              <SettingsView tab={settingsTab} onTabChange={setSettingsTab} />
+              <SettingsView tab={settingsTab} onTabChange={setSettingsTab} archiveId={archiveId} />
             )}
           </div>
           <ContextRail

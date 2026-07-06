@@ -4,16 +4,17 @@ import {
   updateProfile, changePassword, patchMe,
   listTokens, createToken, deleteToken,
   getInstanceSettings, updateInstanceSettings,
+  scanOrphanBlobs, deleteOrphanBlobs,
 } from '../api.js'
 
 const ROLE_ADMIN = 4
 
-export default function SettingsView({ tab, onTabChange }) {
+export default function SettingsView({ tab, onTabChange, archiveId }) {
   const { currentUser, setCurrentUser } = useContext(AuthContext) ?? {}
   const isAdmin = currentUser && ((currentUser.role_bits & ROLE_ADMIN) !== 0)
 
-  const tabs = ['profile', 'tokens', ...(isAdmin ? ['instance'] : [])]
-  const tabLabels = { profile: 'Profile', tokens: 'API Tokens', instance: 'Instance' }
+  const tabs = ['profile', 'tokens', ...(isAdmin ? ['instance', 'storage'] : [])]
+  const tabLabels = { profile: 'Profile', tokens: 'API Tokens', instance: 'Instance', storage: 'Storage' }
 
   return (
     <section className="admin-view">
@@ -31,6 +32,7 @@ export default function SettingsView({ tab, onTabChange }) {
       {tab === 'profile' && <ProfileTab currentUser={currentUser} setCurrentUser={setCurrentUser} />}
       {tab === 'tokens' && <TokensTab />}
       {tab === 'instance' && isAdmin && <InstanceTab />}
+      {tab === 'storage' && isAdmin && <StorageTab archiveId={archiveId} />}
     </section>
   )
 }
@@ -208,7 +210,7 @@ function TokensTab() {
         </form>
         {error && <div className="form-msg form-msg--err">{error}</div>}
         {loading ? (
-          <div className="muted">Loading\u2026</div>
+          <div className="muted">Loading…</div>
         ) : (
           <div>
             {tokens.length === 0 && <div className="muted">No tokens yet.</div>}
@@ -262,7 +264,7 @@ function InstanceTab() {
     }
   }
 
-  if (loading) return <div className="muted">Loading\u2026</div>
+  if (loading) return <div className="muted">Loading…</div>
   if (error) return <div className="form-msg form-msg--err">{error}</div>
   if (!settings) return null
 
@@ -296,6 +298,134 @@ function InstanceTab() {
             {saving ? 'Saving\u2026' : 'Save Settings'}
           </button>
         </form>
+      </div>
+    </div>
+  )
+}
+
+function formatBytes(bytes) {
+  if (bytes === 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.floor(Math.log(bytes) / Math.log(1024))
+  return `${(bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`
+}
+
+function StorageTab({ archiveId }) {
+  // phase: 'idle' | 'scanning' | 'scanned' | 'deleting' | 'done' | 'error'
+  const [phase, setPhase] = useState('idle')
+  const [scanResult, setScanResult] = useState(null)
+  const [deleteResult, setDeleteResult] = useState(null)
+  const [errorMsg, setErrorMsg] = useState(null)
+
+  function reset() {
+    setPhase('idle')
+    setScanResult(null)
+    setDeleteResult(null)
+    setErrorMsg(null)
+  }
+
+  async function handleScan() {
+    setPhase('scanning')
+    setErrorMsg(null)
+    setScanResult(null)
+    try {
+      const result = await scanOrphanBlobs(archiveId)
+      setScanResult(result)
+      setPhase('scanned')
+    } catch (e) {
+      setErrorMsg(e.message)
+      setPhase('error')
+    }
+  }
+
+  async function handleDelete() {
+    setPhase('deleting')
+    setErrorMsg(null)
+    try {
+      const result = await deleteOrphanBlobs(archiveId)
+      setDeleteResult(result)
+      setPhase('done')
+    } catch (e) {
+      setErrorMsg(e.message)
+      setPhase('error')
+    }
+  }
+
+  const nothing = scanResult && scanResult.deletable_files === 0 && scanResult.orphaned_blob_rows === 0
+
+  return (
+    <div style={{ maxWidth: 440 }}>
+      <div className="form-section">
+        <h2>Orphan Cleanup</h2>
+        <p className="muted" style={{ marginBottom: 16 }}>
+          Scan for blob files and database records that are no longer referenced by
+          any archive entry and safely delete them.
+          {' '}<strong>Cleanup is blocked while captures are running.</strong>
+        </p>
+
+        {!archiveId && (
+          <div className="muted">No archive selected.</div>
+        )}
+
+        {archiveId && phase === 'idle' && (
+          <button className="btn-ghost" onClick={handleScan}>
+            Scan for orphaned blobs
+          </button>
+        )}
+
+        {phase === 'scanning' && (
+          <div className="muted">Scanning…</div>
+        )}
+
+        {phase === 'scanned' && scanResult && nothing && (
+          <>
+            <div className="form-msg form-msg--ok">Archive is clean &mdash; nothing to remove.</div>
+            <button className="btn-ghost" style={{ marginTop: 10 }} onClick={reset}>Done</button>
+          </>
+        )}
+
+        {phase === 'scanned' && scanResult && !nothing && (
+          <div>
+            <div style={{ marginBottom: 14, lineHeight: 1.6 }}>
+              Found <strong>{scanResult.deletable_files}</strong> unreferenced file{scanResult.deletable_files !== 1 ? 's' : ''}
+              {' '}and <strong>{scanResult.orphaned_blob_rows}</strong> orphaned DB record{scanResult.orphaned_blob_rows !== 1 ? 's' : ''}
+              {' '}&mdash; <strong>{formatBytes(scanResult.total_bytes)}</strong> recoverable.
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="btn-danger" onClick={handleDelete}>
+                Delete ({formatBytes(scanResult.total_bytes)})
+              </button>
+              <button className="btn-ghost" onClick={reset}>Cancel</button>
+            </div>
+          </div>
+        )}
+
+        {phase === 'deleting' && (
+          <div className="muted">Deleting…</div>
+        )}
+
+        {phase === 'done' && deleteResult && (
+          <div>
+            <div className="form-msg form-msg--ok">
+              Freed <strong>{formatBytes(deleteResult.freed_bytes)}</strong>
+              {' '}&mdash; removed {deleteResult.deleted_files} file{deleteResult.deleted_files !== 1 ? 's' : ''}
+              {' '}and {deleteResult.deleted_blob_rows} DB record{deleteResult.deleted_blob_rows !== 1 ? 's' : ''}.
+            </div>
+            {deleteResult.errors && deleteResult.errors.length > 0 && (
+              <div className="form-msg form-msg--err" style={{ marginTop: 6 }}>
+                {deleteResult.errors.length} file{deleteResult.errors.length !== 1 ? 's' : ''} could not be deleted.
+              </div>
+            )}
+            <button className="btn-ghost" style={{ marginTop: 10 }} onClick={reset}>Scan again</button>
+          </div>
+        )}
+
+        {phase === 'error' && (
+          <div>
+            <div className="form-msg form-msg--err">{errorMsg}</div>
+            <button className="btn-ghost" style={{ marginTop: 10 }} onClick={reset}>Try again</button>
+          </div>
+        )}
       </div>
     </div>
   )
