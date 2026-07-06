@@ -109,7 +109,12 @@ pub fn download(
     let out_template = temp_dir.join(format!("{timestamp}.%(ext)s"));
 
     let mut cmd = Command::new(&ytdlp);
-    cmd.arg(&path).arg("-f").arg(quality_format(quality));
+    cmd.arg(&path)
+        .arg("-f").arg(quality_format(quality))
+        // This function is only called for single-item sources; --no-playlist
+        // prevents yt-dlp from expanding a list= query parameter into a full
+        // playlist download (e.g. music.youtube.com/watch?v=ID&list=RDAMVM…).
+        .arg("--no-playlist");
     if is_audio {
         // -x guarantees audio-only even when /best falls back to a combined
         // A/V format. No --audio-format → native remux only, no re-encode.
@@ -166,6 +171,10 @@ pub fn fetch_metadata(path: &str) -> Option<String> {
 
     let out = std::process::Command::new(&ytdlp)
         .arg("--dump-json")
+        // Same rationale as download(): only called for single-item sources;
+        // prevents --dump-json from emitting one JSON object per playlist item
+        // when the URL contains a list= parameter.
+        .arg("--no-playlist")
         .arg(path)
         .output()
         .ok()?;

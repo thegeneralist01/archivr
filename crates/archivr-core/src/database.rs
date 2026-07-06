@@ -1082,10 +1082,40 @@ pub fn get_capture_job(conn: &Connection, job_uid: &str) -> Result<Option<Captur
     .map_err(Into::into)
 }
 
-/// Marks all 'running' capture jobs as 'failed' with a restart message.
-/// Called at server startup to clean up jobs interrupted by a previous shutdown.
+/// Marks all interrupted capture jobs, runs, and run items as failed.
+/// Called at server startup to recover from a hard shutdown mid-capture.
+///
+/// `capture_jobs.run_uid` is NULL when the server crashes before `perform_capture`
+/// returns, so we cannot join; instead we fail every `archive_runs` row still
+/// `in_progress` directly — any run that survived shutdown unfinished was interrupted.
+///
+/// Returns the number of `capture_jobs` rows updated (used for the startup log).
 pub fn fail_stalled_capture_jobs(conn: &Connection) -> Result<usize> {
     let now = now_timestamp();
+
+    // 1. Fail in-progress run items.
+    conn.execute(
+        "UPDATE archive_run_items
+         SET status = 'failed', error_text = 'interrupted by server restart'
+         WHERE status = 'in_progress'",
+        [],
+    )?;
+
+    // 2. Fail in-progress archive runs; recount failed items from the updated rows.
+    conn.execute(
+        "UPDATE archive_runs
+         SET status     = 'failed',
+             finished_at = ?1,
+             failed_count = (
+                 SELECT COUNT(*) FROM archive_run_items
+                 WHERE run_id = archive_runs.id AND status = 'failed'
+             ),
+             error_summary = 'interrupted by server restart'
+         WHERE status = 'in_progress'",
+        [now.clone()],
+    )?;
+
+    // 3. Fail running capture jobs (the polling layer).
     let n = conn.execute(
         "UPDATE capture_jobs SET status = 'failed',
          error_text = 'interrupted by server restart',
@@ -1093,6 +1123,7 @@ pub fn fail_stalled_capture_jobs(conn: &Connection) -> Result<usize> {
          WHERE status = 'running'",
         [now],
     )?;
+
     Ok(n)
 }
 
@@ -2686,13 +2717,40 @@ mod tests {
     #[test]
     fn fail_stalled_jobs_on_restart() {
         let conn = conn();
+
+        // Simulate an in-progress capture_job (run_uid still NULL — common crash case).
         let uid = create_capture_job(&conn, "test").unwrap();
         update_capture_job_status(&conn, &uid, "running", None, None).unwrap();
+
+        // Simulate an in-progress archive_run and item with no associated capture_job
+        // (covers the case where run_uid was never written back before the crash).
+        let user_id = ensure_default_user(&conn).unwrap();
+        let run = create_archive_run(&conn, user_id, 1).unwrap();
+        create_archive_run_item(&conn, run.id, None, 0, "https://example.com", None, "web", "file").unwrap();
+
         let n = fail_stalled_capture_jobs(&conn).unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(n, 1); // one capture_job updated
+
+        // capture_job is failed
         let job = get_capture_job(&conn, &uid).unwrap().unwrap();
         assert_eq!(job.status, "failed");
         assert!(job.error_text.as_deref().unwrap().contains("interrupted"));
+
+        // archive_run is failed
+        let updated_run: String = conn.query_row(
+            "SELECT status FROM archive_runs WHERE id = ?1",
+            [run.id],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(updated_run, "failed");
+
+        // archive_run_item is failed
+        let item_status: String = conn.query_row(
+            "SELECT status FROM archive_run_items WHERE run_id = ?1",
+            [run.id],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(item_status, "failed");
     }
 
     fn make_auth_conn_for_mgmt() -> Connection {
