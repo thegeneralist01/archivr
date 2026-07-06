@@ -68,7 +68,13 @@ fn build_scraper_args(
 ///
 /// Requires `ARCHIVR_TWITTER_CREDENTIALS_FILE` to be set. The scraper binary
 /// can be overridden via `ARCHIVR_TWEET_SCRAPER` and `ARCHIVR_TWEET_PYTHON`.
-pub fn archive(path: &str, thread: bool, store_path: &Path, timestamp: &str) -> Result<bool> {
+pub fn archive(
+    path: &str,
+    thread: bool,
+    store_path: &Path,
+    timestamp: &str,
+    cookies: &HashMap<String, String>,
+) -> Result<bool> {
     let invocation_cwd = env::current_dir().context("Failed to read current working directory")?;
     // Output directory for Tweet JSON files.
     let output_dir = store_path.join("raw_tweets");
@@ -93,20 +99,59 @@ pub fn archive(path: &str, thread: bool, store_path: &Path, timestamp: &str) -> 
         .unwrap_or_else(|| PathBuf::from("vendor/twitter/scrape_user_tweet_contents.py"));
     let scraper_path = absolutize_path_from_cwd(scraper_path, &invocation_cwd);
 
-    let credentials_file = if let Some(credentials_file) =
-        env::var_os("ARCHIVR_TWITTER_CREDENTIALS_FILE")
-    {
-        absolutize_path_from_cwd(PathBuf::from(credentials_file), &invocation_cwd)
+    // Credentials: only use cookie rules as Twitter credentials when the resolved
+    // map contains both `ct0` AND `auth_token` — the two cookies the scraper
+    // requires. A global cookie rule for an unrelated site must not suppress the
+    // ARCHIVR_TWITTER_CREDENTIALS_FILE fallback.
+    // Fall back to ARCHIVR_TWITTER_CREDENTIALS_FILE otherwise.
+    // The temp file is written in the semicolon-delimited format the Python scraper
+    // expects (`ct0=val;auth_token=val`) and deleted unconditionally after the
+    // subprocess returns so secrets are never left on disk on failure.
+    let temp_creds_path: Option<PathBuf>;
+    let credentials_file: PathBuf;
+
+    let has_twitter_cookies =
+        cookies.contains_key("ct0") && cookies.contains_key("auth_token");
+
+    if has_twitter_cookies {
+        let cf = store_path.join("temp").join(timestamp).join("twitter-creds.txt");
+        // Semicolon-separated, no spaces — matches what the scraper's split(";") expects.
+        let creds_str = cookies
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        {
+            use std::io::Write;
+            #[cfg(unix)]
+            let mut f = {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true).create(true).truncate(true).mode(0o600)
+                    .open(&cf)
+                    .context("failed to write twitter credentials file")?
+            };
+            #[cfg(not(unix))]
+            let mut f = std::fs::File::create(&cf)
+                .context("failed to write twitter credentials file")?;
+            f.write_all(creds_str.as_bytes())
+                .context("failed to write twitter credentials file")?;
+        }
+        temp_creds_path = Some(cf.clone());
+        credentials_file = cf;
+    } else if let Some(env_path) = env::var_os("ARCHIVR_TWITTER_CREDENTIALS_FILE") {
+        credentials_file = absolutize_path_from_cwd(PathBuf::from(env_path), &invocation_cwd);
+        temp_creds_path = None;
+        if !credentials_file.is_file() {
+            bail!(
+                "Twitter credentials file not found: {}",
+                credentials_file.display()
+            );
+        }
     } else {
         bail!(
-            "Twitter scraping requires ARCHIVR_TWITTER_CREDENTIALS_FILE to point to a cookies file."
-        );
-    };
-
-    if !credentials_file.is_file() {
-        bail!(
-            "Twitter credentials file not found: {}",
-            credentials_file.display()
+            "Twitter scraping requires either cookie rules for x.com/twitter.com \
+             or ARCHIVR_TWITTER_CREDENTIALS_FILE to be set."
         );
     }
 
@@ -116,12 +161,21 @@ pub fn archive(path: &str, thread: bool, store_path: &Path, timestamp: &str) -> 
         cmd.arg(arg);
     }
 
-    let output = cmd.output().with_context(|| {
+    // Hold the Result so we can delete the credentials file before propagating
+    // any error — including spawn failures.
+    let spawn_result = cmd.output().with_context(|| {
         format!(
             "Failed to spawn tweet scraper at {}",
             scraper_path.display()
         )
-    })?;
+    });
+
+    // Remove temp credentials file unconditionally — secrets must not persist.
+    if let Some(cf) = &temp_creds_path {
+        let _ = fs::remove_file(cf);
+    }
+
+    let output = spawn_result?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -465,7 +519,7 @@ mod tests {
         fs::write(&credentials, "ct0=test;auth_token=test").unwrap();
         set_test_env("ARCHIVR_TWITTER_CREDENTIALS_FILE", &credentials);
 
-        let archived = archive("tweet:123", false, &store_path, "ts").unwrap();
+        let archived = archive("tweet:123", false, &store_path, "ts", &HashMap::new()).unwrap();
 
         assert!(!archived);
 
@@ -538,7 +592,7 @@ EOF
         set_test_env("ARCHIVR_TWEET_SCRAPER", &script);
         set_test_env("ARCHIVR_TWEET_PYTHON", "/bin/sh");
 
-        let archived = archive("tweet:123", false, &store_path, "ts").unwrap();
+        let archived = archive("tweet:123", false, &store_path, "ts", &HashMap::new()).unwrap();
         let tweet_file = output_dir.join("tweet-123.json");
         let contents = fs::read_to_string(&tweet_file).unwrap();
 

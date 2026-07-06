@@ -265,6 +265,14 @@ pub fn app_with_state(state: AppState) -> Router {
             get(get_instance_settings_handler).patch(update_instance_settings_handler),
         )
         .route(
+            "/api/admin/cookie-rules",
+            get(list_cookie_rules_handler).post(create_cookie_rule_handler),
+        )
+        .route(
+            "/api/admin/cookie-rules/:rule_uid",
+            patch(update_cookie_rule_handler).delete(delete_cookie_rule_handler),
+        )
+        .route(
             "/api/archives/:archive_id/collections",
             get(list_collections_handler).post(create_collection_handler),
         )
@@ -679,6 +687,21 @@ struct PatchTagBody {
     name: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct CreateCookieRuleBody {
+    url_pattern: Option<String>,
+    pattern_kind: String,
+    cookies_json: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UpdateCookieRuleBody {
+    url_pattern: Option<serde_json::Value>, // null → clear, string → set, absent → keep
+    pattern_kind: Option<String>,
+    cookies_json: Option<String>,
+    ordinal: Option<i64>,
+}
+
 async fn capture_handler(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -710,6 +733,15 @@ async fn capture_handler(
     let job_uid = database::create_capture_job(&conn, &archive_id)?;
     drop(conn);
 
+    // Load cookie rules from the auth DB to pass into the capture background task.
+    let cookie_rules = {
+        match database::open_auth_db(&state.auth_db_path) {
+            Ok(conn) => database::list_cookie_rules(&conn).unwrap_or_default(),
+            Err(_) => vec![],
+        }
+    };
+    let capture_config = capture::CaptureConfig { cookie_rules };
+
     // Spawn background capture.
     let locator = body.locator.trim().to_string();
     let quality = body.quality.clone();
@@ -725,7 +757,7 @@ async fn capture_handler(
             }
         };
         database::update_capture_job_status(&conn, &job_uid_bg, "running", None, None).ok();
-        match capture::perform_capture(&archive_paths, &locator, Some(&archive_id_bg), quality.as_deref()) {
+        match capture::perform_capture(&archive_paths, &locator, Some(&archive_id_bg), quality.as_deref(), &capture_config) {
             Ok(result) => {
                 database::update_capture_job_status(
                     &conn,
@@ -806,8 +838,13 @@ async fn probe_handler(
     // extractor, etc.). That is distinct from "yt-dlp ran fine but found no video": we
     // return 502 so the frontend treats it as inconclusive rather than showing
     // "No video detected" for a URL that may well be downloadable.
+    let cookie_rules = match database::open_auth_db(&state.auth_db_path) {
+        Ok(conn) => database::list_cookie_rules(&conn).unwrap_or_default(),
+        Err(_) => vec![],
+    };
+    let cookies = capture::resolve_cookies_for_url(&cookie_rules, &ytdlp_url);
     let maybe_result = tokio::task::spawn_blocking(move || {
-        downloader::ytdlp::fetch_metadata(&ytdlp_url)
+        downloader::ytdlp::fetch_metadata(&ytdlp_url, &cookies)
             .map(|json| downloader::ytdlp::probe_result(&json))
     })
     .await
@@ -995,6 +1032,118 @@ async fn update_instance_settings_handler(
     if let Some(v) = body.open_registration_enabled { settings.open_registration_enabled = v; }
     if let Some(v) = body.default_entry_visibility { settings.default_entry_visibility = v; }
     database::update_instance_settings(&conn, &settings)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Cookie rules ──────────────────────────────────────────────────────────────
+
+async fn list_cookie_rules_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+) -> Result<Json<Vec<database::CookieRule>>, ApiError> {
+    auth_user.require_role(ROLE_ADMIN)?;
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    Ok(Json(database::list_cookie_rules(&conn)?))
+}
+
+async fn create_cookie_rule_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Json(body): Json<CreateCookieRuleBody>,
+) -> Result<(StatusCode, Json<database::CookieRule>), ApiError> {
+    auth_user.require_role(ROLE_ADMIN)?;
+    if !["global", "wildcard", "regex"].contains(&body.pattern_kind.as_str()) {
+        return Err(ApiError::bad_request(
+            "pattern_kind must be 'global', 'wildcard', or 'regex'",
+        ));
+    }
+    if serde_json::from_str::<std::collections::HashMap<String, String>>(&body.cookies_json).is_err() {
+        return Err(ApiError::bad_request(
+            "cookies_json must be a JSON object whose values are all strings, e.g. {\"name\": \"value\"}",
+        ));
+    }
+    if body.pattern_kind != "global"
+        && body.url_pattern.as_deref().unwrap_or("").trim().is_empty()
+    {
+        return Err(ApiError::bad_request(
+            "url_pattern is required for non-global rules",
+        ));
+    }
+    if body.pattern_kind == "regex" {
+        if let Some(pat) = &body.url_pattern {
+            regex::Regex::new(pat)
+                .map_err(|e| ApiError::bad_request(&format!("invalid regex: {e}")))?;
+        }
+    }
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    let url_pattern = body
+        .url_pattern
+        .as_deref()
+        .filter(|s| !s.trim().is_empty());
+    let rule = database::create_cookie_rule(&conn, url_pattern, &body.pattern_kind, &body.cookies_json)?;
+    Ok((StatusCode::CREATED, Json(rule)))
+}
+
+async fn update_cookie_rule_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(rule_uid): Path<String>,
+    Json(body): Json<UpdateCookieRuleBody>,
+) -> Result<StatusCode, ApiError> {
+    auth_user.require_role(ROLE_ADMIN)?;
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    let rules = database::list_cookie_rules(&conn)?;
+    let existing = rules
+        .into_iter()
+        .find(|r| r.rule_uid == rule_uid)
+        .ok_or_else(|| ApiError::not_found("cookie rule not found"))?;
+    let pattern_kind = body.pattern_kind.unwrap_or(existing.pattern_kind);
+    let cookies_json = body.cookies_json.unwrap_or(existing.cookies_json);
+    let ordinal = body.ordinal.unwrap_or(existing.ordinal);
+    // url_pattern: null JSON value → clear, string → set, absent (None) → keep existing
+    let url_pattern: Option<String> = match body.url_pattern {
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if s.trim().is_empty() => None,
+        Some(serde_json::Value::String(s)) => Some(s),
+        None => existing.url_pattern,
+        _ => existing.url_pattern,
+    };
+    if !["global", "wildcard", "regex"].contains(&pattern_kind.as_str()) {
+        return Err(ApiError::bad_request(
+            "pattern_kind must be 'global', 'wildcard', or 'regex'",
+        ));
+    }
+    if serde_json::from_str::<std::collections::HashMap<String, String>>(&cookies_json).is_err() {
+        return Err(ApiError::bad_request(
+            "cookies_json must be a JSON object whose values are all strings, e.g. {\"name\": \"value\"}",
+        ));
+    }
+    if pattern_kind == "regex" {
+        if let Some(pat) = &url_pattern {
+            regex::Regex::new(pat)
+                .map_err(|e| ApiError::bad_request(&format!("invalid regex: {e}")))?;
+        }
+    }
+    database::update_cookie_rule(
+        &conn,
+        &rule_uid,
+        url_pattern.as_deref(),
+        &pattern_kind,
+        &cookies_json,
+        ordinal,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_cookie_rule_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(rule_uid): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    auth_user.require_role(ROLE_ADMIN)?;
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    database::delete_cookie_rule(&conn, &rule_uid)
+        .map_err(|_| ApiError::not_found("cookie rule not found"))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2655,6 +2804,122 @@ mod tests {
                 .unwrap()
         ).await.unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    #[tokio::test]
+    async fn cookie_rules_require_admin() {
+        // Non-admin (no session) should get 401.
+        let (test_app, _dir) = make_test_app();
+        let response = test_app
+            .oneshot(Request::builder().uri("/api/admin/cookie-rules").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cookie_rules_create_list_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+
+        let app = app(registry, auth_path);
+
+        // Create a global rule with valid string-only cookies.
+        let create_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/cookie-rules")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session)
+                    .body(Body::from(r#"{"pattern_kind":"global","cookies_json":"{\"session\":\"abc\"}"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::CREATED);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(create_resp.into_body(), usize::MAX).await.unwrap(),
+        ).unwrap();
+        let rule_uid = body["rule_uid"].as_str().unwrap().to_string();
+        assert_eq!(body["pattern_kind"], "global");
+
+        // List: should contain the created rule.
+        let list_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/cookie-rules")
+                    .header("cookie", &session)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(list_resp.into_body(), usize::MAX).await.unwrap(),
+        ).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
+
+        // Delete.
+        let del_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/admin/cookie-rules/{rule_uid}"))
+                    .header("cookie", &session)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del_resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn cookie_rules_rejects_non_string_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+
+        // cookies_json with a numeric value must be rejected — core only accepts string values.
+        let resp = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/cookie-rules")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session)
+                    .body(Body::from(r#"{"pattern_kind":"global","cookies_json":"{\"session\":123}"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cookie_rules_rejects_invalid_regex() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+
+        let resp = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/cookie-rules")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session)
+                    .body(Body::from(r#"{"pattern_kind":"regex","url_pattern":"[invalid","cookies_json":"{\"x\":\"y\"}"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
     #[tokio::test]
     async fn security_headers_present_on_success_response() {

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
+use crate::downloader::cookies::cookies_to_header;
 use crate::hash::hash_file;
 
 /// Whether a URL resolves to an HTML document or a downloadable file.
@@ -16,25 +17,33 @@ pub enum UrlKind {
 /// Returns `Err` if the probe fails (network error, non-2xx/405 status).
 /// Redirects (3xx) are followed automatically by reqwest; only the final
 /// response status is checked.
-pub fn probe_url_kind(url: &str) -> Result<UrlKind> {
+pub fn probe_url_kind(url: &str, cookies: &HashMap<String, String>) -> Result<UrlKind> {
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
         .user_agent("archivr/0.1")
         .build()
         .context("failed to build HTTP client")?;
 
+    let cookie_header = cookies_to_header(cookies);
+
     // Prefer HEAD: no body transfer.
-    let head = client
-        .head(url)
-        .send()
-        .with_context(|| format!("failed to probe {url}"))?;
+    let head = {
+        let mut req = client.head(url);
+        if !cookie_header.is_empty() {
+            req = req.header(reqwest::header::COOKIE, &cookie_header);
+        }
+        req.send().with_context(|| format!("failed to probe {url}"))?
+    };
 
     if head.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
         // Server rejected HEAD — do a GET but only inspect headers.
-        let get = client
-            .get(url)
-            .send()
-            .with_context(|| format!("failed to probe {url}"))?;
+        let get = {
+            let mut req = client.get(url);
+            if !cookie_header.is_empty() {
+                req = req.header(reqwest::header::COOKIE, &cookie_header);
+            }
+            req.send().with_context(|| format!("failed to probe {url}"))?
+        };
         if !get.status().is_success() {
             bail!("HTTP {} probing {url}", get.status());
         }
@@ -74,17 +83,21 @@ pub fn probe_url_kind(url: &str) -> Result<UrlKind> {
 /// - The request fails or returns a non-2xx status.
 /// - The response Content-Type is `text/html` (caller should use a web-page archiver instead).
 /// - The body cannot be written to disk.
-pub fn download(url: &str, store_path: &Path, timestamp: &str) -> Result<(String, String, Option<String>)> {
+pub fn download(url: &str, store_path: &Path, timestamp: &str, cookies: &HashMap<String, String>) -> Result<(String, String, Option<String>)> {
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
         .user_agent("archivr/0.1")
         .build()
         .context("failed to build HTTP client")?;
 
-    let response = client
-        .get(url)
-        .send()
-        .with_context(|| format!("failed to fetch {url}"))?;
+    let cookie_header = cookies_to_header(cookies);
+    let response = {
+        let mut req = client.get(url);
+        if !cookie_header.is_empty() {
+            req = req.header(reqwest::header::COOKIE, &cookie_header);
+        }
+        req.send().with_context(|| format!("failed to fetch {url}"))?
+    };
 
     if !response.status().is_success() {
         bail!("HTTP {} fetching {url}", response.status());
@@ -393,7 +406,7 @@ mod tests {
     #[test]
     fn probe_url_kind_fails_on_unreachable_host() {
         // 127.0.0.1:1 is guaranteed to refuse connections.
-        let err = probe_url_kind("http://127.0.0.1:1/").unwrap_err();
+        let err = probe_url_kind("http://127.0.0.1:1/", &HashMap::new()).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("probe") || msg.contains("connect") || msg.contains("refused"),

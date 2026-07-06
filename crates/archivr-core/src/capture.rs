@@ -3,7 +3,7 @@ use chrono::Local;
 use uuid::Uuid;
 use serde_json::json;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -67,6 +67,78 @@ impl PlatformMetadata {
             }
         })
     }
+}
+
+/// Configuration passed to `perform_capture` to supply per-instance settings
+/// that live outside the archive (e.g. cookies stored in the auth DB).
+#[derive(Debug, Clone, Default)]
+pub struct CaptureConfig {
+    pub cookie_rules: Vec<database::CookieRule>,
+}
+
+/// Resolves which cookies apply to `url` by evaluating all rules in ordinal order.
+///
+/// Global rules (`url_pattern = None`) always apply.
+/// URL-specific rules apply when their pattern matches:
+/// - `wildcard`: `*` and `?` glob; matched against the URL hostname when the
+///   pattern does not contain `://`, or the full URL when it does.
+/// - `regex`: full regex matched against the full URL.
+///
+/// Later rules in ordinal order override earlier ones for the same cookie name.
+pub fn resolve_cookies_for_url(
+    rules: &[database::CookieRule],
+    url: &str,
+) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    for rule in rules {
+        let applies = match rule.url_pattern.as_deref() {
+            None => true,
+            Some(pattern) => match rule.pattern_kind.as_str() {
+                "wildcard" => wildcard_matches(pattern, url),
+                "regex" => regex::Regex::new(pattern)
+                    .is_ok_and(|re| re.is_match(url)),
+                _ => false,
+            },
+        };
+        if applies {
+            if let Ok(map) =
+                serde_json::from_str::<HashMap<String, String>>(&rule.cookies_json)
+            {
+                result.extend(map);
+            }
+        }
+    }
+    result
+}
+
+/// Converts a wildcard pattern (`*` = any substring, `?` = any character) to a
+/// regex and tests it against the URL.
+///
+/// If the pattern contains `://` it is matched against the full URL; otherwise
+/// only against the hostname (via `reqwest::Url::parse`) so that patterns like
+/// `*.youtube.com` work naturally without matching URL path components.
+fn wildcard_matches(pattern: &str, url: &str) -> bool {
+    use reqwest::Url as ReqwestUrl;
+    let target: String = if pattern.contains("://") {
+        url.to_string()
+    } else {
+        ReqwestUrl::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| url.to_string())
+    };
+    let mut pat = String::with_capacity(pattern.len() * 2 + 2);
+    pat.push('^');
+    for ch in pattern.chars() {
+        match ch {
+            '*' => pat.push_str(".*"),
+            '?' => pat.push('.'),
+            c if "$.+[]{}()|^\\".contains(c) => { pat.push('\\'); pat.push(c); }
+            c => pat.push(c),
+        }
+    }
+    pat.push('$');
+    regex::Regex::new(&pat).is_ok_and(|re| re.is_match(&target))
 }
 
 fn generate_entry_title(source: Source, meta: &PlatformMetadata) -> String {
@@ -786,6 +858,7 @@ pub fn perform_capture(
     locator: &str,
     archive_id: Option<&str>,
     quality: Option<&str>,
+    config: &CaptureConfig,
 ) -> Result<CaptureResult> {
     // Append a UUID so parallel captures starting in the same millisecond
     // never collide on the staging directory or file names.
@@ -801,6 +874,10 @@ pub fn perform_capture(
 
     let mut source = determine_source(locator);
 
+    // Expand shorthands to the canonical URL for cookie matching.
+    let canonical_url = expand_shorthand_to_url(locator, &source);
+    let cookies = resolve_cookies_for_url(&config.cookie_rules, &canonical_url);
+
     // Create the run record before probing so every attempt — including
     // probe failures — is visible in /runs with a proper status and error.
     let run = database::create_archive_run(&conn, user_id, 1)?;
@@ -808,7 +885,7 @@ pub fn perform_capture(
     // For generic http/https URLs, probe Content-Type to decide whether to
     // treat the URL as a raw file download or an HTML page for SingleFile.
     if source == Source::Url {
-        match downloader::http::probe_url_kind(locator) {
+        match downloader::http::probe_url_kind(locator, &cookies) {
             Ok(downloader::http::UrlKind::Html) => source = Source::WebPage,
             Ok(downloader::http::UrlKind::File) => {}
             Err(e) => {
@@ -870,7 +947,7 @@ pub fn perform_capture(
 
     // Source: generic HTTP/S file URL
     if source == Source::Url {
-        match downloader::http::download(locator, store_path, &timestamp) {
+        match downloader::http::download(locator, store_path, &timestamp, &cookies) {
             Ok((hash, file_extension, title_hint)) => {
                 let temp_file = store_path
                     .join("temp")
@@ -929,7 +1006,7 @@ pub fn perform_capture(
 
     // Source: web page — archive as a self-contained HTML snapshot via single-file-cli
     if source == Source::WebPage {
-        match downloader::singlefile::save(locator, store_path, &timestamp) {
+        match downloader::singlefile::save(locator, store_path, &timestamp, &cookies) {
             Ok(result) => {
                 let file_extension = ".html".to_string();
                 let temp_html = store_path
@@ -1083,11 +1160,16 @@ pub fn perform_capture(
             }
         };
 
+        // Tweet shorthands (tweet:ID) don't expand to a URL, so `canonical_url`
+        // won't match x.com patterns. Always resolve cookies against x.com so
+        // that wildcard/global rules containing `ct0`+`auth_token` are picked up.
+        let tweet_cookies = resolve_cookies_for_url(&config.cookie_rules, "https://x.com/");
         match downloader::tweets::archive(
             locator,
             source == Source::TweetThread,
             store_path,
             &timestamp,
+            &tweet_cookies,
         ) {
             Ok(_) => {
                 let tweet_entry = record_tweet_entry(
@@ -1131,7 +1213,7 @@ pub fn perform_capture(
         | Source::Facebook
         | Source::TikTok
         | Source::Reddit
-        | Source::Snapchat => downloader::ytdlp::fetch_metadata(&path),
+        | Source::Snapchat => downloader::ytdlp::fetch_metadata(&path, &cookies),
         _ => None,
     };
 
@@ -1154,7 +1236,7 @@ pub fn perform_capture(
         | Source::TikTok
         | Source::Reddit
         | Source::Snapchat => {
-            match downloader::ytdlp::download(path.clone(), store_path, &timestamp, quality) {
+            match downloader::ytdlp::download(path.clone(), store_path, &timestamp, quality, &cookies) {
                 Ok(result) => result,
                 Err(e) => {
                     return Err(fail_run(
@@ -1168,7 +1250,7 @@ pub fn perform_capture(
         }
         Source::YouTubeMusicTrack => {
             // Music tracks are always audio-only regardless of the caller's quality hint.
-            match downloader::ytdlp::download(path.clone(), store_path, &timestamp, Some("audio")) {
+            match downloader::ytdlp::download(path.clone(), store_path, &timestamp, Some("audio"), &cookies) {
                 Ok(result) => result,
                 Err(e) => {
                     return Err(fail_run(

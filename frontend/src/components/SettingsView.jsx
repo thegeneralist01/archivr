@@ -5,6 +5,7 @@ import {
   listTokens, createToken, deleteToken,
   getInstanceSettings, updateInstanceSettings,
   scanOrphanBlobs, deleteOrphanBlobs,
+  listCookieRules, createCookieRule, updateCookieRule, deleteCookieRule,
 } from '../api.js'
 
 const ROLE_ADMIN = 4
@@ -13,8 +14,8 @@ export default function SettingsView({ tab, onTabChange, archiveId }) {
   const { currentUser, setCurrentUser } = useContext(AuthContext) ?? {}
   const isAdmin = currentUser && ((currentUser.role_bits & ROLE_ADMIN) !== 0)
 
-  const tabs = ['profile', 'tokens', ...(isAdmin ? ['instance', 'storage'] : [])]
-  const tabLabels = { profile: 'Profile', tokens: 'API Tokens', instance: 'Instance', storage: 'Storage' }
+  const tabs = ['profile', 'tokens', ...(isAdmin ? ['instance', 'cookies', 'storage'] : [])]
+  const tabLabels = { profile: 'Profile', tokens: 'API Tokens', instance: 'Instance', cookies: 'Cookies', storage: 'Storage' }
 
   return (
     <section className="admin-view">
@@ -32,6 +33,7 @@ export default function SettingsView({ tab, onTabChange, archiveId }) {
       {tab === 'profile' && <ProfileTab currentUser={currentUser} setCurrentUser={setCurrentUser} />}
       {tab === 'tokens' && <TokensTab />}
       {tab === 'instance' && isAdmin && <InstanceTab />}
+      {tab === 'cookies' && isAdmin && <CookiesTab />}
       {tab === 'storage' && isAdmin && <StorageTab archiveId={archiveId} />}
     </section>
   )
@@ -426,6 +428,213 @@ function StorageTab({ archiveId }) {
             <button className="btn-ghost" style={{ marginTop: 10 }} onClick={reset}>Try again</button>
           </div>
         )}
+      </div>
+    </div>
+  )
+}
+
+
+function CookiesTab() {
+  const [rules, setRules] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+
+  // Form state for adding a new rule
+  const [patternKind, setPatternKind] = useState('global')
+  const [urlPattern, setUrlPattern] = useState('')
+  const [cookiesInput, setCookiesInput] = useState('{}')
+  const [addMsg, setAddMsg] = useState(null)
+  const [adding, setAdding] = useState(false)
+
+  // Inline-edit state: ruleUid → { cookiesInput, saving, msg }
+  const [edits, setEdits] = useState({})
+
+  useEffect(() => {
+    load()
+  }, [])
+
+  async function load() {
+    setLoading(true); setError(null)
+    try { setRules(await listCookieRules()) }
+    catch (e) { setError(e.message) }
+    finally { setLoading(false) }
+  }
+
+  async function handleAdd(e) {
+    e.preventDefault()
+    // Validate JSON
+    try { JSON.parse(cookiesInput) } catch {
+      setAddMsg({ ok: false, text: 'cookies must be valid JSON, e.g. {"session": "abc"}' })
+      return
+    }
+    setAdding(true); setAddMsg(null)
+    try {
+      await createCookieRule(
+        patternKind === 'global' ? null : urlPattern.trim(),
+        patternKind,
+        cookiesInput,
+      )
+      setUrlPattern('')
+      setCookiesInput('{}')
+      setPatternKind('global')
+      setAddMsg({ ok: true, text: 'Rule added.' })
+      await load()
+    } catch (err) {
+      setAddMsg({ ok: false, text: err.message })
+    } finally {
+      setAdding(false)
+    }
+  }
+
+  async function handleDelete(ruleUid) {
+    try {
+      await deleteCookieRule(ruleUid)
+      await load()
+    } catch (err) {
+      setError(err.message)
+    }
+  }
+
+  function startEdit(rule) {
+    setEdits(prev => ({
+      ...prev,
+      [rule.rule_uid]: {
+        cookiesInput: rule.cookies_json,
+        saving: false,
+        msg: null,
+      }
+    }))
+  }
+
+  function cancelEdit(ruleUid) {
+    setEdits(prev => { const n = { ...prev }; delete n[ruleUid]; return n })
+  }
+
+  async function saveEdit(rule) {
+    const edit = edits[rule.rule_uid]
+    try { JSON.parse(edit.cookiesInput) } catch {
+      setEdits(prev => ({ ...prev, [rule.rule_uid]: { ...prev[rule.rule_uid], msg: { ok: false, text: 'Invalid JSON' } } }))
+      return
+    }
+    setEdits(prev => ({ ...prev, [rule.rule_uid]: { ...prev[rule.rule_uid], saving: true, msg: null } }))
+    try {
+      await updateCookieRule(rule.rule_uid, { cookies_json: edit.cookiesInput })
+      cancelEdit(rule.rule_uid)
+      await load()
+    } catch (err) {
+      setEdits(prev => ({ ...prev, [rule.rule_uid]: { ...prev[rule.rule_uid], saving: false, msg: { ok: false, text: err.message } } }))
+    }
+  }
+
+  if (loading) return <div className="muted">Loading&hellip;</div>
+  if (error) return <div className="form-msg form-msg--err">{error}</div>
+
+  return (
+    <div style={{ maxWidth: 560 }}>
+      <div className="form-section">
+        <h2>Cookie Rules</h2>
+        <p className="muted" style={{ marginBottom: 12 }}>
+          Cookies are injected into every capture network request (yt-dlp, HTTP downloads, web-page snapshots).
+          Global rules apply to all URLs; wildcard and regex rules apply only to matching URLs.
+        </p>
+
+        {rules && rules.length > 0 ? (
+          <table className="data-table" style={{ width: '100%', marginBottom: 16 }}>
+            <thead>
+              <tr>
+                <th>Pattern</th>
+                <th>Cookies</th>
+                <th style={{ width: 100 }}>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rules.map(rule => {
+                const edit = edits[rule.rule_uid]
+                const patternLabel = rule.url_pattern
+                  ? <><span className="muted">{rule.pattern_kind}:</span> <code>{rule.url_pattern}</code></>
+                  : <span className="muted">global (all URLs)</span>
+                return (
+                  <tr key={rule.rule_uid}>
+                    <td>{patternLabel}</td>
+                    <td>
+                      {edit ? (
+                        <>
+                          <textarea
+                            className="field-input"
+                            style={{ fontFamily: 'monospace', fontSize: 12, width: '100%', minHeight: 60 }}
+                            value={edit.cookiesInput}
+                            onChange={ev => setEdits(prev => ({ ...prev, [rule.rule_uid]: { ...prev[rule.rule_uid], cookiesInput: ev.target.value } }))}
+                          />
+                          {edit.msg && <div className={`form-msg form-msg--${edit.msg.ok ? 'ok' : 'err'}`}>{edit.msg.text}</div>}
+                          <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+                            <button className="btn-primary" style={{ fontSize: 12, padding: '2px 8px' }} disabled={edit.saving} onClick={() => saveEdit(rule)}>
+                              {edit.saving ? 'Saving\u2026' : 'Save'}
+                            </button>
+                            <button className="btn-secondary" style={{ fontSize: 12, padding: '2px 8px' }} onClick={() => cancelEdit(rule.rule_uid)}>Cancel</button>
+                          </div>
+                        </>
+                      ) : (
+                        <code style={{ fontSize: 12, wordBreak: 'break-all' }}>{rule.cookies_json}</code>
+                      )}
+                    </td>
+                    <td>
+                      {!edit && (
+                        <div style={{ display: 'flex', gap: 6 }}>
+                          <button className="btn-secondary" style={{ fontSize: 12, padding: '2px 8px' }} onClick={() => startEdit(rule)}>Edit</button>
+                          <button className="btn-danger" style={{ fontSize: 12, padding: '2px 8px' }} onClick={() => handleDelete(rule.rule_uid)}>Del</button>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        ) : (
+          <p className="muted" style={{ marginBottom: 16 }}>No cookie rules defined.</p>
+        )}
+
+        <h3 style={{ marginBottom: 8 }}>Add Rule</h3>
+        <form onSubmit={handleAdd}>
+          <div className="form-field">
+            <label className="form-label">Pattern type</label>
+            <select className="field-input" value={patternKind} onChange={e => setPatternKind(e.target.value)}>
+              <option value="global">Global (all URLs)</option>
+              <option value="wildcard">Wildcard (e.g. *.youtube.com)</option>
+              <option value="regex">Regex (matched against full URL)</option>
+            </select>
+          </div>
+          {patternKind !== 'global' && (
+            <div className="form-field">
+              <label className="form-label">
+                {patternKind === 'wildcard' ? 'URL/hostname pattern' : 'Regex pattern'}
+              </label>
+              <input
+                className="field-input"
+                type="text"
+                value={urlPattern}
+                onChange={e => setUrlPattern(e.target.value)}
+                placeholder={patternKind === 'wildcard' ? '*.youtube.com or https://example.com/*' : '.*\\.youtube\\.com.*'}
+                required
+              />
+            </div>
+          )}
+          <div className="form-field">
+            <label className="form-label">Cookies (JSON object)</label>
+            <textarea
+              className="field-input"
+              style={{ fontFamily: 'monospace', fontSize: 13, minHeight: 70 }}
+              value={cookiesInput}
+              onChange={e => setCookiesInput(e.target.value)}
+              placeholder='{"SESSION": "abc123", "token": "xyz"}'
+              required
+            />
+          </div>
+          {addMsg && <div className={`form-msg form-msg--${addMsg.ok ? 'ok' : 'err'}`}>{addMsg.text}</div>}
+          <button className="btn-primary" type="submit" disabled={adding}>
+            {adding ? 'Adding\u2026' : 'Add Rule'}
+          </button>
+        </form>
       </div>
     </div>
   )

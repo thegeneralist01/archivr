@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use archivr_core::archive;
+use archivr_core::{archive, capture::CaptureConfig};
 use clap::{Parser, Subcommand};
 use std::{
     env,
@@ -63,7 +63,7 @@ fn main() -> Result<()> {
                 }
             };
             let archive_paths = archive::read_archive_paths(&archive_path)?;
-            let result = archivr_core::capture::perform_capture(&archive_paths, path, None, None)?;
+            let result = archivr_core::capture::perform_capture(&archive_paths, path, None, None, &CaptureConfig::default())?;
             println!("Archived: run {}", result.run_uid);
             Ok(())
         }
