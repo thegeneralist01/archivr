@@ -354,6 +354,17 @@ export async function deleteCollection(archiveId, collUid) {
   if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error ?? res.statusText) }
 }
 
+// ── Blob / orphan cleanup ─────────────────────────────────────────────────────
+export async function scanOrphanBlobs(archiveId) {
+  return getJson(`/api/archives/${archiveId}/blob-cleanup`)
+}
+
+export async function deleteOrphanBlobs(archiveId) {
+  const res = await fetch(`/api/archives/${archiveId}/blob-cleanup`, { method: 'DELETE' })
+  if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error ?? res.statusText) }
+  return res.json()
+}
+
 // ── 401 interceptor ───────────────────────────────────────────────────────────
 const _origFetch = window.fetch;
 window.fetch = async (...args) => {

@@ -1488,6 +1488,76 @@ pub fn get_blob_by_sha256(conn: &Connection, sha256: &str) -> Result<Option<Blob
     .map_err(anyhow::Error::from)
 }
 
+/// Returns `true` if any capture job in this archive is `pending` or `running`.
+/// Call before scanning or deleting orphans: the capture pipeline moves files into
+/// `raw/` before writing the DB rows, so a mid-capture scan can falsely flag live files.
+pub fn has_active_capture_jobs(conn: &Connection) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM capture_jobs WHERE status IN ('pending', 'running')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Returns `(id, raw_relpath, byte_size)` for every blob row not referenced by any
+/// `entry_artifacts.blob_id`.  These DB rows are safe to delete regardless of whether
+/// a disk file still exists at their `raw_relpath`.
+pub fn list_orphaned_blob_rows(conn: &Connection) -> Result<Vec<(i64, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, raw_relpath, byte_size FROM blobs \
+         WHERE id NOT IN \
+           (SELECT DISTINCT blob_id FROM entry_artifacts WHERE blob_id IS NOT NULL)",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Returns the set of all file relpaths (relative to `store_path`) that are currently
+/// referenced by at least one live entry_artifact, either directly via
+/// `entry_artifacts.relpath` or indirectly via a live blob's `raw_relpath`.
+/// Any disk file whose relpath is in this set must NOT be deleted.
+pub fn all_referenced_file_relpaths(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+    let mut set = std::collections::HashSet::new();
+    {
+        let mut stmt = conn.prepare("SELECT DISTINCT relpath FROM entry_artifacts")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            set.insert(row.get::<_, String>(0)?);
+        }
+    }
+    {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT raw_relpath FROM blobs \
+             WHERE id IN \
+               (SELECT DISTINCT blob_id FROM entry_artifacts WHERE blob_id IS NOT NULL)",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            set.insert(row.get::<_, String>(0)?);
+        }
+    }
+    Ok(set)
+}
+
+/// Delete every blob row not referenced by any `entry_artifacts.blob_id`.
+/// Returns the number of rows deleted.
+pub fn delete_orphaned_blob_rows(conn: &Connection) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM blobs WHERE id NOT IN \
+           (SELECT DISTINCT blob_id FROM entry_artifacts WHERE blob_id IS NOT NULL)",
+        [],
+    )?)
+}
+
 pub fn create_archived_entry(conn: &Connection, entry: &NewEntry) -> Result<ArchivedEntry> {
     validate_visibility(&entry.visibility)?;
     let entry_uid = public_id("entry");
@@ -2929,6 +2999,171 @@ mod tests {
             .query_row("SELECT cached_bytes FROM archived_entries WHERE id = ?1", [external.id], |r| r.get(0))
             .unwrap();
         assert_eq!(after, 0, "cached_bytes must be 0 after whole subtree is deleted");
+    }
+
+    // ── Orphan blob cleanup ───────────────────────────────────────────────────────
+
+    #[test]
+    fn has_active_capture_jobs_false_when_none() {
+        let conn = conn();
+        assert!(!has_active_capture_jobs(&conn).unwrap());
+    }
+
+    #[test]
+    fn has_active_capture_jobs_true_for_pending() {
+        let conn = conn();
+        create_capture_job(&conn, "test").unwrap();
+        assert!(has_active_capture_jobs(&conn).unwrap());
+    }
+
+    #[test]
+    fn has_active_capture_jobs_true_for_running() {
+        let conn = conn();
+        let uid = create_capture_job(&conn, "test").unwrap();
+        update_capture_job_status(&conn, &uid, "running", None, None).unwrap();
+        assert!(has_active_capture_jobs(&conn).unwrap());
+    }
+
+    #[test]
+    fn has_active_capture_jobs_false_for_completed() {
+        let conn = conn();
+        let uid = create_capture_job(&conn, "test").unwrap();
+        update_capture_job_status(&conn, &uid, "completed", Some("run_x"), None).unwrap();
+        assert!(!has_active_capture_jobs(&conn).unwrap());
+    }
+
+    #[test]
+    fn list_orphaned_blob_rows_empty_when_blob_is_referenced() {
+        let conn = conn();
+        let entry = create_entry_fixture(&conn, "private", None, None);
+        let blob = BlobRecord {
+            sha256: "aaa111".to_string(),
+            byte_size: 100,
+            mime_type: None,
+            extension: Some("mp4".to_string()),
+            raw_relpath: "raw/a/a/aaa111.mp4".to_string(),
+        };
+        let blob_id = upsert_blob(&conn, &blob).unwrap();
+        add_entry_artifact(&conn, &NewArtifact {
+            entry_id: entry.id,
+            artifact_role: "main".to_string(),
+            storage_area: "raw".to_string(),
+            relpath: blob.raw_relpath.clone(),
+            blob_id: Some(blob_id),
+            logical_path: None,
+            metadata_json: None,
+        }).unwrap();
+        assert!(list_orphaned_blob_rows(&conn).unwrap().is_empty(),
+            "referenced blob must not appear as orphan");
+    }
+
+    #[test]
+    fn list_orphaned_blob_rows_finds_unreferenced_blob() {
+        let conn = conn();
+        upsert_blob(&conn, &BlobRecord {
+            sha256: "bbb222".to_string(),
+            byte_size: 200,
+            mime_type: None,
+            extension: Some("jpg".to_string()),
+            raw_relpath: "raw/b/b/bbb222.jpg".to_string(),
+        }).unwrap();
+        let orphans = list_orphaned_blob_rows(&conn).unwrap();
+        assert_eq!(orphans.len(), 1, "unreferenced blob must appear as orphan");
+        assert_eq!(orphans[0].1, "raw/b/b/bbb222.jpg");
+    }
+
+    #[test]
+    fn all_referenced_file_relpaths_covers_blob_and_direct_artifact_relpaths() {
+        let conn = conn();
+        let entry = create_entry_fixture(&conn, "private", None, None);
+        // Live blob: linked via blob_id
+        let blob = BlobRecord {
+            sha256: "live1".to_string(), byte_size: 50,
+            mime_type: None, extension: None,
+            raw_relpath: "raw/l/i/live1".to_string(),
+        };
+        let blob_id = upsert_blob(&conn, &blob).unwrap();
+        add_entry_artifact(&conn, &NewArtifact {
+            entry_id: entry.id,
+            artifact_role: "main".to_string(),
+            storage_area: "raw".to_string(),
+            relpath: blob.raw_relpath.clone(),
+            blob_id: Some(blob_id),
+            logical_path: None, metadata_json: None,
+        }).unwrap();
+        // Artifact referencing a file directly (no blob_id)
+        add_entry_artifact(&conn, &NewArtifact {
+            entry_id: entry.id,
+            artifact_role: "sidecar".to_string(),
+            storage_area: "raw".to_string(),
+            relpath: "raw/s/i/sidecar.vtt".to_string(),
+            blob_id: None,
+            logical_path: None, metadata_json: None,
+        }).unwrap();
+        let refs = all_referenced_file_relpaths(&conn).unwrap();
+        assert!(refs.contains("raw/l/i/live1"), "live blob relpath must be protected");
+        assert!(refs.contains("raw/s/i/sidecar.vtt"), "direct artifact relpath must be protected");
+    }
+
+    #[test]
+    fn delete_orphaned_blob_rows_removes_only_unreferenced() {
+        let conn = conn();
+        let entry = create_entry_fixture(&conn, "private", None, None);
+        // Referenced blob
+        let live = BlobRecord {
+            sha256: "live9999".to_string(), byte_size: 10,
+            mime_type: None, extension: None,
+            raw_relpath: "raw/l/v/live9999".to_string(),
+        };
+        let live_id = upsert_blob(&conn, &live).unwrap();
+        add_entry_artifact(&conn, &NewArtifact {
+            entry_id: entry.id,
+            artifact_role: "main".to_string(),
+            storage_area: "raw".to_string(),
+            relpath: live.raw_relpath.clone(),
+            blob_id: Some(live_id),
+            logical_path: None, metadata_json: None,
+        }).unwrap();
+        // Orphaned blob
+        upsert_blob(&conn, &BlobRecord {
+            sha256: "dead0000".to_string(), byte_size: 20,
+            mime_type: None, extension: None,
+            raw_relpath: "raw/d/e/dead0000".to_string(),
+        }).unwrap();
+        let deleted = delete_orphaned_blob_rows(&conn).unwrap();
+        assert_eq!(deleted, 1, "only the unreferenced blob row should be deleted");
+        assert!(get_blob_by_sha256(&conn, "live9999").unwrap().is_some(),
+            "referenced blob row must be preserved");
+    }
+
+    #[test]
+    fn orphan_blob_row_whose_relpath_is_artifact_relpath_stays_in_referenced_set() {
+        // Blob row has no blob_id reference (would be deleted from DB),
+        // but an artifact points to the same file via relpath — the file must
+        // appear in all_referenced_file_relpaths so it won't be deleted from disk.
+        let conn = conn();
+        let entry = create_entry_fixture(&conn, "private", None, None);
+        let blob = BlobRecord {
+            sha256: "edgecase".to_string(), byte_size: 30,
+            mime_type: None, extension: None,
+            raw_relpath: "raw/e/d/edgecase".to_string(),
+        };
+        upsert_blob(&conn, &blob).unwrap();
+        // artifact uses same relpath but no blob_id
+        add_entry_artifact(&conn, &NewArtifact {
+            entry_id: entry.id,
+            artifact_role: "sidecar".to_string(),
+            storage_area: "raw".to_string(),
+            relpath: blob.raw_relpath.clone(),
+            blob_id: None,
+            logical_path: None, metadata_json: None,
+        }).unwrap();
+        // blob row is orphaned (no blob_id reference)
+        assert_eq!(list_orphaned_blob_rows(&conn).unwrap().len(), 1);
+        // but the file relpath is still protected
+        let refs = all_referenced_file_relpaths(&conn).unwrap();
+        assert!(refs.contains(&blob.raw_relpath),
+            "file must be protected because artifact.relpath references it directly");
     }
 
 }
