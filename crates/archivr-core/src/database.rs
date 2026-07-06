@@ -138,6 +138,16 @@ pub struct InstanceSettings {
     pub default_entry_visibility: u32,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CookieRule {
+    pub rule_uid: String,
+    pub url_pattern: Option<String>,
+    pub pattern_kind: String,
+    pub cookies_json: String,
+    pub ordinal: i64,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CollectionRecord {
     pub id: i64,
@@ -464,6 +474,16 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
             created_at    TEXT NOT NULL,
             last_login_at TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS cookie_rules (
+            id           INTEGER PRIMARY KEY,
+            rule_uid     TEXT NOT NULL UNIQUE,
+            url_pattern  TEXT,
+            pattern_kind TEXT NOT NULL DEFAULT 'global',
+            cookies_json TEXT NOT NULL DEFAULT '{}',
+            ordinal      INTEGER NOT NULL DEFAULT 0,
+            created_at   TEXT NOT NULL
+        );
         "#,
     )?;
     // Add display_name column to users if not present (idempotent migration)
@@ -728,6 +748,85 @@ pub fn update_instance_settings(conn: &Connection, settings: &InstanceSettings) 
             settings.default_entry_visibility as i64,
         ],
     )?;
+    Ok(())
+}
+
+pub fn list_cookie_rules(conn: &Connection) -> Result<Vec<CookieRule>> {
+    let mut stmt = conn.prepare(
+        "SELECT rule_uid, url_pattern, pattern_kind, cookies_json, ordinal, created_at
+         FROM cookie_rules ORDER BY ordinal ASC, created_at ASC",
+    )?;
+    let records = stmt
+        .query_map([], |row| {
+            Ok(CookieRule {
+                rule_uid:     row.get(0)?,
+                url_pattern:  row.get(1)?,
+                pattern_kind: row.get(2)?,
+                cookies_json: row.get(3)?,
+                ordinal:      row.get(4)?,
+                created_at:   row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(records)
+}
+
+pub fn create_cookie_rule(
+    conn: &Connection,
+    url_pattern: Option<&str>,
+    pattern_kind: &str,
+    cookies_json: &str,
+) -> Result<CookieRule> {
+    let rule_uid = format!("cr_{}", Uuid::new_v4().simple());
+    let now = Utc::now().to_rfc3339();
+    let ordinal: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM cookie_rules",
+        [],
+        |r| r.get(0),
+    )?;
+    conn.execute(
+        "INSERT INTO cookie_rules (rule_uid, url_pattern, pattern_kind, cookies_json, ordinal, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![rule_uid, url_pattern, pattern_kind, cookies_json, ordinal, now],
+    )?;
+    Ok(CookieRule {
+        rule_uid,
+        url_pattern: url_pattern.map(str::to_string),
+        pattern_kind: pattern_kind.to_string(),
+        cookies_json: cookies_json.to_string(),
+        ordinal,
+        created_at: now,
+    })
+}
+
+pub fn update_cookie_rule(
+    conn: &Connection,
+    rule_uid: &str,
+    url_pattern: Option<&str>,
+    pattern_kind: &str,
+    cookies_json: &str,
+    ordinal: i64,
+) -> Result<()> {
+    let rows = conn.execute(
+        "UPDATE cookie_rules
+         SET url_pattern = ?1, pattern_kind = ?2, cookies_json = ?3, ordinal = ?4
+         WHERE rule_uid = ?5",
+        params![url_pattern, pattern_kind, cookies_json, ordinal, rule_uid],
+    )?;
+    if rows == 0 {
+        anyhow::bail!("cookie rule not found: {rule_uid}");
+    }
+    Ok(())
+}
+
+pub fn delete_cookie_rule(conn: &Connection, rule_uid: &str) -> Result<()> {
+    let rows = conn.execute(
+        "DELETE FROM cookie_rules WHERE rule_uid = ?1",
+        [rule_uid],
+    )?;
+    if rows == 0 {
+        anyhow::bail!("cookie rule not found: {rule_uid}");
+    }
     Ok(())
 }
 

@@ -132,6 +132,7 @@ dependencies = [
  "chrono",
  "parking_lot",
  "rand",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

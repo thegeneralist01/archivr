@@ -365,6 +365,49 @@ export async function deleteOrphanBlobs(archiveId) {
   return res.json()
 }
 
+// ── Cookie rules ──────────────────────────────────────────────────────────────
+
+export async function listCookieRules() {
+  return getJson('/api/admin/cookie-rules')
+}
+
+export async function createCookieRule(urlPattern, patternKind, cookiesJson) {
+  const res = await fetch('/api/admin/cookie-rules', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      url_pattern: urlPattern || null,
+      pattern_kind: patternKind,
+      cookies_json: cookiesJson,
+    }),
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.message || `HTTP ${res.status}`)
+  }
+  return res.json()
+}
+
+export async function updateCookieRule(ruleUid, patch) {
+  const res = await fetch(`/api/admin/cookie-rules/${ruleUid}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.message || `HTTP ${res.status}`)
+  }
+}
+
+export async function deleteCookieRule(ruleUid) {
+  const res = await fetch(`/api/admin/cookie-rules/${ruleUid}`, { method: 'DELETE' })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.message || `HTTP ${res.status}`)
+  }
+}
+
 // ── 401 interceptor ───────────────────────────────────────────────────────────
 const _origFetch = window.fetch;
 window.fetch = async (...args) => {

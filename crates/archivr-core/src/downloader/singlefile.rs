@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use std::{env, io::Read, path::Path, process::Command};
+use std::{collections::HashMap, env, io::Read, path::Path, process::Command};
 
+use crate::downloader::cookies::{domain_from_url, write_netscape_cookie_file};
 use crate::hash::hash_file;
 
 /// Result of archiving a web page with single-file.
@@ -27,11 +28,11 @@ pub struct SaveResult {
 /// Reads two env vars:
 /// - `ARCHIVR_SINGLE_FILE`: path to the `single-file` binary (default: `"single-file"`).
 /// - `ARCHIVR_CHROME`: path to the Chromium/Chrome binary (default: `"chromium"`).
-pub fn save(url: &str, store_path: &Path, timestamp: &str) -> Result<SaveResult> {
+pub fn save(url: &str, store_path: &Path, timestamp: &str, cookies: &HashMap<String, String>) -> Result<SaveResult> {
     let single_file =
         env::var("ARCHIVR_SINGLE_FILE").unwrap_or_else(|_| "single-file".to_string());
     let chrome = env::var("ARCHIVR_CHROME").unwrap_or_else(|_| "chromium".to_string());
-    save_with(url, store_path, timestamp, &single_file, &chrome)
+    save_with(url, store_path, timestamp, &single_file, &chrome, cookies)
 }
 
 /// Inner implementation; takes binary paths explicitly so tests can inject them
@@ -42,6 +43,7 @@ fn save_with(
     timestamp: &str,
     single_file: &str,
     chrome: &str,
+    cookies: &HashMap<String, String>,
 ) -> Result<SaveResult> {
     let temp_dir = store_path.join("temp").join(timestamp);
     std::fs::create_dir_all(&temp_dir).context("failed to create temp dir")?;
@@ -92,8 +94,20 @@ fn save_with(
         .collect();
     let browser_args = format!("[{}]", quoted.join(","));
 
-    let out = Command::new(single_file)
-        .arg(url)
+    // Write cookie file if cookies are provided.
+    // Never pass cookie values in process args (ps exposure).
+    let cookie_file: Option<std::path::PathBuf> = if !cookies.is_empty() {
+        let cf = temp_dir.join("cookies.txt");
+        let domain = domain_from_url(url);
+        write_netscape_cookie_file(cookies, &domain, &cf)
+            .context("failed to write single-file cookie file")?;
+        Some(cf)
+    } else {
+        None
+    };
+
+    let mut cmd = Command::new(single_file);
+    cmd.arg(url)
         .arg(&out_file)
         .arg(format!("--browser-executable-path={chrome}"))
         .arg("--browser-headless")
@@ -120,9 +134,21 @@ fn save_with(
         // Preserve fonts: defaults strip @font-face rules deemed "unused" or
         // "alternative" (unicode-range subsets), losing CDN-served fonts.
         .arg("--remove-unused-fonts=false")
-        .arg("--remove-alternative-fonts=false")
+        .arg("--remove-alternative-fonts=false");
+    if let Some(cf) = &cookie_file {
+        cmd.arg(format!("--browser-cookies-file={}", cf.display()));
+    }
+    let spawn_result = cmd
         .output()
-        .with_context(|| format!("failed to spawn {single_file} process"))?;
+        .with_context(|| format!("failed to spawn {single_file} process"));
+
+    // Delete cookie file unconditionally — including on spawn failure —
+    // so secrets are never left in store/temp when the capture fails.
+    if let Some(cf) = &cookie_file {
+        let _ = std::fs::remove_file(cf);
+    }
+
+    let out = spawn_result?;
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -296,6 +322,7 @@ mod tests {
             "test-ts",
             "/nonexistent/single-file",
             "chromium",
+            &HashMap::new(),
         );
         let err = result.unwrap_err();
         let msg = format!("{err:#}");

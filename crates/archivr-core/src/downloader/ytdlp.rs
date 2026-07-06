@@ -1,6 +1,13 @@
 use anyhow::{bail, Context, Result};
-use std::{env, path::{Path, PathBuf}, process::Command};
+use std::{
+    collections::HashMap,
+    env,
+    path::{Path, PathBuf},
+    process::Command,
+};
+use uuid::Uuid;
 
+use crate::downloader::cookies::{domain_from_url, write_netscape_cookie_file};
 use crate::hash::hash_file;
 
 /// Returns the yt-dlp `-f` format selector for `quality`.
@@ -96,6 +103,7 @@ pub fn download(
     store_path: &Path,
     timestamp: &String,
     quality: Option<&str>,
+    cookies: &HashMap<String, String>,
 ) -> Result<(String, String)> {
     println!("Downloading with yt-dlp: {path}");
 
@@ -104,6 +112,18 @@ pub fn download(
 
     let temp_dir = store_path.join("temp").join(timestamp);
     std::fs::create_dir_all(&temp_dir)?;
+
+    // Write a restrictive-permissions cookie file if cookies are provided.
+    // Never pass cookie values in process args (ps exposure).
+    let cookie_file: Option<PathBuf> = if !cookies.is_empty() {
+        let cf_path = temp_dir.join("cookies.txt");
+        let domain = domain_from_url(&path);
+        write_netscape_cookie_file(cookies, &domain, &cf_path)
+            .context("failed to write yt-dlp cookie file")?;
+        Some(cf_path)
+    } else {
+        None
+    };
 
     // %(ext)s lets yt-dlp write the correct extension for the chosen format.
     let out_template = temp_dir.join(format!("{timestamp}.%(ext)s"));
@@ -123,12 +143,21 @@ pub fn download(
         // Force the video container to mp4 so we always have a known extension.
         cmd.arg("--merge-output-format").arg("mp4");
     }
+    if let Some(cf) = &cookie_file {
+        cmd.arg("--cookies").arg(cf);
+    }
     let out = cmd
         .arg("-o")
         .arg(&out_template)
         .output()
-        .with_context(|| format!("failed to spawn {ytdlp} process"))?;
+        .with_context(|| format!("failed to spawn {ytdlp} process"));
 
+    // Remove cookie file immediately regardless of outcome.
+    if let Some(cf) = &cookie_file {
+        let _ = std::fs::remove_file(cf);
+    }
+
+    let out = out?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("yt-dlp failed: {stderr}");
@@ -166,19 +195,39 @@ fn find_downloaded_file(temp_dir: &Path, timestamp: &str) -> Result<PathBuf> {
 /// This is a simulate call — it does NOT download any media.
 /// On failure (non-zero exit or no stdout), prints the captured stderr
 /// to stderr (for debugging) then returns `None` so callers can proceed.
-pub fn fetch_metadata(path: &str) -> Option<String> {
+pub fn fetch_metadata(path: &str, cookies: &HashMap<String, String>) -> Option<String> {
     let ytdlp = std::env::var("ARCHIVR_YT_DLP").unwrap_or_else(|_| "yt-dlp".to_string());
 
-    let out = std::process::Command::new(&ytdlp)
-        .arg("--dump-json")
+    // Write a temp cookie file if needed; UUID-named to avoid collisions.
+    let cookie_file: Option<PathBuf> = if !cookies.is_empty() {
+        let domain = domain_from_url(path);
+        let p = std::env::temp_dir()
+            .join(format!("archivr-cookies-{}.txt", Uuid::new_v4().simple()));
+        write_netscape_cookie_file(cookies, &domain, &p).ok()?;
+        Some(p)
+    } else {
+        None
+    };
+
+    let mut cmd = std::process::Command::new(&ytdlp);
+    cmd.arg("--dump-json")
         // Same rationale as download(): only called for single-item sources;
         // prevents --dump-json from emitting one JSON object per playlist item
         // when the URL contains a list= parameter.
-        .arg("--no-playlist")
-        .arg(path)
-        .output()
-        .ok()?;
+        .arg("--no-playlist");
+    if let Some(cf) = &cookie_file {
+        cmd.arg("--cookies").arg(cf);
+    }
+    cmd.arg(path);
 
+    let out = cmd.output().ok();
+
+    // Remove cookie file regardless of outcome.
+    if let Some(cf) = &cookie_file {
+        let _ = std::fs::remove_file(cf);
+    }
+
+    let out = out?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         eprintln!(
