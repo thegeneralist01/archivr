@@ -14,6 +14,11 @@ pub enum Source {
     YouTubeVideo,
     YouTubePlaylist,
     YouTubeChannel,
+    YouTubeMusicTrack,
+    YouTubeMusicPlaylist,
+    SpotifyTrack,
+    SpotifyAlbum,
+    SpotifyPlaylist,
     X,
     Tweet,
     TweetThread,
@@ -72,6 +77,19 @@ fn generate_entry_title(source: Source, meta: &PlatformMetadata) -> String {
             "Archival of {}",
             meta.author.as_deref().unwrap_or("Unknown Channel")
         ),
+        Source::YouTubeMusicTrack => {
+            let title = meta.title.as_deref().unwrap_or("Unknown Track");
+            match meta.author.as_deref() {
+                Some(a) => format!("{title} \u{2014} {a}"),
+                None => title.to_string(),
+            }
+        }
+        Source::YouTubeMusicPlaylist => {
+            meta.title.clone().unwrap_or_else(|| "YouTube Music Playlist".to_string())
+        }
+        Source::SpotifyTrack | Source::SpotifyAlbum | Source::SpotifyPlaylist => {
+            meta.title.clone().unwrap_or_else(|| "Spotify Content".to_string())
+        }
         Source::X => format!("X Media by {}", meta.author.as_deref().unwrap_or("unknown")),
         Source::Tweet => {
             let excerpt = meta.caption_excerpt().unwrap_or_else(|| "Tweet".to_string());
@@ -120,6 +138,32 @@ fn expand_shorthand_to_url(path: &str, source: &Source) -> String {
             }
             if let Some(handle) = after.strip_prefix("@") {
                 return format!("https://www.youtube.com/@{handle}");
+            }
+        }
+    }
+
+    // YouTube Music shorthands: ytm:ID (track) or ytm:playlist/ID
+    if matches!(source, Source::YouTubeMusicTrack | Source::YouTubeMusicPlaylist) {
+        if let Some(after) = path.strip_prefix("ytm:") {
+            if let Some(id) = after.strip_prefix("playlist/") {
+                return format!("https://music.youtube.com/playlist?list={id}");
+            }
+            // bare ytm:ID → track
+            return format!("https://music.youtube.com/watch?v={after}");
+        }
+    }
+
+    // Spotify shorthands: spotify:track:ID, spotify:album:ID, spotify:playlist:ID
+    if matches!(source, Source::SpotifyTrack | Source::SpotifyAlbum | Source::SpotifyPlaylist) {
+        if let Some(after) = path.strip_prefix("spotify:") {
+            if let Some(id) = after.strip_prefix("track:") {
+                return format!("https://open.spotify.com/track/{id}");
+            }
+            if let Some(id) = after.strip_prefix("album:") {
+                return format!("https://open.spotify.com/album/{id}");
+            }
+            if let Some(id) = after.strip_prefix("playlist:") {
+                return format!("https://open.spotify.com/playlist/{id}");
             }
         }
     }
@@ -185,6 +229,27 @@ fn determine_source(path: &str) -> Source {
         {
             return Source::YouTubeChannel;
         }
+    }
+
+    // Shorthand scheme: ytm:
+    if let Some(after_scheme) = path.strip_prefix("ytm:") {
+        if after_scheme.starts_with("playlist/") {
+            return Source::YouTubeMusicPlaylist;
+        }
+        // Any other suffix is treated as a track ID
+        return Source::YouTubeMusicTrack;
+    }
+
+    // Shorthand scheme: spotify:
+    if let Some(after_scheme) = path.strip_prefix("spotify:") {
+        if after_scheme.starts_with("album:") {
+            return Source::SpotifyAlbum;
+        }
+        if after_scheme.starts_with("playlist:") {
+            return Source::SpotifyPlaylist;
+        }
+        // track: or anything else maps to a track
+        return Source::SpotifyTrack;
     }
 
     // Shorthand schemes: tweet:, x:, or twitter:
@@ -275,6 +340,37 @@ fn determine_source(path: &str) -> Source {
             return Source::YouTubeChannel;
         }
 
+        // YouTube Music track URLs: music.youtube.com/watch?v=ID
+        if path.starts_with("https://music.youtube.com/watch")
+            || path.starts_with("http://music.youtube.com/watch")
+        {
+            return Source::YouTubeMusicTrack;
+        }
+
+        // YouTube Music playlist URLs: music.youtube.com/playlist?list=ID
+        if path.starts_with("https://music.youtube.com/playlist")
+            || path.starts_with("http://music.youtube.com/playlist")
+        {
+            return Source::YouTubeMusicPlaylist;
+        }
+
+        // Spotify URLs: open.spotify.com/{track,album,playlist}/ID
+        if path.starts_with("https://open.spotify.com/track/")
+            || path.starts_with("http://open.spotify.com/track/")
+        {
+            return Source::SpotifyTrack;
+        }
+        if path.starts_with("https://open.spotify.com/album/")
+            || path.starts_with("http://open.spotify.com/album/")
+        {
+            return Source::SpotifyAlbum;
+        }
+        if path.starts_with("https://open.spotify.com/playlist/")
+            || path.starts_with("http://open.spotify.com/playlist/")
+        {
+            return Source::SpotifyPlaylist;
+        }
+
         if path.starts_with("https://x.com/") {
             return Source::X;
         }
@@ -341,6 +437,7 @@ pub fn locator_to_ytdlp_url(locator: &str) -> Option<String> {
     let source = determine_source(locator);
     match source {
         Source::YouTubeVideo
+        | Source::YouTubeMusicTrack
         | Source::X
         | Source::Instagram
         | Source::Facebook
@@ -426,6 +523,11 @@ fn source_metadata(source: Source) -> (&'static str, &'static str, &'static str)
         Source::YouTubeVideo => ("youtube", "video", "video"),
         Source::YouTubePlaylist => ("youtube", "playlist", "container"),
         Source::YouTubeChannel => ("youtube", "channel", "container"),
+        Source::YouTubeMusicTrack => ("youtube_music", "music", "audio"),
+        Source::YouTubeMusicPlaylist => ("youtube_music", "playlist", "container"),
+        Source::SpotifyTrack => ("spotify", "music", "audio"),
+        Source::SpotifyAlbum => ("spotify", "album", "container"),
+        Source::SpotifyPlaylist => ("spotify", "playlist", "container"),
         Source::X => ("x", "post", "video"),
         Source::Tweet => ("x", "tweet", "tweet_json"),
         Source::TweetThread => ("x", "tweet_thread", "tweet_json"),
@@ -745,6 +847,27 @@ pub fn perform_capture(
         ));
     }
 
+    // Sources: Spotify — not downloadable; Spotify audio is DRM-protected.
+    if matches!(source, Source::SpotifyTrack | Source::SpotifyAlbum | Source::SpotifyPlaylist) {
+        return Err(fail_run(
+            &conn,
+            &run,
+            &item,
+            "Spotify downloads are not supported: Spotify audio is DRM-protected and cannot \
+             be downloaded by yt-dlp. Archive the equivalent YouTube Music track instead.",
+        ));
+    }
+
+    // Sources: YouTube Music Playlist — container expansion not yet implemented.
+    if source == Source::YouTubeMusicPlaylist {
+        return Err(fail_run(
+            &conn,
+            &run,
+            &item,
+            "YouTube Music playlist archiving is not yet implemented.",
+        ));
+    }
+
     // Source: generic HTTP/S file URL
     if source == Source::Url {
         match downloader::http::download(locator, store_path, &timestamp) {
@@ -1002,6 +1125,7 @@ pub fn perform_capture(
     // because --dump-json is a simulate flag that suppresses the download.
     let ytdlp_metadata_json: Option<String> = match source {
         Source::YouTubeVideo
+        | Source::YouTubeMusicTrack
         | Source::X
         | Source::Instagram
         | Source::Facebook
@@ -1038,6 +1162,20 @@ pub fn perform_capture(
                         &run,
                         &item,
                         &format!("Failed to download media: {e}"),
+                    ));
+                }
+            }
+        }
+        Source::YouTubeMusicTrack => {
+            // Music tracks are always audio-only regardless of the caller's quality hint.
+            match downloader::ytdlp::download(path.clone(), store_path, &timestamp, Some("audio")) {
+                Ok(result) => result,
+                Err(e) => {
+                    return Err(fail_run(
+                        &conn,
+                        &run,
+                        &item,
+                        &format!("Failed to download audio: {e}"),
                     ));
                 }
             }
@@ -1410,6 +1548,142 @@ mod tests {
                 case.url
             );
         }
+    }
+
+    #[test]
+    fn test_youtube_music_sources() {
+        // --- determine_source ---
+        let cases = [
+            TestCase {
+                url: "https://music.youtube.com/watch?v=MntbN1DdEP0",
+                expected: Source::YouTubeMusicTrack,
+            },
+            TestCase {
+                url: "http://music.youtube.com/watch?v=MntbN1DdEP0",
+                expected: Source::YouTubeMusicTrack,
+            },
+            TestCase {
+                url: "https://music.youtube.com/playlist?list=PLtest123",
+                expected: Source::YouTubeMusicPlaylist,
+            },
+            TestCase {
+                url: "ytm:MntbN1DdEP0",
+                expected: Source::YouTubeMusicTrack,
+            },
+            TestCase {
+                url: "ytm:playlist/PLtest123",
+                expected: Source::YouTubeMusicPlaylist,
+            },
+        ];
+        for case in &cases {
+            assert_eq!(
+                determine_source(case.url),
+                case.expected,
+                "Failed for URL: {}",
+                case.url
+            );
+        }
+
+        // --- expand_shorthand_to_url ---
+        assert_eq!(
+            expand_shorthand_to_url("ytm:MntbN1DdEP0", &Source::YouTubeMusicTrack),
+            "https://music.youtube.com/watch?v=MntbN1DdEP0"
+        );
+        assert_eq!(
+            expand_shorthand_to_url("ytm:playlist/PLtest123", &Source::YouTubeMusicPlaylist),
+            "https://music.youtube.com/playlist?list=PLtest123"
+        );
+        // Full URL passes through unchanged
+        assert_eq!(
+            expand_shorthand_to_url(
+                "https://music.youtube.com/watch?v=MntbN1DdEP0",
+                &Source::YouTubeMusicTrack
+            ),
+            "https://music.youtube.com/watch?v=MntbN1DdEP0"
+        );
+
+        // --- locator_to_ytdlp_url ---
+        assert_eq!(
+            locator_to_ytdlp_url("ytm:MntbN1DdEP0"),
+            Some("https://music.youtube.com/watch?v=MntbN1DdEP0".to_string())
+        );
+        assert_eq!(
+            locator_to_ytdlp_url("https://music.youtube.com/watch?v=MntbN1DdEP0"),
+            Some("https://music.youtube.com/watch?v=MntbN1DdEP0".to_string())
+        );
+        // Playlist is not exposed to the probe endpoint
+        assert_eq!(locator_to_ytdlp_url("ytm:playlist/PLtest123"), None);
+
+        // --- source_metadata ---
+        assert_eq!(
+            source_metadata(Source::YouTubeMusicTrack),
+            ("youtube_music", "music", "audio")
+        );
+        assert_eq!(
+            source_metadata(Source::YouTubeMusicPlaylist),
+            ("youtube_music", "playlist", "container")
+        );
+    }
+
+    #[test]
+    fn test_spotify_sources() {
+        // --- determine_source ---
+        let cases = [
+            TestCase {
+                url: "https://open.spotify.com/track/4iV5W9uYEdYUVa79Axb7Rh",
+                expected: Source::SpotifyTrack,
+            },
+            TestCase {
+                url: "https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3",
+                expected: Source::SpotifyAlbum,
+            },
+            TestCase {
+                url: "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
+                expected: Source::SpotifyPlaylist,
+            },
+            TestCase {
+                url: "spotify:track:4iV5W9uYEdYUVa79Axb7Rh",
+                expected: Source::SpotifyTrack,
+            },
+            TestCase {
+                url: "spotify:album:1DFixLWuPkv3KT3TnV35m3",
+                expected: Source::SpotifyAlbum,
+            },
+            TestCase {
+                url: "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
+                expected: Source::SpotifyPlaylist,
+            },
+        ];
+        for case in &cases {
+            assert_eq!(
+                determine_source(case.url),
+                case.expected,
+                "Failed for URL: {}",
+                case.url
+            );
+        }
+
+        // --- expand_shorthand_to_url ---
+        assert_eq!(
+            expand_shorthand_to_url("spotify:track:4iV5W9uYEdYUVa79Axb7Rh", &Source::SpotifyTrack),
+            "https://open.spotify.com/track/4iV5W9uYEdYUVa79Axb7Rh"
+        );
+        assert_eq!(
+            expand_shorthand_to_url("spotify:album:1DFixLWuPkv3KT3TnV35m3", &Source::SpotifyAlbum),
+            "https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3"
+        );
+        assert_eq!(
+            expand_shorthand_to_url(
+                "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
+                &Source::SpotifyPlaylist
+            ),
+            "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
+        );
+
+        // --- source_metadata ---
+        assert_eq!(source_metadata(Source::SpotifyTrack), ("spotify", "music", "audio"));
+        assert_eq!(source_metadata(Source::SpotifyAlbum), ("spotify", "album", "container"));
+        assert_eq!(source_metadata(Source::SpotifyPlaylist), ("spotify", "playlist", "container"));
     }
 
     #[test]

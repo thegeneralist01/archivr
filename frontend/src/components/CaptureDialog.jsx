@@ -18,12 +18,20 @@ function isVideoSource(locator) {
     }
   }
 
+  // ytm: shorthand — track only; playlist is not yet implemented
+  if (ll.startsWith('ytm:')) {
+    return !ll.slice(4).startsWith('playlist/')
+  }
+
   // x: / twitter: / tweet: shorthands — only x:media:ID routes to yt-dlp (Source::X)
   for (const scheme of ['x:', 'twitter:', 'tweet:']) {
     if (ll.startsWith(scheme)) {
       return ll.slice(scheme.length).startsWith('media:')
     }
   }
+
+  // spotify: shorthands — all will fail with a clear error; no probe needed
+  if (ll.startsWith('spotify:')) return false
 
   // Other platform shorthands — all go to yt-dlp
   if (ll.startsWith('instagram:') || ll.startsWith('facebook:') ||
@@ -32,6 +40,8 @@ function isVideoSource(locator) {
 
   // HTTP/HTTPS URLs — match the same regexes and prefix checks as determine_source
   if (ll.startsWith('http://') || ll.startsWith('https://')) {
+    // YouTube Music track (watch) — before generic YouTube check
+    if (/^https?:\/\/music\.youtube\.com\/watch/.test(ll)) return true
     // YouTube video (watch, youtu.be, shorts) — not playlist or channel
     if (/^https?:\/\/(?:www\.)?(?:youtu\.be\/[0-9A-Za-z_-]+|youtube\.com\/watch\?v=[0-9A-Za-z_-]+|youtube\.com\/shorts\/[0-9A-Za-z_-]+)/.test(l)) return true
     // x.com → Source::X → yt-dlp (note: twitter.com URLs fall through to Source::Url, not yt-dlp)
@@ -46,6 +56,8 @@ function isVideoSource(locator) {
     if (/^https?:\/\/(?:www\.)?reddit\.com\//.test(ll) || ll.startsWith('https://redd.it/') || ll.startsWith('http://redd.it/')) return true
     // Snapchat
     if (/^https?:\/\/(?:www\.)?snapchat\.com\//.test(ll)) return true
+    // Spotify — all will fail with a clear error; no probe needed
+    if (ll.startsWith('https://open.spotify.com/') || ll.startsWith('http://open.spotify.com/')) return false
   }
 
   return false
@@ -402,7 +414,7 @@ function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemov
           ref={inputRef}
           className="capture-input"
           type="text"
-          placeholder="https://… · yt:ID · tweet:ID · x:ID"
+          placeholder="https://… · yt:ID · ytm:ID · tweet:ID · x:ID"
           value={item.locator}
           onChange={e => onLocatorChange(e.target.value)}
           onKeyDown={e => { if (e.key === 'Enter') onSubmit() }}
