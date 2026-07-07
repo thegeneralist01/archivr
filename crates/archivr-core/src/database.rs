@@ -137,6 +137,9 @@ pub struct InstanceSettings {
     pub public_entry_content_enabled: bool,
     pub open_registration_enabled: bool,  // maps to public_archive_submission_enabled column
     pub default_entry_visibility: u32,
+    /// Global default for ad-blocking via uBlock Origin Lite during WebPage captures.
+    /// Per-capture requests can override this.
+    pub ublock_enabled: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -460,13 +463,14 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
             public_index_enabled               INTEGER NOT NULL DEFAULT 0 CHECK (public_index_enabled IN (0, 1)),
             public_entry_content_enabled       INTEGER NOT NULL DEFAULT 0 CHECK (public_entry_content_enabled IN (0, 1)),
             public_archive_submission_enabled  INTEGER NOT NULL DEFAULT 0 CHECK (public_archive_submission_enabled IN (0, 1)),
-            default_entry_visibility           INTEGER NOT NULL DEFAULT 2
+            default_entry_visibility           INTEGER NOT NULL DEFAULT 2,
+            ublock_enabled                     INTEGER NOT NULL DEFAULT 1 CHECK (ublock_enabled IN (0, 1))
         );
 
         INSERT OR IGNORE INTO instance_settings
             (id, public_index_enabled, public_entry_content_enabled,
-             public_archive_submission_enabled, default_entry_visibility)
-        VALUES (1, 0, 0, 0, 2);
+             public_archive_submission_enabled, default_entry_visibility, ublock_enabled)
+        VALUES (1, 0, 0, 0, 2, 1);
 
         CREATE TABLE IF NOT EXISTS users (
             id            INTEGER PRIMARY KEY,
@@ -497,6 +501,12 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
     // Add humanize_slugs column to users if not present (idempotent migration)
     let _ = conn.execute(
         "ALTER TABLE users ADD COLUMN humanize_slugs INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+
+    // Add ublock_enabled column to instance_settings if not present (idempotent migration)
+    let _ = conn.execute(
+        "ALTER TABLE instance_settings ADD COLUMN ublock_enabled INTEGER NOT NULL DEFAULT 1",
         [],
     );
 
@@ -724,7 +734,8 @@ pub fn list_user_tokens(conn: &Connection, user_id: i64) -> Result<Vec<ApiTokenR
 pub fn get_instance_settings(conn: &Connection) -> Result<InstanceSettings> {
     conn.query_row(
         "SELECT public_index_enabled, public_entry_content_enabled,
-                public_archive_submission_enabled, default_entry_visibility
+                public_archive_submission_enabled, default_entry_visibility,
+                COALESCE(ublock_enabled, 1)
          FROM instance_settings WHERE id = 1",
         [],
         |row| {
@@ -733,6 +744,7 @@ pub fn get_instance_settings(conn: &Connection) -> Result<InstanceSettings> {
                 public_entry_content_enabled: row.get::<_, i64>(1)? != 0,
                 open_registration_enabled: row.get::<_, i64>(2)? != 0,
                 default_entry_visibility: row.get::<_, i64>(3)? as u32,
+                ublock_enabled: row.get::<_, i64>(4)? != 0,
             })
         },
     )
@@ -745,13 +757,15 @@ pub fn update_instance_settings(conn: &Connection, settings: &InstanceSettings) 
          SET public_index_enabled = ?1,
              public_entry_content_enabled = ?2,
              public_archive_submission_enabled = ?3,
-             default_entry_visibility = ?4
+             default_entry_visibility = ?4,
+             ublock_enabled = ?5
          WHERE id = 1",
         params![
             settings.public_index_enabled as i64,
             settings.public_entry_content_enabled as i64,
             settings.open_registration_enabled as i64,
             settings.default_entry_visibility as i64,
+            settings.ublock_enabled as i64,
         ],
     )?;
     Ok(())

@@ -43,11 +43,12 @@ pub fn save(
     store_path: &Path,
     timestamp: &str,
     cookies: &HashMap<String, String>,
+    ublock_enabled_override: Option<bool>,
 ) -> Result<SaveResult> {
     let single_file =
         env::var("ARCHIVR_SINGLE_FILE").unwrap_or_else(|_| "single-file".to_string());
     let chrome = env::var("ARCHIVR_CHROME").unwrap_or_else(|_| "chromium".to_string());
-    let (ublock_ext, ublock_skipped) = resolve_ublock_config();
+    let (ublock_ext, ublock_skipped) = resolve_ublock_config(ublock_enabled_override);
     let mut result = save_with(
         url,
         store_path,
@@ -61,21 +62,26 @@ pub fn save(
     Ok(result)
 }
 
-/// Reads `ARCHIVR_UBLOCK` and `ARCHIVR_UBLOCK_EXT` and returns:
+/// Resolves uBlock configuration from env vars, optionally overridden by the caller.
 ///
+/// Returns:
 /// - `(Some(path), false)` — uBlock is enabled and the extension dir is valid.
 /// - `(None, true)`  — uBlock is enabled but the extension dir is missing/invalid
-///                     (warns to stderr; caller should surface this to the user).
-/// - `(None, false)` — uBlock is explicitly disabled (`ARCHIVR_UBLOCK=false/0`).
-fn resolve_ublock_config() -> (Option<PathBuf>, bool) {
-    let enabled = env::var("ARCHIVR_UBLOCK").unwrap_or_else(|_| "true".to_string());
-    if enabled.eq_ignore_ascii_case("false") || enabled == "0" {
+///                     (warns to stderr; the capture proceeds without ad-blocking).
+/// - `(None, false)` — uBlock is disabled (`ARCHIVR_UBLOCK=false` or overridden).
+fn resolve_ublock_config(enabled_override: Option<bool>) -> (Option<PathBuf>, bool) {
+    // The override (from instance settings or per-capture body) takes precedence over env.
+    let want_ublock = enabled_override.unwrap_or_else(|| {
+        let env_val = env::var("ARCHIVR_UBLOCK").unwrap_or_else(|_| "true".to_string());
+        !env_val.eq_ignore_ascii_case("false") && env_val != "0"
+    });
+    if !want_ublock {
         return (None, false);
     }
     match env::var("ARCHIVR_UBLOCK_EXT").ok().filter(|s| !s.is_empty()) {
         None => {
             eprintln!(
-                "warn: uBlock: ARCHIVR_UBLOCK=true but ARCHIVR_UBLOCK_EXT is not set; \
+                "warn: uBlock: ARCHIVR_UBLOCK_EXT is not set; \
                  capturing without ad-blocking"
             );
             (None, true)

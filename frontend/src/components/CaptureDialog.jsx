@@ -1,5 +1,5 @@
-import { useRef, useEffect, useState } from 'react'
-import { submitCapture, pollCaptureJob, probeCapture } from '../api'
+import { useRef, useEffect, useState, useCallback } from 'react'
+import { submitCapture, pollCaptureJob, probeCapture, getInstanceSettings } from '../api'
 
 let nextItemId = 1
 
@@ -112,6 +112,23 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     sessionStorage.setItem('captureItems', JSON.stringify(items))
   }, [items])
 
+  // Advanced options panel state
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  // null = use server default; true/false = per-session override
+  const [ublockOverride, setUblockOverride] = useState(null)
+  // Server-side global default (loaded on mount, null until loaded)
+  const [globalUblock, setGlobalUblock] = useState(null)
+
+  // Load global uBlock setting from server once on mount
+  useEffect(() => {
+    getInstanceSettings()
+      .then(s => setGlobalUblock(s.ublock_enabled ?? true))
+      .catch(() => setGlobalUblock(true)) // safe default
+  }, [])
+
+  // Effective uBlock for this session
+  const ublockEnabled = ublockOverride !== null ? ublockOverride : (globalUblock ?? true)
+
   // On mount: clean up old single-locator sessionStorage keys; reconnect running jobs
   useEffect(() => {
     ;['captureDialogLocator','captureDialogError','captureDialogBusy',
@@ -223,7 +240,8 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     const qual = item.quality || 'best'
     setItems(prev => prev.map(it => it.id === item.id ? { ...it, status: 'submitting', error: null } : it))
     try {
-      const job = await submitCapture(aid, loc, qual)
+      const extensions = { ublock_enabled: ublockEnabled }
+      const job = await submitCapture(aid, loc, qual, extensions)
       setItems(prev => prev.map(it =>
         it.id === item.id ? { ...it, status: 'running', jobUid: job.job_uid, archiveId: aid } : it
       ))
@@ -342,10 +360,47 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
           Add another
         </button>
 
-        <div className="capture-actions">
-          <button type="button" className="capture-cancel" onClick={() => dialogRef.current?.close()}>
-            {anyActive ? 'Close' : 'Cancel'}
+        {/* ── Advanced options ────────────────────────────── */}
+        <div className="capture-advanced">
+          <button
+            type="button"
+            className="capture-advanced-toggle"
+            onClick={() => setAdvancedOpen(v => !v)}
+            aria-expanded={advancedOpen}
+          >
+            <svg
+              className={`capture-chevron${advancedOpen ? ' capture-chevron--open' : ''}`}
+              viewBox="0 0 16 16" fill="none" stroke="currentColor"
+              strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+            >
+              <polyline points="4 6 8 10 12 6"/>
+            </svg>
+            Advanced options
           </button>
+          {advancedOpen && (
+            <div className="capture-advanced-panel">
+              <label className="capture-ext-row">
+                <span className="capture-ext-label">
+                  <span className="capture-ext-name">uBlock Origin Lite</span>
+                  <span className="capture-ext-desc">Block ads during this capture</span>
+                </span>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={ublockEnabled}
+                  className={`ext-toggle ext-toggle--sm${ublockEnabled ? ' ext-toggle--on' : ''}`}
+                  onClick={() => setUblockOverride(v => v === null ? !ublockEnabled : !v)}
+                  aria-label="Toggle uBlock for this capture"
+                >
+                  <span className="ext-toggle-knob" />
+                </button>
+              </label>
+            </div>
+          )}
+        </div>
+
+        {/* ── Primary action ──────────────────────────────── */}
+        <div className="capture-actions">
           <button
             type="button"
             className="capture-submit"
@@ -353,6 +408,9 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
             disabled={pendingCount === 0}
           >
             {pendingCount > 1 ? `Archive ${pendingCount}` : 'Archive'}
+          </button>
+          <button type="button" className="capture-cancel" onClick={() => dialogRef.current?.close()}>
+            {anyActive ? 'Close' : 'Cancel'}
           </button>
         </div>
       </div>

@@ -77,6 +77,11 @@ impl PlatformMetadata {
 #[derive(Debug, Clone, Default)]
 pub struct CaptureConfig {
     pub cookie_rules: Vec<database::CookieRule>,
+    /// Override for uBlock Origin Lite during WebPage captures.
+    /// `None` = derive from `ARCHIVR_UBLOCK` env var (existing behaviour).
+    /// `Some(false)` = disabled by admin/user choice for this capture.
+    /// `Some(true)` = explicitly enabled (still needs `ARCHIVR_UBLOCK_EXT` to be valid).
+    pub ublock_enabled: Option<bool>,
 }
 
 /// Resolves which cookies apply to `url` by evaluating all rules in ordinal order.
@@ -1010,7 +1015,7 @@ pub fn perform_capture(
 
     // Source: web page — archive as a self-contained HTML snapshot via single-file-cli
     if source == Source::WebPage {
-        match downloader::singlefile::save(locator, store_path, &timestamp, &cookies) {
+        match downloader::singlefile::save(locator, store_path, &timestamp, &cookies, config.ublock_enabled) {
             Ok(result) => {
                 let file_extension = ".html".to_string();
                 let temp_html = store_path

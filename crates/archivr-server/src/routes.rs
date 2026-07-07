@@ -653,6 +653,8 @@ struct CaptureBody {
     /// Optional quality cap for yt-dlp sources: `"best"` or any `"NNNp"` string
     /// (e.g. `"1080p"`, `"720p"`, `"2160p"`). Absent or `"best"` → highest available.
     quality: Option<String>,
+    /// Per-capture uBlock override.  Absent → use global instance setting.
+    ublock_enabled: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -733,14 +735,26 @@ async fn capture_handler(
     let job_uid = database::create_capture_job(&conn, &archive_id)?;
     drop(conn);
 
-    // Load cookie rules from the auth DB to pass into the capture background task.
-    let cookie_rules = {
+    // Load cookie rules and global uBlock setting from the auth DB.
+    let (cookie_rules, global_ublock) = {
         match database::open_auth_db(&state.auth_db_path) {
-            Ok(conn) => database::list_cookie_rules(&conn).unwrap_or_default(),
-            Err(_) => vec![],
+            Ok(conn) => {
+                let rules = database::list_cookie_rules(&conn).unwrap_or_default();
+                let ublock = database::get_instance_settings(&conn)
+                    .map(|s| s.ublock_enabled)
+                    .unwrap_or(true);
+                (rules, ublock)
+            }
+            Err(_) => (vec![], true),
         }
     };
-    let capture_config = capture::CaptureConfig { cookie_rules };
+    // Per-capture body overrides global; if body doesn't specify, use the global setting.
+    // The resolved bool is then passed as Some(_) to singlefile, overriding the env var.
+    let effective_ublock = body.ublock_enabled.unwrap_or(global_ublock);
+    let capture_config = capture::CaptureConfig {
+        cookie_rules,
+        ublock_enabled: Some(effective_ublock),
+    };
 
     // Spawn background capture.
     let locator = body.locator.trim().to_string();
@@ -1020,10 +1034,20 @@ async fn patch_me(
 async fn get_instance_settings_handler(
     State(state): State<AppState>,
     auth_user: AuthUser,
-) -> Result<Json<database::InstanceSettings>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     auth_user.require_role(ROLE_ADMIN)?;
     let conn = database::open_auth_db(&state.auth_db_path)?;
-    Ok(Json(database::get_instance_settings(&conn)?))
+    let settings = database::get_instance_settings(&conn)?;
+    let ublock_ext_available = std::env::var("ARCHIVR_UBLOCK_EXT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|p| std::path::Path::new(&p).is_dir())
+        .unwrap_or(false);
+    let mut val = serde_json::to_value(&settings).unwrap_or_default();
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("ublock_ext_available".into(), serde_json::Value::Bool(ublock_ext_available));
+    }
+    Ok(Json(val))
 }
 
 async fn update_instance_settings_handler(
@@ -1038,6 +1062,7 @@ async fn update_instance_settings_handler(
     if let Some(v) = body.public_entry_content_enabled { settings.public_entry_content_enabled = v; }
     if let Some(v) = body.open_registration_enabled { settings.open_registration_enabled = v; }
     if let Some(v) = body.default_entry_visibility { settings.default_entry_visibility = v; }
+    if let Some(v) = body.ublock_enabled { settings.ublock_enabled = v; }
     database::update_instance_settings(&conn, &settings)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1367,6 +1392,7 @@ struct UpdateInstanceSettingsBody {
     public_entry_content_enabled: Option<bool>,
     open_registration_enabled: Option<bool>,
     default_entry_visibility: Option<u32>,
+    ublock_enabled: Option<bool>,
 }
 
 async fn admin_list_users(
