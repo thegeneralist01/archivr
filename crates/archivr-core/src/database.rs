@@ -469,8 +469,8 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
 
         INSERT OR IGNORE INTO instance_settings
             (id, public_index_enabled, public_entry_content_enabled,
-             public_archive_submission_enabled, default_entry_visibility, ublock_enabled)
-        VALUES (1, 0, 0, 0, 2, 1);
+             public_archive_submission_enabled, default_entry_visibility)
+        VALUES (1, 0, 0, 0, 2);
 
         CREATE TABLE IF NOT EXISTS users (
             id            INTEGER PRIMARY KEY,
