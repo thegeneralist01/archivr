@@ -756,15 +756,21 @@ async fn capture_handler(
                 return;
             }
         };
-        database::update_capture_job_status(&conn, &job_uid_bg, "running", None, None).ok();
+        database::update_capture_job_status(&conn, &job_uid_bg, "running", None, None, None).ok();
         match capture::perform_capture(&archive_paths, &locator, Some(&archive_id_bg), quality.as_deref(), &capture_config) {
             Ok(result) => {
+                let notes = if result.ublock_skipped {
+                    Some(r#"{"ublock_skipped":true}"#)
+                } else {
+                    None
+                };
                 database::update_capture_job_status(
                     &conn,
                     &job_uid_bg,
                     "completed",
                     Some(&result.run_uid),
                     None,
+                    notes,
                 )
                 .ok();
             }
@@ -775,6 +781,7 @@ async fn capture_handler(
                     "failed",
                     None,
                     Some(&format!("{e:#}")),
+                    None,
                 )
                 .ok();
             }

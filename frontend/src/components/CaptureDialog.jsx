@@ -186,6 +186,13 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
             })
           }, 1400)
           onCapturedRef.current()
+          // Warn if uBlock was requested but the extension wasn't available
+          try {
+            const notes = updated.notes_json ? JSON.parse(updated.notes_json) : null
+            if (notes?.ublock_skipped) {
+              onToastRef.current(null, locator, 'warning')
+            }
+          } catch {}
         } else if (updated.status === 'failed') {
           clearInterval(pollIntervals.current.get(jobUid))
           pollIntervals.current.delete(jobUid)

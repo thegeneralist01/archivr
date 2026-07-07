@@ -105,6 +105,7 @@ pub struct CaptureJobRecord {
     pub run_uid: Option<String>,
     pub status: String,
     pub error_text: Option<String>,
+    pub notes_json: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -308,6 +309,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             run_uid     TEXT,
             status      TEXT NOT NULL CHECK (status IN ('pending','running','completed','failed')) DEFAULT 'pending',
             error_text  TEXT,
+            notes_json  TEXT,
             created_at  TEXT NOT NULL,
             updated_at  TEXT NOT NULL
         );
@@ -392,6 +394,10 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
              );",
         )?;
     }
+
+    // Migration: add notes_json column to existing capture_jobs tables.
+    // Silently ignored when the column already exists (idempotent).
+    let _ = conn.execute("ALTER TABLE capture_jobs ADD COLUMN notes_json TEXT", []);
 
     Ok(())
 }
@@ -1142,19 +1148,21 @@ pub fn create_capture_job(conn: &Connection, archive_id: &str) -> Result<String>
     Ok(job_uid)
 }
 
-/// Updates the status (and optionally run_uid / error_text) of a capture job.
+/// Updates the status (and optionally run_uid / error_text / notes_json) of a capture job.
 pub fn update_capture_job_status(
     conn: &Connection,
     job_uid: &str,
     status: &str,
     run_uid: Option<&str>,
     error_text: Option<&str>,
+    notes_json: Option<&str>,
 ) -> Result<()> {
     let now = now_timestamp();
     conn.execute(
         "UPDATE capture_jobs SET status = ?1, run_uid = COALESCE(?2, run_uid),
-         error_text = ?3, updated_at = ?4 WHERE job_uid = ?5",
-        rusqlite::params![status, run_uid, error_text, now, job_uid],
+         error_text = ?3, notes_json = COALESCE(?4, notes_json), updated_at = ?5
+         WHERE job_uid = ?6",
+        rusqlite::params![status, run_uid, error_text, notes_json, now, job_uid],
     )?;
     Ok(())
 }
@@ -1162,7 +1170,7 @@ pub fn update_capture_job_status(
 /// Returns a capture job by uid.
 pub fn get_capture_job(conn: &Connection, job_uid: &str) -> Result<Option<CaptureJobRecord>> {
     conn.query_row(
-        "SELECT job_uid, archive_id, run_uid, status, error_text, created_at, updated_at
+        "SELECT job_uid, archive_id, run_uid, status, error_text, notes_json, created_at, updated_at
          FROM capture_jobs WHERE job_uid = ?1",
         [job_uid],
         |row| {
@@ -1172,8 +1180,9 @@ pub fn get_capture_job(conn: &Connection, job_uid: &str) -> Result<Option<Captur
                 run_uid: row.get(2)?,
                 status: row.get(3)?,
                 error_text: row.get(4)?,
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
+                notes_json: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
             })
         },
     )
@@ -2806,8 +2815,8 @@ mod tests {
     fn capture_job_status_transitions() {
         let conn = conn();
         let job_uid = create_capture_job(&conn, "test").unwrap();
-        update_capture_job_status(&conn, &job_uid, "running", None, None).unwrap();
-        update_capture_job_status(&conn, &job_uid, "completed", Some("run_abc"), None).unwrap();
+        update_capture_job_status(&conn, &job_uid, "running", None, None, None).unwrap();
+        update_capture_job_status(&conn, &job_uid, "completed", Some("run_abc"), None, None).unwrap();
         let job = get_capture_job(&conn, &job_uid).unwrap().unwrap();
         assert_eq!(job.status, "completed");
         assert_eq!(job.run_uid.as_deref(), Some("run_abc"));
@@ -2819,7 +2828,7 @@ mod tests {
 
         // Simulate an in-progress capture_job (run_uid still NULL — common crash case).
         let uid = create_capture_job(&conn, "test").unwrap();
-        update_capture_job_status(&conn, &uid, "running", None, None).unwrap();
+        update_capture_job_status(&conn, &uid, "running", None, None, None).unwrap();
 
         // Simulate an in-progress archive_run and item with no associated capture_job
         // (covers the case where run_uid was never written back before the crash).
@@ -3177,7 +3186,7 @@ mod tests {
     fn has_active_capture_jobs_true_for_running() {
         let conn = conn();
         let uid = create_capture_job(&conn, "test").unwrap();
-        update_capture_job_status(&conn, &uid, "running", None, None).unwrap();
+        update_capture_job_status(&conn, &uid, "running", None, None, None).unwrap();
         assert!(has_active_capture_jobs(&conn).unwrap());
     }
 
@@ -3185,7 +3194,7 @@ mod tests {
     fn has_active_capture_jobs_false_for_completed() {
         let conn = conn();
         let uid = create_capture_job(&conn, "test").unwrap();
-        update_capture_job_status(&conn, &uid, "completed", Some("run_x"), None).unwrap();
+        update_capture_job_status(&conn, &uid, "completed", Some("run_x"), None, None).unwrap();
         assert!(!has_active_capture_jobs(&conn).unwrap());
     }
 

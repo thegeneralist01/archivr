@@ -37,6 +37,9 @@ pub enum Source {
 pub struct CaptureResult {
     pub run_uid: String,
     pub status: String,
+    /// `true` when uBlock was requested but the extension path was not found.
+    /// The capture succeeded without ad-blocking; the UI should warn the user.
+    pub ublock_skipped: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -991,6 +994,7 @@ pub fn perform_capture(
                 return Ok(CaptureResult {
                     run_uid: run.run_uid.clone(),
                     status: "completed".to_string(),
+                    ublock_skipped: false,
                 });
             }
             Err(e) => {
@@ -1133,6 +1137,7 @@ pub fn perform_capture(
                 return Ok(CaptureResult {
                     run_uid: run.run_uid.clone(),
                     status: "completed".to_string(),
+                    ublock_skipped: result.ublock_skipped,
                 });
             }
             Err(e) => {
@@ -1187,6 +1192,7 @@ pub fn perform_capture(
                 return Ok(CaptureResult {
                     run_uid: run.run_uid.clone(),
                     status: "completed".to_string(),
+                    ublock_skipped: false,
                 });
             }
             Err(e) => {
@@ -1342,6 +1348,7 @@ pub fn perform_capture(
     Ok(CaptureResult {
         run_uid: run.run_uid.clone(),
         status: "completed".to_string(),
+        ublock_skipped: false,
     })
 }
 

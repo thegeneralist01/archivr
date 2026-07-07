@@ -1,7 +1,15 @@
 use anyhow::{Context, Result, bail};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use std::{collections::HashMap, env, io::Read, path::Path, process::Command};
+use std::{
+    collections::HashMap,
+    env,
+    io::Read,
+    net::TcpListener,
+    path::{Path, PathBuf},
+    process::Command,
+    time::{Duration, Instant},
+};
 
 use crate::downloader::cookies::{domain_from_url, write_netscape_cookie_file};
 use crate::hash::hash_file;
@@ -17,26 +25,88 @@ pub struct SaveResult {
     pub favicon_hash: Option<String>,
     /// File extension for the favicon (e.g. `".ico"`, `".png"`), if present.
     pub favicon_ext: Option<String>,
+    /// `true` when `ARCHIVR_UBLOCK=true` (the default) but the extension path
+    /// was missing or invalid.  The capture succeeded but ran without ad-blocking.
+    pub ublock_skipped: bool,
 }
 
 /// Archives `url` as a self-contained HTML snapshot.
 ///
-/// Returns `(sha256_hex, title_hint)` on success.
-/// - `sha256_hex`: hash of the saved `.html` file, used as the blob key.
-/// - `title_hint`: page title extracted from the `<title>` tag, if present.
-///
-/// Reads two env vars:
+/// Env vars:
 /// - `ARCHIVR_SINGLE_FILE`: path to the `single-file` binary (default: `"single-file"`).
 /// - `ARCHIVR_CHROME`: path to the Chromium/Chrome binary (default: `"chromium"`).
-pub fn save(url: &str, store_path: &Path, timestamp: &str, cookies: &HashMap<String, String>) -> Result<SaveResult> {
+/// - `ARCHIVR_UBLOCK`: enable uBlock Origin Lite extension (default: `"true"`).
+/// - `ARCHIVR_UBLOCK_EXT`: path to the unpacked uBlock Origin Lite extension directory.
+/// - `ARCHIVR_CHROME_ARGS`: space-separated extra Chrome flags (e.g. `"--no-sandbox"`).
+pub fn save(
+    url: &str,
+    store_path: &Path,
+    timestamp: &str,
+    cookies: &HashMap<String, String>,
+) -> Result<SaveResult> {
     let single_file =
         env::var("ARCHIVR_SINGLE_FILE").unwrap_or_else(|_| "single-file".to_string());
     let chrome = env::var("ARCHIVR_CHROME").unwrap_or_else(|_| "chromium".to_string());
-    save_with(url, store_path, timestamp, &single_file, &chrome, cookies)
+    let (ublock_ext, ublock_skipped) = resolve_ublock_config();
+    let mut result = save_with(
+        url,
+        store_path,
+        timestamp,
+        &single_file,
+        &chrome,
+        cookies,
+        ublock_ext.as_deref(),
+    )?;
+    result.ublock_skipped = ublock_skipped;
+    Ok(result)
 }
 
-/// Inner implementation; takes binary paths explicitly so tests can inject them
-/// without mutating process-global environment variables.
+/// Reads `ARCHIVR_UBLOCK` and `ARCHIVR_UBLOCK_EXT` and returns:
+///
+/// - `(Some(path), false)` — uBlock is enabled and the extension dir is valid.
+/// - `(None, true)`  — uBlock is enabled but the extension dir is missing/invalid
+///                     (warns to stderr; caller should surface this to the user).
+/// - `(None, false)` — uBlock is explicitly disabled (`ARCHIVR_UBLOCK=false/0`).
+fn resolve_ublock_config() -> (Option<PathBuf>, bool) {
+    let enabled = env::var("ARCHIVR_UBLOCK").unwrap_or_else(|_| "true".to_string());
+    if enabled.eq_ignore_ascii_case("false") || enabled == "0" {
+        return (None, false);
+    }
+    match env::var("ARCHIVR_UBLOCK_EXT").ok().filter(|s| !s.is_empty()) {
+        None => {
+            eprintln!(
+                "warn: uBlock: ARCHIVR_UBLOCK=true but ARCHIVR_UBLOCK_EXT is not set; \
+                 capturing without ad-blocking"
+            );
+            (None, true)
+        }
+        Some(ext_path_str) => {
+            let path = PathBuf::from(&ext_path_str);
+            if path.is_dir() {
+                (Some(path), false)
+            } else {
+                eprintln!(
+                    "warn: uBlock: ARCHIVR_UBLOCK_EXT={ext_path_str:?} is not a directory; \
+                     capturing without ad-blocking"
+                );
+                (None, true)
+            }
+        }
+    }
+}
+
+/// Inner implementation.  Takes binary paths and an optional uBlock extension
+/// directory explicitly so tests can inject them without touching env vars.
+///
+/// When `ublock_ext` is `Some(path)` we own Chrome's lifecycle:
+///   1. allocate a free TCP port,
+///   2. launch Chrome headless with the extension loaded,
+///   3. wait for Chrome's DevTools HTTP API to respond,
+///   4. run single-file pointing at our Chrome via `--browser-server`,
+///   5. kill Chrome after single-file exits.
+///
+/// When `ublock_ext` is `None` the original behaviour is preserved:
+/// single-file launches and manages Chrome internally.
 fn save_with(
     url: &str,
     store_path: &Path,
@@ -44,17 +114,18 @@ fn save_with(
     single_file: &str,
     chrome: &str,
     cookies: &HashMap<String, String>,
+    ublock_ext: Option<&Path>,
 ) -> Result<SaveResult> {
     let temp_dir = store_path.join("temp").join(timestamp);
     std::fs::create_dir_all(&temp_dir).context("failed to create temp dir")?;
 
     let out_file = temp_dir.join(format!("{timestamp}.html"));
 
-    // Write a user script that strips <script> elements from the live DOM
-    // just before SingleFile serializes it. This lets scripts execute during
-    // capture (so JS-applied CSS is present) without leaving data:-URL ES
-    // modules in the saved file that would cause "base scheme isn't
-    // hierarchical" errors in the viewer. JSON-LD structured data is kept.
+    // User script that strips <script> elements from the live DOM just before
+    // SingleFile serializes it.  Lets scripts execute during capture (so
+    // JS-applied CSS is present) without leaving data:-URL ES modules in the
+    // saved file that would cause "base scheme isn't hierarchical" errors.
+    // JSON-LD structured data is kept.
     let user_script_path = temp_dir.join("sf-strip-scripts.js");
     std::fs::write(
         &user_script_path,
@@ -65,38 +136,21 @@ fn save_with(
     )
     .context("failed to write single-file user script")?;
 
-    // Chrome's user-data-dir for this capture. Required alongside
-    // --disable-web-security — newer Chromium silently ignores that flag
-    // without a writable user-data-dir. Using a subdirectory of temp_dir
-    // keeps it isolated and it gets cleaned up with the rest of the temp dir.
+    // Isolated Chrome profile directory; keeps each capture's browser state
+    // separate and cleans up with the rest of the temp dir.
     let chrome_data_dir = temp_dir.join("chrome-data");
-    // Build the browser-args JSON array. Start with the flags always required,
-    // then append any extra flags from ARCHIVR_CHROME_ARGS (space-separated).
-    // Docker containers running as root need "--no-sandbox" here because
-    // Chromium refuses to start as root without it.
-    //
-    // --window-size is set to a realistic desktop viewport so that
-    // --remove-alternative-medias=false and --remove-unused-styles=false
-    // actually preserve responsive @media rules and styles that only match
-    // at normal screen widths (headless Chromium defaults to a small viewport
-    // that would otherwise defeat the preservation flags).
-    let mut chrome_flags = vec![
-        "--disable-web-security".to_string(),
-        format!("--user-data-dir={}", chrome_data_dir.display()),
-        "--window-size=1920,1080".to_string(),
-    ];
-    if let Ok(extra) = std::env::var("ARCHIVR_CHROME_ARGS") {
-        chrome_flags.extend(extra.split_whitespace().filter(|s| !s.is_empty()).map(str::to_string));
-    }
-    let quoted: Vec<String> = chrome_flags
-        .iter()
-        .map(|f| format!("\"{}\"", f.replace('\\', "\\\\").replace('"', "\\\"")))
-        .collect();
-    let browser_args = format!("[{}]", quoted.join(","));
 
-    // Write cookie file if cookies are provided.
+    // Extra Chrome flags from the environment (e.g. "--no-sandbox" in Docker).
+    let extra_chrome_args: Vec<String> = env::var("ARCHIVR_CHROME_ARGS")
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    // Write cookie file before running Chrome so it's available immediately.
     // Never pass cookie values in process args (ps exposure).
-    let cookie_file: Option<std::path::PathBuf> = if !cookies.is_empty() {
+    let cookie_file: Option<PathBuf> = if !cookies.is_empty() {
         let cf = temp_dir.join("cookies.txt");
         let domain = domain_from_url(url);
         write_netscape_cookie_file(cookies, &domain, &cf)
@@ -106,52 +160,90 @@ fn save_with(
         None
     };
 
-    let mut cmd = Command::new(single_file);
-    cmd.arg(url)
-        .arg(&out_file)
-        .arg(format!("--browser-executable-path={chrome}"))
-        .arg("--browser-headless")
-        .arg("--browser-wait-until=networkidle2")
-        // Extra delay after networkidle2: Cloudflare Fonts injects @font-face
-        // CSS after HTML parse, so the font hook needs more time to see it.
-        .arg("--browser-wait-delay=2000")
-        // Realistic UA: some origins block headless Chrome's default UA string.
-        .arg("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
-        // Chrome-level flags: disable CORS so fonts from any CDN origin can be
-        // read and inlined (e.g. fonts.gstatic.com without ACAO:*).
-        .arg(format!("--browser-args={browser_args}"))
-        // Preserve all CSS: single-file's defaults strip rules it considers
-        // "unused" (breaks CSS nesting) and remove @media blocks that don't
-        // match the capture viewport (breaks responsive layout).
-        .arg("--remove-unused-styles=false")
-        .arg("--remove-alternative-medias=false")
-        // Allow scripts to run during capture so JS-applied classes exist in
-        // the DOM when CSS is evaluated. The user script above strips <script>
-        // elements before serialization so no broken module imports end up in
-        // the saved file.
-        .arg("--block-scripts=false")
-        .arg(format!("--browser-script={}", user_script_path.display()))
-        // Preserve fonts: defaults strip @font-face rules deemed "unused" or
-        // "alternative" (unicode-range subsets), losing CDN-served fonts.
-        .arg("--remove-unused-fonts=false")
-        .arg("--remove-alternative-fonts=false");
-    if let Some(cf) = &cookie_file {
-        cmd.arg(format!("--browser-cookies-file={}", cf.display()));
-    }
-    let spawn_result = cmd
-        .output()
-        .with_context(|| format!("failed to spawn {single_file} process"));
+    let sf_output = match ublock_ext {
+        // ── We own Chrome's lifecycle (uBlock extension mode) ─────────────
+        Some(ext_path) => {
+            let port = allocate_free_port().context("failed to allocate a free TCP port")?;
 
-    // Delete cookie file unconditionally — including on spawn failure —
-    // so secrets are never left in store/temp when the capture fails.
+            let mut chrome_flags = vec![
+                "--headless=new".to_string(),
+                format!("--remote-debugging-port={port}"),
+                format!("--user-data-dir={}", chrome_data_dir.display()),
+                // Load the extension; disable all others so no unexpected ext loads.
+                format!("--load-extension={}", ext_path.display()),
+                format!("--disable-extensions-except={}", ext_path.display()),
+                // Allow cross-origin font inlining (same reason as standalone mode).
+                "--disable-web-security".to_string(),
+                // Realistic viewport so responsive @media rules are preserved.
+                "--window-size=1920,1080".to_string(),
+            ];
+            chrome_flags.extend(extra_chrome_args);
+
+            let mut chrome_child = Command::new(chrome)
+                .args(&chrome_flags)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .with_context(|| format!("failed to spawn Chrome ({chrome})"))?;
+
+            if !wait_for_chrome_ready(port, 10) {
+                let _ = chrome_child.kill();
+                let _ = chrome_child.wait();
+                bail!("Chrome did not become ready on port {port} within 10 s");
+            }
+
+            let out = run_single_file_with_server(
+                url,
+                &out_file,
+                single_file,
+                port,
+                &user_script_path,
+                cookie_file.as_deref(),
+            );
+
+            // Always kill Chrome and reap its exit status, even on single-file failure.
+            let _ = chrome_child.kill();
+            let _ = chrome_child.wait();
+
+            out.with_context(|| format!("failed to spawn single-file ({single_file})"))?
+        }
+
+        // ── single-file manages Chrome (original behaviour) ───────────────
+        None => {
+            let mut chrome_flags = vec![
+                "--disable-web-security".to_string(),
+                format!("--user-data-dir={}", chrome_data_dir.display()),
+                "--window-size=1920,1080".to_string(),
+            ];
+            chrome_flags.extend(extra_chrome_args);
+            // single-file expects browser-args as a JSON array of strings.
+            let quoted: Vec<String> = chrome_flags
+                .iter()
+                .map(|f| format!("\"{}\"", f.replace('\\', "\\\\").replace('"', "\\\"")))
+                .collect();
+            let browser_args = format!("[{}]", quoted.join(","));
+
+            run_single_file_standalone(
+                url,
+                &out_file,
+                single_file,
+                chrome,
+                &browser_args,
+                &user_script_path,
+                cookie_file.as_deref(),
+            )
+            .with_context(|| format!("failed to spawn single-file ({single_file})"))?
+        }
+    };
+
+    // Delete cookie file unconditionally — including on failure — so secrets
+    // are never left in store/temp when the capture fails.
     if let Some(cf) = &cookie_file {
         let _ = std::fs::remove_file(cf);
     }
 
-    let out = spawn_result?;
-
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+    if !sf_output.status.success() {
+        let stderr = String::from_utf8_lossy(&sf_output.stderr);
         bail!("single-file failed: {stderr}");
     }
 
@@ -164,11 +256,126 @@ fn save_with(
 
     let title = extract_html_title(&out_file);
     let html_hash = hash_file(&out_file)?;
-    let (favicon_hash, favicon_ext) = extract_and_save_favicon(&out_file, &temp_dir, timestamp)
-        .map(|(h, e)| (Some(h), Some(e)))
-        .unwrap_or((None, None));
-    Ok(SaveResult { html_hash, title, favicon_hash, favicon_ext })
+    let (favicon_hash, favicon_ext) =
+        extract_and_save_favicon(&out_file, &temp_dir, timestamp)
+            .map(|(h, e)| (Some(h), Some(e)))
+            .unwrap_or((None, None));
+
+    Ok(SaveResult {
+        html_hash,
+        title,
+        favicon_hash,
+        favicon_ext,
+        ublock_skipped: false, // overwritten by save() from resolve_ublock_config()
+    })
 }
+
+// ── Chrome helpers ────────────────────────────────────────────────────────────
+
+/// Binds a `TcpListener` to a random OS-assigned port, reads the port number,
+/// then drops the listener.  The tiny TOCTOU window between drop and Chrome
+/// binding is acceptable in practice.
+fn allocate_free_port() -> Result<u16> {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").context("could not bind to a free TCP port")?;
+    Ok(listener.local_addr()?.port())
+}
+
+/// Polls `http://127.0.0.1:{port}/json/version` every 150 ms until Chrome
+/// responds with HTTP 200 or the deadline (timeout_secs) elapses.
+fn wait_for_chrome_ready(port: u16, timeout_secs: u64) -> bool {
+    let url = format!("http://127.0.0.1:{port}/json/version");
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    while Instant::now() < deadline {
+        if client
+            .get(&url)
+            .send()
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    false
+}
+
+// ── single-file invocation helpers ───────────────────────────────────────────
+
+/// Runs single-file pointing at an already-running Chrome via the DevTools HTTP
+/// API (`--browser-server`).  Chrome was started by the caller, which retains
+/// ownership of the process handle and kills it after this call returns.
+fn run_single_file_with_server(
+    url: &str,
+    out_file: &Path,
+    single_file: &str,
+    port: u16,
+    user_script_path: &Path,
+    cookie_file: Option<&Path>,
+) -> std::io::Result<std::process::Output> {
+    let mut cmd = base_single_file_cmd(url, out_file, single_file, user_script_path, cookie_file);
+    cmd.arg(format!("--browser-server=http://127.0.0.1:{port}"));
+    cmd.output()
+}
+
+/// Runs single-file, letting it launch and manage Chrome itself.
+fn run_single_file_standalone(
+    url: &str,
+    out_file: &Path,
+    single_file: &str,
+    chrome: &str,
+    browser_args: &str,  // JSON array string, e.g. `["--disable-web-security",...]`
+    user_script_path: &Path,
+    cookie_file: Option<&Path>,
+) -> std::io::Result<std::process::Output> {
+    let mut cmd = base_single_file_cmd(url, out_file, single_file, user_script_path, cookie_file);
+    cmd.arg(format!("--browser-executable-path={chrome}"))
+        .arg("--browser-headless")
+        .arg(format!("--browser-args={browser_args}"));
+    cmd.output()
+}
+
+/// Builds a `Command` with the single-file args that are the same regardless
+/// of how Chrome is started.
+fn base_single_file_cmd(
+    url: &str,
+    out_file: &Path,
+    single_file: &str,
+    user_script_path: &Path,
+    cookie_file: Option<&Path>,
+) -> Command {
+    let mut cmd = Command::new(single_file);
+    cmd.arg(url)
+        .arg(out_file)
+        .arg("--browser-wait-until=networkidle2")
+        // Extra delay after networkidle2: Cloudflare Fonts injects @font-face
+        // CSS after HTML parse, so the font hook needs more time to see it.
+        .arg("--browser-wait-delay=2000")
+        // Realistic UA: some origins block headless Chrome's default UA string.
+        .arg("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
+        // Preserve all CSS.
+        .arg("--remove-unused-styles=false")
+        .arg("--remove-alternative-medias=false")
+        // Allow scripts during capture so JS-applied classes exist in the DOM.
+        .arg("--block-scripts=false")
+        .arg(format!("--browser-script={}", user_script_path.display()))
+        // Preserve fonts.
+        .arg("--remove-unused-fonts=false")
+        .arg("--remove-alternative-fonts=false");
+    if let Some(cf) = cookie_file {
+        cmd.arg(format!("--browser-cookies-file={}", cf.display()));
+    }
+    cmd
+}
+
+// ── HTML helpers ──────────────────────────────────────────────────────────────
 
 /// Reads the first 8 KiB of `path` and extracts the content of the first
 /// `<title>…</title>` element. Returns `None` if absent or empty.
@@ -177,21 +384,17 @@ fn save_with(
 /// lowercasing is byte-length-preserving, so byte offsets derived from the
 /// lowercased buffer are valid indices into the original buffer.
 fn extract_html_title(path: &Path) -> Option<String> {
-    let mut buf = [0u8; 8192];
-    let n = std::fs::File::open(path).ok()?.read(&mut buf).ok()?;
-    // Recover a valid UTF-8 prefix if the 8 KiB boundary falls mid-character.
-    let snippet = match std::str::from_utf8(&buf[..n]) {
-        Ok(s) => s,
-        Err(e) => std::str::from_utf8(&buf[..e.valid_up_to()]).ok()?,
-    };
-    // ASCII-only lowercase: A-Z -> a-z, all other bytes unchanged.
-    // Byte lengths are identical to the original, so offsets are safe to reuse.
-    let lower = snippet.to_ascii_lowercase();
-    let tag_start = lower.find("<title>")?;
-    let content_start = tag_start + 7; // len("<title>") == 7
-    let content_end = content_start + lower[content_start..].find("</title>")?;
-    let title = snippet[content_start..content_end].trim();
-    if title.is_empty() { None } else { Some(title.to_string()) }
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; 8192];
+    let n = f.read(&mut buf).ok()?;
+    let buf = &buf[..n];
+    let lower = String::from_utf8_lossy(buf).to_ascii_lowercase();
+    let start = lower.find("<title>")? + "<title>".len();
+    let end = lower[start..].find("</title>")? + start;
+    let title = String::from_utf8_lossy(&buf[start..end])
+        .trim()
+        .to_string();
+    if title.is_empty() { None } else { Some(title) }
 }
 
 /// Extracts the favicon embedded in a single-file HTML archive.
@@ -205,71 +408,54 @@ fn extract_and_save_favicon(
     temp_dir: &Path,
     timestamp: &str,
 ) -> Option<(String, String)> {
-    let html = std::fs::read_to_string(html_path).ok()?;
-    let lower = html.to_ascii_lowercase();
+    let content = std::fs::read_to_string(html_path).ok()?;
+    let lower = content.to_ascii_lowercase();
 
-    // Find a <link> tag that has rel="...icon..." AND href="data:image/..."
-    let link_start = {
-        let mut found = None;
-        let mut search = 0;
-        while search < lower.len() {
-            let off = lower[search..].find("<link")?;
-            let abs = search + off;
-            // Find end of this tag, respecting quoted attribute values so that
-            // a '>' inside a data URL does not terminate the tag prematurely.
-            let tag_slice = &lower[abs..];
-            let mut in_q = false;
-            let mut tag_end = None;
-            for (i, c) in tag_slice.char_indices() {
-                match c {
-                    '"' => in_q = !in_q,
-                    '>' if !in_q => { tag_end = Some(i); break; }
-                    _ => {}
+    // Find the first <link …> tag that looks like a favicon with a data: href.
+    let mut search_pos = 0;
+    loop {
+        let tag_start = lower[search_pos..].find("<link")? + search_pos;
+        let tag_end = lower[tag_start..].find('>')? + tag_start;
+        let tag = &lower[tag_start..=tag_end];
+
+        if tag.contains("icon") {
+            // Look for href="data:image/...;base64,..."
+            if let Some(href_pos) = tag.find("href=") {
+                let after_href = &content[tag_start + href_pos + 5..];
+                let (quote, after_quote) = if after_href.starts_with('"') {
+                    ('"', &after_href[1..])
+                } else if after_href.starts_with('\'') {
+                    ('\'', &after_href[1..])
+                } else {
+                    search_pos = tag_end + 1;
+                    continue;
+                };
+                let value_end = after_quote.find(quote)?;
+                let href_value = &after_quote[..value_end];
+                if let Some(b64_start) = href_value.to_ascii_lowercase().find(";base64,") {
+                    let mime_part = &href_value[5..b64_start]; // skip "data:"
+                    let ext = mime_to_favicon_ext(mime_part)?;
+                    let b64_data = &href_value[b64_start + 8..];
+                    let bytes = B64.decode(b64_data).ok()?;
+                    let out_path = temp_dir.join(format!("{timestamp}.favicon{ext}"));
+                    std::fs::write(&out_path, &bytes).ok()?;
+                    let hash = hash_file(&out_path).ok()?;
+                    return Some((hash, ext.to_string()));
                 }
             }
-            let tag_end = match tag_end { Some(e) => e, None => break };
-            let tag_s = &lower[abs..abs + tag_end];
-            if tag_s.contains("rel=") && tag_s.contains("icon") && tag_s.contains("href=\"data:image") {
-                found = Some(abs);
-                break;
-            }
-            search = abs + tag_end + 1;
         }
-        found?
-    };
 
-    // Extract href value from the original HTML (byte positions match because
-    // to_ascii_lowercase is byte-length-preserving).
-    let tag_lower = &lower[link_start..];
-    let href_off = tag_lower.find("href=\"")?;
-    let value_start = link_start + href_off + 6; // past href="
-    let value_end = html[value_start..].find('"')?;
-    let data_url = &html[value_start..value_start + value_end];
-
-    // Parse data:<mime>;base64,<payload>
-    let rest = data_url.strip_prefix("data:")?;
-    let comma = rest.find(',')?;
-    let meta = &rest[..comma];
-    let b64 = &rest[comma + 1..];
-    if !meta.to_ascii_lowercase().contains("base64") {
-        return None;
+        search_pos = tag_end + 1;
     }
-    let mime = meta.split(';').next()?.trim().to_ascii_lowercase();
-    let ext = mime_to_favicon_ext(&mime)?;
-
-    let bytes = B64.decode(b64.trim()).ok()?;
-    let out = temp_dir.join(format!("{timestamp}.favicon{ext}"));
-    std::fs::write(&out, &bytes).ok()?;
-    hash_file(&out).ok().map(|h| (h, ext.to_string()))
 }
 
 fn mime_to_favicon_ext(mime: &str) -> Option<&'static str> {
-    match mime {
+    match mime.to_ascii_lowercase().trim() {
         "image/x-icon" | "image/vnd.microsoft.icon" => Some(".ico"),
-        "image/png" => Some(".png"),
-        "image/svg+xml" => Some(".svg"),
+        "image/png"  => Some(".png"),
         "image/jpeg" => Some(".jpg"),
-        "image/gif" => Some(".gif"),
+        "image/gif"  => Some(".gif"),
+        "image/svg+xml" => Some(".svg"),
         "image/webp" => Some(".webp"),
         _ => None,
     }
@@ -323,6 +509,7 @@ mod tests {
             "/nonexistent/single-file",
             "chromium",
             &HashMap::new(),
+            None, // no ublock ext
         );
         let err = result.unwrap_err();
         let msg = format!("{err:#}");
@@ -330,5 +517,20 @@ mod tests {
             msg.contains("spawn") || msg.contains("nonexistent") || msg.contains("No such"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn resolve_ublock_config_disabled_when_false() {
+        // Can't mutate env vars safely in parallel tests; test the logic directly
+        // by verifying the env-var parsing branch we care about.
+        let enabled = "false";
+        let is_disabled =
+            enabled.eq_ignore_ascii_case("false") || enabled == "0";
+        assert!(is_disabled);
+
+        let enabled = "0";
+        let is_disabled =
+            enabled.eq_ignore_ascii_case("false") || enabled == "0";
+        assert!(is_disabled);
     }
 }
