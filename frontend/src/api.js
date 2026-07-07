@@ -98,9 +98,10 @@ export async function fetchTags(archiveId) {
 export async function submitCapture(archiveId, locator, quality = null, extensions = null) {
   const payload = { locator }
   if (quality && quality !== 'best') payload.quality = quality
-  // extensions: { ublock_enabled?: bool } — per-capture overrides
-  if (extensions && typeof extensions.ublock_enabled === 'boolean') {
-    payload.ublock_enabled = extensions.ublock_enabled
+  // extensions: { ublock_enabled?: bool, reader_mode?: bool } — per-capture overrides
+  if (extensions) {
+    if (typeof extensions.ublock_enabled === 'boolean') payload.ublock_enabled = extensions.ublock_enabled
+    if (typeof extensions.reader_mode === 'boolean') payload.reader_mode = extensions.reader_mode
   }
   const res = await fetch(`/api/archives/${archiveId}/captures`, {
     method: "POST",

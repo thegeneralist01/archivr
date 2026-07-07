@@ -650,11 +650,10 @@ async fn delete_entry_handler(
 #[derive(Debug, serde::Deserialize)]
 struct CaptureBody {
     locator: String,
-    /// Optional quality cap for yt-dlp sources: `"best"` or any `"NNNp"` string
-    /// (e.g. `"1080p"`, `"720p"`, `"2160p"`). Absent or `"best"` → highest available.
     quality: Option<String>,
-    /// Per-capture uBlock override.  Absent → use global instance setting.
     ublock_enabled: Option<bool>,
+    /// Distil to article content via Readability before archiving.  Absent = false.
+    reader_mode: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -754,6 +753,7 @@ async fn capture_handler(
     let capture_config = capture::CaptureConfig {
         cookie_rules,
         ublock_enabled: Some(effective_ublock),
+        reader_mode: body.reader_mode.unwrap_or(false),
     };
 
     // Spawn background capture.

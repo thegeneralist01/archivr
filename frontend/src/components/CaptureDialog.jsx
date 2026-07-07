@@ -128,6 +128,8 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
 
   // Effective uBlock for this session
   const ublockEnabled = ublockOverride !== null ? ublockOverride : (globalUblock ?? true)
+  // Reader mode: off by default, per-session only
+  const [readerMode, setReaderMode] = useState(false)
 
   // On mount: clean up old single-locator sessionStorage keys; reconnect running jobs
   useEffect(() => {
@@ -240,7 +242,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     const qual = item.quality || 'best'
     setItems(prev => prev.map(it => it.id === item.id ? { ...it, status: 'submitting', error: null } : it))
     try {
-      const extensions = { ublock_enabled: ublockEnabled }
+      const extensions = { ublock_enabled: ublockEnabled, reader_mode: readerMode }
       const job = await submitCapture(aid, loc, qual, extensions)
       setItems(prev => prev.map(it =>
         it.id === item.id ? { ...it, status: 'running', jobUid: job.job_uid, archiveId: aid } : it
@@ -391,6 +393,22 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
                   className={`ext-toggle ext-toggle--sm${ublockEnabled ? ' ext-toggle--on' : ''}`}
                   onClick={() => setUblockOverride(v => v === null ? !ublockEnabled : !v)}
                   aria-label="Toggle uBlock for this capture"
+                >
+                  <span className="ext-toggle-knob" />
+                </button>
+              </label>
+              <label className="capture-ext-row" style={{ marginTop: 8 }}>
+                <span className="capture-ext-label">
+                  <span className="capture-ext-name">Reader mode</span>
+                  <span className="capture-ext-desc">Distil to article text via Readability (off by default)</span>
+                </span>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={readerMode}
+                  className={`ext-toggle ext-toggle--sm${readerMode ? ' ext-toggle--on' : ''}`}
+                  onClick={() => setReaderMode(v => !v)}
+                  aria-label="Toggle reader mode for this capture"
                 >
                   <span className="ext-toggle-knob" />
                 </button>

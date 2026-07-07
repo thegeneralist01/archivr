@@ -14,6 +14,51 @@ use std::{
 use crate::downloader::cookies::{domain_from_url, write_netscape_cookie_file};
 use crate::hash::hash_file;
 
+/// Mozilla Readability.js (Apache 2.0) — embedded at compile time so captures
+/// don't need it on PATH.  Path is relative to this source file.
+const READABILITY_JS: &str =
+    include_str!("../../../../vendor/readability/Readability.js");
+
+/// Single-file user script that applies Readability just before the page is
+/// serialised.  Fires on `single-file-on-before-capture-start`.
+const READER_MODE_WRAPPER_JS: &str = r#"
+addEventListener('single-file-on-before-capture-start', function() {
+  try {
+    if (typeof Readability === 'undefined') return;
+    var article = new Readability(document.cloneNode(true)).parse();
+    if (!article || !article.content || article.content.length < 100) return;
+    document.body.innerHTML = article.content;
+    if (article.title) document.title = article.title;
+    var hdr = document.createElement('header');
+    hdr.innerHTML =
+      '<h1 style="margin:0 0 .3em;font-family:-apple-system,sans-serif">' +
+        (article.title || '') + '</h1>' +
+      (article.byline
+        ? '<p style="margin:0;color:#666;font-size:14px">' + article.byline + '</p>'
+        : '') +
+      (article.siteName
+        ? '<p style="margin:.2em 0 0;color:#999;font-size:12px">' + article.siteName + '</p>'
+        : '');
+    hdr.style.cssText = 'margin-bottom:2em;padding-bottom:1em;border-bottom:1px solid #ddd';
+    document.body.insertBefore(hdr, document.body.firstChild);
+    var style = document.createElement('style');
+    style.textContent = [
+      'body{max-width:680px;margin:40px auto;padding:0 24px;',
+      'font-family:Georgia,"Times New Roman",serif;font-size:18px;',
+      'line-height:1.75;color:#1a1a1a;background:#fafaf8}',
+      'h1,h2,h3,h4,h5,h6{font-family:-apple-system,BlinkMacSystemFont,sans-serif;',
+      'line-height:1.3;margin-top:1.5em}',
+      'img,figure,video{max-width:100%;height:auto;display:block;margin:1em 0}',
+      'a{color:#0055cc}',
+      'pre{background:#f4f4f4;padding:1em;border-radius:4px;overflow-x:auto;font-size:14px}',
+      'code{background:#f4f4f4;padding:.1em .3em;border-radius:3px;font-size:14px}',
+      'blockquote{border-left:3px solid #ccc;margin:1em 0;padding-left:1.2em;color:#555}',
+    ].join('');
+    document.head.appendChild(style);
+  } catch (e) { /* non-fatal: fall back to original page */ }
+});
+"#;
+
 /// Result of archiving a web page with single-file.
 #[derive(Debug)]
 pub struct SaveResult {
@@ -44,6 +89,7 @@ pub fn save(
     timestamp: &str,
     cookies: &HashMap<String, String>,
     ublock_enabled_override: Option<bool>,
+    reader_mode: bool,
 ) -> Result<SaveResult> {
     let single_file =
         env::var("ARCHIVR_SINGLE_FILE").unwrap_or_else(|_| "single-file".to_string());
@@ -57,6 +103,7 @@ pub fn save(
         &chrome,
         cookies,
         ublock_ext.as_deref(),
+        reader_mode,
     )?;
     result.ublock_skipped = ublock_skipped;
     Ok(result)
@@ -121,20 +168,21 @@ fn save_with(
     chrome: &str,
     cookies: &HashMap<String, String>,
     ublock_ext: Option<&Path>,
+    reader_mode: bool,
 ) -> Result<SaveResult> {
     let temp_dir = store_path.join("temp").join(timestamp);
     std::fs::create_dir_all(&temp_dir).context("failed to create temp dir")?;
 
     let out_file = temp_dir.join(format!("{timestamp}.html"));
 
-    // User script that strips <script> elements from the live DOM just before
-    // SingleFile serializes it.  Lets scripts execute during capture (so
+    // Mandatory user script: strips <script> elements from the live DOM just
+    // before SingleFile serializes it.  Lets scripts execute during capture (so
     // JS-applied CSS is present) without leaving data:-URL ES modules in the
     // saved file that would cause "base scheme isn't hierarchical" errors.
     // JSON-LD structured data is kept.
-    let user_script_path = temp_dir.join("sf-strip-scripts.js");
+    let strip_scripts_path = temp_dir.join("sf-strip-scripts.js");
     std::fs::write(
-        &user_script_path,
+        &strip_scripts_path,
         "addEventListener('single-file-on-before-capture-start',()=>{\
           document.querySelectorAll('script:not([type=\"application/ld+json\"])')\
           .forEach(el=>el.remove());\
@@ -142,8 +190,21 @@ fn save_with(
     )
     .context("failed to write single-file user script")?;
 
-    // Isolated Chrome profile directory; keeps each capture's browser state
-    // separate and cleans up with the rest of the temp dir.
+    // Reader-mode scripts: Readability.js + wrapper.  Written to temp dir and
+    // passed as additional --browser-script args when reader mode is enabled.
+    let mut extra_browser_scripts: Vec<PathBuf> = Vec::new();
+    if reader_mode {
+        let readability_path = temp_dir.join("sf-readability.js");
+        std::fs::write(&readability_path, READABILITY_JS)
+            .context("failed to write Readability.js script")?;
+        let wrapper_path = temp_dir.join("sf-reader-mode.js");
+        std::fs::write(&wrapper_path, READER_MODE_WRAPPER_JS)
+            .context("failed to write reader-mode wrapper script")?;
+        extra_browser_scripts.push(readability_path);
+        extra_browser_scripts.push(wrapper_path);
+    }
+
+    // Isolated Chrome profile directory.
     let chrome_data_dir = temp_dir.join("chrome-data");
 
     // Extra Chrome flags from the environment (e.g. "--no-sandbox" in Docker).
@@ -198,12 +259,15 @@ fn save_with(
                 bail!("Chrome did not become ready on port {port} within 10 s");
             }
 
+            // Build scripts list: strip-scripts first, then any reader-mode scripts.
+            let mut scripts: Vec<&Path> = vec![strip_scripts_path.as_path()];
+            scripts.extend(extra_browser_scripts.iter().map(|p| p.as_path()));
             let out = run_single_file_with_server(
                 url,
                 &out_file,
                 single_file,
                 port,
-                &user_script_path,
+                &scripts,
                 cookie_file.as_deref(),
             );
 
@@ -229,13 +293,15 @@ fn save_with(
                 .collect();
             let browser_args = format!("[{}]", quoted.join(","));
 
+            let mut scripts: Vec<&Path> = vec![strip_scripts_path.as_path()];
+            scripts.extend(extra_browser_scripts.iter().map(|p| p.as_path()));
             run_single_file_standalone(
                 url,
                 &out_file,
                 single_file,
                 chrome,
                 &browser_args,
-                &user_script_path,
+                &scripts,
                 cookie_file.as_deref(),
             )
             .with_context(|| format!("failed to spawn single-file ({single_file})"))?
@@ -323,10 +389,10 @@ fn run_single_file_with_server(
     out_file: &Path,
     single_file: &str,
     port: u16,
-    user_script_path: &Path,
+    scripts: &[&Path],
     cookie_file: Option<&Path>,
 ) -> std::io::Result<std::process::Output> {
-    let mut cmd = base_single_file_cmd(url, out_file, single_file, user_script_path, cookie_file);
+    let mut cmd = base_single_file_cmd(url, out_file, single_file, scripts, cookie_file);
     cmd.arg(format!("--browser-server=http://127.0.0.1:{port}"));
     cmd.output()
 }
@@ -337,11 +403,11 @@ fn run_single_file_standalone(
     out_file: &Path,
     single_file: &str,
     chrome: &str,
-    browser_args: &str,  // JSON array string, e.g. `["--disable-web-security",...]`
-    user_script_path: &Path,
+    browser_args: &str,
+    scripts: &[&Path],
     cookie_file: Option<&Path>,
 ) -> std::io::Result<std::process::Output> {
-    let mut cmd = base_single_file_cmd(url, out_file, single_file, user_script_path, cookie_file);
+    let mut cmd = base_single_file_cmd(url, out_file, single_file, scripts, cookie_file);
     cmd.arg(format!("--browser-executable-path={chrome}"))
         .arg("--browser-headless")
         .arg(format!("--browser-args={browser_args}"));
@@ -349,32 +415,28 @@ fn run_single_file_standalone(
 }
 
 /// Builds a `Command` with the single-file args that are the same regardless
-/// of how Chrome is started.
+/// of how Chrome is started.  Passes each script as a separate `--browser-script` arg.
 fn base_single_file_cmd(
     url: &str,
     out_file: &Path,
     single_file: &str,
-    user_script_path: &Path,
+    scripts: &[&Path],
     cookie_file: Option<&Path>,
 ) -> Command {
     let mut cmd = Command::new(single_file);
     cmd.arg(url)
         .arg(out_file)
         .arg("--browser-wait-until=networkidle2")
-        // Extra delay after networkidle2: Cloudflare Fonts injects @font-face
-        // CSS after HTML parse, so the font hook needs more time to see it.
         .arg("--browser-wait-delay=2000")
-        // Realistic UA: some origins block headless Chrome's default UA string.
         .arg("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
-        // Preserve all CSS.
         .arg("--remove-unused-styles=false")
         .arg("--remove-alternative-medias=false")
-        // Allow scripts during capture so JS-applied classes exist in the DOM.
         .arg("--block-scripts=false")
-        .arg(format!("--browser-script={}", user_script_path.display()))
-        // Preserve fonts.
         .arg("--remove-unused-fonts=false")
         .arg("--remove-alternative-fonts=false");
+    for script in scripts {
+        cmd.arg(format!("--browser-script={}", script.display()));
+    }
     if let Some(cf) = cookie_file {
         cmd.arg(format!("--browser-cookies-file={}", cf.display()));
     }
@@ -516,6 +578,7 @@ mod tests {
             "chromium",
             &HashMap::new(),
             None, // no ublock ext
+            false, // reader mode off
         );
         let err = result.unwrap_err();
         let msg = format!("{err:#}");
