@@ -316,13 +316,33 @@ fn save_with(
 
     if !sf_output.status.success() {
         let stderr = String::from_utf8_lossy(&sf_output.stderr);
-        bail!("single-file failed: {stderr}");
+        bail!("single-file failed (exit {:?}): {stderr}", sf_output.status.code());
     }
 
     if !out_file.exists() {
+        // Collect diagnostics: stdout, stderr, and what's actually in the temp dir.
+        let stdout = String::from_utf8_lossy(&sf_output.stdout);
+        let stderr = String::from_utf8_lossy(&sf_output.stderr);
+        let dir_contents: String = std::fs::read_dir(&temp_dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_else(|_| "<unreadable>".to_string());
+        eprintln!(
+            "warn: single-file produced no file at {}\n  temp dir contents: [{dir_contents}]\n  stderr: {}\n  stdout (first 200 chars): {}",
+            out_file.display(),
+            stderr.trim(),
+            &stdout[..stdout.len().min(200)],
+        );
         bail!(
-            "single-file exited successfully but produced no output file at {}",
-            out_file.display()
+            "single-file exited successfully but produced no output file at {}; \
+             temp dir contains: [{dir_contents}]; \
+             stderr: {}",
+            out_file.display(),
+            stderr.trim(),
         );
     }
 
@@ -433,7 +453,10 @@ fn base_single_file_cmd(
         .arg("--remove-alternative-medias=false")
         .arg("--block-scripts=false")
         .arg("--remove-unused-fonts=false")
-        .arg("--remove-alternative-fonts=false");
+        .arg("--remove-alternative-fonts=false")
+        // Explicitly prevent single-file from dumping HTML to stdout instead of
+        // writing the file (its Docker-detection heuristic can trigger on some setups).
+        .arg("--dump-content=false");
     for script in scripts {
         cmd.arg(format!("--browser-script={}", script.display()));
     }
