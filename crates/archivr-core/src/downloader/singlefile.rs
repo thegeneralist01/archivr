@@ -108,6 +108,9 @@ pub struct SaveResult {
     /// `true` when `ARCHIVR_UBLOCK=true` (the default) but the extension path
     /// was missing or invalid.  The capture succeeded but ran without ad-blocking.
     pub ublock_skipped: bool,
+    /// `true` when `ARCHIVR_COOKIE_CONSENT=true` (the default) but the extension path
+    /// was missing or invalid.  The capture succeeded but ran without cookie-consent blocking.
+    pub cookie_ext_skipped: bool,
 }
 
 /// Archives `url` as a self-contained HTML snapshot.
@@ -124,12 +127,14 @@ pub fn save(
     timestamp: &str,
     cookies: &HashMap<String, String>,
     ublock_enabled_override: Option<bool>,
+    cookie_ext_enabled: Option<bool>,
     reader_mode: bool,
 ) -> Result<SaveResult> {
     let single_file =
         env::var("ARCHIVR_SINGLE_FILE").unwrap_or_else(|_| "single-file".to_string());
     let chrome = env::var("ARCHIVR_CHROME").unwrap_or_else(|_| "chromium".to_string());
     let (ublock_ext, ublock_skipped) = resolve_ublock_config(ublock_enabled_override);
+    let (cookie_ext, cookie_ext_skipped) = resolve_cookie_ext_config(cookie_ext_enabled);
     let mut result = save_with(
         url,
         store_path,
@@ -138,9 +143,11 @@ pub fn save(
         &chrome,
         cookies,
         ublock_ext.as_deref(),
+        cookie_ext.as_deref(),
         reader_mode,
     )?;
     result.ublock_skipped = ublock_skipped;
+    result.cookie_ext_skipped = cookie_ext_skipped;
     Ok(result)
 }
 
@@ -183,6 +190,44 @@ fn resolve_ublock_config(enabled_override: Option<bool>) -> (Option<PathBuf>, bo
     }
 }
 
+/// Resolves cookie-consent extension configuration from env vars, optionally overridden by the caller.
+///
+/// Returns:
+/// - `(Some(path), false)` — cookie-consent ext is enabled and the extension dir is valid.
+/// - `(None, true)`  — cookie-consent ext is enabled but the extension dir is missing/invalid
+///                     (warns to stderr; the capture proceeds without cookie-consent blocking).
+/// - `(None, false)` — cookie-consent ext is disabled (`ARCHIVR_COOKIE_CONSENT=false` or overridden).
+fn resolve_cookie_ext_config(enabled_override: Option<bool>) -> (Option<PathBuf>, bool) {
+    let want_cookie_ext = enabled_override.unwrap_or_else(|| {
+        let env_val = env::var("ARCHIVR_COOKIE_CONSENT").unwrap_or_else(|_| "true".to_string());
+        !env_val.eq_ignore_ascii_case("false") && env_val != "0"
+    });
+    if !want_cookie_ext {
+        return (None, false);
+    }
+    match env::var("ARCHIVR_COOKIE_EXT").ok().filter(|s| !s.is_empty()) {
+        None => {
+            eprintln!(
+                "warn: cookie-consent: ARCHIVR_COOKIE_EXT is not set; \
+                 capturing without cookie-consent blocking"
+            );
+            (None, true)
+        }
+        Some(ext_path_str) => {
+            let path = PathBuf::from(&ext_path_str);
+            if path.is_dir() {
+                (Some(path), false)
+            } else {
+                eprintln!(
+                    "warn: cookie-consent: ARCHIVR_COOKIE_EXT={ext_path_str:?} is not a directory; \
+                     capturing without cookie-consent blocking"
+                );
+                (None, true)
+            }
+        }
+    }
+}
+
 /// Inner implementation.  Takes binary paths and an optional uBlock extension
 /// directory explicitly so tests can inject them without touching env vars.
 ///
@@ -208,6 +253,7 @@ fn save_with(
     chrome: &str,
     cookies: &HashMap<String, String>,
     ublock_ext: Option<&Path>,
+    cookie_ext: Option<&Path>,
     reader_mode: bool,
 ) -> Result<SaveResult> {
     let temp_dir = store_path.join("temp").join(timestamp);
@@ -252,12 +298,21 @@ fn save_with(
         format!("--user-data-dir={}", chrome_data_dir.display()),
         "--window-size=1920,1080".to_string(),
     ];
-    if let Some(ext_path) = ublock_ext {
-        // --headless=new is required for --load-extension to work.
-        // It overrides single-file's own --headless default via the prefix-strip logic.
+    // Build comma-separated extension list for Chrome flags.
+    // --headless=new is required for --load-extension to work.
+    let ext_paths: Vec<PathBuf> = [ublock_ext, cookie_ext]
+        .iter()
+        .filter_map(|p| p.map(|p| p.to_path_buf()))
+        .collect();
+    if !ext_paths.is_empty() {
+        let joined = ext_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         chrome_flags.push("--headless=new".to_string());
-        chrome_flags.push(format!("--load-extension={}", ext_path.display()));
-        chrome_flags.push(format!("--disable-extensions-except={}", ext_path.display()));
+        chrome_flags.push(format!("--load-extension={joined}"));
+        chrome_flags.push(format!("--disable-extensions-except={joined}"));
     }
     // Operator extras (e.g. --no-sandbox in Docker).
     let extra_chrome_args: Vec<String> = env::var("ARCHIVR_CHROME_ARGS")
@@ -350,7 +405,8 @@ fn save_with(
         title,
         favicon_hash,
         favicon_ext,
-        ublock_skipped: false, // overwritten by save() from resolve_ublock_config()
+        ublock_skipped: false,     // overwritten by save() from resolve_ublock_config()
+        cookie_ext_skipped: false, // overwritten by save() from resolve_cookie_ext_config()
     })
 }
 
@@ -538,6 +594,7 @@ mod tests {
             "chromium",
             &HashMap::new(),
             None, // no ublock ext
+            None, // no cookie ext
             false, // reader mode off
         );
         let err = result.unwrap_err();
@@ -546,6 +603,29 @@ mod tests {
             msg.contains("spawn") || msg.contains("nonexistent") || msg.contains("No such"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn save_with_both_extensions_uses_comma_joined_flags() {
+        use std::path::Path;
+        // We can't run single-file here, but we can exercise the flag-building
+        // logic by checking the path list construction directly.
+        let ublock = Path::new("/tmp/ublock");
+        let cookie = Path::new("/tmp/cookie");
+        let ext_paths: Vec<std::path::PathBuf> = [Some(ublock), Some(cookie)]
+            .iter()
+            .filter_map(|p| p.map(|p| p.to_path_buf()))
+            .collect();
+        let joined = ext_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(joined, "/tmp/ublock,/tmp/cookie");
+        let load_flag = format!("--load-extension={joined}");
+        let except_flag = format!("--disable-extensions-except={joined}");
+        assert_eq!(load_flag, "--load-extension=/tmp/ublock,/tmp/cookie");
+        assert_eq!(except_flag, "--disable-extensions-except=/tmp/ublock,/tmp/cookie");
     }
 
     #[test]

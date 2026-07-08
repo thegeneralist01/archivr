@@ -669,10 +669,26 @@ function ExtensionsTab() {
     }
   }
 
+  async function toggleCookieExt(val) {
+    setSaving(true)
+    setMsg(null)
+    try {
+      await updateInstanceSettings({ cookie_ext_enabled: val })
+      setSettings(s => ({ ...s, cookie_ext_enabled: val }))
+      setMsg({ ok: true, text: 'Saved.' })
+    } catch (e) {
+      setMsg({ ok: false, text: e.message })
+    } finally {
+      setSaving(false)
+    }
+  }
+
   if (loading) return <div className="muted">Loading\u2026</div>
 
   const extAvailable = settings?.ublock_ext_available ?? false
   const extEnabled = settings?.ublock_enabled ?? true
+  const cookieExtAvailable = settings?.cookie_ext_available ?? false
+  const cookieExtEnabled = settings?.cookie_ext_enabled ?? true
 
   return (
     <div style={{ maxWidth: 560 }}>
@@ -706,6 +722,34 @@ function ExtensionsTab() {
               onClick={() => toggleUblock(!extEnabled)}
               disabled={saving}
               aria-label="Toggle uBlock Origin Lite"
+            >
+              <span className="ext-toggle-knob" />
+            </button>
+          </div>
+        </div>
+
+        <div className="ext-card">
+          <div className="ext-card-header">
+            <div className="ext-card-info">
+              <span className="ext-card-name">I Still Don&rsquo;t Care About Cookies</span>
+              <span className="ext-card-desc">
+                Dismiss cookie consent banners during archiving.
+              </span>
+              {!cookieExtAvailable && (
+                <span className="ext-card-hint">
+                  Not configured &mdash; set <code>ARCHIVR_COOKIE_EXT</code> to the
+                  unpacked extension directory to enable.
+                </span>
+              )}
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={cookieExtEnabled}
+              className={`ext-toggle${cookieExtEnabled ? ' ext-toggle--on' : ''}`}
+              onClick={() => toggleCookieExt(!cookieExtEnabled)}
+              disabled={saving}
+              aria-label="Toggle I Still Don't Care About Cookies"
             >
               <span className="ext-toggle-knob" />
             </button>

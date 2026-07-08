@@ -102,6 +102,7 @@ export async function submitCapture(archiveId, locator, quality = null, extensio
   if (extensions) {
     if (typeof extensions.ublock_enabled === 'boolean') payload.ublock_enabled = extensions.ublock_enabled
     if (typeof extensions.reader_mode === 'boolean') payload.reader_mode = extensions.reader_mode
+    if (typeof extensions.cookie_ext_enabled === 'boolean') payload.cookie_ext_enabled = extensions.cookie_ext_enabled
   }
   const res = await fetch(`/api/archives/${archiveId}/captures`, {
     method: "POST",

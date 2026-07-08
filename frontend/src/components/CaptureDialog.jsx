@@ -116,18 +116,24 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   const [advancedOpen, setAdvancedOpen] = useState(false)
   // null = use server default; true/false = per-session override
   const [ublockOverride, setUblockOverride] = useState(null)
-  // Server-side global default (loaded on mount, null until loaded)
-  const [globalUblock, setGlobalUblock] = useState(null)
+  // Server-side global settings (loaded on mount, null until loaded)
+  const [globalSettings, setGlobalSettings] = useState(null)
+  // Cookie consent: session-level only, initialized from server default
+  const [cookieExtEnabled, setCookieExtEnabled] = useState(true)
 
-  // Load global uBlock setting from server once on mount
+  // Load global settings from server once on mount
   useEffect(() => {
     getInstanceSettings()
-      .then(s => setGlobalUblock(s.ublock_enabled ?? true))
-      .catch(() => setGlobalUblock(true)) // safe default
+      .then(s => {
+        setGlobalSettings(s)
+        setCookieExtEnabled(s.cookie_ext_enabled ?? true)
+      })
+      .catch(() => setGlobalSettings({}))
   }, [])
 
   // Effective uBlock for this session
-  const ublockEnabled = ublockOverride !== null ? ublockOverride : (globalUblock ?? true)
+  const ublockEnabled = ublockOverride !== null ? ublockOverride : (globalSettings?.ublock_enabled ?? true)
+
   // Reader mode: off by default, per-session only
   const [readerMode, setReaderMode] = useState(false)
 
@@ -242,7 +248,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     const qual = item.quality || 'best'
     setItems(prev => prev.map(it => it.id === item.id ? { ...it, status: 'submitting', error: null } : it))
     try {
-      const extensions = { ublock_enabled: ublockEnabled, reader_mode: readerMode }
+      const extensions = { ublock_enabled: ublockEnabled, reader_mode: readerMode, cookie_ext_enabled: cookieExtEnabled }
       const job = await submitCapture(aid, loc, qual, extensions)
       setItems(prev => prev.map(it =>
         it.id === item.id ? { ...it, status: 'running', jobUid: job.job_uid, archiveId: aid } : it
@@ -393,6 +399,25 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
                   className={`ext-toggle ext-toggle--sm${ublockEnabled ? ' ext-toggle--on' : ''}`}
                   onClick={() => setUblockOverride(v => v === null ? !ublockEnabled : !v)}
                   aria-label="Toggle uBlock for this capture"
+                >
+                  <span className="ext-toggle-knob" />
+                </button>
+              </label>
+              <label className="capture-ext-row" style={{ marginTop: 8 }}>
+                <span className="capture-ext-label">
+                  <span className="capture-ext-name">Block cookie banners</span>
+                  <span className="capture-ext-desc">Dismiss cookie consent banners during this capture</span>
+                  {!globalSettings?.cookie_ext_available && (
+                    <span className="capture-ext-hint">Not configured &mdash; set <code>ARCHIVR_COOKIE_EXT</code></span>
+                  )}
+                </span>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={cookieExtEnabled}
+                  className={`ext-toggle ext-toggle--sm${cookieExtEnabled ? ' ext-toggle--on' : ''}`}
+                  onClick={() => setCookieExtEnabled(v => !v)}
+                  aria-label="Toggle cookie banner blocking for this capture"
                 >
                   <span className="ext-toggle-knob" />
                 </button>
