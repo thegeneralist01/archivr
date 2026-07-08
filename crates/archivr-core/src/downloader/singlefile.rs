@@ -13,49 +13,85 @@ use crate::downloader::cookies::{domain_from_url, write_netscape_cookie_file};
 use crate::hash::hash_file;
 
 /// Mozilla Readability.js (Apache 2.0) — embedded at compile time so captures
-/// don't need it on PATH.  Path is relative to this source file.
-const READABILITY_JS: &str =
-    include_str!("../../../../vendor/readability/Readability.js");
-
-/// Single-file user script that applies Readability just before the page is
-/// serialised.  Fires on `single-file-on-before-capture-start`.
-const READER_MODE_WRAPPER_JS: &str = r#"
-addEventListener('single-file-on-before-capture-start', function() {
-  try {
-    if (typeof Readability === 'undefined') return;
-    var article = new Readability(document.cloneNode(true)).parse();
-    if (!article || !article.content || article.content.length < 100) return;
-    document.body.innerHTML = article.content;
-    if (article.title) document.title = article.title;
-    var hdr = document.createElement('header');
-    hdr.innerHTML =
-      '<h1 style="margin:0 0 .3em;font-family:-apple-system,sans-serif">' +
-        (article.title || '') + '</h1>' +
-      (article.byline
-        ? '<p style="margin:0;color:#666;font-size:14px">' + article.byline + '</p>'
-        : '') +
-      (article.siteName
-        ? '<p style="margin:.2em 0 0;color:#999;font-size:12px">' + article.siteName + '</p>'
-        : '');
-    hdr.style.cssText = 'margin-bottom:2em;padding-bottom:1em;border-bottom:1px solid #ddd';
-    document.body.insertBefore(hdr, document.body.firstChild);
-    var style = document.createElement('style');
-    style.textContent = [
-      'body{max-width:680px;margin:40px auto;padding:0 24px;',
-      'font-family:Georgia,"Times New Roman",serif;font-size:18px;',
-      'line-height:1.75;color:#1a1a1a;background:#fafaf8}',
-      'h1,h2,h3,h4,h5,h6{font-family:-apple-system,BlinkMacSystemFont,sans-serif;',
-      'line-height:1.3;margin-top:1.5em}',
-      'img,figure,video{max-width:100%;height:auto;display:block;margin:1em 0}',
-      'a{color:#0055cc}',
-      'pre{background:#f4f4f4;padding:1em;border-radius:4px;overflow-x:auto;font-size:14px}',
-      'code{background:#f4f4f4;padding:.1em .3em;border-radius:3px;font-size:14px}',
-      'blockquote{border-left:3px solid #ccc;margin:1em 0;padding-left:1.2em;color:#555}',
-    ].join('');
-    document.head.appendChild(style);
-  } catch (e) { /* non-fatal: fall back to original page */ }
-});
-"#;
+/// Combined reader-mode script: Readability.js (Apache 2.0) bundled with the
+/// archivr wrapper in a single IIFE so both share the same execution scope —
+/// passing them as separate `--browser-script` files can put each in its own
+/// context (observed with single-file-cli 1.1.49), making Readability invisible
+/// to the wrapper.
+///
+/// Emits `<meta name="archivr-reader-mode" content="applied|failed:REASON">`
+/// so the outcome is observable in the saved HTML.
+const READER_MODE_SCRIPT: &str = concat!(
+    // Readability.js is injected verbatim first so `Readability` is in scope.
+    include_str!("../../../../vendor/readability/Readability.js"),
+    // Wrapper IIFE — runs on single-file-on-before-capture-request.
+    // Sets 'installed' immediately at script-evaluation time so a missing meta
+    // means the browser-script was never injected at all.
+    r#"
+;(function() {
+  function _archivrReaderMark(content) {
+    try {
+      var m = document.querySelector('meta[name="archivr-reader-mode"]');
+      if (!m) {
+        m = document.createElement('meta');
+        m.name = 'archivr-reader-mode';
+        (document.head || document.documentElement).appendChild(m);
+      }
+      m.content = content;
+    } catch(_) {}
+  }
+  // Mark immediately: if this meta is absent in the artifact the script
+  // was never injected (separate from the hook never firing).
+  _archivrReaderMark('installed');
+  function _archivrApplyReader() {
+    try {
+      if (typeof Readability === 'undefined') {
+        _archivrReaderMark('failed:no-readability');
+        return;
+      }
+      var article = new Readability(document.cloneNode(true)).parse();
+      if (!article || !article.content || article.content.length < 100) {
+        _archivrReaderMark('failed:no-article');
+        return;
+      }
+      document.body.innerHTML = article.content;
+      if (article.title) document.title = article.title;
+      var hdr = document.createElement('header');
+      hdr.innerHTML =
+        '<h1 style="margin:0 0 .3em;font-family:-apple-system,sans-serif">' +
+          (article.title || '') + '</h1>' +
+        (article.byline
+          ? '<p style="margin:0;color:#666;font-size:14px">' + article.byline + '</p>'
+          : '') +
+        (article.siteName
+          ? '<p style="margin:.2em 0 0;color:#999;font-size:12px">' + article.siteName + '</p>'
+          : '');
+      hdr.style.cssText = 'margin-bottom:2em;padding-bottom:1em;border-bottom:1px solid #ddd';
+      document.body.insertBefore(hdr, document.body.firstChild);
+      var style = document.createElement('style');
+      style.textContent = [
+        'body{max-width:680px;margin:40px auto;padding:0 24px;',
+        'font-family:Georgia,"Times New Roman",serif;font-size:18px;',
+        'line-height:1.75;color:#1a1a1a;background:#fafaf8}',
+        'h1,h2,h3,h4,h5,h6{font-family:-apple-system,BlinkMacSystemFont,sans-serif;',
+        'line-height:1.3;margin-top:1.5em}',
+        'img,figure,video{max-width:100%;height:auto;display:block;margin:1em 0}',
+        'a{color:#0055cc}',
+        'pre{background:#f4f4f4;padding:1em;border-radius:4px;overflow-x:auto;font-size:14px}',
+        'code{background:#f4f4f4;padding:.1em .3em;border-radius:3px;font-size:14px}',
+        'blockquote{border-left:3px solid #ccc;margin:1em 0;padding-left:1.2em;color:#555}',
+      ].join('');
+      document.head.appendChild(style);
+      _archivrReaderMark('applied');
+    } catch (e) {
+      _archivrReaderMark('failed:exception:' + (e && e.message ? e.message : String(e)));
+    }
+  }
+  // Synchronous work — no preventDefault()/response dispatch needed.
+  addEventListener('single-file-on-before-capture-request', _archivrApplyReader);
+})();
+"#
+);
 
 /// Result of archiving a web page with single-file.
 #[derive(Debug)]
@@ -183,24 +219,22 @@ fn save_with(
     let strip_scripts_path = temp_dir.join("sf-strip-scripts.js");
     std::fs::write(
         &strip_scripts_path,
-        "addEventListener('single-file-on-before-capture-start',()=>{\
+        "addEventListener('single-file-on-before-capture-request',()=>{\
           document.querySelectorAll('script:not([type=\"application/ld+json\"])')\
           .forEach(el=>el.remove());\
         });",
     )
     .context("failed to write single-file user script")?;
 
-    // Optional reader-mode scripts (Readability.js + wrapper).
+    // Optional reader-mode script: Readability.js + wrapper combined into one
+    // file so both run in the same execution scope.  (Separate --browser-script
+    // files can each get their own context depending on single-file version.)
     let mut extra_browser_scripts: Vec<PathBuf> = Vec::new();
     if reader_mode {
-        let readability_path = temp_dir.join("sf-readability.js");
-        std::fs::write(&readability_path, READABILITY_JS)
-            .context("failed to write Readability.js script")?;
-        let wrapper_path = temp_dir.join("sf-reader-mode.js");
-        std::fs::write(&wrapper_path, READER_MODE_WRAPPER_JS)
-            .context("failed to write reader-mode wrapper script")?;
-        extra_browser_scripts.push(readability_path);
-        extra_browser_scripts.push(wrapper_path);
+        let reader_path = temp_dir.join("sf-reader-mode.js");
+        std::fs::write(&reader_path, READER_MODE_SCRIPT)
+            .context("failed to write reader-mode script")?;
+        extra_browser_scripts.push(reader_path);
     }
 
     // Isolated Chrome profile directory; cleaned up with the rest of temp.
