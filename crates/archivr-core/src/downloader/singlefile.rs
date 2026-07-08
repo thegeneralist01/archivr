@@ -85,6 +85,9 @@ const READER_MODE_SCRIPT: &str = concat!(
       _archivrReaderMark('failed:exception:' + (e && e.message ? e.message : String(e)));
     }
   }
+  // Ensure _singleFile_waitForUserScript is installed (strip-scripts also does
+  // this, but be explicit here in case reader-mode ever runs without it).
+  dispatchEvent(new CustomEvent('single-file-user-script-init'));
   // Synchronous work — no preventDefault()/response dispatch needed.
   addEventListener('single-file-on-before-capture-request', _archivrApplyReader);
 })();
@@ -217,10 +220,13 @@ fn save_with(
     let strip_scripts_path = temp_dir.join("sf-strip-scripts.js");
     std::fs::write(
         &strip_scripts_path,
-        "addEventListener('single-file-on-before-capture-request',()=>{\
-          document.querySelectorAll('script:not([type=\"application/ld+json\"])')\
-          .forEach(el=>el.remove());\
-        });",
+        // Dispatch single-file-user-script-init so single-file installs
+        // _singleFile_waitForUserScript, which gates the -request hooks.
+        "dispatchEvent(new CustomEvent('single-file-user-script-init'));\
+         addEventListener('single-file-on-before-capture-request',()=>{\
+           document.querySelectorAll('script:not([type=\"application/ld+json\"])')\
+           .forEach(el=>el.remove());\
+         });",
     )
     .context("failed to write single-file user script")?;
 
