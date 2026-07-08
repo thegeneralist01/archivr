@@ -5,10 +5,8 @@ use std::{
     collections::HashMap,
     env,
     io::Read,
-    net::TcpListener,
     path::{Path, PathBuf},
     process::Command,
-    time::{Duration, Instant},
 };
 
 use crate::downloader::cookies::{domain_from_url, write_netscape_cookie_file};
@@ -151,15 +149,20 @@ fn resolve_ublock_config(enabled_override: Option<bool>) -> (Option<PathBuf>, bo
 /// Inner implementation.  Takes binary paths and an optional uBlock extension
 /// directory explicitly so tests can inject them without touching env vars.
 ///
-/// When `ublock_ext` is `Some(path)` we own Chrome's lifecycle:
-///   1. allocate a free TCP port,
-///   2. launch Chrome headless with the extension loaded,
-///   3. wait for Chrome's DevTools HTTP API to respond,
-///   4. run single-file pointing at our Chrome via `--browser-server`,
-///   5. kill Chrome after single-file exits.
+/// single-file always manages Chrome.  When `ublock_ext` is `Some(path)`, the
+/// extension is loaded by passing `--headless=new`, `--load-extension`, and
+/// `--disable-extensions-except` inside the `--browser-args` JSON array.
+/// single-file's `browser.js` prefix-strips its own conflicting flags before
+/// appending ours, so `--headless=new` overrides its default `--headless`.
 ///
-/// When `ublock_ext` is `None` the original behaviour is preserved:
-/// single-file launches and manages Chrome internally.
+/// Note: single-file always adds `--single-process` to Chrome.  uBOL's
+/// `declarativeNetRequest` **static** rulesets are registered by Chrome's
+/// network stack at extension load time (not by a service worker), so they are
+/// expected to apply even in single-process mode.  Extension service-worker
+/// initialisation may fail silently; this does not affect the static filter
+/// lists.  Ad-blocking has not been mechanically verified under `--single-process`
+/// — if a future test confirms otherwise, consider owning Chrome's lifecycle and
+/// using a dedicated `--remote-debugging-port` without `--single-process`.
 fn save_with(
     url: &str,
     store_path: &Path,
@@ -175,11 +178,8 @@ fn save_with(
 
     let out_file = temp_dir.join(format!("{timestamp}.html"));
 
-    // Mandatory user script: strips <script> elements from the live DOM just
-    // before SingleFile serializes it.  Lets scripts execute during capture (so
-    // JS-applied CSS is present) without leaving data:-URL ES modules in the
-    // saved file that would cause "base scheme isn't hierarchical" errors.
-    // JSON-LD structured data is kept.
+    // Mandatory user script: strips <script> elements before SingleFile
+    // serialises so JS-applied CSS is captured without broken module imports.
     let strip_scripts_path = temp_dir.join("sf-strip-scripts.js");
     std::fs::write(
         &strip_scripts_path,
@@ -190,8 +190,7 @@ fn save_with(
     )
     .context("failed to write single-file user script")?;
 
-    // Reader-mode scripts: Readability.js + wrapper.  Written to temp dir and
-    // passed as additional --browser-script args when reader mode is enabled.
+    // Optional reader-mode scripts (Readability.js + wrapper).
     let mut extra_browser_scripts: Vec<PathBuf> = Vec::new();
     if reader_mode {
         let readability_path = temp_dir.join("sf-readability.js");
@@ -204,19 +203,41 @@ fn save_with(
         extra_browser_scripts.push(wrapper_path);
     }
 
-    // Isolated Chrome profile directory.
+    // Isolated Chrome profile directory; cleaned up with the rest of temp.
     let chrome_data_dir = temp_dir.join("chrome-data");
 
-    // Extra Chrome flags from the environment (e.g. "--no-sandbox" in Docker).
+    // Build Chrome flags passed via --browser-args to single-file.
+    // single-file's browser.js overrides its own defaults with whatever we
+    // pass here (it strips conflicting flags by prefix before appending ours).
+    let mut chrome_flags = vec![
+        "--disable-web-security".to_string(),
+        format!("--user-data-dir={}", chrome_data_dir.display()),
+        "--window-size=1920,1080".to_string(),
+    ];
+    if let Some(ext_path) = ublock_ext {
+        // --headless=new is required for --load-extension to work.
+        // It overrides single-file's own --headless default via the prefix-strip logic.
+        chrome_flags.push("--headless=new".to_string());
+        chrome_flags.push(format!("--load-extension={}", ext_path.display()));
+        chrome_flags.push(format!("--disable-extensions-except={}", ext_path.display()));
+    }
+    // Operator extras (e.g. --no-sandbox in Docker).
     let extra_chrome_args: Vec<String> = env::var("ARCHIVR_CHROME_ARGS")
         .unwrap_or_default()
         .split_whitespace()
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
+    chrome_flags.extend(extra_chrome_args);
 
-    // Write cookie file before running Chrome so it's available immediately.
-    // Never pass cookie values in process args (ps exposure).
+    // single-file expects browser-args as a JSON array of strings.
+    let quoted: Vec<String> = chrome_flags
+        .iter()
+        .map(|f| format!("\"{}\"", f.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    let browser_args = format!("[{}]", quoted.join(","));
+
+    // Write cookie file (secrets must never appear in process args).
     let cookie_file: Option<PathBuf> = if !cookies.is_empty() {
         let cf = temp_dir.join("cookies.txt");
         let domain = domain_from_url(url);
@@ -227,86 +248,19 @@ fn save_with(
         None
     };
 
-    let sf_output = match ublock_ext {
-        // ── We own Chrome's lifecycle (uBlock extension mode) ─────────────
-        Some(ext_path) => {
-            let port = allocate_free_port().context("failed to allocate a free TCP port")?;
+    let mut scripts: Vec<&Path> = vec![strip_scripts_path.as_path()];
+    scripts.extend(extra_browser_scripts.iter().map(|p| p.as_path()));
 
-            let mut chrome_flags = vec![
-                "--headless=new".to_string(),
-                format!("--remote-debugging-port={port}"),
-                format!("--user-data-dir={}", chrome_data_dir.display()),
-                // Load the extension; disable all others so no unexpected ext loads.
-                format!("--load-extension={}", ext_path.display()),
-                format!("--disable-extensions-except={}", ext_path.display()),
-                // Allow cross-origin font inlining (same reason as standalone mode).
-                "--disable-web-security".to_string(),
-                // Realistic viewport so responsive @media rules are preserved.
-                "--window-size=1920,1080".to_string(),
-            ];
-            chrome_flags.extend(extra_chrome_args);
-
-            let mut chrome_child = Command::new(chrome)
-                .args(&chrome_flags)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .with_context(|| format!("failed to spawn Chrome ({chrome})"))?;
-
-            if !wait_for_chrome_ready(port, 10) {
-                let _ = chrome_child.kill();
-                let _ = chrome_child.wait();
-                bail!("Chrome did not become ready on port {port} within 10 s");
-            }
-
-            // Build scripts list: strip-scripts first, then any reader-mode scripts.
-            let mut scripts: Vec<&Path> = vec![strip_scripts_path.as_path()];
-            scripts.extend(extra_browser_scripts.iter().map(|p| p.as_path()));
-            let out = run_single_file_with_server(
-                url,
-                &out_file,
-                single_file,
-                port,
-                &scripts,
-                cookie_file.as_deref(),
-            );
-
-            // Always kill Chrome and reap its exit status, even on single-file failure.
-            let _ = chrome_child.kill();
-            let _ = chrome_child.wait();
-
-            out.with_context(|| format!("failed to spawn single-file ({single_file})"))?
-        }
-
-        // ── single-file manages Chrome (original behaviour) ───────────────
-        None => {
-            let mut chrome_flags = vec![
-                "--disable-web-security".to_string(),
-                format!("--user-data-dir={}", chrome_data_dir.display()),
-                "--window-size=1920,1080".to_string(),
-            ];
-            chrome_flags.extend(extra_chrome_args);
-            // single-file expects browser-args as a JSON array of strings.
-            let quoted: Vec<String> = chrome_flags
-                .iter()
-                .map(|f| format!("\"{}\"", f.replace('\\', "\\\\").replace('"', "\\\"")))
-                .collect();
-            let browser_args = format!("[{}]", quoted.join(","));
-
-            let mut scripts: Vec<&Path> = vec![strip_scripts_path.as_path()];
-            scripts.extend(extra_browser_scripts.iter().map(|p| p.as_path()));
-            run_single_file_standalone(
-                url,
-                &out_file,
-                single_file,
-                chrome,
-                &browser_args,
-                &scripts,
-                cookie_file.as_deref(),
-            )
-            .with_context(|| format!("failed to spawn single-file ({single_file})"))?
-        }
-    };
+    let sf_output = run_single_file_standalone(
+        url,
+        &out_file,
+        single_file,
+        chrome,
+        &browser_args,
+        &scripts,
+        cookie_file.as_deref(),
+    )
+    .with_context(|| format!("failed to spawn single-file ({single_file})"))?;
 
     // Delete cookie file unconditionally — including on failure — so secrets
     // are never left in store/temp when the capture fails.
@@ -360,61 +314,6 @@ fn save_with(
         favicon_ext,
         ublock_skipped: false, // overwritten by save() from resolve_ublock_config()
     })
-}
-
-// ── Chrome helpers ────────────────────────────────────────────────────────────
-
-/// Binds a `TcpListener` to a random OS-assigned port, reads the port number,
-/// then drops the listener.  The tiny TOCTOU window between drop and Chrome
-/// binding is acceptable in practice.
-fn allocate_free_port() -> Result<u16> {
-    let listener =
-        TcpListener::bind("127.0.0.1:0").context("could not bind to a free TCP port")?;
-    Ok(listener.local_addr()?.port())
-}
-
-/// Polls `http://127.0.0.1:{port}/json/version` every 150 ms until Chrome
-/// responds with HTTP 200 or the deadline (timeout_secs) elapses.
-fn wait_for_chrome_ready(port: u16, timeout_secs: u64) -> bool {
-    let url = format!("http://127.0.0.1:{port}/json/version");
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(500))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    while Instant::now() < deadline {
-        if client
-            .get(&url)
-            .send()
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(150));
-    }
-    false
-}
-
-// ── single-file invocation helpers ───────────────────────────────────────────
-
-/// Runs single-file pointing at an already-running Chrome via the DevTools HTTP
-/// API (`--browser-server`).  Chrome was started by the caller, which retains
-/// ownership of the process handle and kills it after this call returns.
-fn run_single_file_with_server(
-    url: &str,
-    out_file: &Path,
-    single_file: &str,
-    port: u16,
-    scripts: &[&Path],
-    cookie_file: Option<&Path>,
-) -> std::io::Result<std::process::Output> {
-    let mut cmd = base_single_file_cmd(url, out_file, single_file, scripts, cookie_file);
-    cmd.arg(format!("--browser-server=http://127.0.0.1:{port}"));
-    cmd.output()
 }
 
 /// Runs single-file, letting it launch and manage Chrome itself.
