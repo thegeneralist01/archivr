@@ -305,11 +305,11 @@ fn save_with(
                 iframe[src*=\"googlesyndication\"],\
                 iframe[src*=\"doubleclick\"]'\
              ).forEach(function(el){\
-               var p=el.parentElement;\
-               el.remove();\
-               /* collapse parent if it's now empty and was ad-only */\
-               if(p&&!p.textContent.trim()&&p.children.length===0)\
-                 p.style.display='none';\
+               /* Walk up to the nearest ad-slot container so padding/margin  \
+                * on the wrapper (e.g. .top-ad, .google-auto-placed) collapses \
+                * too, not just the inner ins/iframe element.                  */\
+               var slot=el.closest('.top-ad,.google-auto-placed,.ad-slot,.ad-container');\
+               (slot||el).remove();\
              });",
         );
     }
