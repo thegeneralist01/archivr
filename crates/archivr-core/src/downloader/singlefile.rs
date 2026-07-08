@@ -12,12 +12,10 @@ use std::{
 use crate::downloader::cookies::{domain_from_url, write_netscape_cookie_file};
 use crate::hash::hash_file;
 
-/// Mozilla Readability.js (Apache 2.0) — embedded at compile time so captures
 /// Combined reader-mode script: Readability.js (Apache 2.0) bundled with the
-/// archivr wrapper in a single IIFE so both share the same execution scope —
-/// passing them as separate `--browser-script` files can put each in its own
-/// context (observed with single-file-cli 1.1.49), making Readability invisible
-/// to the wrapper.
+/// archivr wrapper in a single IIFE.  single-file-cli concatenates all
+/// `--browser-script` files into one string before injection (scripts.js:84),
+/// so scope sharing is guaranteed; the combined file is kept for clarity.
 ///
 /// Emits `<meta name="archivr-reader-mode" content="applied|failed:REASON">`
 /// so the outcome is observable in the saved HTML.
