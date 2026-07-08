@@ -69,6 +69,7 @@ pub struct CaptureJobSummary {
     pub run_uid: Option<String>,
     pub status: String,
     pub error_text: Option<String>,
+    pub notes_json: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -341,6 +342,7 @@ pub fn get_capture_job(
         run_uid: r.run_uid,
         status: r.status,
         error_text: r.error_text,
+        notes_json: r.notes_json,
         created_at: r.created_at,
         updated_at: r.updated_at,
     }))

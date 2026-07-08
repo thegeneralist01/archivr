@@ -37,6 +37,11 @@ pub enum Source {
 pub struct CaptureResult {
     pub run_uid: String,
     pub status: String,
+    /// `true` when uBlock was requested but the extension path was not found.
+    /// The capture succeeded without ad-blocking; the UI should warn the user.
+    pub ublock_skipped: bool,
+    /// `true` when cookie-consent extension was requested but the path was not found.
+    pub cookie_ext_skipped: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -74,6 +79,12 @@ impl PlatformMetadata {
 #[derive(Debug, Clone, Default)]
 pub struct CaptureConfig {
     pub cookie_rules: Vec<database::CookieRule>,
+    /// Override for uBlock Origin Lite during WebPage captures.
+    pub ublock_enabled: Option<bool>,
+    /// Override for cookie-consent extension during WebPage captures.
+    pub cookie_ext_enabled: Option<bool>,
+    /// Apply Mozilla Readability to distil the page to article content before archiving.
+    pub reader_mode: bool,
 }
 
 /// Resolves which cookies apply to `url` by evaluating all rules in ordinal order.
@@ -991,6 +1002,8 @@ pub fn perform_capture(
                 return Ok(CaptureResult {
                     run_uid: run.run_uid.clone(),
                     status: "completed".to_string(),
+                    ublock_skipped: false,
+                    cookie_ext_skipped: false,
                 });
             }
             Err(e) => {
@@ -1006,7 +1019,7 @@ pub fn perform_capture(
 
     // Source: web page — archive as a self-contained HTML snapshot via single-file-cli
     if source == Source::WebPage {
-        match downloader::singlefile::save(locator, store_path, &timestamp, &cookies) {
+        match downloader::singlefile::save(locator, store_path, &timestamp, &cookies, config.ublock_enabled, config.cookie_ext_enabled, config.reader_mode) {
             Ok(result) => {
                 let file_extension = ".html".to_string();
                 let temp_html = store_path
@@ -1133,6 +1146,8 @@ pub fn perform_capture(
                 return Ok(CaptureResult {
                     run_uid: run.run_uid.clone(),
                     status: "completed".to_string(),
+                    ublock_skipped: result.ublock_skipped,
+                    cookie_ext_skipped: result.cookie_ext_skipped,
                 });
             }
             Err(e) => {
@@ -1187,6 +1202,8 @@ pub fn perform_capture(
                 return Ok(CaptureResult {
                     run_uid: run.run_uid.clone(),
                     status: "completed".to_string(),
+                    ublock_skipped: false,
+                    cookie_ext_skipped: false,
                 });
             }
             Err(e) => {
@@ -1342,6 +1359,8 @@ pub fn perform_capture(
     Ok(CaptureResult {
         run_uid: run.run_uid.clone(),
         status: "completed".to_string(),
+        ublock_skipped: false,
+        cookie_ext_skipped: false,
     })
 }
 

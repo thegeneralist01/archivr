@@ -85,6 +85,9 @@ export default function App() {
 
   const [toasts, setToasts] = useState([])
   const toastIdRef = useRef(0)
+  const [ublockWarningIgnored, setUblockWarningIgnored] = useState(
+    () => sessionStorage.getItem('ublockWarningIgnored') === 'true'
+  )
 
   const humanizeTags = currentUser?.humanize_slugs ?? false;
 
@@ -238,13 +241,20 @@ export default function App() {
     ])
   }, [archiveId, searchQuery, tagFilter, loadEntries])
 
-  const handleToast = useCallback((errorText, locator) => {
+  const handleToast = useCallback((text, locator, type = 'error') => {
+    if (type === 'warning' && ublockWarningIgnored) return
     const id = ++toastIdRef.current
-    setToasts(prev => [...prev, { id, errorText, locator }])
-  }, [])
+    setToasts(prev => [...prev, { id, text, locator, type }])
+  }, [ublockWarningIgnored])
 
   const handleDismissToast = useCallback((id) => {
     setToasts(prev => prev.filter(t => t.id !== id))
+  }, [])
+
+  const handleIgnoreUblock = useCallback(() => {
+    sessionStorage.setItem('ublockWarningIgnored', 'true')
+    setUblockWarningIgnored(true)
+    setToasts(prev => prev.filter(t => t.type !== 'warning'))
   }, [])
 
   if (authState === 'loading') return <div className="auth-loading">Loading\u2026</div>;
@@ -347,7 +357,7 @@ export default function App() {
           onCaptured={handleCaptured}
           onToast={handleToast}
         />
-        <ToastStack toasts={toasts} onDismiss={handleDismissToast} />
+        <ToastStack toasts={toasts} onDismiss={handleDismissToast} onIgnoreUblock={handleIgnoreUblock} />
       </>
     </AuthContext.Provider>
   )

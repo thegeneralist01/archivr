@@ -14,8 +14,8 @@ export default function SettingsView({ tab, onTabChange, archiveId }) {
   const { currentUser, setCurrentUser } = useContext(AuthContext) ?? {}
   const isAdmin = currentUser && ((currentUser.role_bits & ROLE_ADMIN) !== 0)
 
-  const tabs = ['profile', 'tokens', ...(isAdmin ? ['instance', 'cookies', 'storage'] : [])]
-  const tabLabels = { profile: 'Profile', tokens: 'API Tokens', instance: 'Instance', cookies: 'Cookies', storage: 'Storage' }
+  const tabs = ['profile', 'tokens', ...(isAdmin ? ['instance', 'cookies', 'extensions', 'storage'] : [])]
+  const tabLabels = { profile: 'Profile', tokens: 'API Tokens', instance: 'Instance', cookies: 'Cookies', extensions: 'Extensions', storage: 'Storage' }
 
   return (
     <section className="admin-view">
@@ -34,6 +34,7 @@ export default function SettingsView({ tab, onTabChange, archiveId }) {
       {tab === 'tokens' && <TokensTab />}
       {tab === 'instance' && isAdmin && <InstanceTab />}
       {tab === 'cookies' && isAdmin && <CookiesTab />}
+      {tab === 'extensions' && isAdmin && <ExtensionsTab />}
       {tab === 'storage' && isAdmin && <StorageTab archiveId={archiveId} />}
     </section>
   )
@@ -635,6 +636,127 @@ function CookiesTab() {
             {adding ? 'Adding\u2026' : 'Add Rule'}
           </button>
         </form>
+      </div>
+    </div>
+  )
+}
+
+function ExtensionsTab() {
+  const [settings, setSettings] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [msg, setMsg] = useState(null)
+
+  useEffect(() => {
+    (async () => {
+      try { setSettings(await getInstanceSettings()) }
+      catch (e) { setMsg({ ok: false, text: e.message }) }
+      finally { setLoading(false) }
+    })()
+  }, [])
+
+  async function toggleUblock(val) {
+    setSaving(true)
+    setMsg(null)
+    try {
+      await updateInstanceSettings({ ublock_enabled: val })
+      setSettings(s => ({ ...s, ublock_enabled: val }))
+      setMsg({ ok: true, text: 'Saved.' })
+    } catch (e) {
+      setMsg({ ok: false, text: e.message })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function toggleCookieExt(val) {
+    setSaving(true)
+    setMsg(null)
+    try {
+      await updateInstanceSettings({ cookie_ext_enabled: val })
+      setSettings(s => ({ ...s, cookie_ext_enabled: val }))
+      setMsg({ ok: true, text: 'Saved.' })
+    } catch (e) {
+      setMsg({ ok: false, text: e.message })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (loading) return <div className="muted">Loading\u2026</div>
+
+  const extAvailable = settings?.ublock_ext_available ?? false
+  const extEnabled = settings?.ublock_enabled ?? true
+  const cookieExtAvailable = settings?.cookie_ext_available ?? false
+  const cookieExtEnabled = settings?.cookie_ext_enabled ?? true
+
+  return (
+    <div style={{ maxWidth: 560 }}>
+      <div className="form-section">
+        <h2>Extensions</h2>
+        <p className="form-hint" style={{ marginBottom: 20 }}>
+          Extensions run inside the browser during WebPage captures and can block ads,
+          accept cookie banners, and more. Changes take effect on the next capture.
+        </p>
+
+        <div className="ext-card">
+          <div className="ext-card-header">
+            <div className="ext-card-info">
+              <span className="ext-card-name">uBlock Origin Lite</span>
+              <span className="ext-card-desc">
+                Blocks ads, trackers, and other page clutter during archiving
+                via Chrome&rsquo;s declarativeNetRequest API (Manifest V3).
+              </span>
+              {!extAvailable && (
+                <span className="ext-card-hint">
+                  Not configured &mdash; set <code>ARCHIVR_UBLOCK_EXT</code> to the
+                  unpacked extension directory to enable.
+                </span>
+              )}
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={extEnabled}
+              className={`ext-toggle${extEnabled ? ' ext-toggle--on' : ''}`}
+              onClick={() => toggleUblock(!extEnabled)}
+              disabled={saving}
+              aria-label="Toggle uBlock Origin Lite"
+            >
+              <span className="ext-toggle-knob" />
+            </button>
+          </div>
+        </div>
+
+        <div className="ext-card">
+          <div className="ext-card-header">
+            <div className="ext-card-info">
+              <span className="ext-card-name">I Still Don&rsquo;t Care About Cookies</span>
+              <span className="ext-card-desc">
+                Dismiss cookie consent banners during archiving.
+              </span>
+              {!cookieExtAvailable && (
+                <span className="ext-card-hint">
+                  Not configured &mdash; set <code>ARCHIVR_COOKIE_EXT</code> to the
+                  unpacked extension directory to enable.
+                </span>
+              )}
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={cookieExtEnabled}
+              className={`ext-toggle${cookieExtEnabled ? ' ext-toggle--on' : ''}`}
+              onClick={() => toggleCookieExt(!cookieExtEnabled)}
+              disabled={saving}
+              aria-label="Toggle I Still Don't Care About Cookies"
+            >
+              <span className="ext-toggle-knob" />
+            </button>
+          </div>
+        </div>
+
+        {msg && <div className={`form-msg form-msg--${msg.ok ? 'ok' : 'err'}`}>{msg.text}</div>}
       </div>
     </div>
   )

@@ -60,6 +60,40 @@
           tweetPython = pkgs.python312.withPackages (ps: [
             twitterApiClient
           ]);
+          # uBlock Origin Lite (MV3) — unpacked Chromium extension for headless ad-blocking.
+          # Fetched from the uBOL-home GitHub releases; update version + hash together.
+          ublockLite = pkgs.stdenv.mkDerivation {
+            pname = "ublock-origin-lite";
+            version = "2026.705.2152";
+            src = pkgs.fetchurl {
+              url = "https://github.com/uBlockOrigin/uBOL-home/releases/download/2026.705.2152/uBOLite_2026.705.2152.chromium.zip";
+              hash = "sha256-4TbvDYbkOkDuVK17TeAbLDBcgf9O6f/vh2buGbLu4XQ=";
+            };
+            nativeBuildInputs = [ pkgs.unzip ];
+            sourceRoot = ".";
+            installPhase = ''
+              mkdir -p $out
+              cp -r . $out/
+            '';
+          };
+          # I Still Don't Care About Cookies (MV3) — unpacked Chromium extension
+          # for dismissing cookie consent banners during headless captures.
+          # Fetched from GitHub releases; update version + hash together.
+          isdcac = pkgs.stdenv.mkDerivation {
+            pname = "istilldontcareaboutcookies";
+            version = "1.1.9";
+            src = pkgs.fetchurl {
+              url = "https://github.com/OhMyGuus/I-Still-Dont-Care-About-Cookies/releases/download/v1.1.9/ISDCAC-chrome-source.zip";
+              hash = "sha256-j3CrlHyy0nT0AiqXD13Tzs2OwCsGDgUYe++e48sYu8s=";
+            };
+            nativeBuildInputs = [ pkgs.unzip ];
+            sourceRoot = ".";
+            installPhase = ''
+              test -f manifest.json || { echo "ERROR: manifest.json not at extension root; zip structure may have changed"; exit 1; }
+              mkdir -p $out
+              cp -r . $out/
+            '';
+          };
           version = "0.1.0";
           src = pkgs.lib.cleanSource ./.;
           cargoLock = {
@@ -123,6 +157,8 @@
                 ${lib.optionalString pkgs.stdenv.isLinux "--set ARCHIVR_CHROME ${pkgs.chromium}/bin/chromium"} \
                 --set ARCHIVR_TWEET_PYTHON ${tweetPython}/bin/python3 \
                 --set ARCHIVR_TWEET_SCRAPER $out/libexec/archivr/scrape_user_tweet_contents.py \
+                --set ARCHIVR_UBLOCK_EXT ${ublockLite} \
+                --set ARCHIVR_COOKIE_EXT ${isdcac} \
                 --prefix PATH : ${
                   lib.makeBinPath ([
                     pkgs.yt-dlp
@@ -149,7 +185,9 @@
                 --set ARCHIVR_SINGLE_FILE ${pkgs.single-file-cli}/bin/single-file \
                 ${lib.optionalString pkgs.stdenv.isLinux "--set ARCHIVR_CHROME ${pkgs.chromium}/bin/chromium"} \
                 --set ARCHIVR_TWEET_PYTHON ${tweetPython}/bin/python3 \
-                --set ARCHIVR_TWEET_SCRAPER $out/libexec/archivr-server/scrape_user_tweet_contents.py
+                --set ARCHIVR_TWEET_SCRAPER $out/libexec/archivr-server/scrape_user_tweet_contents.py \
+                --set ARCHIVR_UBLOCK_EXT ${ublockLite} \
+                --set ARCHIVR_COOKIE_EXT ${isdcac}
             '';
           };
           archivr-all = pkgs.symlinkJoin {

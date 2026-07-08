@@ -95,9 +95,15 @@ export async function fetchTags(archiveId) {
   return getJson(`/api/archives/${archiveId}/tags`);
 }
 
-export async function submitCapture(archiveId, locator, quality = null) {
+export async function submitCapture(archiveId, locator, quality = null, extensions = null) {
   const payload = { locator }
   if (quality && quality !== 'best') payload.quality = quality
+  // extensions: { ublock_enabled?: bool, reader_mode?: bool } — per-capture overrides
+  if (extensions) {
+    if (typeof extensions.ublock_enabled === 'boolean') payload.ublock_enabled = extensions.ublock_enabled
+    if (typeof extensions.reader_mode === 'boolean') payload.reader_mode = extensions.reader_mode
+    if (typeof extensions.cookie_ext_enabled === 'boolean') payload.cookie_ext_enabled = extensions.cookie_ext_enabled
+  }
   const res = await fetch(`/api/archives/${archiveId}/captures`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

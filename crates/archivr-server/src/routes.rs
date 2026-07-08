@@ -650,9 +650,11 @@ async fn delete_entry_handler(
 #[derive(Debug, serde::Deserialize)]
 struct CaptureBody {
     locator: String,
-    /// Optional quality cap for yt-dlp sources: `"best"` or any `"NNNp"` string
-    /// (e.g. `"1080p"`, `"720p"`, `"2160p"`). Absent or `"best"` → highest available.
     quality: Option<String>,
+    ublock_enabled: Option<bool>,
+    /// Distil to article content via Readability before archiving.  Absent = false.
+    reader_mode: Option<bool>,
+    cookie_ext_enabled: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -732,15 +734,29 @@ async fn capture_handler(
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let job_uid = database::create_capture_job(&conn, &archive_id)?;
     drop(conn);
-
-    // Load cookie rules from the auth DB to pass into the capture background task.
-    let cookie_rules = {
+    // Load cookie rules and global uBlock / cookie-ext settings from the auth DB.
+    let (cookie_rules, global_ublock, global_cookie_ext) = {
         match database::open_auth_db(&state.auth_db_path) {
-            Ok(conn) => database::list_cookie_rules(&conn).unwrap_or_default(),
-            Err(_) => vec![],
+            Ok(conn) => {
+                let rules = database::list_cookie_rules(&conn).unwrap_or_default();
+                let settings = database::get_instance_settings(&conn);
+                let ublock = settings.as_ref().map(|s| s.ublock_enabled).unwrap_or(true);
+                let cookie_ext = settings.map(|s| s.cookie_ext_enabled).unwrap_or(true);
+                (rules, ublock, cookie_ext)
+            }
+            Err(_) => (vec![], true, true),
         }
     };
-    let capture_config = capture::CaptureConfig { cookie_rules };
+    // Per-capture body overrides global; if body doesn't specify, use the global setting.
+    // The resolved bool is then passed as Some(_) to singlefile, overriding the env var.
+    let effective_ublock = body.ublock_enabled.unwrap_or(global_ublock);
+    let effective_cookie_ext = body.cookie_ext_enabled.unwrap_or(global_cookie_ext);
+    let capture_config = capture::CaptureConfig {
+        cookie_rules,
+        ublock_enabled: Some(effective_ublock),
+        cookie_ext_enabled: Some(effective_cookie_ext),
+        reader_mode: body.reader_mode.unwrap_or(false),
+    };
 
     // Spawn background capture.
     let locator = body.locator.trim().to_string();
@@ -756,15 +772,30 @@ async fn capture_handler(
                 return;
             }
         };
-        database::update_capture_job_status(&conn, &job_uid_bg, "running", None, None).ok();
+        database::update_capture_job_status(&conn, &job_uid_bg, "running", None, None, None).ok();
         match capture::perform_capture(&archive_paths, &locator, Some(&archive_id_bg), quality.as_deref(), &capture_config) {
             Ok(result) => {
+                let mut notes_map = serde_json::Map::new();
+                if result.ublock_skipped {
+                    notes_map.insert("ublock_skipped".into(), serde_json::Value::Bool(true));
+                }
+                if result.cookie_ext_skipped {
+                    notes_map.insert("cookie_ext_skipped".into(), serde_json::Value::Bool(true));
+                }
+                let notes_str;
+                let notes: Option<&str> = if notes_map.is_empty() {
+                    None
+                } else {
+                    notes_str = serde_json::Value::Object(notes_map).to_string();
+                    Some(&notes_str)
+                };
                 database::update_capture_job_status(
                     &conn,
                     &job_uid_bg,
                     "completed",
                     Some(&result.run_uid),
                     None,
+                    notes,
                 )
                 .ok();
             }
@@ -775,6 +806,7 @@ async fn capture_handler(
                     "failed",
                     None,
                     Some(&format!("{e:#}")),
+                    None,
                 )
                 .ok();
             }
@@ -1013,10 +1045,26 @@ async fn patch_me(
 async fn get_instance_settings_handler(
     State(state): State<AppState>,
     auth_user: AuthUser,
-) -> Result<Json<database::InstanceSettings>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     auth_user.require_role(ROLE_ADMIN)?;
     let conn = database::open_auth_db(&state.auth_db_path)?;
-    Ok(Json(database::get_instance_settings(&conn)?))
+    let settings = database::get_instance_settings(&conn)?;
+    let ublock_ext_available = std::env::var("ARCHIVR_UBLOCK_EXT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|p| std::path::Path::new(&p).is_dir())
+        .unwrap_or(false);
+    let cookie_ext_available = std::env::var("ARCHIVR_COOKIE_EXT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|p| std::path::Path::new(&p).is_dir())
+        .unwrap_or(false);
+    let mut val = serde_json::to_value(&settings).unwrap_or_default();
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("ublock_ext_available".into(), serde_json::Value::Bool(ublock_ext_available));
+        obj.insert("cookie_ext_available".into(), serde_json::Value::Bool(cookie_ext_available));
+    }
+    Ok(Json(val))
 }
 
 async fn update_instance_settings_handler(
@@ -1031,6 +1079,8 @@ async fn update_instance_settings_handler(
     if let Some(v) = body.public_entry_content_enabled { settings.public_entry_content_enabled = v; }
     if let Some(v) = body.open_registration_enabled { settings.open_registration_enabled = v; }
     if let Some(v) = body.default_entry_visibility { settings.default_entry_visibility = v; }
+    if let Some(v) = body.ublock_enabled { settings.ublock_enabled = v; }
+    if let Some(v) = body.cookie_ext_enabled { settings.cookie_ext_enabled = v; }
     database::update_instance_settings(&conn, &settings)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1360,6 +1410,8 @@ struct UpdateInstanceSettingsBody {
     public_entry_content_enabled: Option<bool>,
     open_registration_enabled: Option<bool>,
     default_entry_visibility: Option<u32>,
+    ublock_enabled: Option<bool>,
+    cookie_ext_enabled: Option<bool>,
 }
 
 async fn admin_list_users(

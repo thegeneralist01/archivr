@@ -105,6 +105,7 @@ pub struct CaptureJobRecord {
     pub run_uid: Option<String>,
     pub status: String,
     pub error_text: Option<String>,
+    pub notes_json: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -136,6 +137,11 @@ pub struct InstanceSettings {
     pub public_entry_content_enabled: bool,
     pub open_registration_enabled: bool,  // maps to public_archive_submission_enabled column
     pub default_entry_visibility: u32,
+    /// Global default for ad-blocking via uBlock Origin Lite during WebPage captures.
+    /// Per-capture requests can override this.
+    pub ublock_enabled: bool,
+    /// Global default for cookie-consent banner dismissal via extension during WebPage captures.
+    pub cookie_ext_enabled: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -194,7 +200,8 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             id INTEGER PRIMARY KEY CHECK (id = 1),
             public_index_enabled INTEGER NOT NULL DEFAULT 0 CHECK (public_index_enabled IN (0, 1)),
             public_entry_content_enabled INTEGER NOT NULL DEFAULT 0 CHECK (public_entry_content_enabled IN (0, 1)),
-            public_archive_submission_enabled INTEGER NOT NULL DEFAULT 0 CHECK (public_archive_submission_enabled IN (0, 1))
+            public_archive_submission_enabled INTEGER NOT NULL DEFAULT 0 CHECK (public_archive_submission_enabled IN (0, 1)),
+            cookie_ext_enabled INTEGER NOT NULL DEFAULT 1 CHECK (cookie_ext_enabled IN (0, 1))
         );
 
         INSERT OR IGNORE INTO instance_settings (
@@ -308,6 +315,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             run_uid     TEXT,
             status      TEXT NOT NULL CHECK (status IN ('pending','running','completed','failed')) DEFAULT 'pending',
             error_text  TEXT,
+            notes_json  TEXT,
             created_at  TEXT NOT NULL,
             updated_at  TEXT NOT NULL
         );
@@ -393,6 +401,10 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Migration: add notes_json column to existing capture_jobs tables.
+    // Silently ignored when the column already exists (idempotent).
+    let _ = conn.execute("ALTER TABLE capture_jobs ADD COLUMN notes_json TEXT", []);
+
     Ok(())
 }
 
@@ -454,7 +466,9 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
             public_index_enabled               INTEGER NOT NULL DEFAULT 0 CHECK (public_index_enabled IN (0, 1)),
             public_entry_content_enabled       INTEGER NOT NULL DEFAULT 0 CHECK (public_entry_content_enabled IN (0, 1)),
             public_archive_submission_enabled  INTEGER NOT NULL DEFAULT 0 CHECK (public_archive_submission_enabled IN (0, 1)),
-            default_entry_visibility           INTEGER NOT NULL DEFAULT 2
+            default_entry_visibility           INTEGER NOT NULL DEFAULT 2,
+            ublock_enabled                     INTEGER NOT NULL DEFAULT 1 CHECK (ublock_enabled IN (0, 1)),
+            cookie_ext_enabled                 INTEGER NOT NULL DEFAULT 1 CHECK (cookie_ext_enabled IN (0, 1))
         );
 
         INSERT OR IGNORE INTO instance_settings
@@ -491,6 +505,17 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
     // Add humanize_slugs column to users if not present (idempotent migration)
     let _ = conn.execute(
         "ALTER TABLE users ADD COLUMN humanize_slugs INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+
+    // Add ublock_enabled column to instance_settings if not present (idempotent migration)
+    let _ = conn.execute(
+        "ALTER TABLE instance_settings ADD COLUMN ublock_enabled INTEGER NOT NULL DEFAULT 1",
+        [],
+    );
+    // Add cookie_ext_enabled column to instance_settings if not present (idempotent migration)
+    let _ = conn.execute(
+        "ALTER TABLE instance_settings ADD COLUMN cookie_ext_enabled INTEGER NOT NULL DEFAULT 1",
         [],
     );
 
@@ -718,7 +743,9 @@ pub fn list_user_tokens(conn: &Connection, user_id: i64) -> Result<Vec<ApiTokenR
 pub fn get_instance_settings(conn: &Connection) -> Result<InstanceSettings> {
     conn.query_row(
         "SELECT public_index_enabled, public_entry_content_enabled,
-                public_archive_submission_enabled, default_entry_visibility
+                public_archive_submission_enabled, default_entry_visibility,
+                COALESCE(ublock_enabled, 1),
+                COALESCE(cookie_ext_enabled, 1)
          FROM instance_settings WHERE id = 1",
         [],
         |row| {
@@ -727,6 +754,8 @@ pub fn get_instance_settings(conn: &Connection) -> Result<InstanceSettings> {
                 public_entry_content_enabled: row.get::<_, i64>(1)? != 0,
                 open_registration_enabled: row.get::<_, i64>(2)? != 0,
                 default_entry_visibility: row.get::<_, i64>(3)? as u32,
+                ublock_enabled: row.get::<_, i64>(4)? != 0,
+                cookie_ext_enabled: row.get::<_, i64>(5)? != 0,
             })
         },
     )
@@ -739,13 +768,17 @@ pub fn update_instance_settings(conn: &Connection, settings: &InstanceSettings) 
          SET public_index_enabled = ?1,
              public_entry_content_enabled = ?2,
              public_archive_submission_enabled = ?3,
-             default_entry_visibility = ?4
+             default_entry_visibility = ?4,
+             ublock_enabled = ?5,
+             cookie_ext_enabled = ?6
          WHERE id = 1",
         params![
             settings.public_index_enabled as i64,
             settings.public_entry_content_enabled as i64,
             settings.open_registration_enabled as i64,
             settings.default_entry_visibility as i64,
+            settings.ublock_enabled as i64,
+            settings.cookie_ext_enabled as i64,
         ],
     )?;
     Ok(())
@@ -1142,19 +1175,21 @@ pub fn create_capture_job(conn: &Connection, archive_id: &str) -> Result<String>
     Ok(job_uid)
 }
 
-/// Updates the status (and optionally run_uid / error_text) of a capture job.
+/// Updates the status (and optionally run_uid / error_text / notes_json) of a capture job.
 pub fn update_capture_job_status(
     conn: &Connection,
     job_uid: &str,
     status: &str,
     run_uid: Option<&str>,
     error_text: Option<&str>,
+    notes_json: Option<&str>,
 ) -> Result<()> {
     let now = now_timestamp();
     conn.execute(
         "UPDATE capture_jobs SET status = ?1, run_uid = COALESCE(?2, run_uid),
-         error_text = ?3, updated_at = ?4 WHERE job_uid = ?5",
-        rusqlite::params![status, run_uid, error_text, now, job_uid],
+         error_text = ?3, notes_json = COALESCE(?4, notes_json), updated_at = ?5
+         WHERE job_uid = ?6",
+        rusqlite::params![status, run_uid, error_text, notes_json, now, job_uid],
     )?;
     Ok(())
 }
@@ -1162,7 +1197,7 @@ pub fn update_capture_job_status(
 /// Returns a capture job by uid.
 pub fn get_capture_job(conn: &Connection, job_uid: &str) -> Result<Option<CaptureJobRecord>> {
     conn.query_row(
-        "SELECT job_uid, archive_id, run_uid, status, error_text, created_at, updated_at
+        "SELECT job_uid, archive_id, run_uid, status, error_text, notes_json, created_at, updated_at
          FROM capture_jobs WHERE job_uid = ?1",
         [job_uid],
         |row| {
@@ -1172,8 +1207,9 @@ pub fn get_capture_job(conn: &Connection, job_uid: &str) -> Result<Option<Captur
                 run_uid: row.get(2)?,
                 status: row.get(3)?,
                 error_text: row.get(4)?,
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
+                notes_json: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
             })
         },
     )
@@ -2806,8 +2842,8 @@ mod tests {
     fn capture_job_status_transitions() {
         let conn = conn();
         let job_uid = create_capture_job(&conn, "test").unwrap();
-        update_capture_job_status(&conn, &job_uid, "running", None, None).unwrap();
-        update_capture_job_status(&conn, &job_uid, "completed", Some("run_abc"), None).unwrap();
+        update_capture_job_status(&conn, &job_uid, "running", None, None, None).unwrap();
+        update_capture_job_status(&conn, &job_uid, "completed", Some("run_abc"), None, None).unwrap();
         let job = get_capture_job(&conn, &job_uid).unwrap().unwrap();
         assert_eq!(job.status, "completed");
         assert_eq!(job.run_uid.as_deref(), Some("run_abc"));
@@ -2819,7 +2855,7 @@ mod tests {
 
         // Simulate an in-progress capture_job (run_uid still NULL — common crash case).
         let uid = create_capture_job(&conn, "test").unwrap();
-        update_capture_job_status(&conn, &uid, "running", None, None).unwrap();
+        update_capture_job_status(&conn, &uid, "running", None, None, None).unwrap();
 
         // Simulate an in-progress archive_run and item with no associated capture_job
         // (covers the case where run_uid was never written back before the crash).
@@ -3177,7 +3213,7 @@ mod tests {
     fn has_active_capture_jobs_true_for_running() {
         let conn = conn();
         let uid = create_capture_job(&conn, "test").unwrap();
-        update_capture_job_status(&conn, &uid, "running", None, None).unwrap();
+        update_capture_job_status(&conn, &uid, "running", None, None, None).unwrap();
         assert!(has_active_capture_jobs(&conn).unwrap());
     }
 
@@ -3185,7 +3221,7 @@ mod tests {
     fn has_active_capture_jobs_false_for_completed() {
         let conn = conn();
         let uid = create_capture_job(&conn, "test").unwrap();
-        update_capture_job_status(&conn, &uid, "completed", Some("run_x"), None).unwrap();
+        update_capture_job_status(&conn, &uid, "completed", Some("run_x"), None, None).unwrap();
         assert!(!has_active_capture_jobs(&conn).unwrap());
     }
 
