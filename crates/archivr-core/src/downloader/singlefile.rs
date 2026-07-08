@@ -263,18 +263,38 @@ fn save_with(
 
     // Mandatory user script: strips <script> elements before SingleFile
     // serialises so JS-applied CSS is captured without broken module imports.
+    // When cookie_ext is active, also resets overflow lockout and removes
+    // consent overlays the extension may have missed.
     let strip_scripts_path = temp_dir.join("sf-strip-scripts.js");
-    std::fs::write(
-        &strip_scripts_path,
+    let mut strip_scripts = String::from(
         // Dispatch single-file-user-script-init so single-file installs
         // _singleFile_waitForUserScript, which gates the -request hooks.
         "dispatchEvent(new CustomEvent('single-file-user-script-init'));\
          addEventListener('single-file-on-before-capture-request',()=>{\
            document.querySelectorAll('script:not([type=\"application/ld+json\"])')\
-           .forEach(el=>el.remove());\
-         });",
-    )
-    .context("failed to write single-file user script")?;
+           .forEach(el=>el.remove());",
+    );
+    if cookie_ext.is_some() {
+        // Reset overflow:hidden that consent modals inject on body/html.
+        // Gate on cookie_ext so we never mutate pages where the feature is off.
+        strip_scripts.push_str(
+            "document.body&&(document.body.style.overflow='');\
+             document.documentElement&&(document.documentElement.style.overflow='');\
+             /* Remove consent overlays the extension may have missed          \
+              * (e.g. Google Funding Choices, Quantcast, Sourcepoint).        \
+              * Selectors are specific to consent infrastructure, not content. */\
+             document.querySelectorAll(\
+               '.fc-consent-root,.fc-dialog-overlay,.fc-dialog,\
+                .qc-cmp2-container,.qc-cmp2-ui,\
+                .sp-message-container,\
+                #sp-cc,\
+                #usercentrics-root'\
+             ).forEach(function(el){el.remove();});",
+        );
+    }
+    strip_scripts.push_str("});");
+    std::fs::write(&strip_scripts_path, &strip_scripts)
+        .context("failed to write single-file user script")?;
 
     // Optional reader-mode script: Readability.js + wrapper combined into one
     // file so both run in the same execution scope.  (Separate --browser-script
