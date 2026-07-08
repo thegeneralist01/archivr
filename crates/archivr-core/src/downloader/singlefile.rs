@@ -292,6 +292,27 @@ fn save_with(
              ).forEach(function(el){el.remove();});",
         );
     }
+    if ublock_ext.is_some() {
+        // uBlock blocks ad network requests but first-party ad placeholder
+        // elements (ins.adsbygoogle, iframe hosts) retain their computed
+        // height, leaving blank space. Remove them pre-capture.
+        strip_scripts.push_str(
+            "document.querySelectorAll(\
+               'ins.adsbygoogle,\
+                [id^=\"aswift_\"],\
+                iframe[id^=\"google_ads_\"],\
+                iframe[name^=\"google_ads_frame\"],\
+                iframe[src*=\"googlesyndication\"],\
+                iframe[src*=\"doubleclick\"]'\
+             ).forEach(function(el){\
+               var p=el.parentElement;\
+               el.remove();\
+               /* collapse parent if it's now empty and was ad-only */\
+               if(p&&!p.textContent.trim()&&p.children.length===0)\
+                 p.style.display='none';\
+             });",
+        );
+    }
     strip_scripts.push_str("});");
     std::fs::write(&strip_scripts_path, &strip_scripts)
         .context("failed to write single-file user script")?;
