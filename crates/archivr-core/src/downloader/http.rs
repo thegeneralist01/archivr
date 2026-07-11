@@ -20,7 +20,7 @@ pub enum UrlKind {
 pub fn probe_url_kind(url: &str, cookies: &HashMap<String, String>) -> Result<UrlKind> {
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
-        .user_agent("archivr/0.1")
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 archivr/0.1")
         .build()
         .context("failed to build HTTP client")?;
 
@@ -86,7 +86,7 @@ pub fn probe_url_kind(url: &str, cookies: &HashMap<String, String>) -> Result<Ur
 pub fn download(url: &str, store_path: &Path, timestamp: &str, cookies: &HashMap<String, String>) -> Result<(String, String, Option<String>)> {
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
-        .user_agent("archivr/0.1")
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 archivr/0.1")
         .build()
         .context("failed to build HTTP client")?;
 
