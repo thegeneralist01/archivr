@@ -371,6 +371,18 @@ export async function deleteOrphanBlobs(archiveId) {
   return res.json()
 }
 
+// ── Re-archive ────────────────────────────────────────────────────────────────
+export async function rearchiveEntry(archiveId, entryUid) {
+  const res = await fetch(`/api/archives/${archiveId}/entries/${entryUid}/rearchive`, {
+    method: 'POST',
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.message || `rearchive failed: ${res.status}`)
+  }
+  return res.json() // { job_uid, status: 'pending' }
+}
+
 // ── Cookie rules ──────────────────────────────────────────────────────────────
 
 export async function listCookieRules() {

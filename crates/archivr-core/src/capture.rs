@@ -742,6 +742,52 @@ fn tweet_metadata_from_json(json_str: &str) -> PlatformMetadata {
     }
 }
 
+/// Registers all tweet JSON files and their media blobs as entry_artifacts.
+/// Called by both record_tweet_entry (new captures) and perform_rearchive (re-captures).
+/// `tweet_json_relpaths`: store-relative paths like `"raw_tweets/tweet-123.json"`.
+fn register_tweet_artifacts(
+    conn: &rusqlite::Connection,
+    store_path: &Path,
+    entry_id: i64,
+    tweet_json_relpaths: &[String],
+) -> Result<()> {
+    for relpath in tweet_json_relpaths {
+        database::add_entry_artifact(
+            conn,
+            &database::NewArtifact {
+                entry_id,
+                artifact_role: "raw_tweet_json".to_string(),
+                storage_area: "raw_tweets".to_string(),
+                relpath: relpath.clone(),
+                blob_id: None,
+                logical_path: None,
+                metadata_json: None,
+            },
+        )?;
+        let json_path = store_path.join(relpath);
+        let json_str = fs::read_to_string(&json_path)
+            .with_context(|| format!("failed to read tweet JSON for artifact registration: {}", json_path.display()))?;
+        for (role, raw_relpath) in tweet_raw_artifacts(&json_str)? {
+            let raw_path = PathBuf::from(&raw_relpath);
+            let blob = blob_record_for_raw_relpath(store_path, &raw_path)?;
+            let blob_id = database::upsert_blob(conn, &blob)?;
+            database::add_entry_artifact(
+                conn,
+                &database::NewArtifact {
+                    entry_id,
+                    artifact_role: role,
+                    storage_area: "raw".to_string(),
+                    relpath: raw_relpath,
+                    blob_id: Some(blob_id),
+                    logical_path: None,
+                    metadata_json: None,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn record_tweet_entry(
     conn: &rusqlite::Connection,
     store_path: &Path,
@@ -751,6 +797,7 @@ fn record_tweet_entry(
     requested_locator: &str,
     source: Source,
     tweet_id: &str,
+    tweet_json_relpaths: &[String],
 ) -> Result<database::ArchivedEntry> {
     debug_assert!(run.run_uid.starts_with("run_"));
     debug_assert!(item.item_uid.starts_with("item_"));
@@ -764,7 +811,7 @@ fn record_tweet_entry(
         Some(&canonical_locator),
         &canonical_locator,
     )?;
-    // Read tweet JSON early to extract title before entry creation
+    // Read the primary tweet JSON to extract title before entry creation.
     let tweet_json_relpath = PathBuf::from("raw_tweets").join(format!("tweet-{tweet_id}.json"));
     let tweet_json = fs::read_to_string(store_path.join(&tweet_json_relpath))?;
     let tweet_meta = tweet_metadata_from_json(&tweet_json);
@@ -794,36 +841,8 @@ fn record_tweet_entry(
     )?;
     create_structured_root(store_path, &entry)?;
 
-    database::add_entry_artifact(
-        conn,
-        &database::NewArtifact {
-            entry_id: entry.id,
-            artifact_role: "raw_tweet_json".to_string(),
-            storage_area: "raw_tweets".to_string(),
-            relpath: path_to_store_string(&tweet_json_relpath),
-            blob_id: None,
-            logical_path: None,
-            metadata_json: None,
-        },
-    )?;
-
-    for (role, raw_relpath) in tweet_raw_artifacts(&tweet_json)? {
-        let raw_path = PathBuf::from(&raw_relpath);
-        let blob = blob_record_for_raw_relpath(store_path, &raw_path)?;
-        let blob_id = database::upsert_blob(conn, &blob)?;
-        database::add_entry_artifact(
-            conn,
-            &database::NewArtifact {
-                entry_id: entry.id,
-                artifact_role: role,
-                storage_area: "raw".to_string(),
-                relpath: raw_relpath,
-                blob_id: Some(blob_id),
-                logical_path: None,
-                metadata_json: None,
-            },
-        )?;
-    }
+    // Register all tweet JSONs and their blobs.
+    register_tweet_artifacts(conn, store_path, entry.id, tweet_json_relpaths)?;
 
     database::complete_archive_run_item(conn, item.id, entry.id)?;
     Ok(entry)
@@ -1184,7 +1203,7 @@ pub fn perform_capture(
             &timestamp,
             &tweet_cookies,
         ) {
-            Ok(_) => {
+            Ok(tweet_json_relpaths) => {
                 let tweet_entry = record_tweet_entry(
                     &conn,
                     store_path,
@@ -1194,6 +1213,7 @@ pub fn perform_capture(
                     locator,
                     source,
                     &tweet_id,
+                    &tweet_json_relpaths,
                 )?;
                 database::refresh_entry_cached_bytes(&conn, tweet_entry.id)?;
                 database::finish_archive_run(&conn, run.id)?;
@@ -1359,6 +1379,107 @@ pub fn perform_capture(
         status: "completed".to_string(),
         ublock_skipped: false,
         cookie_ext_skipped: false,
+    })
+}
+
+/// Result of a tweet re-archive operation.
+#[derive(Debug, serde::Serialize)]
+pub struct RearchiveResult {
+    /// One of: "completed", "not_a_tweet", "scraper_failed".
+    pub status: String,
+    /// Human-readable detail (empty string for "completed").
+    pub message: String,
+}
+
+/// Re-archives an existing tweet or tweet_thread entry in-place.
+///
+/// - Looks up the entry by `entry_uid`; returns `not_a_tweet` if not found or wrong kind.
+/// - Runs the scraper against the original `requested_locator`; if it fails (tweet deleted/private),
+///   returns `scraper_failed` WITHOUT touching the existing data.
+/// - On success: atomically deletes old entry_artifacts and re-registers all produced tweet JSONs
+///   and their media blobs. Does not change archived_at, title, tags, or collections.
+pub fn perform_rearchive(
+    archive_paths: &ArchivePaths,
+    entry_uid: &str,
+    config: &CaptureConfig,
+) -> Result<RearchiveResult> {
+    let store_path = &archive_paths.store_path;
+    let mut conn = database::open_or_initialize(&archive_paths.archive_path)?;
+
+    // Look up the entry.
+    let entry = match database::get_entry_for_rearchive(&conn, entry_uid)? {
+        None => {
+            return Ok(RearchiveResult {
+                status: "not_a_tweet".to_string(),
+                message: "entry not found".to_string(),
+            });
+        }
+        Some(e) => e,
+    };
+
+    // Only tweet / tweet_thread entries can be re-archived this way.
+    if entry.entity_kind != "tweet" && entry.entity_kind != "tweet_thread" {
+        return Ok(RearchiveResult {
+            status: "not_a_tweet".to_string(),
+            message: format!("entry is '{}', not a tweet", entry.entity_kind),
+        });
+    }
+
+    // Parse source_metadata_json for tweet_id and requested_locator.
+    let meta: serde_json::Value = serde_json::from_str(&entry.source_metadata_json)
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+    let requested_locator = meta["requested_locator"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let tweet_id = meta["tweet_id"].as_str().unwrap_or("").to_string();
+    if requested_locator.is_empty() || tweet_id.is_empty() {
+        return Ok(RearchiveResult {
+            status: "not_a_tweet".to_string(),
+            message: "entry source_metadata_json missing tweet_id or requested_locator".to_string(),
+        });
+    }
+
+    let is_thread = entry.entity_kind == "tweet_thread";
+    let timestamp = format!(
+        "{}-{}",
+        chrono::Local::now().format("%Y-%m-%dT%H-%M-%S%.3f"),
+        uuid::Uuid::new_v4().simple(),
+    );
+    let tweet_cookies = resolve_cookies_for_url(&config.cookie_rules, "https://x.com/");
+
+    // Run the scraper (staged). If this fails, existing data is untouched.
+    let tweet_json_relpaths = match downloader::tweets::rearchive(
+        &requested_locator,
+        is_thread,
+        store_path,
+        &timestamp,
+        &tweet_cookies,
+    ) {
+        Ok(relpaths) => relpaths,
+        Err(e) => {
+            return Ok(RearchiveResult {
+                status: "scraper_failed".to_string(),
+                message: format!("{e:#}"),
+            });
+        }
+    };
+
+    // Atomically swap artifact rows: delete old, insert new.
+    {
+        let tx = conn.transaction()?;
+        database::delete_entry_artifacts(&tx, entry.id)?;
+        register_tweet_artifacts(&tx, store_path, entry.id, &tweet_json_relpaths)?;
+        tx.commit()?;
+    }
+
+    database::refresh_entry_cached_bytes(&conn, entry.id)?;
+
+    eprintln!("info: rearchived entry {entry_uid}: {} tweet JSONs", tweet_json_relpaths.len());
+
+    Ok(RearchiveResult {
+        status: "completed".to_string(),
+        message: String::new(),
     })
 }
 
@@ -1988,6 +2109,7 @@ mod tests {
             "tweet:123",
             Source::Tweet,
             "123",
+            &["raw_tweets/tweet-123.json".to_string()],
         )
         .unwrap();
         database::finish_archive_run(&conn, run.id).unwrap();
