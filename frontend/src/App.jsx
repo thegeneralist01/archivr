@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, createContext } from 'react'
-import { fetchArchives, fetchEntries, searchEntries, fetchRuns, fetchTags, checkSetup, fetchMe } from './api'
+import { fetchArchives, fetchEntries, searchEntries, fetchRuns, fetchTags, checkSetup, fetchMe, fetchEntryDetail } from './api'
 import LoginPage from './components/LoginPage.jsx'
 import SetupPage from './components/SetupPage.jsx'
 
@@ -12,6 +12,8 @@ import TagsView from './components/TagsView'
 import CollectionsView from './components/CollectionsView'
 import SettingsView from './components/SettingsView'
 import ContextRail from './components/ContextRail'
+import PreviewPanel from './components/PreviewPanel'
+import AudioBar from './components/AudioBar'
 import { displayPath } from './utils'
 import ToastStack from './components/ToastStack'
 
@@ -89,7 +91,25 @@ export default function App() {
     () => sessionStorage.getItem('ublockWarningIgnored') === 'true'
   )
 
+
+  // ── Entry detail (shared between PreviewPanel and ContextRail) ──────────
+  const [entryDetail, setEntryDetail] = useState(null)
+  const detailSeqRef = useRef(0)
+
+  // ── Persistent audio bar state ───────────────────────────────────────────
+  const [currentAudio, setCurrentAudio] = useState(null) // { entry, src, archiveId }
   const humanizeTags = currentUser?.humanize_slugs ?? false;
+
+  // Fetch entry detail whenever selected entry changes
+  useEffect(() => {
+    const seq = ++detailSeqRef.current
+    setEntryDetail(null)
+    if (!selectedEntry || !archiveId) return
+    fetchEntryDetail(archiveId, selectedEntry.entry_uid).then(det => {
+      if (seq !== detailSeqRef.current) return
+      setEntryDetail(det)
+    }).catch(() => {})
+  }, [selectedEntry, archiveId])
 
   // Persist captureDialogOpen to sessionStorage
   useEffect(() => {
@@ -217,7 +237,21 @@ export default function App() {
     setSelectedEntry(prev =>
       prev && prev.entry_uid === entryUid ? { ...prev, title: newTitle } : prev
     )
+    setEntryDetail(prev =>
+      prev && prev.summary.entry_uid === entryUid
+        ? { ...prev, summary: { ...prev.summary, title: newTitle } }
+        : prev
+    )
   }, [])
+
+  const handleDetailRefresh = useCallback(() => {
+    if (!archiveId || !selectedEntry) return
+    const seq = ++detailSeqRef.current
+    fetchEntryDetail(archiveId, selectedEntry.entry_uid).then(det => {
+      if (seq !== detailSeqRef.current) return
+      setEntryDetail(det)
+    }).catch(() => {})
+  }, [archiveId, selectedEntry])
 
   const handleEntryDeleted = useCallback((entryUid) => {
     setEntries(prev => prev.filter(e => e.entry_uid !== entryUid))
@@ -259,6 +293,27 @@ export default function App() {
     setToasts(prev => prev.filter(t => !(t.type === 'warning' && t.locator)))
   }, [])
 
+  const handleSetAudio = useCallback(({ entry, src, archiveId: aid }) => {
+    setCurrentAudio({ entry, src, archiveId: aid })
+  }, [])
+
+  const handleCloseAudio = useCallback(() => {
+    setCurrentAudio(null)
+  }, [])
+
+  // Compute whether the selected entry has a previewable artifact
+  const VIDEO_EXTS = new Set(['mp4','webm','mov','mkv','avi','m4v','ogv'])
+  const AUDIO_EXTS = new Set(['mp3','ogg','m4a','opus','wav','flac','aac'])
+  const PREVIEW_EXTS = new Set([...VIDEO_EXTS, ...AUDIO_EXTS, 'pdf','html','htm','jpg','jpeg','png','gif','webp','avif','svg','bmp'])
+  const hasPreview = view === 'archive' && selectedEntry && (() => {
+    if (selectedEntry.entity_kind === 'tweet' || selectedEntry.entity_kind === 'tweet_thread') return true
+    if (!entryDetail) return false
+    const pm = entryDetail.artifacts.find(a => a.artifact_role === 'primary_media')
+    if (!pm) return false
+    const ext = pm.relpath.split('.').pop().toLowerCase()
+    return PREVIEW_EXTS.has(ext)
+  })()
+
   if (authState === 'loading') return <div className="auth-loading">Loading\u2026</div>;
   if (authState === 'setup')   return <SetupPage onComplete={() => setAuthState('login')} />;
   if (authState === 'login')   return <LoginPage onLogin={user => { setCurrentUser(user); setAuthState('authenticated'); }} />;
@@ -274,7 +329,7 @@ export default function App() {
           onViewChange={handleViewChange}
           onCaptureClick={handleCaptureClick}
         />
-        <main className="app-shell">
+        <main className={`app-shell${hasPreview ? ' has-preview' : ''}${currentAudio ? ' audio-playing' : ''}`}>
           <div className="workspace">
             {view === 'archive' && (
               <div className="toolbar">
@@ -341,17 +396,37 @@ export default function App() {
               <SettingsView tab={settingsTab} onTabChange={setSettingsTab} archiveId={archiveId} />
             )}
           </div>
+          {hasPreview && (
+            <div className="preview-pane">
+              <PreviewPanel
+                archiveId={archiveId}
+                entry={selectedEntry}
+                detail={entryDetail}
+                onSetAudio={handleSetAudio}
+              />
+            </div>
+          )}
           <ContextRail
             archiveId={archiveId}
             selectedEntry={selectedEntry}
+            detail={entryDetail}
             onTagFilterSet={handleTagFilterSet}
             tagNodes={tagNodes}
             onTagsRefresh={handleTagsRefresh}
             onEntryTitleChange={handleEntryTitleChange}
             onEntryDeleted={handleEntryDeleted}
             humanizeTags={humanizeTags}
+            onDetailRefresh={handleDetailRefresh}
           />
         </main>
+        {currentAudio && (
+          <AudioBar
+            entry={currentAudio.entry}
+            src={currentAudio.src}
+            archiveId={currentAudio.archiveId}
+            onClose={handleCloseAudio}
+          />
+        )}
         <CaptureDialog
           open={captureDialogOpen}
           archiveId={archiveId}
