@@ -85,6 +85,8 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   const pollIntervals = useRef(new Map())
   // itemId → debounce timeoutId for probe calls
   const probeTimers = useRef(new Map())
+  // batchId → { total, archived, warnings, failed }; only populated for multi-URL submits
+  const batchRef = useRef(new Map())
   // stable ref so probe callbacks always see the current archiveId
   const archiveIdRef = useRef(archiveId)
   useEffect(() => { archiveIdRef.current = archiveId }, [archiveId])
@@ -194,7 +196,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     }
   }, [])
 
-  function startPolling(itemId, jobUid, locator, aid) {
+  function startPolling(itemId, jobUid, locator, aid, batchId = null) {
     if (pollIntervals.current.has(jobUid)) return // already polling
     const intervalId = setInterval(async () => {
       try {
@@ -202,7 +204,6 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
         if (updated.status === 'completed') {
           clearInterval(pollIntervals.current.get(jobUid))
           pollIntervals.current.delete(jobUid)
-          // Show ✓ briefly then remove the row; if last row add a fresh one
           setItems(prev => prev.map(it => it.id === itemId ? { ...it, status: 'completed' } : it))
           setTimeout(() => {
             setItems(prev => {
@@ -211,13 +212,25 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
             })
           }, 1400)
           onCapturedRef.current()
-          // Warn if uBlock was requested but the extension wasn't available
           try {
             const notes = updated.notes_json ? JSON.parse(updated.notes_json) : null
             if (notes?.ublock_skipped || notes?.cookie_ext_skipped) {
-              onToastRef.current(null, locator, 'warning')
+              const both = notes.ublock_skipped && notes.cookie_ext_skipped
+              const msg = both
+                ? 'Captured without ad-blocking or cookie-consent extension. Check ARCHIVR_UBLOCK_EXT and ARCHIVR_COOKIE_EXT in your server config.'
+                : notes.ublock_skipped
+                  ? 'Captured without ad-blocking. ARCHIVR_UBLOCK=true but ARCHIVR_UBLOCK_EXT is not set or the path is invalid.'
+                  : 'Captured without cookie-consent extension. ARCHIVR_COOKIE_EXT is not set or the path is invalid.'
+              onToastRef.current(msg, locator, 'warning')
+              settleBatch(batchId, 'warning', locator)
+            } else {
+              if (!batchId) onToastRef.current(null, locator, 'success')
+              settleBatch(batchId, 'archived')
             }
-          } catch {}
+          } catch {
+            if (!batchId) onToastRef.current(null, locator, 'success')
+            settleBatch(batchId, 'archived')
+          }
         } else if (updated.status === 'failed') {
           clearInterval(pollIntervals.current.get(jobUid))
           pollIntervals.current.delete(jobUid)
@@ -226,6 +239,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
             it.id === itemId ? { ...it, status: 'failed', error: errText } : it
           ))
           onToastRef.current(errText, locator)
+          settleBatch(batchId, 'failed', locator)
         }
         // 'pending' / 'running': keep polling
       } catch (e) {
@@ -236,14 +250,51 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
           it.id === itemId ? { ...it, status: 'failed', error: msg } : it
         ))
         onToastRef.current(msg, locator)
+        settleBatch(batchId, 'failed', locator)
       }
     }, 500)
     pollIntervals.current.set(jobUid, intervalId)
   }
 
-  async function submitItem(item) {
+  // Increments the batch counter for the given outcome and emits a summary
+  // toast once all jobs in the batch have settled.
+  // 'warning' counts as archived (succeeded with caveats); locator recorded for detail text.
+  function settleBatch(batchId, outcome, locator = null) {
+    if (!batchId) return
+    const batch = batchRef.current.get(batchId)
+    if (!batch) return
+    if (outcome === 'archived' || outcome === 'warning') {
+      batch.archived++
+      if (outcome === 'warning') { batch.warnings++; if (locator) batch.warningLocators.push(locator) }
+    } else {
+      batch.failed++
+      if (locator) batch.failedLocators.push(locator)
+    }
+    if (batch.archived + batch.failed < batch.total) return
+    // All settled — build headline + detail text, then emit summary and clean up.
+    batchRef.current.delete(batchId)
+    const { archived, warnings, failed, failedLocators, warningLocators } = batch
+    let headline
+    if (archived === 0) {
+      headline = `${failed} failed`
+    } else {
+      const archivedStr = warnings > 0
+        ? `${archived} archived (${warnings} with warnings)`
+        : `${archived} archived`
+      headline = failed > 0 ? `${archivedStr}, ${failed} failed` : archivedStr
+    }
+    const type = archived === 0 ? 'error' : (failed > 0 || warnings > 0) ? 'warning' : 'success'
+    const parts = []
+    if (failedLocators.length > 0) parts.push(`Failed:\n${failedLocators.map(l => `  ${l}`).join('\n')}`)
+    if (warningLocators.length > 0) parts.push(`With warnings:\n${warningLocators.map(l => `  ${l}`).join('\n')}`)
+    const text = parts.length > 0 ? parts.join('\n') : null
+    onToastRef.current(text, null, type, headline)
+  }
+
+
+  async function submitItem(item, batchId = null) {
     if (!item.locator.trim()) return
-    const aid = archiveId // capture at submit time
+    const aid = archiveId
     const loc = item.locator.trim()
     const qual = item.quality || 'best'
     setItems(prev => prev.map(it => it.id === item.id ? { ...it, status: 'submitting', error: null } : it))
@@ -253,17 +304,27 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
       setItems(prev => prev.map(it =>
         it.id === item.id ? { ...it, status: 'running', jobUid: job.job_uid, archiveId: aid } : it
       ))
-      startPolling(item.id, job.job_uid, loc, aid)
+      startPolling(item.id, job.job_uid, loc, aid, batchId)
     } catch (e) {
       const msg = e.message || 'Submission failed.'
       setItems(prev => prev.map(it => it.id === item.id ? { ...it, status: 'failed', error: msg } : it))
       onToastRef.current(msg, loc)
+      settleBatch(batchId, 'failed', loc)
     }
   }
 
+
   function handleArchive() {
     const toSubmit = items.filter(it => it.status === 'idle' && it.locator.trim())
-    toSubmit.forEach(it => submitItem(it))
+    if (toSubmit.length === 0) return
+    const batchId = toSubmit.length > 1
+      ? (crypto.randomUUID?.() ?? `batch-${Date.now()}`)
+      : null
+    if (batchId) {
+      batchRef.current.set(batchId, { total: toSubmit.length, archived: 0, warnings: 0, failed: 0, failedLocators: [], warningLocators: [] })
+    }
+    toSubmit.forEach(it => submitItem(it, batchId))
+    dialogRef.current?.close()
   }
 
   function addRow() {

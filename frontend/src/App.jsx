@@ -241,10 +241,12 @@ export default function App() {
     ])
   }, [archiveId, searchQuery, tagFilter, loadEntries])
 
-  const handleToast = useCallback((text, locator, type = 'error') => {
-    if (type === 'warning' && ublockWarningIgnored) return
+  const handleToast = useCallback((text, locator, type = 'error', headline = null) => {
+    // Only suppress per-item ublock/cookie warnings (those carry a locator).
+    // Batch summary warnings (locator = null) must always show.
+    if (type === 'warning' && ublockWarningIgnored && locator) return
     const id = ++toastIdRef.current
-    setToasts(prev => [...prev, { id, text, locator, type }])
+    setToasts(prev => [...prev, { id, text, locator, type, headline }])
   }, [ublockWarningIgnored])
 
   const handleDismissToast = useCallback((id) => {
@@ -254,7 +256,7 @@ export default function App() {
   const handleIgnoreUblock = useCallback(() => {
     sessionStorage.setItem('ublockWarningIgnored', 'true')
     setUblockWarningIgnored(true)
-    setToasts(prev => prev.filter(t => t.type !== 'warning'))
+    setToasts(prev => prev.filter(t => !(t.type === 'warning' && t.locator)))
   }, [])
 
   if (authState === 'loading') return <div className="auth-loading">Loading\u2026</div>;

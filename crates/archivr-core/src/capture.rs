@@ -900,14 +900,12 @@ pub fn perform_capture(
             Ok(downloader::http::UrlKind::Html) => source = Source::WebPage,
             Ok(downloader::http::UrlKind::File) => {}
             Err(e) => {
-                // Record a failed item using the pre-probe source_kind so
-                // failed_count increments and the item carries error_text.
-                let (probe_sk, probe_ek, _) = source_metadata(Source::Url);
-                let item = database::create_archive_run_item(
-                    &conn, run.id, None, 0, locator, None, probe_sk, probe_ek,
-                )?;
-                let msg = format!("Failed to probe URL: {e}");
-                return Err(fail_run(&conn, &run, &item, &msg));
+                // Probe failed (e.g. Cloudflare JS challenge, 403, network
+                // issue). Fall back to treating the URL as an HTML page so
+                // that the SingleFile/Chromium path can try — a real browser
+                // can pass bot challenges that a plain HTTP client cannot.
+                eprintln!("warn: probe failed for {locator}, assuming HTML: {e}");
+                source = Source::WebPage;
             }
         }
     }
