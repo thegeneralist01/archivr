@@ -20,7 +20,7 @@ const S = {
     border: '1px solid var(--line)',
     borderRadius: '12px',
     overflow: 'hidden',
-    maxWidth: '598px',
+    maxWidth: '560px',
     margin: '0 auto',
     fontFamily: 'var(--sans, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif)',
   },
@@ -28,44 +28,44 @@ const S = {
     border: '1px solid var(--line)',
     borderRadius: '12px',
     overflow: 'hidden',
-    maxWidth: '598px',
+    maxWidth: '560px',
     margin: '0 auto',
     background: 'var(--paper)',
     fontFamily: 'var(--sans, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif)',
   },
   tweetRow: {
     display: 'flex',
-    gap: '12px',
-    padding: '16px',
+    gap: '10px',
+    padding: '10px 12px',
   },
   tweetRowThread: {
     display: 'flex',
-    gap: '12px',
-    padding: '16px 16px 0',
+    gap: '10px',
+    padding: '10px 12px 0',
   },
   leftCol: {
     display: 'flex',
     flexDirection: 'column',
     alignItems: 'center',
     flexShrink: 0,
-    width: '40px',
+    width: '36px',
   },
   rightCol: {
     flex: 1,
     minWidth: 0,
-    paddingBottom: '16px',
+    paddingBottom: '8px',
   },
   avatar: {
-    width: '40px',
-    height: '40px',
+    width: '36px',
+    height: '36px',
     borderRadius: '50%',
     objectFit: 'cover',
     flexShrink: 0,
     display: 'block',
   },
   avatarPh: {
-    width: '40px',
-    height: '40px',
+    width: '36px',
+    height: '36px',
     borderRadius: '50%',
     background: 'var(--line)',
     flexShrink: 0,
@@ -75,7 +75,7 @@ const S = {
     width: '2px',
     background: 'var(--line-soft, var(--line))',
     margin: '4px 0',
-    minHeight: '16px',
+    minHeight: '12px',
     borderRadius: '1px',
   },
   authorRow: {
@@ -83,34 +83,34 @@ const S = {
     alignItems: 'baseline',
     gap: '4px',
     flexWrap: 'wrap',
-    marginBottom: '6px',
+    marginBottom: '4px',
     lineHeight: '1.3',
   },
   authorName: {
     fontWeight: '700',
-    fontSize: '15px',
+    fontSize: '14px',
     color: 'var(--ink)',
   },
   authorHandle: {
-    fontSize: '14px',
+    fontSize: '13px',
     color: 'var(--muted)',
   },
   datePart: {
-    fontSize: '14px',
+    fontSize: '13px',
     color: 'var(--muted)',
   },
   tweetText: {
-    fontSize: '15px',
-    lineHeight: '1.6',
+    fontSize: '14px',
+    lineHeight: '1.5',
     color: 'var(--ink)',
     whiteSpace: 'pre-line',
-    marginBottom: '10px',
+    marginBottom: '8px',
     wordBreak: 'break-word',
   },
   stats: {
     display: 'flex',
-    gap: '16px',
-    fontSize: '14px',
+    gap: '12px',
+    fontSize: '13px',
     color: 'var(--muted)',
   },
   link: {
@@ -118,20 +118,38 @@ const S = {
     textDecoration: 'none',
   },
   loading: {
-    padding: '32px 16px',
+    padding: '24px 16px',
     textAlign: 'center',
     color: 'var(--muted)',
-    fontSize: '15px',
+    fontSize: '14px',
   },
   error: {
-    padding: '32px 16px',
+    padding: '24px 16px',
     textAlign: 'center',
     color: 'var(--alert)',
-    fontSize: '15px',
+    fontSize: '14px',
+  },
+  mediaGrid: {
+    marginBottom: '8px',
+    borderRadius: '10px',
+    overflow: 'hidden',
+    border: '1px solid var(--line)',
+  },
+  mediaImg: {
+    display: 'block',
+    width: '100%',
+    objectFit: 'cover',
+    maxHeight: '260px',
+  },
+  mediaVideo: {
+    display: 'block',
+    width: '100%',
+    maxHeight: '260px',
+    background: '#000',
   },
   // ── Article ──
   article: {
-    maxWidth: '598px',
+    maxWidth: '560px',
     margin: '0 auto',
     border: '1px solid var(--line)',
     borderRadius: '12px',
@@ -143,48 +161,48 @@ const S = {
     width: '100%',
     display: 'block',
     objectFit: 'cover',
-    maxHeight: '420px',
+    maxHeight: '280px',
   },
   aMeta: {
-    padding: '20px 16px 0',
+    padding: '14px 14px 0',
   },
   aTweetTitle: {
-    fontSize: '23px',
+    fontSize: '20px',
     fontWeight: '800',
     letterSpacing: '-0.3px',
     color: 'var(--ink)',
     lineHeight: '1.3',
-    marginBottom: '16px',
+    marginBottom: '10px',
   },
   aAuthorRow: {
     display: 'flex',
     alignItems: 'center',
-    gap: '12px',
-    marginBottom: '16px',
+    gap: '8px',
+    marginBottom: '10px',
   },
   aAvatar: {
-    width: '40px',
-    height: '40px',
+    width: '36px',
+    height: '36px',
     borderRadius: '50%',
     objectFit: 'cover',
     flexShrink: 0,
     display: 'block',
   },
   aAvatarPh: {
-    width: '40px',
-    height: '40px',
+    width: '36px',
+    height: '36px',
     borderRadius: '50%',
     background: 'var(--line)',
     flexShrink: 0,
   },
   aAuthorName: {
-    fontSize: '15px',
+    fontSize: '14px',
     fontWeight: '700',
     color: 'var(--ink)',
     lineHeight: '1.3',
   },
   aAuthorSub: {
-    fontSize: '15px',
+    fontSize: '13px',
     color: 'var(--muted)',
     lineHeight: '1.3',
   },
@@ -194,92 +212,92 @@ const S = {
     margin: '0',
   },
   aBody: {
-    padding: '4px 16px 24px',
+    padding: '4px 14px 16px',
   },
   // ── Article blocks ──
   bH1: {
-    fontSize: '26px',
+    fontSize: '22px',
     fontWeight: '800',
     letterSpacing: '-0.4px',
     color: 'var(--ink)',
     lineHeight: '1.25',
-    margin: '24px 0 10px',
+    margin: '20px 0 8px',
   },
   bH2: {
-    fontSize: '20px',
+    fontSize: '18px',
     fontWeight: '700',
     letterSpacing: '-0.2px',
     color: 'var(--ink)',
     lineHeight: '1.3',
-    margin: '22px 0 8px',
+    margin: '18px 0 6px',
   },
   bP: {
-    fontSize: '17px',
+    fontSize: '15px',
     color: 'var(--ink)',
-    lineHeight: '1.7',
-    marginBottom: '16px',
+    lineHeight: '1.65',
+    marginBottom: '12px',
     marginTop: '0',
   },
   bSpacer: {
-    height: '6px',
+    height: '4px',
     display: 'block',
   },
   bQuote: {
     borderLeft: '3px solid var(--line)',
-    padding: '2px 14px',
-    margin: '14px 0',
+    padding: '2px 12px',
+    margin: '12px 0',
     color: 'var(--muted)',
-    fontSize: '17px',
-    lineHeight: '1.65',
+    fontSize: '15px',
+    lineHeight: '1.6',
   },
   bHr: {
     border: 'none',
     borderTop: '1px solid var(--line)',
-    margin: '28px 0',
+    margin: '20px 0',
   },
   bImg: {
     width: '100%',
     display: 'block',
-    borderRadius: '12px',
-    margin: '16px 0',
+    borderRadius: '8px',
+    margin: '12px 0',
   },
   bUl: {
-    margin: '10px 0 16px',
-    paddingLeft: '28px',
+    margin: '8px 0 12px',
+    paddingLeft: '24px',
   },
   bOl: {
-    margin: '10px 0 16px',
-    paddingLeft: '28px',
+    margin: '8px 0 12px',
+    paddingLeft: '24px',
   },
   bLi: {
-    fontSize: '17px',
+    fontSize: '15px',
     color: 'var(--ink)',
-    lineHeight: '1.65',
-    marginBottom: '6px',
+    lineHeight: '1.6',
+    marginBottom: '4px',
   },
   bTweet: {
     display: 'flex',
     alignItems: 'center',
-    gap: '12px',
+    gap: '10px',
     border: '1px solid var(--line)',
-    borderRadius: '12px',
-    padding: '14px 16px',
-    margin: '14px 0',
+    borderRadius: '10px',
+    padding: '10px 14px',
+    margin: '12px 0',
     color: 'var(--muted)',
-    fontSize: '15px',
+    fontSize: '14px',
     textDecoration: 'none',
   },
   bMdPre: {
     borderRadius: '8px',
-    margin: '12px 0',
+    margin: '10px 0',
     overflow: 'auto',
     background: 'var(--paper-3, var(--field))',
-    padding: '14px 16px',
+    padding: '12px 14px',
   },
   bMdCode: {
     fontFamily: "ui-monospace, 'Cascadia Code', 'Fira Code', Menlo, Consolas, monospace",
-    fontSize: '13px',
-    lineHeight: '1.65',
+    fontSize: '12px',
+    lineHeight: '1.6',
     color: 'var(--ink)',
     background: 'transparent',
     display: 'block',
@@ -288,11 +306,32 @@ const S = {
     fontFamily: "ui-monospace, 'Cascadia Code', Menlo, Consolas, monospace",
     fontSize: '0.875em',
     background: 'var(--paper-3, var(--field))',
-    padding: '2px 6px',
+    padding: '1px 5px',
     borderRadius: '4px',
     color: 'var(--ink)',
   },
 };
+
+// ── Artifact URL helpers ────────────────────────────────────────────────────────
+// Build relpath → artifact API URL map from the artifacts array so archived
+// copies are preferred over CDN URLs (avatars, media, cover images).
+function buildArtifactMap(archiveId, entryUid, artifacts) {
+  const map = {};
+  if (!artifacts) return map;
+  artifacts.forEach((a, idx) => {
+    if (a.relpath) {
+      map[a.relpath] = `/api/archives/${archiveId}/entries/${entryUid}/artifacts/${idx}`;
+    }
+  });
+  return map;
+}
+
+// Return the archived artifact URL if available, otherwise fall back to cdnUrl.
+function resolveUrl(localPath, cdnUrl, artifactMap) {
+  if (localPath && artifactMap[localPath]) return artifactMap[localPath];
+  return cdnUrl || null;
+}
+
 
 // ── SVG X logo ─────────────────────────────────────────────────────────────────
 
@@ -473,7 +512,7 @@ function renderInlineJSX(text, styleRanges, urls, mentions) {
 // ── Article atomic block renderer ──────────────────────────────────────────────
 // Port of renderAtomic() from x-article-renderer.
 
-function renderAtomicJSX(block) {
+function renderAtomicJSX(block, artifactMap) {
   const entities = block.resolved_entities || [];
   if (entities.length === 0) return null;
 
@@ -482,10 +521,10 @@ function renderAtomicJSX(block) {
       case 'divider':
         return <hr key={i} style={S.bHr} />;
 
-      case 'media':
-        return e.url
-          ? <img key={i} src={e.url} style={S.bImg} loading="lazy" alt="" />
-          : null;
+      case 'media': {
+        const src = resolveUrl(e.local_path, e.url, artifactMap);
+        return src ? <img key={i} src={src} style={S.bImg} loading="lazy" alt="" /> : null;
+      }
 
       case 'tweet':
         return e.tweet_id ? (
@@ -538,7 +577,7 @@ function renderAtomicJSX(block) {
 // ── Article single block renderer ──────────────────────────────────────────────
 // Port of renderBlock() from x-article-renderer.
 
-function renderBlockJSX(block, key) {
+function renderBlockJSX(block, key, artifactMap) {
   const type = block.type || '';
   const text = block.text || '';
   const styleRanges = block.inline_style_ranges || [];
@@ -550,7 +589,6 @@ function renderBlockJSX(block, key) {
       return <h1 key={key} style={S.bH1}>{inner}</h1>;
 
     case 'header-two': {
-      // X's editor sometimes stores a tweet URL as the sole content of an H2.
       const m = text.match(/(?:x\.com|twitter\.com)\/i\/status\/(\d+)/);
       if (m) {
         return (
@@ -576,13 +614,12 @@ function renderBlockJSX(block, key) {
     case 'blockquote':
       return <blockquote key={key} style={S.bQuote}>{inner}</blockquote>;
 
-    // List items — the wrapper ul/ol is added by renderBlocksJSX.
     case 'unordered-list-item':
     case 'ordered-list-item':
       return <li key={key} style={S.bLi}>{inner}</li>;
 
     case 'atomic':
-      return <span key={key}>{renderAtomicJSX(block)}</span>;
+      return <span key={key}>{renderAtomicJSX(block, artifactMap)}</span>;
 
     default:
       return text ? <p key={key} style={S.bP}>{inner}</p> : null;
@@ -593,7 +630,7 @@ function renderBlockJSX(block, key) {
 // Port of renderBlocks() from x-article-renderer.
 // Groups consecutive same-type list items into a single ul/ol.
 
-function renderBlocksJSX(blocks) {
+function renderBlocksJSX(blocks, artifactMap) {
   const items = [];
   let i = 0;
 
@@ -604,7 +641,7 @@ function renderBlocksJSX(blocks) {
       const startIdx = i;
       const listItems = [];
       while (i < blocks.length && blocks[i].type === 'unordered-list-item') {
-        listItems.push(renderBlockJSX(blocks[i], i));
+        listItems.push(renderBlockJSX(blocks[i], i, artifactMap));
         i++;
       }
       items.push(<ul key={`ul-${startIdx}`} style={S.bUl}>{listItems}</ul>);
@@ -612,12 +649,12 @@ function renderBlocksJSX(blocks) {
       const startIdx = i;
       const listItems = [];
       while (i < blocks.length && blocks[i].type === 'ordered-list-item') {
-        listItems.push(renderBlockJSX(blocks[i], i));
+        listItems.push(renderBlockJSX(blocks[i], i, artifactMap));
         i++;
       }
       items.push(<ol key={`ol-${startIdx}`} style={S.bOl}>{listItems}</ol>);
     } else {
-      items.push(renderBlockJSX(b, i));
+      items.push(renderBlockJSX(b, i, artifactMap));
       i++;
     }
   }
@@ -627,9 +664,8 @@ function renderBlocksJSX(blocks) {
 
 // ── Article renderer ───────────────────────────────────────────────────────────
 
-function ArticleRenderer({ article, tweetAuthor }) {
+function ArticleRenderer({ article, tweetAuthor, artifactMap }) {
   const cover = article.cover_media || {};
-  // article.author is preferred; fall back to the tweet-level author.
   const author = article.author || tweetAuthor || {};
   const date = article.first_published_at_secs
     ? fmtDate(article.first_published_at_secs)
@@ -637,18 +673,21 @@ function ArticleRenderer({ article, tweetAuthor }) {
   const handlePart = author.screen_name ? `@${author.screen_name}` : '';
   const subLine = [handlePart, date].filter(Boolean).join(' · ');
 
+  const coverSrc = resolveUrl(cover.local_path, cover.url, artifactMap);
+  const avatarSrc = resolveUrl(author.avatar_local_path, author.avatar_url, artifactMap);
+
   return (
     <div style={S.article}>
-      {cover.url && (
-        <img src={cover.url} style={S.aCover} alt="Article cover" />
+      {coverSrc && (
+        <img src={coverSrc} style={S.aCover} alt="Article cover" />
       )}
       <div style={S.aMeta}>
         {article.title && (
           <div style={S.aTweetTitle}>{article.title}</div>
         )}
         <div style={S.aAuthorRow}>
-          {author.avatar_url
-            ? <img src={author.avatar_url} style={S.aAvatar} alt={author.name || ''} />
+          {avatarSrc
+            ? <img src={avatarSrc} style={S.aAvatar} alt={author.name || ''} />
             : <div style={S.aAvatarPh} />
           }
           <div>
@@ -663,7 +702,7 @@ function ArticleRenderer({ article, tweetAuthor }) {
       </div>
       <hr style={S.aDivider} />
       <div style={S.aBody}>
-        {renderBlocksJSX(article.blocks || [])}
+        {renderBlocksJSX(article.blocks || [], artifactMap)}
       </div>
     </div>
   );
@@ -673,27 +712,30 @@ function ArticleRenderer({ article, tweetAuthor }) {
 // Renders one tweet. When isInThread, omits bottom padding from the row and
 // shows a thread connector line below the avatar (except on the last card).
 
-function TweetCard({ tweet, isInThread, isLast }) {
+function TweetCard({ tweet, isInThread, isLast, artifactMap }) {
   const author = tweet.author || {};
   const date = tweet.created_at_secs ? fmtDate(tweet.created_at_secs) : '';
   const entities = tweet.entities || {};
-  const avatarUrl = author.avatar_url;
+  const avatarSrc = resolveUrl(author.avatar_local_path, author.avatar_url, artifactMap);
   const showConnector = isInThread && !isLast;
 
   const rowStyle = isInThread ? S.tweetRowThread : S.tweetRow;
 
+  // Prefer extended_entities for video/multi-photo, fall back to entities.media
+  const media = (tweet.extended_entities?.media?.length
+    ? tweet.extended_entities.media
+    : entities.media) || [];
+
   return (
     <div style={rowStyle}>
-      {/* Left column: avatar + optional thread connector line */}
       <div style={S.leftCol}>
-        {avatarUrl
-          ? <img src={avatarUrl} style={S.avatar} alt={author.name || ''} />
+        {avatarSrc
+          ? <img src={avatarSrc} style={S.avatar} alt={author.name || ''} />
           : <div style={S.avatarPh} />
         }
         {showConnector && <div style={S.threadLine} />}
       </div>
 
-      {/* Right column: author row, tweet text, stats */}
       <div style={S.rightCol}>
         <div style={S.authorRow}>
           <span style={S.authorName}>
@@ -710,6 +752,42 @@ function TweetCard({ tweet, isInThread, isLast }) {
         <div style={S.tweetText}>
           {renderTweetTextJSX(tweet.full_text || '', entities)}
         </div>
+
+        {media.length > 0 && (
+          <div style={S.mediaGrid}>
+            {media.map((m, i) => {
+              if (m.type === 'photo') {
+                // Local archived file preferred; CDN thumbnail as fallback
+                const src = resolveUrl(m.local_path, m.media_url_https, artifactMap);
+                if (!src) return null;
+                return (
+                  <img key={i} src={src} style={S.mediaImg}
+                    alt={m.alt_text || ''} loading="lazy" />
+                );
+              }
+              if (m.type === 'video' || m.type === 'animated_gif') {
+                // Local archived file preferred; fall back to best-bitrate CDN mp4.
+                // m.media_url_https is a thumbnail image, NOT a video — don't use it.
+                const videoSrc = (m.local_path && artifactMap[m.local_path])
+                  || (() => {
+                    const variants = m.video_info?.variants || [];
+                    return variants
+                      .filter(v => v.content_type === 'video/mp4')
+                      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0]?.url;
+                  })();
+                if (!videoSrc) return null;
+                return (
+                  <video key={i} src={videoSrc} style={S.mediaVideo}
+                    controls
+                    loop={m.type === 'animated_gif'}
+                    muted={m.type === 'animated_gif'}
+                  />
+                );
+              }
+              return null;
+            })}
+          </div>
+        )}
 
         {(tweet.retweet_count > 0 || tweet.favorite_count > 0) && (
           <div style={S.stats}>
@@ -764,30 +842,20 @@ export default function TweetPreview({ archiveId, entryUid, artifacts, entityKin
           })
       )
     )
-      .then(data => {
-        if (!cancelled) setTweets(data);
-      })
-      .catch(e => {
-        if (!cancelled) setError(e.message || 'Failed to load tweet.');
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+      .then(data => { if (!cancelled) setTweets(data); })
+      .catch(e => { if (!cancelled) setError(e.message || 'Failed to load tweet.'); })
+      .finally(() => { if (!cancelled) setLoading(false); });
 
     return () => { cancelled = true; };
   }, [archiveId, entryUid, artifacts]);
 
-  if (loading) {
-    return <div style={S.loading}>Loading…</div>;
-  }
-
-  if (error) {
-    return <div style={S.error}>Error: {error}</div>;
-  }
-
+  if (loading) return <div style={S.loading}>Loading…</div>;
+  if (error) return <div style={S.error}>Error: {error}</div>;
   if (tweets.length === 0) return null;
 
-  // Thread: multiple tweet cards joined by a connector line.
+  // Build relpath → artifact URL map once for this entry
+  const artifactMap = buildArtifactMap(archiveId, entryUid, artifacts);
+
   if (entityKind === 'tweet_thread') {
     return (
       <div style={S.threadOuter}>
@@ -797,22 +865,21 @@ export default function TweetPreview({ archiveId, entryUid, artifacts, entityKin
             tweet={tweet}
             isInThread
             isLast={i === tweets.length - 1}
+            artifactMap={artifactMap}
           />
         ))}
       </div>
     );
   }
 
-  // Single tweet — check for X Article first.
   const tweet = tweets[0];
-
   if (tweet.is_article && tweet.article) {
-    return <ArticleRenderer article={tweet.article} tweetAuthor={tweet.author} />;
+    return <ArticleRenderer article={tweet.article} tweetAuthor={tweet.author} artifactMap={artifactMap} />;
   }
 
   return (
     <div style={S.card}>
-      <TweetCard tweet={tweet} isInThread={false} isLast />
+      <TweetCard tweet={tweet} isInThread={false} isLast artifactMap={artifactMap} />
     </div>
   );
 }

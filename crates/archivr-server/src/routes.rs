@@ -91,6 +91,8 @@ async fn setup_guard(
 /// Tower middleware: injects HTTP security response headers on every response.
 /// HSTS is intentionally omitted — that belongs at the reverse-proxy layer.
 async fn security_headers(req: Request, next: Next) -> Response {
+    // Capture path before consuming req for next.run()
+    let is_artifact = req.uri().path().contains("/artifacts/");
     let mut response = next.run(req).await;
     let headers = response.headers_mut();
     headers.insert(
@@ -98,29 +100,52 @@ async fn security_headers(req: Request, next: Next) -> Response {
         axum::http::HeaderValue::from_static("nosniff"),
     );
     headers.insert(
-        axum::http::header::HeaderName::from_static("x-frame-options"),
-        axum::http::HeaderValue::from_static("DENY"),
-    );
-    headers.insert(
         axum::http::header::HeaderName::from_static("referrer-policy"),
         axum::http::HeaderValue::from_static("strict-origin-when-cross-origin"),
     );
     headers.insert(
-        axum::http::header::HeaderName::from_static("content-security-policy"),
-        axum::http::HeaderValue::from_static(
-            "default-src 'self'; \
-             script-src 'self'; \
-             style-src 'self' 'unsafe-inline'; \
-             img-src 'self' data: blob:; \
-             font-src 'self'; \
-             connect-src 'self'; \
-             frame-ancestors 'none'",
-        ),
-    );
-    headers.insert(
         axum::http::header::HeaderName::from_static("permissions-policy"),
-        axum::http::HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+        axum::http::HeaderValue::from_static("camera=(), microphone=(), geolocation=(), autoplay=()"),
     );
+    if is_artifact {
+        // Artifact responses are iframed by the preview modal (sandboxed, no allow-scripts).
+        // When opened directly in a new tab scripts must still be blocked so archived
+        // pages cannot make same-origin API calls with the user's session.
+        // Only styles, images, fonts and media need to be relaxed for rendering.
+        headers.insert(
+            axum::http::header::HeaderName::from_static("content-security-policy"),
+            axum::http::HeaderValue::from_static(
+                "default-src 'none'; \
+                 script-src 'none'; \
+                 style-src 'self' 'unsafe-inline' https:; \
+                 img-src 'self' data: blob: https:; \
+                 font-src 'self' https:; \
+                 media-src 'self' blob:; \
+                 connect-src 'none'; \
+                 frame-ancestors 'self'",
+            ),
+        );
+    } else {
+        headers.insert(
+            axum::http::header::HeaderName::from_static("x-frame-options"),
+            axum::http::HeaderValue::from_static("DENY"),
+        );
+        // Main app CSP — allow Google Fonts and external images for tweet previews
+        headers.insert(
+            axum::http::header::HeaderName::from_static("content-security-policy"),
+            axum::http::HeaderValue::from_static(
+                "default-src 'self'; \
+                 script-src 'self'; \
+                 style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+                 img-src 'self' data: blob: https:; \
+                 font-src 'self' https://fonts.gstatic.com; \
+                 media-src 'self' blob: https:; \
+                 connect-src 'self'; \
+                 frame-src 'self'; \
+                 frame-ancestors 'none'",
+            ),
+        );
+    }
     response
 }
 

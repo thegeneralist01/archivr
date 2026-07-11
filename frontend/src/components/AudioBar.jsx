@@ -15,18 +15,13 @@ export default function AudioBar({ entry, src, archiveId, onClose }) {
   const [duration, setDuration] = useState(NaN);
   const [volume, setVolume] = useState(1.0);
 
-  // Auto-play whenever src changes
+  // Load and reset state whenever src changes — play only on explicit user action
   useEffect(() => {
     if (!audioRef.current || !src) return;
     audioRef.current.load();
-    audioRef.current.play().then(() => {
-      setIsPlaying(true);
-    }).catch(() => {
-      // Autoplay blocked — silently remain paused
-      setIsPlaying(false);
-    });
     setCurrentTime(0);
     setDuration(NaN);
+    setIsPlaying(false);
   }, [src]);
 
   // Sync volume to audio element

@@ -11,7 +11,7 @@ const ExternalIcon = () => (
   </svg>
 )
 
-export default function ContextRail({ archiveId, selectedEntry, detail, onTagFilterSet, tagNodes, onTagsRefresh, onEntryTitleChange, onEntryDeleted, humanizeTags, onDetailRefresh }) {
+export default function ContextRail({ archiveId, selectedEntry, detail, onTagFilterSet, tagNodes, onTagsRefresh, onEntryTitleChange, onEntryDeleted, humanizeTags, onDetailRefresh, onOpenPreview, onPlay }) {
   const [tags, setTags] = useState([])
   const [assignInput, setAssignInput] = useState('')
   const [entryCollections, setEntryCollections] = useState([])
@@ -156,6 +156,20 @@ export default function ContextRail({ archiveId, selectedEntry, detail, onTagFil
     ['Root',       detail.structured_root_relpath],
   ] : []
 
+  const AUDIO_EXTS = new Set(['mp3','ogg','m4a','opus','wav','flac','aac'])
+  const PREVIEW_EXTS = new Set(['mp4','webm','mov','mkv','avi','m4v','ogv','pdf','html','htm','jpg','jpeg','png','gif','webp','avif','svg','bmp'])
+  const primaryMediaIdx = detail ? detail.artifacts.findIndex(a => a.artifact_role === 'primary_media') : -1
+  const primaryMedia = primaryMediaIdx >= 0 ? detail.artifacts[primaryMediaIdx] : null
+  const pmExt = primaryMedia ? primaryMedia.relpath.split('.').pop().toLowerCase() : ''
+  const isAudio = primaryMedia && AUDIO_EXTS.has(pmExt)
+  const primaryMediaUrl = (primaryMediaIdx >= 0 && selectedEntry)
+    ? `/api/archives/${archiveId}/entries/${selectedEntry.entry_uid}/artifacts/${primaryMediaIdx}`
+    : null
+  const isPreviewable = detail && !isAudio && (
+    (detail.summary.entity_kind === 'tweet' || detail.summary.entity_kind === 'tweet_thread') ||
+    (primaryMedia && PREVIEW_EXTS.has(pmExt))
+  )
+
   return (
     <aside className="context-rail">
       <div className="rail-eyebrow">Context</div>
@@ -205,6 +219,17 @@ export default function ContextRail({ archiveId, selectedEntry, detail, onTagFil
               <span className="u-text">{detail.summary.original_url}</span>
               <span className="ext"><ExternalIcon /></span>
             </a>
+          )}
+
+          {isAudio && onPlay && (
+            <button className="rail-preview-btn" onClick={() => onPlay(primaryMediaUrl, selectedEntry)}>
+              ▶ Play
+            </button>
+          )}
+          {isPreviewable && onOpenPreview && (
+            <button className="rail-preview-btn" onClick={onOpenPreview}>
+              Preview
+            </button>
           )}
 
           <div className="meta-list">

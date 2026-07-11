@@ -48,7 +48,8 @@ export default function IframePreview({ src, type }) {
           </div>
           <iframe
             src={src}
-            sandbox="allow-scripts allow-same-origin allow-popups"
+            sandbox="allow-same-origin allow-popups"
+            allow="autoplay 'none'"
             referrerPolicy="no-referrer"
             style={{ flex: 1, border: 'none', width: '100%' }}
             title="Page preview"
@@ -71,6 +72,7 @@ export default function IframePreview({ src, type }) {
           </div>
           <iframe
             src={src}
+            allow="autoplay 'none'"
             style={{ flex: 1, border: 'none', width: '100%' }}
             title="PDF preview"
           />

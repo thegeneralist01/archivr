@@ -12,12 +12,19 @@ import TagsView from './components/TagsView'
 import CollectionsView from './components/CollectionsView'
 import SettingsView from './components/SettingsView'
 import ContextRail from './components/ContextRail'
-import PreviewPanel from './components/PreviewPanel'
+import PreviewModal from './components/PreviewModal'
 import AudioBar from './components/AudioBar'
+import PreviewPage from './components/PreviewPage'
 import { displayPath } from './utils'
 import ToastStack from './components/ToastStack'
 
 export const AuthContext = createContext(null);
+
+// Detect /preview/:archiveId/:entryUid at load time (static — no navigation)
+const PREVIEW_ROUTE = (() => {
+  const m = window.location.pathname.match(/^\/preview\/([^/]+)\/([^/]+)/)
+  return m ? { archiveId: m[1], entryUid: m[2] } : null
+})()
 
 const VIEWS = ['archive','tags','collections','runs','admin','settings']
 const SETTINGS_TABS = ['profile','tokens','instance','storage']
@@ -96,8 +103,6 @@ export default function App() {
   const [entryDetail, setEntryDetail] = useState(null)
   const detailSeqRef = useRef(0)
 
-  // ── Persistent audio bar state ───────────────────────────────────────────
-  const [currentAudio, setCurrentAudio] = useState(null) // { entry, src, archiveId }
   const humanizeTags = currentUser?.humanize_slugs ?? false;
 
   // Fetch entry detail whenever selected entry changes
@@ -192,7 +197,9 @@ export default function App() {
   }, [archiveId])
 
   // Sync view + settingsTab → URL
+  // Sync view + settingsTab → URL (skip when serving a standalone preview page)
   useEffect(() => {
+    if (PREVIEW_ROUTE) return
     const path = locationPath(view, settingsTab)
     if (window.location.pathname !== path) {
       history.pushState(null, '', path)
@@ -292,31 +299,33 @@ export default function App() {
     setUblockWarningIgnored(true)
     setToasts(prev => prev.filter(t => !(t.type === 'warning' && t.locator)))
   }, [])
+  const [previewEntryUid, setPreviewEntryUid] = useState(null)
+  const [currentAudio, setCurrentAudio] = useState(null)
 
-  const handleSetAudio = useCallback(({ entry, src, archiveId: aid }) => {
-    setCurrentAudio({ entry, src, archiveId: aid })
+  const handleOpenPreview = useCallback(() => {
+    if (selectedEntry) setPreviewEntryUid(selectedEntry.entry_uid)
+  }, [selectedEntry])
+  const handleClosePreview = useCallback(() => setPreviewEntryUid(null), [])
+  const handlePlay = useCallback((src, entry) => {
+    setCurrentAudio({ src, entry })
   }, [])
+  const handleCloseAudio = useCallback(() => setCurrentAudio(null), [])
 
-  const handleCloseAudio = useCallback(() => {
-    setCurrentAudio(null)
-  }, [])
+  // Close stale modal when selection changes (audio persists intentionally)
+  useEffect(() => {
+    setPreviewEntryUid(null)
+  }, [selectedEntry])
 
-  // Compute whether the selected entry has a previewable artifact
-  const VIDEO_EXTS = new Set(['mp4','webm','mov','mkv','avi','m4v','ogv'])
-  const AUDIO_EXTS = new Set(['mp3','ogg','m4a','opus','wav','flac','aac'])
-  const PREVIEW_EXTS = new Set([...VIDEO_EXTS, ...AUDIO_EXTS, 'pdf','html','htm','jpg','jpeg','png','gif','webp','avif','svg','bmp'])
-  const hasPreview = view === 'archive' && selectedEntry && (() => {
-    if (selectedEntry.entity_kind === 'tweet' || selectedEntry.entity_kind === 'tweet_thread') return true
-    if (!entryDetail) return false
-    const pm = entryDetail.artifacts.find(a => a.artifact_role === 'primary_media')
-    if (!pm) return false
-    const ext = pm.relpath.split('.').pop().toLowerCase()
-    return PREVIEW_EXTS.has(ext)
-  })()
+  // Toggle body class so fixed AudioBar doesn't obscure scrollable content
+  useEffect(() => {
+    document.body.classList.toggle('has-audio-bar', !!currentAudio)
+    return () => document.body.classList.remove('has-audio-bar')
+  }, [currentAudio])
 
   if (authState === 'loading') return <div className="auth-loading">Loading\u2026</div>;
   if (authState === 'setup')   return <SetupPage onComplete={() => setAuthState('login')} />;
   if (authState === 'login')   return <LoginPage onLogin={user => { setCurrentUser(user); setAuthState('authenticated'); }} />;
+  if (PREVIEW_ROUTE)           return <PreviewPage archiveId={PREVIEW_ROUTE.archiveId} entryUid={PREVIEW_ROUTE.entryUid} />;
 
   return (
     <AuthContext.Provider value={{ currentUser, setCurrentUser }}>
@@ -329,7 +338,7 @@ export default function App() {
           onViewChange={handleViewChange}
           onCaptureClick={handleCaptureClick}
         />
-        <main className={`app-shell${hasPreview ? ' has-preview' : ''}${currentAudio ? ' audio-playing' : ''}`}>
+        <main className="app-shell">
           <div className="workspace">
             {view === 'archive' && (
               <div className="toolbar">
@@ -396,16 +405,6 @@ export default function App() {
               <SettingsView tab={settingsTab} onTabChange={setSettingsTab} archiveId={archiveId} />
             )}
           </div>
-          {hasPreview && (
-            <div className="preview-pane">
-              <PreviewPanel
-                archiveId={archiveId}
-                entry={selectedEntry}
-                detail={entryDetail}
-                onSetAudio={handleSetAudio}
-              />
-            </div>
-          )}
           <ContextRail
             archiveId={archiveId}
             selectedEntry={selectedEntry}
@@ -417,13 +416,23 @@ export default function App() {
             onEntryDeleted={handleEntryDeleted}
             humanizeTags={humanizeTags}
             onDetailRefresh={handleDetailRefresh}
+            onOpenPreview={handleOpenPreview}
+            onPlay={handlePlay}
           />
         </main>
+        {previewEntryUid && selectedEntry && selectedEntry.entry_uid === previewEntryUid && (
+          <PreviewModal
+            archiveId={archiveId}
+            entry={selectedEntry}
+            detail={entryDetail}
+            onClose={handleClosePreview}
+          />
+        )}
         {currentAudio && (
           <AudioBar
             entry={currentAudio.entry}
             src={currentAudio.src}
-            archiveId={currentAudio.archiveId}
+            archiveId={archiveId}
             onClose={handleCloseAudio}
           />
         )}
