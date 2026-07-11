@@ -164,7 +164,7 @@ const S = {
     maxHeight: '280px',
   },
   aMeta: {
-    padding: '14px 14px 0',
+    padding: '10px 14px 0',
   },
   aTweetTitle: {
     fontSize: '20px',
@@ -172,13 +172,13 @@ const S = {
     letterSpacing: '-0.3px',
     color: 'var(--ink)',
     lineHeight: '1.3',
-    marginBottom: '10px',
+    marginBottom: '8px',
   },
   aAuthorRow: {
     display: 'flex',
     alignItems: 'center',
     gap: '8px',
-    marginBottom: '10px',
+    marginBottom: '8px',
   },
   aAvatar: {
     width: '36px',
@@ -221,7 +221,7 @@ const S = {
     letterSpacing: '-0.4px',
     color: 'var(--ink)',
     lineHeight: '1.25',
-    margin: '20px 0 8px',
+    margin: '16px 0 6px',
   },
   bH2: {
     fontSize: '18px',
@@ -229,7 +229,7 @@ const S = {
     letterSpacing: '-0.2px',
     color: 'var(--ink)',
     lineHeight: '1.3',
-    margin: '18px 0 6px',
+    margin: '14px 0 4px',
   },
   bP: {
     fontSize: '15px',
@@ -253,7 +253,7 @@ const S = {
   bHr: {
     border: 'none',
     borderTop: '1px solid var(--line)',
-    margin: '20px 0',
+    margin: '14px 0',
   },
   bImg: {
     width: '100%',
