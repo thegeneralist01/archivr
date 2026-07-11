@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { fetchEntryDetail, fetchEntryTags, assignTag, removeTag, listEntryCollections, updateEntryTitle, deleteEntry } from '../api'
+import { fetchEntryDetail, fetchEntryTags, assignTag, removeTag, listEntryCollections, updateEntryTitle, deleteEntry, rearchiveEntry, pollCaptureJob } from '../api'
 import { formatTimestamp, formatBytes, valueText, sourceIconSvg, displayPath } from '../utils'
 
 const VIS_LABEL = { 0: 'Private', 1: 'Public', 2: 'Users only', 3: 'Public' }
@@ -21,8 +21,14 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
   const titleCancelRef = useRef(false)
   const [editingTitle, setEditingTitle] = useState(false)
   const [titleDraft, setTitleDraft] = useState('')
+  const [rearchiveState, setRearchiveState] = useState('idle') // 'idle' | 'running' | 'done' | 'error'
+  const [rearchiveError, setRearchiveError] = useState('')
+  const rearchivePollRef = useRef(null)
 
   useEffect(() => {
+    if (rearchivePollRef.current) { clearInterval(rearchivePollRef.current); rearchivePollRef.current = null }
+    setRearchiveState('idle')
+    setRearchiveError('')
     if (!selectedEntry || !archiveId) {
       setDetail(null)
       setTags([])
@@ -46,6 +52,12 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
       setEntryCollections(ecs)
     }).catch(() => {})
   }, [selectedEntry, archiveId])
+
+  useEffect(() => {
+    return () => {
+      clearInterval(rearchivePollRef.current)
+    }
+  }, [])
 
   async function handleTitleSave() {
     const newTitle = titleDraft.trim() || null
@@ -94,6 +106,46 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
       onEntryDeleted?.(selectedEntry.entry_uid)
     } catch {
       // silently ignore — entry stays selected if delete failed
+    }
+  }
+
+  async function handleRearchive() {
+    if (!selectedEntry || !archiveId || rearchiveState === 'running') return
+    setRearchiveState('running')
+    setRearchiveError('')
+    try {
+      const { job_uid } = await rearchiveEntry(archiveId, selectedEntry.entry_uid)
+      // Poll for job completion at 500ms — same interval as CaptureDialog
+      rearchivePollRef.current = setInterval(async () => {
+        try {
+          const job = await pollCaptureJob(archiveId, job_uid)
+          if (job.status === 'completed') {
+            clearInterval(rearchivePollRef.current)
+            rearchivePollRef.current = null
+            setRearchiveState('done')
+            // Refresh entry detail so artifact list updates
+            const [det, tgs] = await Promise.all([
+              fetchEntryDetail(archiveId, selectedEntry.entry_uid),
+              fetchEntryTags(archiveId, selectedEntry.entry_uid),
+            ])
+            setDetail(det)
+            setTags(tgs)
+          } else if (job.status === 'failed') {
+            clearInterval(rearchivePollRef.current)
+            rearchivePollRef.current = null
+            setRearchiveState('error')
+            setRearchiveError(job.error_text || 'Re-archive failed.')
+          }
+        } catch {
+          clearInterval(rearchivePollRef.current)
+          rearchivePollRef.current = null
+          setRearchiveState('error')
+          setRearchiveError('Network error while polling.')
+        }
+      }, 500)
+    } catch (e) {
+      setRearchiveState('error')
+      setRearchiveError(e.message || 'Failed to start re-archive.')
     }
   }
 
@@ -241,6 +293,25 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
                   </span>
                 </div>
               ))}
+            </div>
+          )}
+
+          {detail && (detail.summary.entity_kind === 'tweet' || detail.summary.entity_kind === 'tweet_thread') && (
+            <div className="rail-section">
+              <div className="rail-section-heading">Actions</div>
+              <button
+                className="rail-rearchive-btn"
+                onClick={handleRearchive}
+                disabled={rearchiveState === 'running'}
+              >
+                {rearchiveState === 'running' ? 'Re-archiving\u2026' : 'Re-archive'}
+              </button>
+              {rearchiveState === 'done' && (
+                <p className="form-msg form-msg--ok" style={{ marginTop: '6px' }}>Re-archived successfully.</p>
+              )}
+              {rearchiveState === 'error' && (
+                <p className="form-msg form-msg--err" style={{ marginTop: '6px' }}>{rearchiveError}</p>
+              )}
             </div>
           )}
 

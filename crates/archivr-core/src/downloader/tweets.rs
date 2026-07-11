@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     env,
     ffi::OsString,
     fs,
@@ -59,63 +59,39 @@ fn build_scraper_args(
     args
 }
 
-/// Archives a tweet (or full thread) identified by `path` (e.g. `"tweet:123"`).
-///
-/// Invokes the Python scraper, then moves all produced media assets into the
-/// content-addressed raw store and rewrites the JSON output to use the new
-/// store-relative paths. Returns `true` if new content was archived, `false`
-/// if the tweet was already present and `thread` is `false`.
-///
-/// Requires `ARCHIVR_TWITTER_CREDENTIALS_FILE` to be set. The scraper binary
-/// can be overridden via `ARCHIVR_TWEET_SCRAPER` and `ARCHIVR_TWEET_PYTHON`.
-pub fn archive(
-    path: &str,
+/// Runs the scraper into a staging dir, rewrites assets into raw/, moves tweet JSONs
+/// to `raw_tweets/`, and returns their store-relative relpaths (e.g. `"raw_tweets/tweet-123.json"`).
+/// The staging dir starts empty so all files found there are exactly the touched set.
+fn run_scraper_staged(
+    tweet_id: &str,
     thread: bool,
     store_path: &Path,
     timestamp: &str,
     cookies: &HashMap<String, String>,
-) -> Result<bool> {
+) -> Result<Vec<String>> {
     let invocation_cwd = env::current_dir().context("Failed to read current working directory")?;
-    // Output directory for Tweet JSON files.
+
+    // staging_dir = store_path/temp/{timestamp}/tweet_stage/
+    // staging_tweets_dir = staging_dir/raw_tweets/  ← scraper writes JSONs here
+    // Scraper media-dir = staging_dir/media/
+    let staging_dir = store_path.join("temp").join(timestamp).join("tweet_stage");
+    let staging_tweets_dir = staging_dir.join("raw_tweets");
+    fs::create_dir_all(&staging_tweets_dir)?;
+
+    // Final destination for tweet JSONs.
     let output_dir = store_path.join("raw_tweets");
-    // Temporary directory for media assets downloaded by the scraper in `temp/...`.
-    let temp_dir = store_path.join("temp").join(timestamp).join("tweets");
-    let tweet_id = tweet_id_from_path(path).context("Invalid tweet ID")?;
-
     fs::create_dir_all(&output_dir)?;
-    fs::create_dir_all(&temp_dir)?;
-
-    // Path to the root - the to-be-archived tweet's JSON file.
-    let root_json = output_dir.join(format!("tweet-{tweet_id}.json"));
-    if !thread && root_json.exists() {
-        return Ok(false);
-    }
-
-    let before = tweet_json_files(&output_dir)?;
 
     let python = env::var_os("ARCHIVR_TWEET_PYTHON").unwrap_or_else(|| OsString::from("python3"));
     let scraper_path = env::var_os("ARCHIVR_TWEET_SCRAPER")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("vendor/twitter/scrape_user_tweet_contents.py"));
     let scraper_path = absolutize_path_from_cwd(scraper_path, &invocation_cwd);
-
-    // Credentials: only use cookie rules as Twitter credentials when the resolved
-    // map contains both `ct0` AND `auth_token` — the two cookies the scraper
-    // requires. A global cookie rule for an unrelated site must not suppress the
-    // ARCHIVR_TWITTER_CREDENTIALS_FILE fallback.
-    // Fall back to ARCHIVR_TWITTER_CREDENTIALS_FILE otherwise.
-    // The temp file is written in the semicolon-delimited format the Python scraper
-    // expects (`ct0=val;auth_token=val`) and deleted unconditionally after the
-    // subprocess returns so secrets are never left on disk on failure.
     let temp_creds_path: Option<PathBuf>;
     let credentials_file: PathBuf;
-
-    let has_twitter_cookies =
-        cookies.contains_key("ct0") && cookies.contains_key("auth_token");
-
+    let has_twitter_cookies = cookies.contains_key("ct0") && cookies.contains_key("auth_token");
     if has_twitter_cookies {
         let cf = store_path.join("temp").join(timestamp).join("twitter-creds.txt");
-        // Semicolon-separated, no spaces — matches what the scraper's split(";") expects.
         let creds_str = cookies
             .iter()
             .map(|(k, v)| format!("{k}={v}"))
@@ -135,7 +111,7 @@ pub fn archive(
             let mut f = std::fs::File::create(&cf)
                 .context("failed to write twitter credentials file")?;
             f.write_all(creds_str.as_bytes())
-                .context("failed to write twitter credentials file")?;
+                .context("failed to write twitter credentials file")?
         }
         temp_creds_path = Some(cf.clone());
         credentials_file = cf;
@@ -156,28 +132,21 @@ pub fn archive(
     }
 
     let mut cmd = Command::new(&python);
-    cmd.current_dir(&temp_dir).arg(&scraper_path);
-    for arg in build_scraper_args(&tweet_id, thread, &output_dir, &temp_dir, &credentials_file) {
+    // Run the scraper from staging_dir so relative paths in JSON resolve correctly.
+    cmd.current_dir(&staging_dir).arg(&scraper_path);
+    for arg in build_scraper_args(tweet_id, thread, &staging_tweets_dir, &staging_dir, &credentials_file) {
         cmd.arg(arg);
     }
 
-    // Hold the Result so we can delete the credentials file before propagating
-    // any error — including spawn failures.
     let spawn_result = cmd.output().with_context(|| {
-        format!(
-            "Failed to spawn tweet scraper at {}",
-            scraper_path.display()
-        )
+        format!("Failed to spawn tweet scraper at {}", scraper_path.display())
     });
-
-    // Remove temp credentials file unconditionally — secrets must not persist.
     if let Some(cf) = &temp_creds_path {
         let _ = fs::remove_file(cf);
     }
-
     let output = spawn_result?;
-
     if !output.status.success() {
+        let _ = fs::remove_dir_all(&staging_dir);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         bail!(
@@ -187,7 +156,9 @@ pub fn archive(
         );
     }
 
+    let root_json = staging_tweets_dir.join(format!("tweet-{tweet_id}.json"));
     if !root_json.exists() {
+        let _ = fs::remove_dir_all(&staging_dir);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         bail!(
@@ -198,13 +169,82 @@ pub fn archive(
         );
     }
 
-    cleanup_summary(&output_dir)?;
-    let after = tweet_json_files(&output_dir)?;
-    let new_jsons = new_tweet_jsons(&before, &after);
-    rewrite_tweet_outputs(&new_jsons, &output_dir, &temp_dir, store_path)?;
-    let _ = fs::remove_dir_all(store_path.join("temp").join(timestamp));
+    // Remove the scraping_summary.json if the scraper left one.
+    cleanup_summary(&staging_tweets_dir)?;
 
-    Ok(true)
+    // Collect all tweet-*.json files from staging (this is the exact touched set).
+    let mut staged_jsons: Vec<PathBuf> = fs::read_dir(&staging_tweets_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("tweet-") && n.ends_with(".json"))
+        })
+        .collect();
+    staged_jsons.sort();
+
+    // Rewrite asset paths in staged JSONs (moves media blobs from staging into raw/).
+    // staging_tweets_dir is base for avatar_local_path; staging_dir is base for local_path.
+    rewrite_tweet_outputs(&staged_jsons, &staging_tweets_dir, &staging_dir, store_path)?;
+
+    // Move each staged JSON to its final destination, collecting store-relative relpaths.
+    let mut relpaths = Vec::with_capacity(staged_jsons.len());
+    for staged_path in &staged_jsons {
+        let filename = staged_path.file_name().context("tweet JSON path has no filename")?;
+        let dest = output_dir.join(filename);
+        fs::rename(staged_path, &dest)
+            .or_else(|_| {
+                fs::copy(staged_path, &dest).map(|_| ())?;
+                fs::remove_file(staged_path)
+            })
+            .with_context(|| format!("failed to move staged tweet JSON to {}", dest.display()))?;
+        let rel = dest
+            .strip_prefix(store_path)
+            .context("dest tweet JSON is not under store_path")?;
+        relpaths.push(rel.to_string_lossy().replace('\\', "/"));
+    }
+
+    // Clean up the staging directory (media already moved to raw/ by rewrite_tweet_outputs).
+    let _ = fs::remove_dir_all(&staging_dir);
+
+    Ok(relpaths)
+}
+
+/// Archives a tweet (or full thread) identified by `path`.
+///
+/// Returns store-relative relpaths of all tweet JSON files registered for this capture.
+/// For single tweets already on disk, returns the existing file path without re-downloading.
+/// For new or thread captures, stages output in a temp dir then moves to `raw_tweets/`.
+pub fn archive(
+    path: &str,
+    thread: bool,
+    store_path: &Path,
+    timestamp: &str,
+    cookies: &HashMap<String, String>,
+) -> Result<Vec<String>> {
+    let tweet_id = tweet_id_from_path(path).context("Invalid tweet ID")?;
+    let root_json = store_path.join("raw_tweets").join(format!("tweet-{tweet_id}.json"));
+    if !thread && root_json.exists() {
+        // Already present; skip re-download, return the existing file for artifact registration.
+        return Ok(vec![format!("raw_tweets/tweet-{tweet_id}.json")]);
+    }
+    run_scraper_staged(&tweet_id, thread, store_path, timestamp, cookies)
+}
+
+/// Re-archives a tweet or thread, replacing files in `raw_tweets/` with fresh content.
+/// Always runs the scraper; output is staged before replacing existing files.
+/// Returns store-relative relpaths of all produced tweet JSON files.
+/// If the scraper fails (tweet deleted/private), returns an error; existing files are untouched.
+pub fn rearchive(
+    path: &str,
+    thread: bool,
+    store_path: &Path,
+    timestamp: &str,
+    cookies: &HashMap<String, String>,
+) -> Result<Vec<String>> {
+    let tweet_id = tweet_id_from_path(path).context("Invalid tweet ID")?;
+    run_scraper_staged(&tweet_id, thread, store_path, timestamp, cookies)
 }
 
 /// Removes the `scraping_summary.json` file left by the scraper, if present.
@@ -216,33 +256,6 @@ fn cleanup_summary(output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Returns the set of `tweet-*.json` files present in `output_dir`.
-fn tweet_json_files(output_dir: &Path) -> Result<HashSet<PathBuf>> {
-    let mut files = HashSet::new();
-
-    for entry in fs::read_dir(output_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_file()
-            && path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("tweet-") && name.ends_with(".json"))
-        {
-            files.insert(path);
-        }
-    }
-
-    Ok(files)
-}
-
-/// Returns the sorted list of JSON files present in `after` but not in `before`.
-fn new_tweet_jsons(before: &HashSet<PathBuf>, after: &HashSet<PathBuf>) -> Vec<PathBuf> {
-    let mut files = after.difference(before).cloned().collect::<Vec<_>>();
-    files.sort();
-    files
-}
 
 /// Returns a lazily-compiled regex matching `"avatar_local_path": "..."` in JSON.
 fn avatar_regex() -> &'static Regex {
@@ -519,9 +532,9 @@ mod tests {
         fs::write(&credentials, "ct0=test;auth_token=test").unwrap();
         set_test_env("ARCHIVR_TWITTER_CREDENTIALS_FILE", &credentials);
 
-        let archived = archive("tweet:123", false, &store_path, "ts", &HashMap::new()).unwrap();
+        let relpaths = archive("tweet:123", false, &store_path, "ts", &HashMap::new()).unwrap();
 
-        assert!(!archived);
+        assert_eq!(relpaths, vec!["raw_tweets/tweet-123.json"]);
 
         remove_test_env("ARCHIVR_TWITTER_CREDENTIALS_FILE");
         let _ = fs::remove_dir_all(store_path);
@@ -576,7 +589,7 @@ cat > "$output_dir/tweet-$tweet_id.json" <<EOF
 {
   "id": "$tweet_id",
   "entities": { "media": [{ "local_path": "media/$tweet_id/media_1.jpg" }] },
-  "author": { "avatar_local_path": "../temp/ts/tweets/media/avatars/author.jpg" }
+  "author": { "avatar_local_path": "$media_dir/avatars/author.jpg" }
 }
 EOF
 "#,
@@ -592,16 +605,16 @@ EOF
         set_test_env("ARCHIVR_TWEET_SCRAPER", &script);
         set_test_env("ARCHIVR_TWEET_PYTHON", "/bin/sh");
 
-        let archived = archive("tweet:123", false, &store_path, "ts", &HashMap::new()).unwrap();
+        let relpaths = archive("tweet:123", false, &store_path, "ts", &HashMap::new()).unwrap();
         let tweet_file = output_dir.join("tweet-123.json");
         let contents = fs::read_to_string(&tweet_file).unwrap();
 
-        assert!(archived);
+        assert!(!relpaths.is_empty());
         assert!(tweet_file.exists());
         assert!(!output_dir.join("scraping_summary.json").exists());
         assert!(contents.contains(r#""avatar_local_path": "raw/"#));
         assert!(contents.contains(r#""local_path": "raw/"#));
-        assert!(!store_path.join("temp").join("ts").exists());
+        assert!(!store_path.join("temp").join("ts").join("tweet_stage").exists());
 
         remove_test_env("ARCHIVR_TWITTER_CREDENTIALS_FILE");
         remove_test_env("ARCHIVR_TWEET_SCRAPER");

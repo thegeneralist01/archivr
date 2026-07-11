@@ -2391,6 +2391,43 @@ fn humanize_slug(slug: &str) -> String {
         .join(" ")
 }
 
+/// A minimal view of an archived entry needed for re-archiving.
+pub struct EntryForRearchive {
+    pub id: i64,
+    pub entity_kind: String,
+    pub source_metadata_json: String,
+}
+
+/// Looks up an entry by its public UID for re-archive purposes.
+pub fn get_entry_for_rearchive(
+    conn: &Connection,
+    entry_uid: &str,
+) -> Result<Option<EntryForRearchive>> {
+    conn.query_row(
+        "SELECT id, entity_kind, source_metadata_json \
+         FROM archived_entries WHERE entry_uid = ?1",
+        [entry_uid],
+        |row| {
+            Ok(EntryForRearchive {
+                id: row.get(0)?,
+                entity_kind: row.get(1)?,
+                source_metadata_json: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(anyhow::Error::from)
+}
+
+/// Deletes all `entry_artifacts` rows for the given entry.
+/// Call within a transaction for atomicity with re-insertion.
+pub fn delete_entry_artifacts(conn: &Connection, entry_id: i64) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM entry_artifacts WHERE entry_id = ?1",
+        [entry_id],
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

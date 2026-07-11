@@ -552,6 +552,24 @@ select {
   border-color: var(--accent);
 }
 
+.rail-rearchive-btn {
+  width: 100%;
+  padding: 6px 12px;
+  background: var(--surface-2, #2a2a2a);
+  color: var(--text, #e0e0e0);
+  border: 1px solid var(--border, #444);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.rail-rearchive-btn:hover:not(:disabled) {
+  background: var(--surface-3, #333);
+}
+.rail-rearchive-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 /* ── Capture dialog ──────────────────────────────────────────────────────── */
 .capture-dialog {
   border: 1px solid var(--line);

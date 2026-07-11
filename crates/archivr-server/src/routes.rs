@@ -222,6 +222,10 @@ pub fn app_with_state(state: AppState) -> Router {
             get(serve_artifact),
         )
         .route(
+            "/api/archives/:archive_id/entries/:entry_uid/rearchive",
+            post(rearchive_handler),
+        )
+        .route(
             "/api/archives/:archive_id/entries/:entry_uid/favicon",
             get(serve_entry_favicon),
         )
@@ -830,6 +834,83 @@ async fn get_capture_job_handler(
     archive::get_capture_job(&conn, &job_uid)?
         .map(Json)
         .ok_or_else(|| ApiError::not_found("capture job not found"))
+}
+
+/// POST /api/archives/:archive_id/entries/:entry_uid/rearchive
+///
+/// Re-archives an existing tweet or tweet_thread entry in-place:
+/// - Stages scraper output in a temp dir (existing data safe if scraper fails)
+/// - On success: atomically replaces entry_artifacts and refreshes cached_bytes
+/// - On failure (tweet deleted/private): job is marked failed; existing data preserved
+///
+/// Returns 202 immediately with a job_uid the client should poll via
+/// GET /api/archives/:archive_id/capture_jobs/:job_uid.
+async fn rearchive_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((archive_id, entry_uid)): Path<(String, String)>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let archive_paths = archive::read_archive_paths(&mounted.archive_path)
+        .map_err(ApiError::from)?;
+
+    // Create a capture job record so the client can poll for completion.
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let job_uid = database::create_capture_job(&conn, &archive_id)?;
+    drop(conn);
+
+    // Load cookie rules from the auth DB (needed for Twitter credentials resolution).
+    let cookie_rules = match database::open_auth_db(&state.auth_db_path) {
+        Ok(conn) => database::list_cookie_rules(&conn).unwrap_or_default(),
+        Err(_) => vec![],
+    };
+    let capture_config = capture::CaptureConfig {
+        cookie_rules,
+        ublock_enabled: None,
+        cookie_ext_enabled: None,
+        reader_mode: false,
+    };
+
+    let job_uid_bg = job_uid.clone();
+    let archive_path = mounted.archive_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = match database::open_or_initialize(&archive_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("warn: rearchive job {job_uid_bg}: db open failed: {e:#}");
+                return;
+            }
+        };
+        database::update_capture_job_status(&conn, &job_uid_bg, "running", None, None, None).ok();
+        match capture::perform_rearchive(&archive_paths, &entry_uid, &capture_config) {
+            Ok(result) => {
+                if result.status == "completed" {
+                    database::update_capture_job_status(
+                        &conn, &job_uid_bg, "completed", None, None, None,
+                    ).ok();
+                } else {
+                    // "not_a_tweet" or "scraper_failed" — surface as a job failure
+                    // so the client sees a meaningful error message.
+                    database::update_capture_job_status(
+                        &conn, &job_uid_bg, "failed",
+                        None, Some(&result.message), None,
+                    ).ok();
+                }
+            }
+            Err(e) => {
+                database::update_capture_job_status(
+                    &conn, &job_uid_bg, "failed",
+                    None, Some(&format!("{e:#}")), None,
+                ).ok();
+            }
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "job_uid": job_uid, "status": "pending" })),
+    ))
 }
 
 /// `GET /api/archives/:id/captures/probe?locator=<url>`
