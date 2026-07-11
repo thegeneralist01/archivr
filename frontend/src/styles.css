@@ -869,6 +869,7 @@ select {
 }
 .toast--error { border-left: 3px solid var(--accent); }
 .toast--warning { border-left: 3px solid #e8a000; }
+.toast--success { border-left: 3px solid #22a855; }
 
 .toast-top {
   display: flex;
@@ -883,6 +884,8 @@ select {
   color: var(--accent);
   margin-top: 2px;
 }
+.toast--success .toast-icon { color: #22a855; }
+.toast--warning .toast-icon { color: #e8a000; }
 .toast-body {
   flex: 1;
   min-width: 0;
