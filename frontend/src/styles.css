@@ -1951,19 +1951,19 @@ select {
 }
 .preview-iframe-toolbar {
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  gap: 2px;
   padding: 6px 12px;
-  background: var(--paper-3);
+  background: var(--paper-2);
   border-bottom: 1px solid var(--line);
-  gap: 8px;
   flex-shrink: 0;
+  /* never uppercase the toolbar text */
+  text-transform: none;
+  letter-spacing: normal;
 }
 .preview-iframe-toolbar span {
   font-size: 11px;
   color: var(--muted-2);
-  text-transform: uppercase;
-  letter-spacing: 0.07em;
-  font-weight: 600;
 }
 .preview-iframe-toolbar a {
   margin-left: auto;
@@ -2360,6 +2360,14 @@ select {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+/* Full-height variant for iframe/PDF/video/image (needs explicit height
+   so flex children like <iframe style="flex:1"> have a concrete container). */
+.preview-modal--full {
+  height: 88vh;
+}
+.preview-modal--full .preview-modal-body {
+  max-height: none;
 }
 .preview-modal-header {
   display: flex;

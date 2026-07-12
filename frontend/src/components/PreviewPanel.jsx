@@ -103,8 +103,9 @@ export default function PreviewPanel({ archiveId, entry, detail }) {
   // 5. PDF
   if (ext === 'pdf') {
     return (
-      <div className="preview-panel" style={{ height: '100%' }}>
-        <IframePreview src={primaryMediaUrl} type="pdf" />
+      <div className="preview-panel" style={{ flex: 1, minHeight: 0 }}>
+        <IframePreview src={primaryMediaUrl} type="pdf"
+          title={summary.title} originalUrl={summary.original_url} />
       </div>
     );
   }
@@ -112,8 +113,9 @@ export default function PreviewPanel({ archiveId, entry, detail }) {
   // 6. HTML page
   if (ext === 'html' || ext === 'htm') {
     return (
-      <div className="preview-panel" style={{ height: '100%' }}>
-        <IframePreview src={primaryMediaUrl} type="page" />
+      <div className="preview-panel" style={{ flex: 1, minHeight: 0 }}>
+        <IframePreview src={primaryMediaUrl} type="page"
+          title={summary.title} originalUrl={summary.original_url} />
       </div>
     );
   }

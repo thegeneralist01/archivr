@@ -11,7 +11,15 @@ export default function PreviewModal({ archiveId, entry, detail, onClose }) {
 
   return (
     <div className="preview-modal-backdrop" onClick={onClose}>
-      <div className="preview-modal" onClick={e => e.stopPropagation()}>
+      <div
+        className={`preview-modal${
+          detail?.summary?.entity_kind === 'tweet' ||
+          detail?.summary?.entity_kind === 'tweet_thread'
+            ? ''
+            : ' preview-modal--full'
+        }`}
+        onClick={e => e.stopPropagation()}
+      >
         <div className="preview-modal-header">
           <span className="preview-modal-title">{entry?.title || entry?.entry_uid || 'Preview'}</span>
           <a
