@@ -523,25 +523,37 @@ function linkifyText(text, linkStyle) {
   return parts;
 }
 
-function renderTweetTextJSX(fullText, entities) {
+function renderTweetTextJSX(fullText, entities, skipSpans = []) {
   if (!fullText) return null;
 
   const anns = [
     ...(entities.urls || []).map(u => normalizeUrlAnn(u, fullText)).filter(Boolean),
     ...(entities.user_mentions || []).map(m => normalizeMentionAnn(m, fullText)).filter(Boolean),
   ];
-  if (anns.length === 0) return linkifyText(decodeEnt(fullText), S.link);
 
+  // If there are no annotations and no spans to skip, fast path.
+  if (anns.length === 0 && skipSpans.length === 0) return linkifyText(decodeEnt(fullText), S.link);
 
   const pts = new Set([0, fullText.length]);
   for (const a of anns) {
     if (a.s >= 0 && a.s <= fullText.length) pts.add(a.s);
     if (a.e >= 0 && a.e <= fullText.length) pts.add(a.e);
   }
+  // Skip-span boundaries MUST be in pts so a media t.co that lives inside a
+  // larger plain-text segment still gets split out and suppressed.
+  for (const [ss, se] of skipSpans) {
+    if (ss >= 0 && ss <= fullText.length) pts.add(ss);
+    if (se >= 0 && se <= fullText.length) pts.add(se);
+  }
+  const isSkipped = (s, e) => skipSpans.some(([ss, se]) => ss <= s && se >= e);
+
   const sorted = [...pts].sort((a, b) => a - b);
 
   return sorted.slice(0, -1).map((s, i) => {
     const e = sorted[i + 1];
+    // Suppress spans whose range is covered by a rendered media item.
+    if (isSkipped(s, e)) return null;
+
     const seg = fullText.slice(s, e);
     const active = anns.filter(a => a.s <= s && a.e >= e);
 
@@ -570,7 +582,7 @@ function renderTweetTextJSX(fullText, entities) {
     }
 
     return <span key={i}>{linkifyText(decodeEnt(seg), S.link)}</span>;
-  });
+  }).filter(n => n !== null);
 }
 
 // ── Article inline text renderer ───────────────────────────────────────────────
@@ -1025,6 +1037,7 @@ function TweetCard({ tweet, isInThread, isLast, artifactMap }) {
   const showConnector = isInThread && !isLast;
   const isQT = tweet.is_quote_status === true;
   const rowStyle = isInThread ? S.tweetRowThread : S.tweetRow;
+  const ft = tweet.full_text || '';
 
   // Build resolved media lists first; skip the grid entirely if every item resolves to null.
   const rawMedia = (tweet.extended_entities?.media?.length
@@ -1047,6 +1060,21 @@ function TweetCard({ tweet, isInThread, isLast, artifactMap }) {
         })();
       if (src) videoItems.push({ kind: m.type === 'animated_gif' ? 'gif' : 'video', src });
     }
+  }
+
+  // Suppress media attachment t.co links from the tweet text when the media
+  // actually rendered. Uses resolveEntityBounds (prefers indices/fromIndex,
+  // falls back to indexOf) so the span is always precise.
+  const mediaSkipSpans = [];
+  for (const m of rawMedia) {
+    if (!m.url) continue;
+    const rendered =
+      m.type === 'photo'
+        ? photos.some(p => p.src === resolveUrl(m.local_path, m.media_url_https, artifactMap))
+        : videoItems.length > 0;
+    if (!rendered) continue;
+    const b = resolveEntityBounds(m, ft, m.url);
+    if (b) mediaSkipSpans.push([b.s, b.e]);
   }
 
   return (
@@ -1080,7 +1108,7 @@ function TweetCard({ tweet, isInThread, isLast, artifactMap }) {
           </div>
 
           <div style={S.tweetText}>
-            {renderTweetTextJSX(tweet.full_text || '', entities)}
+            {renderTweetTextJSX(ft, entities, mediaSkipSpans)}
           </div>
 
           {photos.length > 0 && (
