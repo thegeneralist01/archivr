@@ -11,6 +11,21 @@ function fmtDate(secs) {
   }).format(new Date(secs * 1000));
 }
 
+// Decode common HTML entities Twitter stores in full_text.
+// MUST be called on already-sliced segments, not on the raw string before
+// entity-offset arithmetic, because entity offsets are into the stored text.
+function decodeEnt(str) {
+  if (!str || !str.includes('&')) return str;
+  // &amp; first so &amp;gt; → &gt; → > (handles double-encoded entities)
+  return str
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'");
+}
+
 // ── Inline style definitions ───────────────────────────────────────────────────
 
 const S = {
@@ -310,6 +325,93 @@ const S = {
     borderRadius: '4px',
     color: 'var(--ink)',
   },
+  // ── QT badge ──
+  qtBadge: {
+    fontSize: '11px',
+    color: 'var(--muted)',
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: '2px',
+    marginLeft: '4px',
+    letterSpacing: '0.03em',
+    flexShrink: 0,
+  },
+  // ── Lightbox ──
+  lightboxBackdrop: {
+    position: 'fixed',
+    inset: 0,
+    zIndex: 500,
+    background: 'rgba(0,0,0,0.92)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: '20px',
+  },
+  lightboxContent: {
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    gap: '10px',
+    maxWidth: '90vw',
+    maxHeight: '90vh',
+  },
+  lightboxToolbar: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '10px',
+    alignSelf: 'flex-end',
+  },
+  lightboxImg: {
+    maxWidth: '88vw',
+    maxHeight: '80vh',
+    objectFit: 'contain',
+    borderRadius: '6px',
+    display: 'block',
+  },
+  lightboxNav: {
+    display: 'flex',
+    gap: '12px',
+    alignItems: 'center',
+  },
+  lightboxNavBtn: {
+    background: 'rgba(255,255,255,0.18)',
+    border: 'none',
+    color: '#fff',
+    fontSize: '20px',
+    cursor: 'pointer',
+    borderRadius: '50%',
+    width: '36px',
+    height: '36px',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    lineHeight: 1,
+    flexShrink: 0,
+  },
+  lightboxBtn: {
+    background: 'rgba(255,255,255,0.18)',
+    border: 'none',
+    color: '#fff',
+    fontSize: '16px',
+    cursor: 'pointer',
+    borderRadius: '50%',
+    width: '30px',
+    height: '30px',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    lineHeight: 1,
+    flexShrink: 0,
+  },
+  lightboxLink: {
+    color: 'rgba(255,255,255,0.7)',
+    textDecoration: 'none',
+    fontSize: '14px',
+  },
+  lightboxCounter: {
+    color: 'rgba(255,255,255,0.6)',
+    fontSize: '13px',
+  },
 };
 
 // ── Artifact URL helpers ────────────────────────────────────────────────────────
@@ -365,7 +467,7 @@ function renderTweetTextJSX(fullText, entities) {
     m => m.fromIndex != null && m.toIndex != null
   );
 
-  if (urls.length === 0 && mentions.length === 0) return fullText;
+  if (urls.length === 0 && mentions.length === 0) return decodeEnt(fullText);
 
   const anns = [
     ...urls.map(u => ({
@@ -419,7 +521,7 @@ function renderTweetTextJSX(fullText, entities) {
       );
     }
 
-    return <span key={i}>{seg}</span>;
+    return <span key={i}>{decodeEnt(seg)}</span>;
   });
 }
 
@@ -512,7 +614,7 @@ function renderInlineJSX(text, styleRanges, urls, mentions) {
 // ── Article atomic block renderer ──────────────────────────────────────────────
 // Port of renderAtomic() from x-article-renderer.
 
-function renderAtomicJSX(block, artifactMap) {
+function renderAtomicJSX(block, artifactMap, opts) {
   const entities = block.resolved_entities || [];
   if (entities.length === 0) return null;
 
@@ -523,7 +625,24 @@ function renderAtomicJSX(block, artifactMap) {
 
       case 'media': {
         const src = resolveUrl(e.local_path, e.url, artifactMap);
-        return src ? <img key={i} src={src} style={S.bImg} loading="lazy" alt="" /> : null;
+        if (!src) return null;
+        return (
+          <a
+            key={i}
+            href={src}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ display: 'block', cursor: 'zoom-in' }}
+            onClick={ev => {
+              if (!ev.metaKey && !ev.ctrlKey) {
+                ev.preventDefault();
+                opts?.onImgClick?.(src);
+              }
+            }}
+          >
+            <img src={src} style={S.bImg} loading="lazy" alt="" />
+          </a>
+        );
       }
 
       case 'tweet':
@@ -577,7 +696,7 @@ function renderAtomicJSX(block, artifactMap) {
 // ── Article single block renderer ──────────────────────────────────────────────
 // Port of renderBlock() from x-article-renderer.
 
-function renderBlockJSX(block, key, artifactMap) {
+function renderBlockJSX(block, key, artifactMap, opts) {
   const type = block.type || '';
   const text = block.text || '';
   const styleRanges = block.inline_style_ranges || [];
@@ -619,7 +738,7 @@ function renderBlockJSX(block, key, artifactMap) {
       return <li key={key} style={S.bLi}>{inner}</li>;
 
     case 'atomic':
-      return <span key={key}>{renderAtomicJSX(block, artifactMap)}</span>;
+      return <span key={key}>{renderAtomicJSX(block, artifactMap, opts)}</span>;
 
     default:
       return text ? <p key={key} style={S.bP}>{inner}</p> : null;
@@ -630,7 +749,7 @@ function renderBlockJSX(block, key, artifactMap) {
 // Port of renderBlocks() from x-article-renderer.
 // Groups consecutive same-type list items into a single ul/ol.
 
-function renderBlocksJSX(blocks, artifactMap) {
+function renderBlocksJSX(blocks, artifactMap, opts) {
   const items = [];
   let i = 0;
 
@@ -641,7 +760,7 @@ function renderBlocksJSX(blocks, artifactMap) {
       const startIdx = i;
       const listItems = [];
       while (i < blocks.length && blocks[i].type === 'unordered-list-item') {
-        listItems.push(renderBlockJSX(blocks[i], i, artifactMap));
+        listItems.push(renderBlockJSX(blocks[i], i, artifactMap, opts));
         i++;
       }
       items.push(<ul key={`ul-${startIdx}`} style={S.bUl}>{listItems}</ul>);
@@ -649,12 +768,12 @@ function renderBlocksJSX(blocks, artifactMap) {
       const startIdx = i;
       const listItems = [];
       while (i < blocks.length && blocks[i].type === 'ordered-list-item') {
-        listItems.push(renderBlockJSX(blocks[i], i, artifactMap));
+        listItems.push(renderBlockJSX(blocks[i], i, artifactMap, opts));
         i++;
       }
       items.push(<ol key={`ol-${startIdx}`} style={S.bOl}>{listItems}</ol>);
     } else {
-      items.push(renderBlockJSX(b, i, artifactMap));
+      items.push(renderBlockJSX(b, i, artifactMap, opts));
       i++;
     }
   }
@@ -665,6 +784,8 @@ function renderBlocksJSX(blocks, artifactMap) {
 // ── Article renderer ───────────────────────────────────────────────────────────
 
 function ArticleRenderer({ article, tweetAuthor, artifactMap }) {
+  const [lightboxSrc, setLightboxSrc] = useState(null);
+
   const cover = article.cover_media || {};
   const author = article.author || tweetAuthor || {};
   const date = article.first_published_at_secs
@@ -678,8 +799,23 @@ function ArticleRenderer({ article, tweetAuthor, artifactMap }) {
 
   return (
     <div style={S.article}>
+      {lightboxSrc && (
+        <MediaLightbox
+          items={[{ src: lightboxSrc, alt: '' }]}
+          startIndex={0}
+          onClose={() => setLightboxSrc(null)}
+        />
+      )}
       {coverSrc && (
-        <img src={coverSrc} style={S.aCover} alt="Article cover" />
+        <a
+          href={coverSrc}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ display: 'block', cursor: 'zoom-in' }}
+          onClick={e => { if (!e.metaKey && !e.ctrlKey) { e.preventDefault(); setLightboxSrc(coverSrc); } }}
+        >
+          <img src={coverSrc} style={S.aCover} alt="Article cover" />
+        </a>
       )}
       <div style={S.aMeta}>
         {article.title && (
@@ -702,7 +838,7 @@ function ArticleRenderer({ article, tweetAuthor, artifactMap }) {
       </div>
       <hr style={S.aDivider} />
       <div style={S.aBody}>
-        {renderBlocksJSX(article.blocks || [], artifactMap)}
+        {renderBlocksJSX(article.blocks || [], artifactMap, { onImgClick: setLightboxSrc })}
       </div>
     </div>
   );
@@ -712,95 +848,214 @@ function ArticleRenderer({ article, tweetAuthor, artifactMap }) {
 // Renders one tweet. When isInThread, omits bottom padding from the row and
 // shows a thread connector line below the avatar (except on the last card).
 
+
+// ── Photo grid ─────────────────────────────────────────────────────────────────
+// Renders 1–4 photos in Twitter-style grid. Regular click = lightbox;
+// Cmd/Ctrl+click follows the <a> href to open the image in a new tab.
+function PhotoGrid({ photos, onOpen }) {
+  const n = photos.length;
+  if (n === 0) return null;
+
+  if (n === 1) {
+    return (
+      <a
+        href={photos[0].src}
+        target="_blank"
+        rel="noopener noreferrer"
+        style={{ display: 'block' }}
+        onClick={e => { if (!e.metaKey && !e.ctrlKey) { e.preventDefault(); onOpen(0); } }}
+      >
+        <img src={photos[0].src} alt={photos[0].alt || ''} style={S.mediaImg} loading="lazy" />
+      </a>
+    );
+  }
+
+  // 2 → two columns, 1 row; 3 → left spans 2 rows; 4 → 2×2
+  const rowH = n <= 2 ? '180px' : '140px';
+  return (
+    <div style={{
+      display: 'grid',
+      gridTemplateColumns: '1fr 1fr',
+      gridTemplateRows: n === 2 ? rowH : `${rowH} ${rowH}`,
+      gap: '2px',
+    }}>
+      {photos.map((ph, i) => (
+        <a
+          key={i}
+          href={ph.src}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{
+            display: 'block',
+            overflow: 'hidden',
+            gridRow: (n === 3 && i === 0) ? 'span 2' : undefined,
+          }}
+          onClick={e => { if (!e.metaKey && !e.ctrlKey) { e.preventDefault(); onOpen(i); } }}
+        >
+          <img
+            src={ph.src}
+            alt={ph.alt || ''}
+            loading="lazy"
+            style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+          />
+        </a>
+      ))}
+    </div>
+  );
+}
+
+// ── Media lightbox ─────────────────────────────────────────────────────────────
+// position:fixed escapes any overflow/stacking context.
+function MediaLightbox({ items, startIndex, onClose }) {
+  const [idx, setIdx] = useState(startIndex);
+
+  useEffect(() => {
+    const h = e => {
+      if (e.key === 'Escape') onClose();
+      if (e.key === 'ArrowRight') setIdx(i => Math.min(i + 1, items.length - 1));
+      if (e.key === 'ArrowLeft') setIdx(i => Math.max(i - 1, 0));
+    };
+    document.addEventListener('keydown', h);
+    return () => document.removeEventListener('keydown', h);
+  }, [onClose, items.length]);
+
+  const item = items[idx];
+  return (
+    <div style={S.lightboxBackdrop} onClick={onClose}>
+      <div style={S.lightboxContent} onClick={e => e.stopPropagation()}>
+        <div style={S.lightboxToolbar}>
+          {items.length > 1 && (
+            <span style={S.lightboxCounter}>{idx + 1} / {items.length}</span>
+          )}
+          <a
+            href={item.src}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={S.lightboxLink}
+            title="Open in new tab"
+          >↗</a>
+          <button style={S.lightboxBtn} onClick={onClose} aria-label="Close">×</button>
+        </div>
+        <img src={item.src} alt={item.alt || ''} style={S.lightboxImg} />
+        {items.length > 1 && (
+          <div style={S.lightboxNav}>
+            <button
+              style={S.lightboxNavBtn}
+              onClick={() => setIdx(i => Math.max(i - 1, 0))}
+              disabled={idx === 0}
+            >‹</button>
+            <button
+              style={S.lightboxNavBtn}
+              onClick={() => setIdx(i => Math.min(i + 1, items.length - 1))}
+              disabled={idx === items.length - 1}
+            >›</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function TweetCard({ tweet, isInThread, isLast, artifactMap }) {
+  const [lightboxIdx, setLightboxIdx] = useState(null);
+
   const author = tweet.author || {};
   const date = tweet.created_at_secs ? fmtDate(tweet.created_at_secs) : '';
   const entities = tweet.entities || {};
   const avatarSrc = resolveUrl(author.avatar_local_path, author.avatar_url, artifactMap);
   const showConnector = isInThread && !isLast;
-
+  const isQT = tweet.is_quote_status === true;
   const rowStyle = isInThread ? S.tweetRowThread : S.tweetRow;
 
-  // Prefer extended_entities for video/multi-photo, fall back to entities.media
-  const media = (tweet.extended_entities?.media?.length
+  // Build resolved media lists first; skip the grid entirely if every item resolves to null.
+  const rawMedia = (tweet.extended_entities?.media?.length
     ? tweet.extended_entities.media
     : entities.media) || [];
 
+  const photos = [];
+  const videoItems = [];
+  for (const m of rawMedia) {
+    if (m.type === 'photo') {
+      const src = resolveUrl(m.local_path, m.media_url_https, artifactMap);
+      if (src) photos.push({ kind: 'photo', src, alt: m.alt_text || '' });
+    } else if (m.type === 'video' || m.type === 'animated_gif') {
+      const src = (m.local_path && artifactMap[m.local_path])
+        || (() => {
+          const variants = m.video_info?.variants || [];
+          return variants
+            .filter(v => v.content_type === 'video/mp4')
+            .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0]?.url;
+        })();
+      if (src) videoItems.push({ kind: m.type === 'animated_gif' ? 'gif' : 'video', src });
+    }
+  }
+
   return (
-    <div style={rowStyle}>
-      <div style={S.leftCol}>
-        {avatarSrc
-          ? <img src={avatarSrc} style={S.avatar} alt={author.name || ''} />
-          : <div style={S.avatarPh} />
-        }
-        {showConnector && <div style={S.threadLine} />}
-      </div>
-
-      <div style={S.rightCol}>
-        <div style={S.authorRow}>
-          <span style={S.authorName}>
-            {author.name || author.screen_name || 'Unknown'}
-          </span>
-          {author.screen_name && (
-            <span style={S.authorHandle}>@{author.screen_name}</span>
-          )}
-          {date && (
-            <span style={S.datePart}>· {date}</span>
-          )}
+    <>
+      {lightboxIdx !== null && (
+        <MediaLightbox
+          items={photos}
+          startIndex={lightboxIdx}
+          onClose={() => setLightboxIdx(null)}
+        />
+      )}
+      <div style={rowStyle}>
+        <div style={S.leftCol}>
+          {avatarSrc
+            ? <img src={avatarSrc} style={S.avatar} alt={author.name || ''} />
+            : <div style={S.avatarPh} />
+          }
+          {showConnector && <div style={S.threadLine} />}
         </div>
 
-        <div style={S.tweetText}>
-          {renderTweetTextJSX(tweet.full_text || '', entities)}
+        <div style={S.rightCol}>
+          <div style={S.authorRow}>
+            <span style={S.authorName}>{author.name || author.screen_name || 'Unknown'}</span>
+            {author.screen_name && (
+              <span style={S.authorHandle}>@{author.screen_name}</span>
+            )}
+            {date && <span style={S.datePart}>· {date}</span>}
+            {isQT && (
+              <span style={S.qtBadge} title="Quote tweet">↻ QT</span>
+            )}
+          </div>
+
+          <div style={S.tweetText}>
+            {renderTweetTextJSX(tweet.full_text || '', entities)}
+          </div>
+
+          {photos.length > 0 && (
+            <div style={S.mediaGrid}>
+              <PhotoGrid photos={photos} onOpen={i => setLightboxIdx(i)} />
+            </div>
+          )}
+
+          {videoItems.map((v, i) => (
+            <div key={i} style={S.mediaGrid}>
+              <video
+                src={v.src}
+                style={S.mediaVideo}
+                controls
+                loop={v.kind === 'gif'}
+                muted={v.kind === 'gif'}
+                autoPlay={v.kind === 'gif'}
+              />
+            </div>
+          ))}
+
+          {(tweet.retweet_count > 0 || tweet.favorite_count > 0) && (
+            <div style={S.stats}>
+              {tweet.favorite_count > 0 && (
+                <span>❤️ {tweet.favorite_count.toLocaleString()}</span>
+              )}
+              {tweet.retweet_count > 0 && (
+                <span>🔁 {tweet.retweet_count.toLocaleString()}</span>
+              )}
+            </div>
+          )}
         </div>
-
-        {media.length > 0 && (
-          <div style={S.mediaGrid}>
-            {media.map((m, i) => {
-              if (m.type === 'photo') {
-                // Local archived file preferred; CDN thumbnail as fallback
-                const src = resolveUrl(m.local_path, m.media_url_https, artifactMap);
-                if (!src) return null;
-                return (
-                  <img key={i} src={src} style={S.mediaImg}
-                    alt={m.alt_text || ''} loading="lazy" />
-                );
-              }
-              if (m.type === 'video' || m.type === 'animated_gif') {
-                // Local archived file preferred; fall back to best-bitrate CDN mp4.
-                // m.media_url_https is a thumbnail image, NOT a video — don't use it.
-                const videoSrc = (m.local_path && artifactMap[m.local_path])
-                  || (() => {
-                    const variants = m.video_info?.variants || [];
-                    return variants
-                      .filter(v => v.content_type === 'video/mp4')
-                      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0]?.url;
-                  })();
-                if (!videoSrc) return null;
-                return (
-                  <video key={i} src={videoSrc} style={S.mediaVideo}
-                    controls
-                    loop={m.type === 'animated_gif'}
-                    muted={m.type === 'animated_gif'}
-                  />
-                );
-              }
-              return null;
-            })}
-          </div>
-        )}
-
-        {(tweet.retweet_count > 0 || tweet.favorite_count > 0) && (
-          <div style={S.stats}>
-            {tweet.favorite_count > 0 && (
-              <span>❤️ {tweet.favorite_count.toLocaleString()}</span>
-            )}
-            {tweet.retweet_count > 0 && (
-              <span>🔁 {tweet.retweet_count.toLocaleString()}</span>
-            )}
-          </div>
-        )}
       </div>
-    </div>
+    </>
   );
 }
 
