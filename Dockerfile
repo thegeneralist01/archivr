@@ -54,6 +54,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
+    unzip \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends \
     chromium \
@@ -75,6 +76,27 @@ RUN python3 -m venv /opt/archivr-venv \
         yt-dlp \
         twitter-api-client
 
+# Download Chromium extensions used during headless captures.
+# uBlock Origin Lite (MV3) — ad/tracker blocking.
+# I Still Don't Care About Cookies (MV3) — cookie-banner dismissal.
+RUN mkdir -p \
+        /usr/local/lib/archivr/extensions/ublock-origin-lite \
+        /usr/local/lib/archivr/extensions/istilldontcareaboutcookies \
+    && curl -fsSL \
+        "https://github.com/uBlockOrigin/uBOL-home/releases/download/2026.705.2152/uBOLite_2026.705.2152.chromium.zip" \
+        -o /tmp/ublock.zip \
+    && echo "e136ef0d86e43a40ee54ad7b4de01b2c305c81ff4ee9ffef8766ee19b2eee174  /tmp/ublock.zip" | sha256sum -c - \
+    && unzip -q /tmp/ublock.zip -d /usr/local/lib/archivr/extensions/ublock-origin-lite \
+    && rm /tmp/ublock.zip \
+    && curl -fsSL \
+        "https://github.com/OhMyGuus/I-Still-Dont-Care-About-Cookies/releases/download/v1.1.9/ISDCAC-chrome-source.zip" \
+        -o /tmp/isdcac.zip \
+    && echo "8f70ab947cb2d274f4022a970f5dd3cecd8ec02b060e05187bef9ee3cb18bbcb  /tmp/isdcac.zip" | sha256sum -c - \
+    && unzip -q /tmp/isdcac.zip -d /usr/local/lib/archivr/extensions/istilldontcareaboutcookies \
+    && rm /tmp/isdcac.zip \
+    && test -f /usr/local/lib/archivr/extensions/istilldontcareaboutcookies/manifest.json \
+        || { echo "ERROR: manifest.json not at ISDCAC extension root; zip structure may have changed"; exit 1; }
+
 # Server and CLI binaries (CLI is needed to run `archivr init` on first setup)
 COPY --from=builder /build/target/release/archivr-server /usr/local/bin/archivr-server
 COPY --from=builder /build/target/release/archivr       /usr/local/bin/archivr
@@ -95,6 +117,8 @@ ENV ARCHIVR_STATIC_DIR=/usr/share/archivr-server/static \
     ARCHIVR_TWEET_PYTHON=/opt/archivr-venv/bin/python3 \
     ARCHIVR_TWEET_SCRAPER=/usr/local/lib/archivr/scrape_user_tweet_contents.py \
     ARCHIVR_YT_DLP=/opt/archivr-venv/bin/yt-dlp \
+    ARCHIVR_UBLOCK_EXT=/usr/local/lib/archivr/extensions/ublock-origin-lite \
+    ARCHIVR_COOKIE_EXT=/usr/local/lib/archivr/extensions/istilldontcareaboutcookies \
     ARCHIVR_CHROME_ARGS=--no-sandbox
 
 EXPOSE 8080
