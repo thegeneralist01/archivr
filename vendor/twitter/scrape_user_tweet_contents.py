@@ -493,14 +493,23 @@ def extract_tweet_data(
     # Extract is_quote_status (bare)
     tweet_data["is_quote_status"] = legacy.get("is_quote_status", False)
 
-    # Extract entities (always included)
-    entities = legacy.get("entities", {})
+    # Extract entities - when note_tweet text is used, its entity_set has the
+    # correct indices for that text; legacy.entities indices match legacy.full_text
+    # (truncated) and will be wrong/missing for long tweets.
+    note_result = (
+        tweet_result.get("note_tweet", {})
+        .get("note_tweet_results", {})
+        .get("result", {})
+    )
+    note_ents = note_result.get("entity_set", {}) if note_tweet_text else {}
+    legacy_ents = legacy.get("entities", {})
     tweet_data["entities"] = {
-        "hashtags": entities.get("hashtags", []),
-        "urls": entities.get("urls", []),
-        "user_mentions": entities.get("user_mentions", []),
-        "symbols": entities.get("symbols", []),
-        "media": entities.get("media", []) if not bare_scrape else [],
+        "hashtags":      note_ents.get("hashtags",      legacy_ents.get("hashtags", [])),
+        "urls":          note_ents.get("urls",          legacy_ents.get("urls", [])),
+        "user_mentions": note_ents.get("user_mentions", legacy_ents.get("user_mentions", [])),
+        "symbols":       note_ents.get("symbols",       legacy_ents.get("symbols", [])),
+        # media always from legacy (note_tweet has no media downloads)
+        "media": legacy_ents.get("media", []) if not bare_scrape else [],
     }
 
     # Extract optional fields if not bare scrape

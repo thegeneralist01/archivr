@@ -458,33 +458,80 @@ function XLogo() {
 // links and @mentions with x.com links. Returns an array of React nodes.
 // white-space: pre-line on the container preserves newlines in plain segments.
 
+// Resolve start/end offsets for a URL or mention entity, handling three
+// storage formats: camelCase fromIndex/toIndex (article inline), Twitter
+// native indices:[s,e] array, and fallback exact-string search in fullText.
+function resolveEntityBounds(ent, fullText, ...candidates) {
+  if (ent.fromIndex != null && ent.toIndex != null)
+    return { s: ent.fromIndex, e: ent.toIndex };
+  if (ent.indices?.length === 2)
+    return { s: ent.indices[0], e: ent.indices[1] };
+  if (fullText) {
+    for (const c of candidates) {
+      if (!c) continue;
+      const idx = fullText.indexOf(c);
+      if (idx !== -1) return { s: idx, e: idx + c.length };
+    }
+  }
+  return null;
+}
+
+// Build a canonical URL annotation from any entity format.
+// Search candidates: short url first (appears in fullText), then expanded.
+function normalizeUrlAnn(u, fullText) {
+  const href    = u.expanded_url || u.url || u.text || '';
+  const display = u.display_url  || u.expanded_url || u.url || u.text || '';
+  const bounds  = resolveEntityBounds(u, fullText, u.url, u.text, u.display_url, u.expanded_url);
+  if (!bounds || !href) return null;
+  return { ...bounds, kind: 'url', href, display };
+}
+
+// Build a canonical mention annotation from any entity format.
+function normalizeMentionAnn(m, fullText) {
+  const screen_name = m.screen_name || m.name || m.text || '';
+  const matchStr = screen_name ? `@${screen_name}` : null;
+  const bounds = resolveEntityBounds(m, fullText, matchStr);
+  if (!bounds || !screen_name) return null;
+  return { ...bounds, kind: 'mention', screen_name };
+}
+
+// Linkify bare http(s) URLs in a plain-text string that have no entity coverage.
+// Returns an array of strings and <a> nodes, or the original string if no URLs.
+const URL_RE = /https?:\/\/[^\s<>"'\]）]+/g;
+// Characters that commonly trail a URL but aren't part of it
+const TRAIL_PUNCT = /[.,;:!?)（）]+$/;
+function linkifyText(text, linkStyle) {
+  const parts = [];
+  let last = 0;
+  let m;
+  URL_RE.lastIndex = 0;
+  while ((m = URL_RE.exec(text)) !== null) {
+    if (m.index > last) parts.push(text.slice(last, m.index));
+    let href = m[0].replace(TRAIL_PUNCT, '');
+    parts.push(
+      <a key={m.index} href={href} target="_blank" rel="noopener noreferrer" style={linkStyle}>
+        {href}
+      </a>
+    );
+    // Put back any trimmed trailing chars as plain text
+    const trail = m[0].slice(href.length);
+    if (trail) parts.push(trail);
+    last = m.index + m[0].length;
+  }
+  if (last === 0) return text; // no URLs — return string directly (no array alloc)
+  if (last < text.length) parts.push(text.slice(last));
+  return parts;
+}
+
 function renderTweetTextJSX(fullText, entities) {
   if (!fullText) return null;
 
-  const urls = (entities.urls || []).filter(
-    u => u.fromIndex != null && u.toIndex != null
-  );
-  const mentions = (entities.user_mentions || []).filter(
-    m => m.fromIndex != null && m.toIndex != null
-  );
-
-  if (urls.length === 0 && mentions.length === 0) return decodeEnt(fullText);
-
   const anns = [
-    ...urls.map(u => ({
-      s: u.fromIndex,
-      e: u.toIndex,
-      kind: 'url',
-      href: u.expanded_url,
-      display: u.display_url,
-    })),
-    ...mentions.map(m => ({
-      s: m.fromIndex,
-      e: m.toIndex,
-      kind: 'mention',
-      screen_name: m.screen_name,
-    })),
+    ...(entities.urls || []).map(u => normalizeUrlAnn(u, fullText)).filter(Boolean),
+    ...(entities.user_mentions || []).map(m => normalizeMentionAnn(m, fullText)).filter(Boolean),
   ];
+  if (anns.length === 0) return linkifyText(decodeEnt(fullText), S.link);
+
 
   const pts = new Set([0, fullText.length]);
   for (const a of anns) {
@@ -522,7 +569,7 @@ function renderTweetTextJSX(fullText, entities) {
       );
     }
 
-    return <span key={i}>{decodeEnt(seg)}</span>;
+    return <span key={i}>{linkifyText(decodeEnt(seg), S.link)}</span>;
   });
 }
 
@@ -542,12 +589,16 @@ function renderInlineJSX(text, styleRanges, urls, mentions) {
     if (r.length > 0)
       anns.push({ s: r.offset, e: r.offset + r.length, kind: 'style', style: r.style });
   }
-  for (const u of urls)
-    anns.push({ s: u.fromIndex, e: u.toIndex, kind: 'url', href: u.text });
-  for (const m of mentions)
-    anns.push({ s: m.fromIndex, e: m.toIndex, kind: 'mention', name: m.text });
+  for (const u of urls) {
+    const ann = normalizeUrlAnn(u, text);
+    if (ann) anns.push(ann);
+  }
+  for (const m of mentions) {
+    const ann = normalizeMentionAnn(m, text);
+    if (ann) anns.push(ann);
+  }
 
-  if (anns.length === 0) return text;
+  if (anns.length === 0) return linkifyText(text, S.link);
 
   const pts = new Set([0, text.length]);
   for (const a of anns) {
@@ -587,9 +638,12 @@ function renderInlineJSX(text, styleRanges, urls, mentions) {
     // Links wrap outermost.
     const url = active.find(a => a.kind === 'url');
     if (url) {
+      // If the visible segment is a raw t.co short URL, replace it with the
+      // human-readable display URL; otherwise keep the styled anchor text.
+      const isTco = /^https?:\/\/t\.co\//i.test(content);
       content = (
         <a href={url.href} target="_blank" rel="noopener noreferrer" style={S.link}>
-          {content}
+          {isTco ? url.display : content}
         </a>
       );
     }
@@ -598,7 +652,7 @@ function renderInlineJSX(text, styleRanges, urls, mentions) {
     if (mention) {
       content = (
         <a
-          href={`https://x.com/${mention.name}`}
+          href={`https://x.com/${mention.screen_name}`}
           target="_blank"
           rel="noopener noreferrer"
           style={S.link}
@@ -608,7 +662,7 @@ function renderInlineJSX(text, styleRanges, urls, mentions) {
       );
     }
 
-    return <span key={i}>{content}</span>;
+    return <span key={i}>{typeof content === 'string' ? linkifyText(content, S.link) : content}</span>;
   });
 }
 
