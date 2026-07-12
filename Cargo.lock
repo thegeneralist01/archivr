@@ -133,6 +133,7 @@ dependencies = [
  "parking_lot",
  "rand",
  "regex",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

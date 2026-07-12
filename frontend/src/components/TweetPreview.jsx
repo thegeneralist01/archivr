@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { fetchEntryArtifacts } from '../api';
+import { fetchEntryArtifacts, resolveTcoUrls } from '../api';
 
 // ── Date helper ────────────────────────────────────────────────────────────────
 
@@ -1148,7 +1148,57 @@ export default function TweetPreview({ archiveId, entryUid, artifacts, entityKin
     let cancelled = false;
 
     fetchEntryArtifacts(archiveId, entryUid, tweetArtifacts.map(a => a.index))
-      .then(data => { if (!cancelled) setTweets(data); })
+      .then(async data => {
+        if (cancelled) return;
+
+        const tcoRe = /https?:\/\/t\.co\/[A-Za-z0-9]+/g;
+
+        // For each tweet, build the set of [start,end) spans already covered by
+        // existing URL entities. A regex match is only "entity-less" if its span
+        // is not covered — avoids skipping real duplicate occurrences.
+        const coveredRanges = tweet => {
+          const ft = tweet.full_text || '';
+          return (tweet.entities?.urls || []).map(u => {
+            if (u.fromIndex != null && u.toIndex != null) return [u.fromIndex, u.toIndex];
+            if (u.indices?.length === 2) return [u.indices[0], u.indices[1]];
+            if (u.url) { const i = ft.indexOf(u.url); if (i !== -1) return [i, i + u.url.length]; }
+            return null;
+          }).filter(Boolean);
+        };
+        const isCovered = (ranges, s, e) => ranges.some(([cs, ce]) => cs <= s && ce >= e);
+
+        const uniqueTco = new Set();
+        for (const t of data) {
+          const ft = t.full_text || '';
+          const ranges = coveredRanges(t);
+          let m; tcoRe.lastIndex = 0;
+          while ((m = tcoRe.exec(ft)) !== null) {
+            if (!isCovered(ranges, m.index, m.index + m[0].length)) uniqueTco.add(m[0]);
+          }
+        }
+
+        const resolved = uniqueTco.size > 0 ? await resolveTcoUrls([...uniqueTco]).catch(() => ({})) : {};
+
+        const augmented = data.map(t => {
+          const ft = t.full_text || '';
+          const ranges = coveredRanges(t);
+          const synth = [];
+          let m; tcoRe.lastIndex = 0;
+          while ((m = tcoRe.exec(ft)) !== null) {
+            const tco = m[0]; const exp = resolved[tco];
+            if (exp && exp !== tco && !isCovered(ranges, m.index, m.index + tco.length)) {
+              synth.push({
+                url: tco, expanded_url: exp,
+                display_url: (() => { try { const u = new URL(exp); return u.hostname + (u.pathname.length > 1 ? '/…' : ''); } catch (_) { return exp; } })(),
+                fromIndex: m.index, toIndex: m.index + tco.length,
+              });
+            }
+          }
+          if (synth.length === 0) return t;
+          return { ...t, entities: { ...(t.entities || {}), urls: [...(t.entities?.urls || []), ...synth] } };
+        });
+        if (!cancelled) setTweets(augmented);
+      })
       .catch(e => { if (!cancelled) setError(e.message || 'Failed to load tweet.'); })
       .finally(() => { if (!cancelled) setLoading(false); });
 

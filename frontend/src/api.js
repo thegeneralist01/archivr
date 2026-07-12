@@ -35,6 +35,20 @@ export function fetchEntryArtifacts(archiveId, entryUid, indices) {
   );
 }
 
+// Resolve t.co short URLs server-side (HEAD→GET, no-follow).
+// Returns a map { [tcoUrl]: expandedUrl }.
+// Silently returns {} on failure — callers fall back to plain t.co links.
+export async function resolveTcoUrls(urls) {
+  if (!urls || urls.length === 0) return {};
+  const res = await fetch('/api/util/resolve-tco', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(urls),
+  });
+  if (!res.ok) return {};
+  return res.json();
+}
+
 export async function updateEntryTitle(archiveId, entryUid, title) {
   const res = await fetch(`/api/archives/${archiveId}/entries/${entryUid}`, {
     method: 'PATCH',
