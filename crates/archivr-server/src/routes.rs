@@ -91,6 +91,8 @@ async fn setup_guard(
 /// Tower middleware: injects HTTP security response headers on every response.
 /// HSTS is intentionally omitted — that belongs at the reverse-proxy layer.
 async fn security_headers(req: Request, next: Next) -> Response {
+    // Capture path before consuming req for next.run()
+    let is_artifact = req.uri().path().contains("/artifacts/");
     let mut response = next.run(req).await;
     let headers = response.headers_mut();
     headers.insert(
@@ -98,29 +100,52 @@ async fn security_headers(req: Request, next: Next) -> Response {
         axum::http::HeaderValue::from_static("nosniff"),
     );
     headers.insert(
-        axum::http::header::HeaderName::from_static("x-frame-options"),
-        axum::http::HeaderValue::from_static("DENY"),
-    );
-    headers.insert(
         axum::http::header::HeaderName::from_static("referrer-policy"),
         axum::http::HeaderValue::from_static("strict-origin-when-cross-origin"),
     );
     headers.insert(
-        axum::http::header::HeaderName::from_static("content-security-policy"),
-        axum::http::HeaderValue::from_static(
-            "default-src 'self'; \
-             script-src 'self'; \
-             style-src 'self' 'unsafe-inline'; \
-             img-src 'self' data: blob:; \
-             font-src 'self'; \
-             connect-src 'self'; \
-             frame-ancestors 'none'",
-        ),
-    );
-    headers.insert(
         axum::http::header::HeaderName::from_static("permissions-policy"),
-        axum::http::HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+        axum::http::HeaderValue::from_static("camera=(), microphone=(), geolocation=(), autoplay=()"),
     );
+    if is_artifact {
+        // Artifact responses are iframed by the preview modal (sandboxed, no allow-scripts).
+        // When opened directly in a new tab scripts must still be blocked so archived
+        // pages cannot make same-origin API calls with the user's session.
+        // Only styles, images, fonts and media need to be relaxed for rendering.
+        headers.insert(
+            axum::http::header::HeaderName::from_static("content-security-policy"),
+            axum::http::HeaderValue::from_static(
+                "default-src 'none'; \
+                 script-src 'none'; \
+                 style-src 'self' 'unsafe-inline' https:; \
+                 img-src 'self' data: blob: https:; \
+                 font-src 'self' https:; \
+                 media-src 'self' blob:; \
+                 connect-src 'none'; \
+                 frame-ancestors 'self'",
+            ),
+        );
+    } else {
+        headers.insert(
+            axum::http::header::HeaderName::from_static("x-frame-options"),
+            axum::http::HeaderValue::from_static("DENY"),
+        );
+        // Main app CSP — allow Google Fonts and external images for tweet previews
+        headers.insert(
+            axum::http::header::HeaderName::from_static("content-security-policy"),
+            axum::http::HeaderValue::from_static(
+                "default-src 'self'; \
+                 script-src 'self'; \
+                 style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+                 img-src 'self' data: blob: https:; \
+                 font-src 'self' https://fonts.gstatic.com; \
+                 media-src 'self' blob: https:; \
+                 connect-src 'self'; \
+                 frame-src 'self'; \
+                 frame-ancestors 'none'",
+            ),
+        );
+    }
     response
 }
 
@@ -303,6 +328,7 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/archives/:archive_id/blob-cleanup",
             get(blob_cleanup_scan_handler).delete(blob_cleanup_delete_handler),
         )
+        .route("/api/util/resolve-tco", post(resolve_tco_handler))
         .nest_service("/assets", ServeDir::new(static_dir.join("assets")))
         .fallback_service(ServeFile::new(static_dir.join("index.html")))
         .layer(axum::middleware::from_fn_with_state(state.clone(), setup_guard))
@@ -1881,6 +1907,74 @@ async fn delete_collection_handler(
     } else {
         Err(ApiError::not_found("collection not found"))
     }
+}
+
+// ── t.co resolver ──────────────────────────────────────────────────────────────
+// POST /api/util/resolve-tco
+// Body: JSON array of t.co short URLs (max 50).
+// Returns: JSON object mapping each input URL to its expanded destination.
+//
+// Security:
+// - Input restricted to https://t.co/<alphanumeric token> only (no SSRF via input).
+// - redirect(Policy::none()): makes ONE HEAD to t.co, reads Location header, never
+//   fetches the expanded destination (no open-proxy).
+// - 3 s timeout, 1-hop max.
+// - No auth required (t.co is public; no data exposed).
+
+static TCO_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"^https://t\.co/[A-Za-z0-9]+$").unwrap()
+});
+
+async fn resolve_tco_handler(
+    Json(urls): Json<Vec<String>>,
+) -> Result<Json<std::collections::HashMap<String, String>>, ApiError> {
+    const MAX_BATCH: usize = 50;
+    let urls: Vec<String> = urls
+        .into_iter()
+        .filter(|u| TCO_RE.is_match(u))
+        .take(MAX_BATCH)
+        .collect();
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(3))
+        .build()
+        .map_err(|e| ApiError::internal(&format!("http client: {e}")))?;
+
+    let mut map = std::collections::HashMap::new();
+    let futs: Vec<_> = urls.iter().map(|url| {
+        let client = client.clone();
+        let url = url.clone();
+        tokio::spawn(async move {
+            // Try HEAD first; fall back to GET if HEAD returns no Location.
+            // Neither follows redirects (Policy::none), so the server only
+            // ever connects to t.co itself — never to the destination.
+            // Only accept http/https destinations — never javascript:, data:, etc.
+            let safe_location = |resp: reqwest::Response| {
+                resp.headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string())
+                    .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+            };
+            let expanded = match client.head(&url).send().await.ok().and_then(safe_location) {
+                Some(loc) => loc,
+                None => match client.get(&url).send().await.ok().and_then(safe_location) {
+                    Some(loc) => loc,
+                    None => url.clone(),
+                },
+            };
+            (url, expanded)
+        })
+    }).collect();
+
+    for fut in futs {
+        if let Ok((k, v)) = fut.await {
+            map.insert(k, v);
+        }
+    }
+
+    Ok(Json(map))
 }
 
 #[cfg(test)]

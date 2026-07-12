@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { fetchEntryDetail, fetchEntryTags, assignTag, removeTag, listEntryCollections, updateEntryTitle, deleteEntry, rearchiveEntry, pollCaptureJob } from '../api'
+import { fetchEntryTags, assignTag, removeTag, listEntryCollections, updateEntryTitle, deleteEntry, rearchiveEntry, pollCaptureJob } from '../api'
 import { formatTimestamp, formatBytes, valueText, sourceIconSvg, displayPath } from '../utils'
 
 const VIS_LABEL = { 0: 'Private', 1: 'Public', 2: 'Users only', 3: 'Public' }
@@ -11,8 +11,7 @@ const ExternalIcon = () => (
   </svg>
 )
 
-export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, tagNodes, onTagsRefresh, onEntryTitleChange, onEntryDeleted, humanizeTags }) {
-  const [detail, setDetail] = useState(null)
+export default function ContextRail({ archiveId, selectedEntry, detail, onTagFilterSet, tagNodes, onTagsRefresh, onEntryTitleChange, onEntryDeleted, humanizeTags, onDetailRefresh, onOpenPreview, onPlay }) {
   const [tags, setTags] = useState([])
   const [assignInput, setAssignInput] = useState('')
   const [entryCollections, setEntryCollections] = useState([])
@@ -26,11 +25,11 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
   const rearchivePollRef = useRef(null)
 
   useEffect(() => {
+    const seq = ++selectSeqRef.current
     if (rearchivePollRef.current) { clearInterval(rearchivePollRef.current); rearchivePollRef.current = null }
     setRearchiveState('idle')
     setRearchiveError('')
     if (!selectedEntry || !archiveId) {
-      setDetail(null)
       setTags([])
       setEntryCollections([])
       return
@@ -38,16 +37,12 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
     setEditingTitle(false)
     setTitleDraft('')
     titleCancelRef.current = false
-    const seq = ++selectSeqRef.current
-    setDetail(null)
     setTags([])
     Promise.all([
-      fetchEntryDetail(archiveId, selectedEntry.entry_uid),
       fetchEntryTags(archiveId, selectedEntry.entry_uid),
       listEntryCollections(archiveId, selectedEntry.entry_uid),
-    ]).then(([det, tgs, ecs]) => {
+    ]).then(([tgs, ecs]) => {
       if (seq !== selectSeqRef.current) return
-      setDetail(det)
       setTags(tgs)
       setEntryCollections(ecs)
     }).catch(() => {})
@@ -63,7 +58,6 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
     const newTitle = titleDraft.trim() || null
     try {
       await updateEntryTitle(archiveId, selectedEntry.entry_uid, newTitle)
-      setDetail(prev => prev ? { ...prev, summary: { ...prev.summary, title: newTitle } } : prev)
       onEntryTitleChange?.(selectedEntry.entry_uid, newTitle)
     } catch {
       // silently revert
@@ -111,39 +105,44 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
 
   async function handleRearchive() {
     if (!selectedEntry || !archiveId || rearchiveState === 'running') return
+    // Capture identity at start so closure comparisons are stable
+    const startSeq = selectSeqRef.current
+    const entryUid = selectedEntry.entry_uid
     setRearchiveState('running')
     setRearchiveError('')
     try {
-      const { job_uid } = await rearchiveEntry(archiveId, selectedEntry.entry_uid)
-      // Poll for job completion at 500ms — same interval as CaptureDialog
+      const { job_uid } = await rearchiveEntry(archiveId, entryUid)
+      // If selection changed while waiting for the kick-off response, bail.
+      if (selectSeqRef.current !== startSeq) return
       rearchivePollRef.current = setInterval(async () => {
         try {
           const job = await pollCaptureJob(archiveId, job_uid)
           if (job.status === 'completed') {
             clearInterval(rearchivePollRef.current)
             rearchivePollRef.current = null
+            if (selectSeqRef.current !== startSeq) return
             setRearchiveState('done')
-            // Refresh entry detail so artifact list updates
-            const [det, tgs] = await Promise.all([
-              fetchEntryDetail(archiveId, selectedEntry.entry_uid),
-              fetchEntryTags(archiveId, selectedEntry.entry_uid),
-            ])
-            setDetail(det)
-            setTags(tgs)
+            const updated = await fetchEntryTags(archiveId, entryUid)
+            if (selectSeqRef.current !== startSeq) return
+            setTags(updated)
+            onDetailRefresh?.()
           } else if (job.status === 'failed') {
             clearInterval(rearchivePollRef.current)
             rearchivePollRef.current = null
+            if (selectSeqRef.current !== startSeq) return
             setRearchiveState('error')
             setRearchiveError(job.error_text || 'Re-archive failed.')
           }
         } catch {
           clearInterval(rearchivePollRef.current)
           rearchivePollRef.current = null
+          if (selectSeqRef.current !== startSeq) return
           setRearchiveState('error')
           setRearchiveError('Network error while polling.')
         }
       }, 500)
     } catch (e) {
+      if (selectSeqRef.current !== startSeq) return
       setRearchiveState('error')
       setRearchiveError(e.message || 'Failed to start re-archive.')
     }
@@ -156,6 +155,20 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
     ['Visibility', VIS_LABEL[detail.summary.visibility] ?? detail.summary.visibility],
     ['Root',       detail.structured_root_relpath],
   ] : []
+
+  const AUDIO_EXTS = new Set(['mp3','ogg','m4a','opus','wav','flac','aac'])
+  const PREVIEW_EXTS = new Set(['mp4','webm','mov','mkv','avi','m4v','ogv','pdf','html','htm','jpg','jpeg','png','gif','webp','avif','svg','bmp'])
+  const primaryMediaIdx = detail ? detail.artifacts.findIndex(a => a.artifact_role === 'primary_media') : -1
+  const primaryMedia = primaryMediaIdx >= 0 ? detail.artifacts[primaryMediaIdx] : null
+  const pmExt = primaryMedia ? primaryMedia.relpath.split('.').pop().toLowerCase() : ''
+  const isAudio = primaryMedia && AUDIO_EXTS.has(pmExt)
+  const primaryMediaUrl = (primaryMediaIdx >= 0 && selectedEntry)
+    ? `/api/archives/${archiveId}/entries/${selectedEntry.entry_uid}/artifacts/${primaryMediaIdx}`
+    : null
+  const isPreviewable = detail && !isAudio && (
+    (detail.summary.entity_kind === 'tweet' || detail.summary.entity_kind === 'tweet_thread') ||
+    (primaryMedia && PREVIEW_EXTS.has(pmExt))
+  )
 
   return (
     <aside className="context-rail">
@@ -206,6 +219,17 @@ export default function ContextRail({ archiveId, selectedEntry, onTagFilterSet, 
               <span className="u-text">{detail.summary.original_url}</span>
               <span className="ext"><ExternalIcon /></span>
             </a>
+          )}
+
+          {isAudio && onPlay && (
+            <button className="rail-preview-btn" onClick={() => onPlay(primaryMediaUrl, selectedEntry)}>
+              ▶ Play
+            </button>
+          )}
+          {isPreviewable && onOpenPreview && (
+            <button className="rail-preview-btn" onClick={onOpenPreview}>
+              Preview
+            </button>
           )}
 
           <div className="meta-list">

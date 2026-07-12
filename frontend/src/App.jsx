@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, createContext } from 'react'
-import { fetchArchives, fetchEntries, searchEntries, fetchRuns, fetchTags, checkSetup, fetchMe } from './api'
+import { fetchArchives, fetchEntries, searchEntries, fetchRuns, fetchTags, checkSetup, fetchMe, fetchEntryDetail } from './api'
 import LoginPage from './components/LoginPage.jsx'
 import SetupPage from './components/SetupPage.jsx'
 
@@ -12,10 +12,19 @@ import TagsView from './components/TagsView'
 import CollectionsView from './components/CollectionsView'
 import SettingsView from './components/SettingsView'
 import ContextRail from './components/ContextRail'
+import PreviewModal from './components/PreviewModal'
+import AudioBar from './components/AudioBar'
+import PreviewPage from './components/PreviewPage'
 import { displayPath } from './utils'
 import ToastStack from './components/ToastStack'
 
 export const AuthContext = createContext(null);
+
+// Detect /preview/:archiveId/:entryUid at load time (static — no navigation)
+const PREVIEW_ROUTE = (() => {
+  const m = window.location.pathname.match(/^\/preview\/([^/]+)\/([^/]+)/)
+  return m ? { archiveId: m[1], entryUid: m[2] } : null
+})()
 
 const VIEWS = ['archive','tags','collections','runs','admin','settings']
 const SETTINGS_TABS = ['profile','tokens','instance','storage']
@@ -89,7 +98,23 @@ export default function App() {
     () => sessionStorage.getItem('ublockWarningIgnored') === 'true'
   )
 
+
+  // ── Entry detail (shared between PreviewPanel and ContextRail) ──────────
+  const [entryDetail, setEntryDetail] = useState(null)
+  const detailSeqRef = useRef(0)
+
   const humanizeTags = currentUser?.humanize_slugs ?? false;
+
+  // Fetch entry detail whenever selected entry changes
+  useEffect(() => {
+    const seq = ++detailSeqRef.current
+    setEntryDetail(null)
+    if (!selectedEntry || !archiveId) return
+    fetchEntryDetail(archiveId, selectedEntry.entry_uid).then(det => {
+      if (seq !== detailSeqRef.current) return
+      setEntryDetail(det)
+    }).catch(() => {})
+  }, [selectedEntry, archiveId])
 
   // Persist captureDialogOpen to sessionStorage
   useEffect(() => {
@@ -172,7 +197,9 @@ export default function App() {
   }, [archiveId])
 
   // Sync view + settingsTab → URL
+  // Sync view + settingsTab → URL (skip when serving a standalone preview page)
   useEffect(() => {
+    if (PREVIEW_ROUTE) return
     const path = locationPath(view, settingsTab)
     if (window.location.pathname !== path) {
       history.pushState(null, '', path)
@@ -217,7 +244,21 @@ export default function App() {
     setSelectedEntry(prev =>
       prev && prev.entry_uid === entryUid ? { ...prev, title: newTitle } : prev
     )
+    setEntryDetail(prev =>
+      prev && prev.summary.entry_uid === entryUid
+        ? { ...prev, summary: { ...prev.summary, title: newTitle } }
+        : prev
+    )
   }, [])
+
+  const handleDetailRefresh = useCallback(() => {
+    if (!archiveId || !selectedEntry) return
+    const seq = ++detailSeqRef.current
+    fetchEntryDetail(archiveId, selectedEntry.entry_uid).then(det => {
+      if (seq !== detailSeqRef.current) return
+      setEntryDetail(det)
+    }).catch(() => {})
+  }, [archiveId, selectedEntry])
 
   const handleEntryDeleted = useCallback((entryUid) => {
     setEntries(prev => prev.filter(e => e.entry_uid !== entryUid))
@@ -258,10 +299,33 @@ export default function App() {
     setUblockWarningIgnored(true)
     setToasts(prev => prev.filter(t => !(t.type === 'warning' && t.locator)))
   }, [])
+  const [previewEntryUid, setPreviewEntryUid] = useState(null)
+  const [currentAudio, setCurrentAudio] = useState(null)
+
+  const handleOpenPreview = useCallback(() => {
+    if (selectedEntry) setPreviewEntryUid(selectedEntry.entry_uid)
+  }, [selectedEntry])
+  const handleClosePreview = useCallback(() => setPreviewEntryUid(null), [])
+  const handlePlay = useCallback((src, entry) => {
+    setCurrentAudio({ src, entry })
+  }, [])
+  const handleCloseAudio = useCallback(() => setCurrentAudio(null), [])
+
+  // Close stale modal when selection changes (audio persists intentionally)
+  useEffect(() => {
+    setPreviewEntryUid(null)
+  }, [selectedEntry])
+
+  // Toggle body class so fixed AudioBar doesn't obscure scrollable content
+  useEffect(() => {
+    document.body.classList.toggle('has-audio-bar', !!currentAudio)
+    return () => document.body.classList.remove('has-audio-bar')
+  }, [currentAudio])
 
   if (authState === 'loading') return <div className="auth-loading">Loading\u2026</div>;
   if (authState === 'setup')   return <SetupPage onComplete={() => setAuthState('login')} />;
   if (authState === 'login')   return <LoginPage onLogin={user => { setCurrentUser(user); setAuthState('authenticated'); }} />;
+  if (PREVIEW_ROUTE)           return <PreviewPage archiveId={PREVIEW_ROUTE.archiveId} entryUid={PREVIEW_ROUTE.entryUid} />;
 
   return (
     <AuthContext.Provider value={{ currentUser, setCurrentUser }}>
@@ -344,14 +408,34 @@ export default function App() {
           <ContextRail
             archiveId={archiveId}
             selectedEntry={selectedEntry}
+            detail={entryDetail}
             onTagFilterSet={handleTagFilterSet}
             tagNodes={tagNodes}
             onTagsRefresh={handleTagsRefresh}
             onEntryTitleChange={handleEntryTitleChange}
             onEntryDeleted={handleEntryDeleted}
             humanizeTags={humanizeTags}
+            onDetailRefresh={handleDetailRefresh}
+            onOpenPreview={handleOpenPreview}
+            onPlay={handlePlay}
           />
         </main>
+        {previewEntryUid && selectedEntry && selectedEntry.entry_uid === previewEntryUid && (
+          <PreviewModal
+            archiveId={archiveId}
+            entry={selectedEntry}
+            detail={entryDetail}
+            onClose={handleClosePreview}
+          />
+        )}
+        {currentAudio && (
+          <AudioBar
+            entry={currentAudio.entry}
+            src={currentAudio.src}
+            archiveId={archiveId}
+            onClose={handleCloseAudio}
+          />
+        )}
         <CaptureDialog
           open={captureDialogOpen}
           archiveId={archiveId}
