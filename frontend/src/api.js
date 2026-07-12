@@ -25,6 +25,16 @@ export async function fetchEntryDetail(archiveId, entryUid) {
   return getJson(`/api/archives/${archiveId}/entries/${entryUid}`);
 }
 
+// Fetch multiple artifact JSON payloads for an entry in parallel.
+// Returns a Promise<Array> preserving index order.
+export function fetchEntryArtifacts(archiveId, entryUid, indices) {
+  return Promise.all(
+    indices.map(idx =>
+      getJson(`/api/archives/${archiveId}/entries/${entryUid}/artifacts/${idx}`)
+    )
+  );
+}
+
 export async function updateEntryTitle(archiveId, entryUid, title) {
   const res = await fetch(`/api/archives/${archiveId}/entries/${entryUid}`, {
     method: 'PATCH',

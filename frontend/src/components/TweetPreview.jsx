@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { fetchEntryArtifacts } from '../api';
 
 // ── Date helper ────────────────────────────────────────────────────────────────
 
@@ -911,6 +912,10 @@ function MediaLightbox({ items, startIndex, onClose }) {
 
   useEffect(() => {
     const h = e => {
+      if (e.key === 'Escape' || e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        e.stopPropagation();
+        e.preventDefault();
+      }
       if (e.key === 'Escape') onClose();
       if (e.key === 'ArrowRight') setIdx(i => Math.min(i + 1, items.length - 1));
       if (e.key === 'ArrowLeft') setIdx(i => Math.max(i - 1, 0));
@@ -1088,15 +1093,7 @@ export default function TweetPreview({ archiveId, entryUid, artifacts, entityKin
 
     let cancelled = false;
 
-    Promise.all(
-      tweetArtifacts.map(a =>
-        fetch(`/api/archives/${archiveId}/entries/${entryUid}/artifacts/${a.index}`)
-          .then(r => {
-            if (!r.ok) throw new Error(`HTTP ${r.status}`);
-            return r.json();
-          })
-      )
-    )
+    fetchEntryArtifacts(archiveId, entryUid, tweetArtifacts.map(a => a.index))
       .then(data => { if (!cancelled) setTweets(data); })
       .catch(e => { if (!cancelled) setError(e.message || 'Failed to load tweet.'); })
       .finally(() => { if (!cancelled) setLoading(false); });
