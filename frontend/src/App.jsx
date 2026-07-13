@@ -36,7 +36,8 @@ function parseLocation() {
   const params = new URLSearchParams(window.location.search)
   const q = params.get('q') ?? ''
   const tag = params.get('tag') ?? null
-  return { view, settingsTab, q, tag }
+  const entry = params.get('entry') ?? null
+  return { view, settingsTab, q, tag, entry }
 }
 
 function locationPath(view, settingsTab) {
@@ -69,11 +70,12 @@ export default function App() {
   // Sync URL → state on back/forward
   useEffect(() => {
     const handler = () => {
-      const { view, settingsTab, q, tag } = parseLocation()
+      const { view, settingsTab, q, tag, entry } = parseLocation()
       setView(view)
       setSettingsTab(settingsTab)
       setSearchQuery(q)
       setTagFilter(tag)
+      setSelectedEntryUid(entry)
       setSelectedEntry(null)
     }
     window.addEventListener('popstate', handler)
@@ -83,7 +85,7 @@ export default function App() {
   const [archives, setArchives] = useState([])
   const [archiveId, setArchiveId] = useState(null)
   const [entries, setEntries] = useState([])
-  const [selectedEntryUid, setSelectedEntryUid] = useState(null)
+  const [selectedEntryUid, setSelectedEntryUid] = useState(() => parseLocation().entry)
   const [selectedEntry, setSelectedEntry] = useState(null)
   const [tagFilter, setTagFilter] = useState(() => parseLocation().tag)
   const [view, setView] = useState(() => parseLocation().view)
@@ -285,17 +287,26 @@ export default function App() {
     setSelectedEntryUid(prev => prev === entryUid ? null : prev)
   }, [])
 
+  // Restore selectedEntry object from selectedEntryUid when entries load.
+  // Handles page refresh and back/forward navigation where only the UID is known.
+  useEffect(() => {
+    if (!selectedEntryUid || selectedEntry) return
+    const found = entries.find(e => e.entry_uid === selectedEntryUid)
+    if (found) setSelectedEntry(found)
+  }, [entries, selectedEntryUid])
+
   // Sync search params → URL via replaceState (no new history entry).
   useEffect(() => {
     if (PREVIEW_ROUTE) return
     const params = new URLSearchParams()
     if (searchQuery) params.set('q', searchQuery)
     if (tagFilter) params.set('tag', tagFilter)
+    if (selectedEntryUid) params.set('entry', selectedEntryUid)
     const qs = params.toString()
     const url = window.location.pathname + (qs ? '?' + qs : '')
     const current = window.location.pathname + window.location.search
     if (current !== url) history.replaceState(null, '', url)
-  }, [searchQuery, tagFilter])
+  }, [searchQuery, tagFilter, selectedEntryUid])
 
   // ⌘K / Ctrl+K: focus the search input, switching to archive view first if needed.
   useEffect(() => {
