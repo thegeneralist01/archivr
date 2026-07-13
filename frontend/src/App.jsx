@@ -33,7 +33,10 @@ function parseLocation() {
   const parts = window.location.pathname.split('/').filter(Boolean)
   const view = VIEWS.includes(parts[0]) ? parts[0] : 'archive'
   const settingsTab = (view === 'settings' && SETTINGS_TABS.includes(parts[1])) ? parts[1] : 'profile'
-  return { view, settingsTab }
+  const params = new URLSearchParams(window.location.search)
+  const q = params.get('q') ?? ''
+  const tag = params.get('tag') ?? null
+  return { view, settingsTab, q, tag }
 }
 
 function locationPath(view, settingsTab) {
@@ -66,9 +69,12 @@ export default function App() {
   // Sync URL → state on back/forward
   useEffect(() => {
     const handler = () => {
-      const { view, settingsTab } = parseLocation()
+      const { view, settingsTab, q, tag } = parseLocation()
       setView(view)
       setSettingsTab(settingsTab)
+      setSearchQuery(q)
+      setTagFilter(tag)
+      setSelectedEntry(null)
     }
     window.addEventListener('popstate', handler)
     return () => window.removeEventListener('popstate', handler)
@@ -79,10 +85,10 @@ export default function App() {
   const [entries, setEntries] = useState([])
   const [selectedEntryUid, setSelectedEntryUid] = useState(null)
   const [selectedEntry, setSelectedEntry] = useState(null)
-  const [tagFilter, setTagFilter] = useState(null)
+  const [tagFilter, setTagFilter] = useState(() => parseLocation().tag)
   const [view, setView] = useState(() => parseLocation().view)
   const [settingsTab, setSettingsTab] = useState(() => parseLocation().settingsTab)
-  const [searchQuery, setSearchQuery] = useState('')
+  const [searchQuery, setSearchQuery] = useState(() => parseLocation().q)
   const [resultCount, setResultCount] = useState('')
   const [searchBusy, setSearchBusy] = useState(false)
   const [runs, setRuns] = useState([])
@@ -104,6 +110,7 @@ export default function App() {
   const detailSeqRef = useRef(0)
   const searchInputRef = useRef(null)
   const pendingSearchFocus = useRef(false)
+  const firstArchiveLoad = useRef(true)
 
   const humanizeTags = currentUser?.humanize_slugs ?? false;
 
@@ -159,6 +166,16 @@ export default function App() {
   // Archive change: parallel load entries + runs + tags
   useEffect(() => {
     if (!archiveId) return
+    if (firstArchiveLoad.current) {
+      // First load: URL-initialized filters are already in state; the debounced
+      // search and tagFilter effects will call loadEntries with the right values.
+      firstArchiveLoad.current = false
+      Promise.all([
+        fetchRuns(archiveId).then(setRuns),
+        fetchTags(archiveId).then(setTagNodes),
+      ])
+      return
+    }
     setTagFilter(null)
     setSelectedEntry(null)
     setSelectedEntryUid(null)
@@ -198,13 +215,13 @@ export default function App() {
     }
   }, [archiveId])
 
-  // Sync view + settingsTab → URL
   // Sync view + settingsTab → URL (skip when serving a standalone preview page)
+  // Preserve existing search params so ?q/tag/entry survive view navigation.
   useEffect(() => {
     if (PREVIEW_ROUTE) return
     const path = locationPath(view, settingsTab)
     if (window.location.pathname !== path) {
-      history.pushState(null, '', path)
+      history.pushState(null, '', path + window.location.search)
     }
   }, [view, settingsTab])
 
@@ -268,6 +285,18 @@ export default function App() {
     setSelectedEntryUid(prev => prev === entryUid ? null : prev)
   }, [])
 
+  // Sync search params → URL via replaceState (no new history entry).
+  useEffect(() => {
+    if (PREVIEW_ROUTE) return
+    const params = new URLSearchParams()
+    if (searchQuery) params.set('q', searchQuery)
+    if (tagFilter) params.set('tag', tagFilter)
+    const qs = params.toString()
+    const url = window.location.pathname + (qs ? '?' + qs : '')
+    const current = window.location.pathname + window.location.search
+    if (current !== url) history.replaceState(null, '', url)
+  }, [searchQuery, tagFilter])
+
   // ⌘K / Ctrl+K: focus the search input, switching to archive view first if needed.
   useEffect(() => {
     const handler = (e) => {
@@ -296,6 +325,7 @@ export default function App() {
       })
     }
   }, [view])
+
   const handleCaptureClick = useCallback(() => {
     setCaptureDialogOpen(true)
   }, [])
