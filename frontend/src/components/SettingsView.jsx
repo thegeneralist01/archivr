@@ -691,7 +691,7 @@ function ExtensionsTab() {
   const cookieExtEnabled = settings?.cookie_ext_enabled ?? true
 
   return (
-    <div style={{ maxWidth: 560 }}>
+    <div>
       <div className="form-section">
         <h2>Extensions</h2>
         <p className="form-hint" style={{ marginBottom: 20 }}>
@@ -699,60 +699,62 @@ function ExtensionsTab() {
           accept cookie banners, and more. Changes take effect on the next capture.
         </p>
 
-        <div className="ext-card">
-          <div className="ext-card-header">
-            <div className="ext-card-info">
-              <span className="ext-card-name">uBlock Origin Lite</span>
-              <span className="ext-card-desc">
-                Blocks ads, trackers, and other page clutter during archiving
-                via Chrome&rsquo;s declarativeNetRequest API (Manifest V3).
-              </span>
-              {!extAvailable && (
-                <span className="ext-card-hint">
-                  Not configured &mdash; set <code>ARCHIVR_UBLOCK_EXT</code> to the
-                  unpacked extension directory to enable.
+        <div className="ext-grid">
+          <div className="ext-card">
+            <div className="ext-card-header">
+              <div className="ext-card-info">
+                <span className="ext-card-name">uBlock Origin Lite</span>
+                <span className="ext-card-desc">
+                  Blocks ads, trackers, and other page clutter during archiving
+                  via Chrome&rsquo;s declarativeNetRequest API (Manifest V3).
                 </span>
-              )}
+                {!extAvailable && (
+                  <span className="ext-card-hint">
+                    Not configured &mdash; set <code>ARCHIVR_UBLOCK_EXT</code> to the
+                    unpacked extension directory to enable.
+                  </span>
+                )}
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={extEnabled}
+                className={`ext-toggle${extEnabled ? ' ext-toggle--on' : ''}`}
+                onClick={() => toggleUblock(!extEnabled)}
+                disabled={saving}
+                aria-label="Toggle uBlock Origin Lite"
+              >
+                <span className="ext-toggle-knob" />
+              </button>
             </div>
-            <button
-              type="button"
-              role="switch"
-              aria-checked={extEnabled}
-              className={`ext-toggle${extEnabled ? ' ext-toggle--on' : ''}`}
-              onClick={() => toggleUblock(!extEnabled)}
-              disabled={saving}
-              aria-label="Toggle uBlock Origin Lite"
-            >
-              <span className="ext-toggle-knob" />
-            </button>
           </div>
-        </div>
 
-        <div className="ext-card">
-          <div className="ext-card-header">
-            <div className="ext-card-info">
-              <span className="ext-card-name">I Still Don&rsquo;t Care About Cookies</span>
-              <span className="ext-card-desc">
-                Dismiss cookie consent banners during archiving.
-              </span>
-              {!cookieExtAvailable && (
-                <span className="ext-card-hint">
-                  Not configured &mdash; set <code>ARCHIVR_COOKIE_EXT</code> to the
-                  unpacked extension directory to enable.
+          <div className="ext-card">
+            <div className="ext-card-header">
+              <div className="ext-card-info">
+                <span className="ext-card-name">I Still Don&rsquo;t Care About Cookies</span>
+                <span className="ext-card-desc">
+                  Dismiss cookie consent banners during archiving.
                 </span>
-              )}
+                {!cookieExtAvailable && (
+                  <span className="ext-card-hint">
+                    Not configured &mdash; set <code>ARCHIVR_COOKIE_EXT</code> to the
+                    unpacked extension directory to enable.
+                  </span>
+                )}
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={cookieExtEnabled}
+                className={`ext-toggle${cookieExtEnabled ? ' ext-toggle--on' : ''}`}
+                onClick={() => toggleCookieExt(!cookieExtEnabled)}
+                disabled={saving}
+                aria-label="Toggle I Still Don't Care About Cookies"
+              >
+                <span className="ext-toggle-knob" />
+              </button>
             </div>
-            <button
-              type="button"
-              role="switch"
-              aria-checked={cookieExtEnabled}
-              className={`ext-toggle${cookieExtEnabled ? ' ext-toggle--on' : ''}`}
-              onClick={() => toggleCookieExt(!cookieExtEnabled)}
-              disabled={saving}
-              aria-label="Toggle I Still Don't Care About Cookies"
-            >
-              <span className="ext-toggle-knob" />
-            </button>
           </div>
         </div>
 

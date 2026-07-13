@@ -27,13 +27,17 @@ const PREVIEW_ROUTE = (() => {
 })()
 
 const VIEWS = ['archive','tags','collections','runs','admin','settings']
-const SETTINGS_TABS = ['profile','tokens','instance','storage']
+const SETTINGS_TABS = ['profile','tokens','instance','cookies','extensions','storage']
 
 function parseLocation() {
   const parts = window.location.pathname.split('/').filter(Boolean)
   const view = VIEWS.includes(parts[0]) ? parts[0] : 'archive'
   const settingsTab = (view === 'settings' && SETTINGS_TABS.includes(parts[1])) ? parts[1] : 'profile'
-  return { view, settingsTab }
+  const params = new URLSearchParams(window.location.search)
+  const q = params.get('q') ?? ''
+  const tag = view === 'archive' ? (params.get('tag') ?? null) : null
+  const entry = view === 'archive' ? (params.get('entry') ?? null) : null
+  return { view, settingsTab, q, tag, entry }
 }
 
 function locationPath(view, settingsTab) {
@@ -66,9 +70,13 @@ export default function App() {
   // Sync URL → state on back/forward
   useEffect(() => {
     const handler = () => {
-      const { view, settingsTab } = parseLocation()
+      const { view, settingsTab, q, tag, entry } = parseLocation()
       setView(view)
       setSettingsTab(settingsTab)
+      setSearchQuery(q)
+      setTagFilter(tag)
+      setSelectedEntryUid(entry)
+      setSelectedEntry(null)
     }
     window.addEventListener('popstate', handler)
     return () => window.removeEventListener('popstate', handler)
@@ -77,12 +85,12 @@ export default function App() {
   const [archives, setArchives] = useState([])
   const [archiveId, setArchiveId] = useState(null)
   const [entries, setEntries] = useState([])
-  const [selectedEntryUid, setSelectedEntryUid] = useState(null)
+  const [selectedEntryUid, setSelectedEntryUid] = useState(() => parseLocation().entry)
   const [selectedEntry, setSelectedEntry] = useState(null)
-  const [tagFilter, setTagFilter] = useState(null)
+  const [tagFilter, setTagFilter] = useState(() => parseLocation().tag)
   const [view, setView] = useState(() => parseLocation().view)
   const [settingsTab, setSettingsTab] = useState(() => parseLocation().settingsTab)
-  const [searchQuery, setSearchQuery] = useState('')
+  const [searchQuery, setSearchQuery] = useState(() => parseLocation().q)
   const [resultCount, setResultCount] = useState('')
   const [searchBusy, setSearchBusy] = useState(false)
   const [runs, setRuns] = useState([])
@@ -102,6 +110,9 @@ export default function App() {
   // ── Entry detail (shared between PreviewPanel and ContextRail) ──────────
   const [entryDetail, setEntryDetail] = useState(null)
   const detailSeqRef = useRef(0)
+  const searchInputRef = useRef(null)
+  const pendingSearchFocus = useRef(false)
+  const firstArchiveLoad = useRef(true)
 
   const humanizeTags = currentUser?.humanize_slugs ?? false;
 
@@ -157,6 +168,16 @@ export default function App() {
   // Archive change: parallel load entries + runs + tags
   useEffect(() => {
     if (!archiveId) return
+    if (firstArchiveLoad.current) {
+      // First load: URL-initialized filters are already in state; the debounced
+      // search and tagFilter effects will call loadEntries with the right values.
+      firstArchiveLoad.current = false
+      Promise.all([
+        fetchRuns(archiveId).then(setRuns),
+        fetchTags(archiveId).then(setTagNodes),
+      ])
+      return
+    }
     setTagFilter(null)
     setSelectedEntry(null)
     setSelectedEntryUid(null)
@@ -196,13 +217,13 @@ export default function App() {
     }
   }, [archiveId])
 
-  // Sync view + settingsTab → URL
   // Sync view + settingsTab → URL (skip when serving a standalone preview page)
+  // Preserve existing search params so ?q/tag/entry survive view navigation.
   useEffect(() => {
     if (PREVIEW_ROUTE) return
     const path = locationPath(view, settingsTab)
     if (window.location.pathname !== path) {
-      history.pushState(null, '', path)
+      history.pushState(null, '', path + window.location.search)
     }
   }, [view, settingsTab])
 
@@ -265,6 +286,56 @@ export default function App() {
     setSelectedEntry(prev => prev?.entry_uid === entryUid ? null : prev)
     setSelectedEntryUid(prev => prev === entryUid ? null : prev)
   }, [])
+
+  // Restore selectedEntry object from selectedEntryUid when entries load.
+  // Handles page refresh and back/forward navigation where only the UID is known.
+  useEffect(() => {
+    if (!selectedEntryUid || selectedEntry) return
+    const found = entries.find(e => e.entry_uid === selectedEntryUid)
+    if (found) setSelectedEntry(found)
+  }, [entries, selectedEntryUid, selectedEntry])
+
+  // Sync search params → URL via replaceState (no new history entry).
+  useEffect(() => {
+    if (PREVIEW_ROUTE) return
+    const params = new URLSearchParams()
+    if (searchQuery) params.set('q', searchQuery)
+    if (view === 'archive' && tagFilter) params.set('tag', tagFilter)
+    if (view === 'archive' && selectedEntryUid) params.set('entry', selectedEntryUid)
+    const qs = params.toString()
+    const url = window.location.pathname + (qs ? '?' + qs : '')
+    const current = window.location.pathname + window.location.search
+    if (current !== url) history.replaceState(null, '', url)
+  }, [searchQuery, tagFilter, selectedEntryUid, view])
+
+  // ⌘K / Ctrl+K: focus the search input, switching to archive view first if needed.
+  useEffect(() => {
+    const handler = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault()
+        if (view === 'archive') {
+          searchInputRef.current?.focus()
+          searchInputRef.current?.select()
+        } else {
+          pendingSearchFocus.current = true
+          setView('archive')
+        }
+      }
+    }
+    document.addEventListener('keydown', handler)
+    return () => document.removeEventListener('keydown', handler)
+  }, [view])
+
+  // After switching to archive view via ⌘K, focus the search input once rendered.
+  useEffect(() => {
+    if (view === 'archive' && pendingSearchFocus.current) {
+      pendingSearchFocus.current = false
+      requestAnimationFrame(() => {
+        searchInputRef.current?.focus()
+        searchInputRef.current?.select()
+      })
+    }
+  }, [view])
 
   const handleCaptureClick = useCallback(() => {
     setCaptureDialogOpen(true)
@@ -349,6 +420,7 @@ export default function App() {
                     </svg>
                   </span>
                   <input
+                    ref={searchInputRef}
                     className="search-input"
                     type="search"
                     aria-label="Search archive"
