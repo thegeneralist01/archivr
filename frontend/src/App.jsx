@@ -35,8 +35,8 @@ function parseLocation() {
   const settingsTab = (view === 'settings' && SETTINGS_TABS.includes(parts[1])) ? parts[1] : 'profile'
   const params = new URLSearchParams(window.location.search)
   const q = params.get('q') ?? ''
-  const tag = params.get('tag') ?? null
-  const entry = params.get('entry') ?? null
+  const tag = view === 'archive' ? (params.get('tag') ?? null) : null
+  const entry = view === 'archive' ? (params.get('entry') ?? null) : null
   return { view, settingsTab, q, tag, entry }
 }
 
@@ -293,20 +293,20 @@ export default function App() {
     if (!selectedEntryUid || selectedEntry) return
     const found = entries.find(e => e.entry_uid === selectedEntryUid)
     if (found) setSelectedEntry(found)
-  }, [entries, selectedEntryUid])
+  }, [entries, selectedEntryUid, selectedEntry])
 
   // Sync search params → URL via replaceState (no new history entry).
   useEffect(() => {
     if (PREVIEW_ROUTE) return
     const params = new URLSearchParams()
     if (searchQuery) params.set('q', searchQuery)
-    if (tagFilter) params.set('tag', tagFilter)
-    if (selectedEntryUid) params.set('entry', selectedEntryUid)
+    if (view === 'archive' && tagFilter) params.set('tag', tagFilter)
+    if (view === 'archive' && selectedEntryUid) params.set('entry', selectedEntryUid)
     const qs = params.toString()
     const url = window.location.pathname + (qs ? '?' + qs : '')
     const current = window.location.pathname + window.location.search
     if (current !== url) history.replaceState(null, '', url)
-  }, [searchQuery, tagFilter, selectedEntryUid])
+  }, [searchQuery, tagFilter, selectedEntryUid, view])
 
   // ⌘K / Ctrl+K: focus the search input, switching to archive view first if needed.
   useEffect(() => {
