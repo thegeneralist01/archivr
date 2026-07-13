@@ -102,6 +102,8 @@ export default function App() {
   // ── Entry detail (shared between PreviewPanel and ContextRail) ──────────
   const [entryDetail, setEntryDetail] = useState(null)
   const detailSeqRef = useRef(0)
+  const searchInputRef = useRef(null)
+  const pendingSearchFocus = useRef(false)
 
   const humanizeTags = currentUser?.humanize_slugs ?? false;
 
@@ -266,6 +268,34 @@ export default function App() {
     setSelectedEntryUid(prev => prev === entryUid ? null : prev)
   }, [])
 
+  // ⌘K / Ctrl+K: focus the search input, switching to archive view first if needed.
+  useEffect(() => {
+    const handler = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault()
+        if (view === 'archive') {
+          searchInputRef.current?.focus()
+          searchInputRef.current?.select()
+        } else {
+          pendingSearchFocus.current = true
+          setView('archive')
+        }
+      }
+    }
+    document.addEventListener('keydown', handler)
+    return () => document.removeEventListener('keydown', handler)
+  }, [view])
+
+  // After switching to archive view via ⌘K, focus the search input once rendered.
+  useEffect(() => {
+    if (view === 'archive' && pendingSearchFocus.current) {
+      pendingSearchFocus.current = false
+      requestAnimationFrame(() => {
+        searchInputRef.current?.focus()
+        searchInputRef.current?.select()
+      })
+    }
+  }, [view])
   const handleCaptureClick = useCallback(() => {
     setCaptureDialogOpen(true)
   }, [])
@@ -349,6 +379,7 @@ export default function App() {
                     </svg>
                   </span>
                   <input
+                    ref={searchInputRef}
                     className="search-input"
                     type="search"
                     aria-label="Search archive"
