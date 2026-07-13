@@ -27,7 +27,7 @@ const PREVIEW_ROUTE = (() => {
 })()
 
 const VIEWS = ['archive','tags','collections','runs','admin','settings']
-const SETTINGS_TABS = ['profile','tokens','instance','storage']
+const SETTINGS_TABS = ['profile','tokens','instance','cookies','extensions','storage']
 
 function parseLocation() {
   const parts = window.location.pathname.split('/').filter(Boolean)
