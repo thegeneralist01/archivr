@@ -142,6 +142,8 @@ pub struct InstanceSettings {
     pub ublock_enabled: bool,
     /// Global default for cookie-consent banner dismissal via extension during WebPage captures.
     pub cookie_ext_enabled: bool,
+    /// Global default for modal-closer browser-script behavior during WebPage captures.
+    pub modal_closer_enabled: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -468,7 +470,8 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
             public_archive_submission_enabled  INTEGER NOT NULL DEFAULT 0 CHECK (public_archive_submission_enabled IN (0, 1)),
             default_entry_visibility           INTEGER NOT NULL DEFAULT 2,
             ublock_enabled                     INTEGER NOT NULL DEFAULT 1 CHECK (ublock_enabled IN (0, 1)),
-            cookie_ext_enabled                 INTEGER NOT NULL DEFAULT 1 CHECK (cookie_ext_enabled IN (0, 1))
+            cookie_ext_enabled                 INTEGER NOT NULL DEFAULT 1 CHECK (cookie_ext_enabled IN (0, 1)),
+            modal_closer_enabled               INTEGER NOT NULL DEFAULT 1 CHECK (modal_closer_enabled IN (0, 1))
         );
 
         INSERT OR IGNORE INTO instance_settings
@@ -516,6 +519,11 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
     // Add cookie_ext_enabled column to instance_settings if not present (idempotent migration)
     let _ = conn.execute(
         "ALTER TABLE instance_settings ADD COLUMN cookie_ext_enabled INTEGER NOT NULL DEFAULT 1",
+        [],
+    );
+    // Add modal_closer_enabled column to instance_settings if not present (idempotent migration)
+    let _ = conn.execute(
+        "ALTER TABLE instance_settings ADD COLUMN modal_closer_enabled INTEGER NOT NULL DEFAULT 1",
         [],
     );
 
@@ -745,7 +753,8 @@ pub fn get_instance_settings(conn: &Connection) -> Result<InstanceSettings> {
         "SELECT public_index_enabled, public_entry_content_enabled,
                 public_archive_submission_enabled, default_entry_visibility,
                 COALESCE(ublock_enabled, 1),
-                COALESCE(cookie_ext_enabled, 1)
+                COALESCE(cookie_ext_enabled, 1),
+                COALESCE(modal_closer_enabled, 1)
          FROM instance_settings WHERE id = 1",
         [],
         |row| {
@@ -756,6 +765,7 @@ pub fn get_instance_settings(conn: &Connection) -> Result<InstanceSettings> {
                 default_entry_visibility: row.get::<_, i64>(3)? as u32,
                 ublock_enabled: row.get::<_, i64>(4)? != 0,
                 cookie_ext_enabled: row.get::<_, i64>(5)? != 0,
+                modal_closer_enabled: row.get::<_, i64>(6)? != 0,
             })
         },
     )
@@ -770,7 +780,8 @@ pub fn update_instance_settings(conn: &Connection, settings: &InstanceSettings) 
              public_archive_submission_enabled = ?3,
              default_entry_visibility = ?4,
              ublock_enabled = ?5,
-             cookie_ext_enabled = ?6
+             cookie_ext_enabled = ?6,
+             modal_closer_enabled = ?7
          WHERE id = 1",
         params![
             settings.public_index_enabled as i64,
@@ -779,6 +790,7 @@ pub fn update_instance_settings(conn: &Connection, settings: &InstanceSettings) 
             settings.default_entry_visibility as i64,
             settings.ublock_enabled as i64,
             settings.cookie_ext_enabled as i64,
+            settings.modal_closer_enabled as i64,
         ],
     )?;
     Ok(())

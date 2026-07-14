@@ -94,6 +94,112 @@ const READER_MODE_SCRIPT: &str = concat!(
 "#
 );
 
+// The modal-closer browser scripts below (MODAL_CLOSER_DIALOG_OVERRIDES and
+// MODAL_CLOSER_POLLING_SETUP) incorporate logic ported from the modalcloser
+// plugin in the abx-plugins project:
+//   https://github.com/ArchiveBox/abx-plugins/tree/main/abx_plugins/plugins/modalcloser
+//
+// MIT License
+// Copyright (c) 2024 Nick Sweeting
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+/// Injected at the top of the strip-scripts user-script when modal-closer is enabled.
+/// Bridges to the main JS world via an inline `<script>` element.  Best-effort: strict
+/// `script-src` CSP can block inline script execution entirely.  SingleFile injects
+/// `--browser-script` files in `worldName: SINGLE_FILE_WORLD_NAME`, so direct
+/// `window.alert = …` assignment would not reach page scripts; the `<script>` bridge
+/// reaches the main world but is subject to the page's content security policy.
+const MODAL_CLOSER_DIALOG_OVERRIDES: &str = r#"(function(){try{
+var s=document.createElement('script');
+s.textContent="window.alert=function(){};window.confirm=function(){return true;};window.prompt=function(m,d){return typeof d!=='undefined'?d:'';};window.print=function(){};window.onbeforeunload=null;try{Object.defineProperty(window,'onbeforeunload',{set:function(){},get:function(){return null;},configurable:true});}catch(e){}var _ael=window.addEventListener.bind(window);window.addEventListener=function(t,h,o){if(t==='beforeunload')return;_ael(t,h,o);};";
+(document.head||document.documentElement).appendChild(s);s.remove();
+}catch(e){}})();
+"#;
+
+/// Defines `_archivr_mc_run()` and schedules it every 500 ms (matching
+/// `MODALCLOSER_POLL_INTERVAL` default) to catch overlays that appear after initial
+/// page load.  Each run does two passes:
+///
+/// **Pass 1 — main-world `<script>` bridge (best-effort):** calls Bootstrap,
+/// jQuery, jQuery UI, and SweetAlert teardown APIs.  Framework globals live in the
+/// main world and cannot be reached from the isolated world; the bridge gets there
+/// but is blocked by strict `script-src` CSP.
+///
+/// **Pass 2 — isolated-world direct DOM (always runs, CSP-immune):** Escape-key
+/// dispatch, Angular Material backdrop click, full CSS selector hiding, scroll-lock
+/// reset.  DOM mutations and `KeyboardEvent` dispatch go through the shared document
+/// without inline script execution, so strict CSP does not affect this pass.
+///
+/// The before-capture hook clears the interval and fires one final run.
+const MODAL_CLOSER_POLLING_SETUP: &str = r#"var _archivr_mc_interval=null;
+function _archivr_mc_run(){
+// Pass 1: main-world bridge — framework teardown APIs (Bootstrap/jQuery/Swal).
+// Best-effort: blocked by strict script-src CSP. Pass 2 below is the reliable fallback.
+try{var s=document.createElement('script');s.textContent=`(function(){
+if(window.bootstrap&&window.bootstrap.Modal){document.querySelectorAll('.modal.show').forEach(function(el){try{var m=bootstrap.Modal.getInstance(el);if(m)m.hide();}catch(e){}});}
+if(window.jQuery&&jQuery.fn&&jQuery.fn.modal){try{jQuery('.modal.in,.modal.show').modal('hide');}catch(e){}}
+if(window.jQuery&&jQuery.ui&&jQuery.ui.dialog){try{jQuery('.ui-dialog-content').dialog('close');}catch(e){}}
+if(window.Swal&&Swal.close){try{Swal.close();}catch(e){}}
+if(window.swal&&swal.close){try{swal.close();}catch(e){}}
+})()`;(document.head||document.documentElement).appendChild(s);s.remove();}catch(e){}
+// Pass 2: isolated-world direct DOM — CSP-immune (no inline script execution).
+document.querySelectorAll('[data-radix-dialog-overlay],[data-state="open"][role="dialog"],[role="dialog"][aria-modal="true"]').forEach(function(el){try{el.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));}catch(e){}});
+document.querySelectorAll('.cdk-overlay-backdrop').forEach(function(el){try{el.click();}catch(e){}});
+var sels=['.cky-consent-container','.cky-popup-center','.cky-overlay','.cky-modal','#ckyPreferenceCenter',
+'#onetrust-consent-sdk','#onetrust-banner-sdk','.onetrust-pc-dark-filter','#onetrust-pc-sdk',
+'#CybotCookiebotDialog','#CybotCookiebotDialogBodyUnderlay','#CookiebotWidget',
+'.qc-cmp-ui-container','#qc-cmp2-container','.qc-cmp2-summary-buttons','#truste-consent-track','.truste-banner','#truste-consent-content',
+'.osano-cm-window','.osano-cm-dialog','.klaro .cookie-modal','.klaro .cookie-notice',
+'#tarteaucitronRoot','#tarteaucitronAlertBig','.cmplz-cookiebanner','#cmplz-cookiebanner-container',
+'#gdpr-cookie-consent-bar','.gdpr-cookie-consent-popup','#cookie-notice','.cookie-notice-container',
+'.eupopup','#eu-cookie-law',
+'#didomi-popup','#didomi-host','.didomi-popup-container','#usercentrics-root','.uc-banner',
+'#axeptio_overlay','#axeptio_btn','#iubenda-cs-banner','.iubenda-cs-container',
+'.termly-consent-banner','#termly-code-snippet-support','#BorlabsCookieBox','.BorlabsCookie',
+'.cookiefirst-root','#cookiefirst-root','#cookiescript_injected','.cookiescript_injected_wrapper',
+'#ccc','#ccc-overlay','#cookie-consent','.cookie-banner','.cookie-notice',
+'#cookieConsent','.cookie-consent','.cookies-banner',
+'.modal.show','.modal.in','.ui-dialog','.ui-widget-overlay',
+'.swal2-container','.swal2-overlay','.sweet-alert','#sweetAlert',
+'[class*="cookie"][class*="banner"]','[class*="cookie"][class*="notice"]',
+'[class*="cookie"][class*="popup"]','[class*="cookie"][class*="modal"]',
+'[class*="consent"][class*="banner"]','[class*="consent"][class*="popup"]',
+'[class*="gdpr"]','[class*="privacy"][class*="banner"]',
+'.modal-overlay','.modal-backdrop','.overlay-visible','.popup-overlay','.newsletter-popup',
+'.age-gate','.subscribe-popup','.subscription-modal',
+'[class*="modal"][class*="open"]:not(.modal-open)','[class*="modal"][class*="show"][class*="overlay"]','[class*="modal"][class*="visible"]',
+'[class*="dialog"][class*="open"]','[class*="overlay"][class*="visible"]',
+'.interstitial','.interstitial-wrapper','[class*="interstitial"]'];
+sels.forEach(function(sel){try{document.querySelectorAll(sel).forEach(function(el){
+var cs=window.getComputedStyle(el);
+if(cs.display==='none'||cs.visibility==='hidden')return;
+el.style.display='none';el.style.visibility='hidden';el.style.opacity='0';el.style.pointerEvents='none';
+});}catch(e){}});
+try{document.body.style.overflow='';document.body.style.position='';
+document.body.classList.remove('modal-open','overflow-hidden','no-scroll','scroll-locked');
+document.documentElement.style.overflow='';
+document.documentElement.classList.remove('overflow-hidden','no-scroll');}catch(e){}
+}
+_archivr_mc_run();
+_archivr_mc_interval=setInterval(_archivr_mc_run,500);
+"#;
+
 /// Result of archiving a web page with single-file.
 #[derive(Debug)]
 pub struct SaveResult {
@@ -129,12 +235,14 @@ pub fn save(
     ublock_enabled_override: Option<bool>,
     cookie_ext_enabled: Option<bool>,
     reader_mode: bool,
+    modal_closer_enabled: Option<bool>,
 ) -> Result<SaveResult> {
     let single_file =
         env::var("ARCHIVR_SINGLE_FILE").unwrap_or_else(|_| "single-file".to_string());
     let chrome = env::var("ARCHIVR_CHROME").unwrap_or_else(|_| "chromium".to_string());
     let (ublock_ext, ublock_skipped) = resolve_ublock_config(ublock_enabled_override);
     let (cookie_ext, cookie_ext_skipped) = resolve_cookie_ext_config(cookie_ext_enabled);
+    let modal_closer = resolve_modal_closer_config(modal_closer_enabled);
     let mut result = save_with(
         url,
         store_path,
@@ -145,6 +253,7 @@ pub fn save(
         ublock_ext.as_deref(),
         cookie_ext.as_deref(),
         reader_mode,
+        modal_closer,
     )?;
     result.ublock_skipped = ublock_skipped;
     result.cookie_ext_skipped = cookie_ext_skipped;
@@ -228,6 +337,19 @@ fn resolve_cookie_ext_config(enabled_override: Option<bool>) -> (Option<PathBuf>
     }
 }
 
+/// Resolves modal-closer configuration from env vars, optionally overridden by the caller.
+/// Returns `true` when enabled (the default), `false` when explicitly disabled via
+/// `ARCHIVR_MODAL_CLOSER=false` or `0`.
+///
+/// Unlike uBlock and cookie-ext, modal-closer has no external resource dependency; the
+/// behaviour is implemented entirely as an injected browser script.
+fn resolve_modal_closer_config(enabled_override: Option<bool>) -> bool {
+    enabled_override.unwrap_or_else(|| {
+        let env_val = env::var("ARCHIVR_MODAL_CLOSER").unwrap_or_else(|_| "true".to_string());
+        !env_val.eq_ignore_ascii_case("false") && env_val != "0"
+    })
+}
+
 /// Inner implementation.  Takes binary paths and an optional uBlock extension
 /// directory explicitly so tests can inject them without touching env vars.
 ///
@@ -255,6 +377,7 @@ fn save_with(
     ublock_ext: Option<&Path>,
     cookie_ext: Option<&Path>,
     reader_mode: bool,
+    modal_closer: bool,
 ) -> Result<SaveResult> {
     let temp_dir = store_path.join("temp").join(timestamp);
     std::fs::create_dir_all(&temp_dir).context("failed to create temp dir")?;
@@ -265,12 +388,29 @@ fn save_with(
     // serialises so JS-applied CSS is captured without broken module imports.
     // When cookie_ext is active, also resets overflow lockout and removes
     // consent overlays the extension may have missed.
+    // When modal_closer is active, dialog overrides are prepended (main-world
+    // bridge), a 500 ms polling loop starts after dispatchEvent (matches
+    // MODALCLOSER_POLL_INTERVAL default), and the before-capture hook clears
+    // the interval and fires a final main-world pass before serialisation.
     let strip_scripts_path = temp_dir.join("sf-strip-scripts.js");
-    let mut strip_scripts = String::from(
+    let mut strip_scripts = String::new();
+    if modal_closer {
+        // Must come before dispatchEvent so overrides are installed before any page
+        // scripts fire.  Bridges to main world — see MODAL_CLOSER_DIALOG_OVERRIDES.
+        strip_scripts.push_str(MODAL_CLOSER_DIALOG_OVERRIDES);
+    }
+    strip_scripts.push_str(
         // Dispatch single-file-user-script-init so single-file installs
         // _singleFile_waitForUserScript, which gates the -request hooks.
-        "dispatchEvent(new CustomEvent('single-file-user-script-init'));\
-         addEventListener('single-file-on-before-capture-request',()=>{\
+        "dispatchEvent(new CustomEvent('single-file-user-script-init'));",
+    );
+    if modal_closer {
+        // Start the 500 ms main-world polling loop after dispatchEvent so the
+        // interval is live before any page scripts run.
+        strip_scripts.push_str(MODAL_CLOSER_POLLING_SETUP);
+    }
+    strip_scripts.push_str(
+        "addEventListener('single-file-on-before-capture-request',()=>{\
            document.querySelectorAll('script:not([type=\"application/ld+json\"])')\
            .forEach(el=>el.remove());",
     );
@@ -311,6 +451,17 @@ fn save_with(
                var slot=el.closest('.top-ad,.google-auto-placed,.ad-slot,.ad-container');\
                (slot||el).remove();\
              });",
+        );
+    }
+    if modal_closer {
+        // Clear the polling interval and fire a final main-world pass right
+        // before SingleFile serialises the DOM.
+        strip_scripts.push_str(
+            "if(_archivr_mc_interval){\
+               clearInterval(_archivr_mc_interval);\
+               _archivr_mc_interval=null;\
+             }\
+             _archivr_mc_run();"
         );
     }
     strip_scripts.push_str("});");
@@ -634,9 +785,10 @@ mod tests {
             "/nonexistent/single-file",
             "chromium",
             &HashMap::new(),
-            None, // no ublock ext
-            None, // no cookie ext
+            None,  // no ublock ext
+            None,  // no cookie ext
             false, // reader mode off
+            false, // modal closer off
         );
         let err = result.unwrap_err();
         let msg = format!("{err:#}");

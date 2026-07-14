@@ -122,6 +122,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   const [globalSettings, setGlobalSettings] = useState(null)
   // Cookie consent: session-level only, initialized from server default
   const [cookieExtEnabled, setCookieExtEnabled] = useState(true)
+  const [modalCloserEnabled, setModalCloserEnabled] = useState(true)
 
   // Load global settings from server once on mount
   useEffect(() => {
@@ -129,6 +130,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
       .then(s => {
         setGlobalSettings(s)
         setCookieExtEnabled(s.cookie_ext_enabled ?? true)
+        setModalCloserEnabled(s.modal_closer_enabled ?? true)
       })
       .catch(() => setGlobalSettings({}))
   }, [])
@@ -299,7 +301,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     const qual = item.quality || 'best'
     setItems(prev => prev.map(it => it.id === item.id ? { ...it, status: 'submitting', error: null } : it))
     try {
-      const extensions = { ublock_enabled: ublockEnabled, reader_mode: readerMode, cookie_ext_enabled: cookieExtEnabled }
+      const extensions = { ublock_enabled: ublockEnabled, reader_mode: readerMode, cookie_ext_enabled: cookieExtEnabled, modal_closer_enabled: modalCloserEnabled }
       const job = await submitCapture(aid, loc, qual, extensions)
       setItems(prev => prev.map(it =>
         it.id === item.id ? { ...it, status: 'running', jobUid: job.job_uid, archiveId: aid } : it
@@ -495,6 +497,22 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
                   className={`ext-toggle ext-toggle--sm${readerMode ? ' ext-toggle--on' : ''}`}
                   onClick={() => setReaderMode(v => !v)}
                   aria-label="Toggle reader mode for this capture"
+                >
+                  <span className="ext-toggle-knob" />
+                </button>
+              </label>
+              <label className="capture-ext-row" style={{ marginTop: 8 }}>
+                <span className="capture-ext-label">
+                  <span className="capture-ext-name">Close modals and dialogs</span>
+                  <span className="capture-ext-desc">Auto-dismiss cookie banners and overlays during this capture</span>
+                </span>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={modalCloserEnabled}
+                  className={`ext-toggle ext-toggle--sm${modalCloserEnabled ? ' ext-toggle--on' : ''}`}
+                  onClick={() => setModalCloserEnabled(v => !v)}
+                  aria-label="Toggle modal closer for this capture"
                 >
                   <span className="ext-toggle-knob" />
                 </button>
