@@ -683,12 +683,27 @@ function ExtensionsTab() {
     }
   }
 
+  async function toggleModalCloser(val) {
+    setSaving(true)
+    setMsg(null)
+    try {
+      await updateInstanceSettings({ modal_closer_enabled: val })
+      setSettings(s => ({ ...s, modal_closer_enabled: val }))
+      setMsg({ ok: true, text: 'Saved.' })
+    } catch (e) {
+      setMsg({ ok: false, text: e.message })
+    } finally {
+      setSaving(false)
+    }
+  }
+
   if (loading) return <div className="muted">Loading\u2026</div>
 
   const extAvailable = settings?.ublock_ext_available ?? false
   const extEnabled = settings?.ublock_enabled ?? true
   const cookieExtAvailable = settings?.cookie_ext_available ?? false
   const cookieExtEnabled = settings?.cookie_ext_enabled ?? true
+  const modalCloserEnabled = settings?.modal_closer_enabled ?? true
 
   return (
     <div>
@@ -751,6 +766,30 @@ function ExtensionsTab() {
                 onClick={() => toggleCookieExt(!cookieExtEnabled)}
                 disabled={saving}
                 aria-label="Toggle I Still Don't Care About Cookies"
+              >
+                <span className="ext-toggle-knob" />
+              </button>
+            </div>
+          </div>
+
+          <div className="ext-card">
+            <div className="ext-card-header">
+              <div className="ext-card-info">
+                <span className="ext-card-name">Modal &amp; Dialog Closer</span>
+                <span className="ext-card-desc">
+                  Auto-dismiss cookie banners, consent overlays, and other modal dialogs
+                  before a WebPage capture is taken. Implemented as an injected browser
+                  script; no external extension required.
+                </span>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={modalCloserEnabled}
+                className={`ext-toggle${modalCloserEnabled ? ' ext-toggle--on' : ''}`}
+                onClick={() => toggleModalCloser(!modalCloserEnabled)}
+                disabled={saving}
+                aria-label="Toggle Modal and Dialog Closer"
               >
                 <span className="ext-toggle-knob" />
               </button>

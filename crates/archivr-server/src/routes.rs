@@ -685,6 +685,7 @@ struct CaptureBody {
     /// Distil to article content via Readability before archiving.  Absent = false.
     reader_mode: Option<bool>,
     cookie_ext_enabled: Option<bool>,
+    modal_closer_enabled: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -765,26 +766,29 @@ async fn capture_handler(
     let job_uid = database::create_capture_job(&conn, &archive_id)?;
     drop(conn);
     // Load cookie rules and global uBlock / cookie-ext settings from the auth DB.
-    let (cookie_rules, global_ublock, global_cookie_ext) = {
+    let (cookie_rules, global_ublock, global_cookie_ext, global_modal_closer) = {
         match database::open_auth_db(&state.auth_db_path) {
             Ok(conn) => {
                 let rules = database::list_cookie_rules(&conn).unwrap_or_default();
                 let settings = database::get_instance_settings(&conn);
                 let ublock = settings.as_ref().map(|s| s.ublock_enabled).unwrap_or(true);
-                let cookie_ext = settings.map(|s| s.cookie_ext_enabled).unwrap_or(true);
-                (rules, ublock, cookie_ext)
+                let cookie_ext = settings.as_ref().map(|s| s.cookie_ext_enabled).unwrap_or(true);
+                let modal_closer = settings.map(|s| s.modal_closer_enabled).unwrap_or(true);
+                (rules, ublock, cookie_ext, modal_closer)
             }
-            Err(_) => (vec![], true, true),
+            Err(_) => (vec![], true, true, true),
         }
     };
     // Per-capture body overrides global; if body doesn't specify, use the global setting.
     // The resolved bool is then passed as Some(_) to singlefile, overriding the env var.
     let effective_ublock = body.ublock_enabled.unwrap_or(global_ublock);
     let effective_cookie_ext = body.cookie_ext_enabled.unwrap_or(global_cookie_ext);
+    let effective_modal_closer = body.modal_closer_enabled.unwrap_or(global_modal_closer);
     let capture_config = capture::CaptureConfig {
         cookie_rules,
         ublock_enabled: Some(effective_ublock),
         cookie_ext_enabled: Some(effective_cookie_ext),
+        modal_closer_enabled: Some(effective_modal_closer),
         reader_mode: body.reader_mode.unwrap_or(false),
     };
 
@@ -895,6 +899,7 @@ async fn rearchive_handler(
         cookie_rules,
         ublock_enabled: None,
         cookie_ext_enabled: None,
+        modal_closer_enabled: None,
         reader_mode: false,
     };
 
@@ -1188,6 +1193,7 @@ async fn update_instance_settings_handler(
     if let Some(v) = body.default_entry_visibility { settings.default_entry_visibility = v; }
     if let Some(v) = body.ublock_enabled { settings.ublock_enabled = v; }
     if let Some(v) = body.cookie_ext_enabled { settings.cookie_ext_enabled = v; }
+    if let Some(v) = body.modal_closer_enabled { settings.modal_closer_enabled = v; }
     database::update_instance_settings(&conn, &settings)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1519,6 +1525,7 @@ struct UpdateInstanceSettingsBody {
     default_entry_visibility: Option<u32>,
     ublock_enabled: Option<bool>,
     cookie_ext_enabled: Option<bool>,
+    modal_closer_enabled: Option<bool>,
 }
 
 async fn admin_list_users(

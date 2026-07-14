@@ -85,6 +85,8 @@ pub struct CaptureConfig {
     pub cookie_ext_enabled: Option<bool>,
     /// Apply Mozilla Readability to distil the page to article content before archiving.
     pub reader_mode: bool,
+    /// Override for modal-closer browser-script behavior during WebPage captures.
+    pub modal_closer_enabled: Option<bool>,
 }
 
 /// Resolves which cookies apply to `url` by evaluating all rules in ordinal order.
@@ -1036,7 +1038,7 @@ pub fn perform_capture(
 
     // Source: web page — archive as a self-contained HTML snapshot via single-file-cli
     if source == Source::WebPage {
-        match downloader::singlefile::save(locator, store_path, &timestamp, &cookies, config.ublock_enabled, config.cookie_ext_enabled, config.reader_mode) {
+        match downloader::singlefile::save(locator, store_path, &timestamp, &cookies, config.ublock_enabled, config.cookie_ext_enabled, config.reader_mode, config.modal_closer_enabled) {
             Ok(result) => {
                 let file_extension = ".html".to_string();
                 let temp_html = store_path
