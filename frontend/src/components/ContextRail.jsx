@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { fetchEntryTags, assignTag, removeTag, listEntryCollections, updateEntryTitle, deleteEntry, rearchiveEntry, pollCaptureJob } from '../api'
+import { fetchEntryTags, assignTag, removeTag, listEntryCollections, listCollections, addEntryToCollection, updateEntryTitle, deleteEntry, rearchiveEntry, pollCaptureJob } from '../api'
 import { formatTimestamp, formatBytes, valueText, sourceIconSvg, displayPath } from '../utils'
 
 const VIS_LABEL = { 0: 'Private', 1: 'Public', 2: 'Users only', 3: 'Public' }
@@ -11,7 +11,7 @@ const ExternalIcon = () => (
   </svg>
 )
 
-export default function ContextRail({ archiveId, selectedEntry, detail, onTagFilterSet, tagNodes, onTagsRefresh, onEntryTitleChange, onEntryDeleted, humanizeTags, onDetailRefresh, onOpenPreview, onPlay }) {
+export default function ContextRail({ archiveId, selectedEntry, selectedUids, selectedEntries, detail, onTagFilterSet, tagNodes, onTagsRefresh, onEntryTitleChange, onEntryDeleted, onBulkDeleted, humanizeTags, onDetailRefresh, onOpenPreview, onPlay }) {
   const [tags, setTags] = useState([])
   const [assignInput, setAssignInput] = useState('')
   const [entryCollections, setEntryCollections] = useState([])
@@ -23,6 +23,17 @@ export default function ContextRail({ archiveId, selectedEntry, detail, onTagFil
   const [rearchiveState, setRearchiveState] = useState('idle') // 'idle' | 'running' | 'done' | 'error'
   const [rearchiveError, setRearchiveError] = useState('')
   const rearchivePollRef = useRef(null)
+
+  // ── Bulk-panel state ────────────────────────────────────────────────────
+  const isBulk = selectedUids?.size >= 2
+  const [bulkTagInput, setBulkTagInput] = useState('')
+  const [bulkTagState, setBulkTagState] = useState('idle') // 'idle'|'running'|'done'|'error'
+  const [bulkTagError, setBulkTagError] = useState('')
+  const [collections, setCollections] = useState([])
+  const [bulkCollUid, setBulkCollUid] = useState('')
+  const [bulkCollState, setBulkCollState] = useState('idle') // 'idle'|'running'|'done'|'error'
+  const [bulkCollError, setBulkCollError] = useState('')
+  const [bulkDeleteState, setBulkDeleteState] = useState('idle') // 'idle'|'running'
 
   useEffect(() => {
     const seq = ++selectSeqRef.current
@@ -53,6 +64,80 @@ export default function ContextRail({ archiveId, selectedEntry, detail, onTagFil
       clearInterval(rearchivePollRef.current)
     }
   }, [])
+
+  // Fetch available collections when entering bulk mode
+  useEffect(() => {
+    if (!isBulk || !archiveId) { setCollections([]); return }
+    listCollections(archiveId).then(setCollections).catch(() => setCollections([]))
+  }, [isBulk, archiveId])
+
+  // Reset transient bulk state when selection changes
+  useEffect(() => {
+    setBulkTagInput('')
+    setBulkTagState('idle')
+    setBulkTagError('')
+    setBulkCollUid('')
+    setBulkCollState('idle')
+    setBulkCollError('')
+    setBulkDeleteState('idle')
+  }, [selectedUids])
+
+  async function handleBulkDelete() {
+    const n = selectedUids.size
+    if (!window.confirm(`Delete ${n} entr${n === 1 ? 'y' : 'ies'}? This cannot be undone.`)) return
+    setBulkDeleteState('running')
+    const deletedUids = new Set()
+    for (const uid of selectedUids) {
+      try {
+        await deleteEntry(archiveId, uid)
+        deletedUids.add(uid)
+      } catch {
+        // partial failure — skip and continue
+      }
+    }
+    setBulkDeleteState('idle')
+    onBulkDeleted?.(deletedUids)
+  }
+
+  async function handleBulkTag() {
+    const path = bulkTagInput.trim()
+    if (!path) return
+    setBulkTagState('running')
+    setBulkTagError('')
+    try {
+      for (const uid of selectedUids) {
+        await assignTag(archiveId, uid, path)
+      }
+      setBulkTagInput('')
+      setBulkTagState('done')
+      onTagsRefresh?.()
+      setTimeout(() => setBulkTagState('idle'), 1800)
+    } catch (err) {
+      setBulkTagError(err.message)
+      setBulkTagState('error')
+    }
+  }
+
+  async function handleBulkAddToCollection() {
+    if (!bulkCollUid) return
+    setBulkCollState('running')
+    setBulkCollError('')
+    const failed = []
+    for (const uid of selectedUids) {
+      try {
+        await addEntryToCollection(archiveId, bulkCollUid, uid)
+      } catch (err) {
+        failed.push(uid)
+      }
+    }
+    if (failed.length > 0) {
+      setBulkCollError(`Failed for ${failed.length} entr${failed.length === 1 ? 'y' : 'ies'}.`)
+      setBulkCollState('error')
+    } else {
+      setBulkCollState('done')
+      setTimeout(() => setBulkCollState('idle'), 1800)
+    }
+  }
 
   async function handleTitleSave() {
     const newTitle = titleDraft.trim() || null
@@ -174,10 +259,83 @@ export default function ContextRail({ archiveId, selectedEntry, detail, onTagFil
     <aside className="context-rail">
       <div className="rail-eyebrow">Context</div>
 
-      {!selectedEntry ? (
+      {isBulk ? (
+        <div className="bulk-panel">
+          <p className="bulk-count">
+            <span className="bulk-count-num">{selectedUids.size}</span>
+            {' entries selected'}
+          </p>
+
+          <div className="rail-section">
+            <div className="rail-section-heading">Assign tag</div>
+            {bulkTagError && (
+              <p className="form-msg form-msg--err" style={{ margin: '0 0 8px' }}>{bulkTagError}</p>
+            )}
+            <div className="tag-input-wrap">
+              <span className="hash">/</span>
+              <input
+                className="tag-input"
+                type="text"
+                placeholder="science/cs"
+                autoComplete="off"
+                value={bulkTagInput}
+                onChange={e => setBulkTagInput(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') handleBulkTag() }}
+              />
+              <button
+                className="tag-add-btn"
+                onClick={handleBulkTag}
+                disabled={bulkTagState === 'running' || !bulkTagInput.trim()}
+              >
+                {bulkTagState === 'running' ? '…' : bulkTagState === 'done' ? '✓' : 'Add'}
+              </button>
+            </div>
+          </div>
+
+          {collections.length > 0 && (
+            <div className="rail-section">
+              <div className="rail-section-heading">Add to collection</div>
+              <div className="bulk-coll-row">
+                <select
+                  className="bulk-coll-select"
+                  value={bulkCollUid}
+                  onChange={e => setBulkCollUid(e.target.value)}
+                >
+                  <option value="">Pick a collection…</option>
+                  {collections.map(c => (
+                    <option key={c.collection_uid} value={c.collection_uid}>{c.name}</option>
+                  ))}
+                </select>
+                <button
+                  className="tag-add-btn"
+                  onClick={handleBulkAddToCollection}
+                  disabled={!bulkCollUid || bulkCollState === 'running'}
+                >
+                  {bulkCollState === 'running' ? '…' : bulkCollState === 'done' ? '✓' : bulkCollState === 'error' ? '!' : 'Add'}
+                </button>
+              </div>
+              {bulkCollError && (
+                <p className="form-msg form-msg--err" style={{ margin: '6px 0 0' }}>{bulkCollError}</p>
+              )}
+            </div>
+          )}
+
+          <div className="rail-delete-zone">
+            <button
+              className="rail-delete-btn"
+              onClick={handleBulkDelete}
+              disabled={bulkDeleteState === 'running'}
+            >
+              {bulkDeleteState === 'running'
+                ? 'Deleting\u2026'
+                : `Delete ${selectedUids.size} entr${selectedUids.size === 1 ? 'y' : 'ies'}`}
+            </button>
+          </div>
+        </div>
+      ) : !selectedEntry ? (
         <p className="tags-empty">Select an entry.</p>
       ) : !detail ? (
-        <p className="tags-empty">Loading…</p>
+        <p className="tags-empty">Loading\u2026</p>
       ) : (
         <>
           {editingTitle ? (
@@ -268,7 +426,7 @@ export default function ContextRail({ archiveId, selectedEntry, detail, onTagFil
         </>
       )}
 
-      {selectedEntry && (
+      {selectedEntry && !isBulk && (
         <>
           <div className="rail-section">
             <div className="rail-section-heading">Tags</div>
