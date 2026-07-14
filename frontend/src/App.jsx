@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, createContext } from 'react'
+import { useState, useEffect, useCallback, useRef, useMemo, createContext } from 'react'
 import { fetchArchives, fetchEntries, searchEntries, fetchRuns, fetchTags, checkSetup, fetchMe, fetchEntryDetail } from './api'
 import LoginPage from './components/LoginPage.jsx'
 import SetupPage from './components/SetupPage.jsx'
@@ -77,6 +77,7 @@ export default function App() {
       setTagFilter(tag)
       setSelectedEntryUid(entry)
       setSelectedEntry(null)
+      setSelectedUids(entry ? new Set([entry]) : new Set())
     }
     window.addEventListener('popstate', handler)
     return () => window.removeEventListener('popstate', handler)
@@ -87,6 +88,10 @@ export default function App() {
   const [entries, setEntries] = useState([])
   const [selectedEntryUid, setSelectedEntryUid] = useState(() => parseLocation().entry)
   const [selectedEntry, setSelectedEntry] = useState(null)
+  const [selectedUids, setSelectedUids] = useState(() => {
+    const e = parseLocation().entry
+    return e ? new Set([e]) : new Set()
+  })
   const [tagFilter, setTagFilter] = useState(() => parseLocation().tag)
   const [view, setView] = useState(() => parseLocation().view)
   const [settingsTab, setSettingsTab] = useState(() => parseLocation().settingsTab)
@@ -113,6 +118,7 @@ export default function App() {
   const searchInputRef = useRef(null)
   const pendingSearchFocus = useRef(false)
   const firstArchiveLoad = useRef(true)
+  const lastAnchorIndexRef = useRef(null)
 
   const humanizeTags = currentUser?.humanize_slugs ?? false;
 
@@ -143,6 +149,14 @@ export default function App() {
         results = await fetchEntries(aid)
       }
       setEntries(results)
+      // Prune multi-selection to only entries still visible after load.
+      // Single-select (size 1) survives naturally; bulk-select is clipped to visible rows.
+      setSelectedUids(prev => {
+        if (prev.size < 2) return prev  // single-select persists across search/filter
+        const visible = new Set(results.map(e => e.entry_uid))
+        const pruned = new Set([...prev].filter(uid => visible.has(uid)))
+        return pruned.size === prev.size ? prev : pruned
+      })
       setResultCount(results.length === 0 ? 'No results' : `${results.length} result${results.length === 1 ? '' : 's'}`)
     } catch {
       setEntries([])
@@ -181,6 +195,7 @@ export default function App() {
     setTagFilter(null)
     setSelectedEntry(null)
     setSelectedEntryUid(null)
+    setSelectedUids(new Set())
     Promise.all([
       loadEntries(archiveId, '', null),
       fetchRuns(archiveId).then(setRuns),
@@ -231,6 +246,39 @@ export default function App() {
     setSelectedEntryUid(entry ? entry.entry_uid : null)
     setSelectedEntry(entry)
   }, [])
+
+  const handleRowClick = useCallback((entry, e) => {
+    if (e.shiftKey && lastAnchorIndexRef.current !== null) {
+      e.preventDefault()
+      const anchorIdx = entries.findIndex(x => x.entry_uid === lastAnchorIndexRef.current)
+      const clickIdx  = entries.findIndex(x => x.entry_uid === entry.entry_uid)
+      if (anchorIdx === -1 || clickIdx === -1) {
+        // anchor evicted by search/filter/delete — fall back to single select
+        lastAnchorIndexRef.current = entry.entry_uid
+        setSelectedUids(new Set([entry.entry_uid]))
+        selectEntry(entry)
+        return
+      }
+      const lo = Math.min(anchorIdx, clickIdx)
+      const hi = Math.max(anchorIdx, clickIdx)
+      const range = entries.slice(lo, hi + 1)
+      const uids = new Set(range.map(x => x.entry_uid))
+      setSelectedUids(uids)
+      if (uids.size === 1) selectEntry(range[0])
+    } else if (e.ctrlKey || e.metaKey) {
+      lastAnchorIndexRef.current = entry.entry_uid
+      setSelectedUids(prev => {
+        const next = new Set(prev)
+        if (next.has(entry.entry_uid)) next.delete(entry.entry_uid)
+        else next.add(entry.entry_uid)
+        return next
+      })
+    } else {
+      lastAnchorIndexRef.current = entry.entry_uid
+      setSelectedUids(new Set([entry.entry_uid]))
+      selectEntry(entry)
+    }
+  }, [entries, selectEntry])
 
   const handleTagFilterSet = useCallback((fullPath) => {
     setTagFilter(fullPath)
@@ -285,7 +333,36 @@ export default function App() {
     setEntries(prev => prev.filter(e => e.entry_uid !== entryUid))
     setSelectedEntry(prev => prev?.entry_uid === entryUid ? null : prev)
     setSelectedEntryUid(prev => prev === entryUid ? null : prev)
+    setSelectedUids(prev => { const n = new Set(prev); n.delete(entryUid); return n })
   }, [])
+
+  const handleBulkDeleted = useCallback((uids) => {
+    setEntries(prev => prev.filter(e => !uids.has(e.entry_uid)))
+    setSelectedUids(new Set())
+    setSelectedEntry(null)
+    setSelectedEntryUid(null)
+  }, [])
+
+  // Auto-snap: drive selectedEntryUid from selectedUids so URL sync and detail
+  // panel stay correct. size >= 2 clears single-entry state (bulk panel takes over).
+  useEffect(() => {
+    if (selectedUids.size >= 2) {
+      setSelectedEntryUid(null)
+      setSelectedEntry(null)
+    } else if (selectedUids.size === 1) {
+      const [uid] = selectedUids
+      setSelectedEntryUid(uid)
+      // selectedEntry object restored by the existing restore effect below
+    } else {
+      setSelectedEntryUid(null)
+      setSelectedEntry(null)
+    }
+  }, [selectedUids])
+
+  const selectedEntries = useMemo(
+    () => entries.filter(e => selectedUids.has(e.entry_uid)),
+    [entries, selectedUids]
+  )
 
   // Restore selectedEntry object from selectedEntryUid when entries load.
   // Handles page refresh and back/forward navigation where only the UID is known.
@@ -444,15 +521,9 @@ export default function App() {
             {view === 'archive' && (
             <EntriesView
                 entries={entries}
-                selectedEntryUid={selectedEntryUid}
-                onSelectEntry={selectEntry}
+                selectedUids={selectedUids}
+                onRowClick={handleRowClick}
                 archiveId={archiveId}
-                tagFilter={tagFilter}
-                onClearTagFilter={handleClearTagFilter}
-                searchQuery={searchQuery}
-                onSearchChange={setSearchQuery}
-                resultCount={resultCount}
-                searchBusy={searchBusy}
               />
             )}
             {view === 'runs' && <RunsView runs={runs} />}
@@ -480,12 +551,15 @@ export default function App() {
           <ContextRail
             archiveId={archiveId}
             selectedEntry={selectedEntry}
+            selectedUids={selectedUids}
+            selectedEntries={selectedEntries}
             detail={entryDetail}
             onTagFilterSet={handleTagFilterSet}
             tagNodes={tagNodes}
             onTagsRefresh={handleTagsRefresh}
             onEntryTitleChange={handleEntryTitleChange}
             onEntryDeleted={handleEntryDeleted}
+            onBulkDeleted={handleBulkDeleted}
             humanizeTags={humanizeTags}
             onDetailRefresh={handleDetailRefresh}
             onOpenPreview={handleOpenPreview}

@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { formatTimestamp, formatBytes, valueText, sourceIconSvg } from '../utils';
 
-export default function EntryRow({ entry, archiveId, isSelected, onSelect }) {
+export default function EntryRow({ entry, archiveId, isSelected, isMultiSelected, onRowClick }) {
   const [favFailed, setFavFailed] = useState(false);
   const showFavicon =
     entry.source_kind === 'web' &&
@@ -23,14 +23,33 @@ export default function EntryRow({ entry, archiveId, isSelected, onSelect }) {
     <span dangerouslySetInnerHTML={{ __html: sourceIconSvg(entry.source_kind) }} />
   );
 
+  const checked = isSelected || isMultiSelected;
+
+  function handleCheckboxClick(e) {
+    e.stopPropagation();
+    // treat checkbox tap as ctrl+click: toggle this entry without clearing others
+    onRowClick(entry, { ctrlKey: true, metaKey: false, shiftKey: false, preventDefault() {} });
+  }
+
   return (
     <div
-      className={isSelected ? 'is-selected' : undefined}
+      className={[isSelected && 'is-selected', isMultiSelected && 'is-multi-selected'].filter(Boolean).join(' ') || undefined}
       tabIndex={0}
       data-entry-uid={entry.entry_uid}
-      onClick={onSelect}
-      onKeyDown={e => { if (e.key === 'Enter') onSelect(); }}
+      onMouseDown={e => { if (e.shiftKey) e.preventDefault() }}
+      onClick={e => onRowClick(entry, e)}
+      onKeyDown={e => { if (e.key === 'Enter') onRowClick(entry, e) }}
     >
+      <div className="col-check">
+        <button
+          type="button"
+          className={`row-checkbox${checked ? ' is-checked' : ''}`}
+          aria-pressed={checked}
+          aria-label={checked ? 'Deselect entry' : 'Select entry'}
+          onClick={handleCheckboxClick}
+          onKeyDown={e => e.stopPropagation()}
+        />
+      </div>
       <div className="col-added">{formatTimestamp(entry.archived_at)}</div>
       <div className="col-title">
         <span className="source-icon">{icon}</span>
