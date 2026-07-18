@@ -7,7 +7,7 @@ const VIDEO_EXTS = new Set(['mp4', 'webm', 'mov', 'mkv', 'avi', 'm4v', 'ogv']);
 const AUDIO_EXTS = new Set(['mp3', 'ogg', 'm4a', 'opus', 'wav', 'flac', 'aac']);
 const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'svg', 'bmp']);
 
-export default function PreviewPanel({ archiveId, entry, detail }) {
+export default function PreviewPanel({ archiveId, entry, detail, fullPage, onXArticle }) {
 
   if (!entry) {
     return (
@@ -35,16 +35,20 @@ export default function PreviewPanel({ archiveId, entry, detail }) {
 
   // 1. Tweet / tweet thread
   if (entityKind === 'tweet' || entityKind === 'tweet_thread') {
-    return (
-      <div className="preview-tweet-wrap">
-        <TweetPreview
-          archiveId={archiveId}
-          entryUid={entryUid}
-          artifacts={artifacts}
-          entityKind={entityKind}
-        />
-      </div>
+    const tweetPreview = (
+      <TweetPreview
+        archiveId={archiveId}
+        entryUid={entryUid}
+        artifacts={artifacts}
+        entityKind={entityKind}
+        fullPage={fullPage}
+        onXArticle={onXArticle}
+      />
     );
+    // In fullPage mode the parent (PreviewPage) is the scroll container;
+    // skip preview-tweet-wrap to avoid nested overflow/scroll.
+    if (fullPage) return tweetPreview;
+    return <div className="preview-tweet-wrap">{tweetPreview}</div>;
   }
 
   // 2. Find primary_media artifact

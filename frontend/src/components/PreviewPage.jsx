@@ -9,8 +9,28 @@ export default function PreviewPage({ archiveId, entryUid }) {
   const [detail, setDetail] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  // Set to true by ArticleRenderer when the entry turns out to be an X article,
+  // triggering the X dark palette on the page shell.
+  const [xArticle, setXArticle] = useState(false)
+
+  // When displaying an X article, make the document scroll (not an inner div)
+  // and apply color-scheme:dark so native scrollbars match the dark palette.
+  useEffect(() => {
+    if (!xArticle) return
+    const html = document.documentElement
+    const body = document.body
+    const prevScheme = html.style.colorScheme
+    const prevBg     = body.style.background
+    html.style.colorScheme = 'dark'
+    body.style.background  = '#000'
+    return () => {
+      html.style.colorScheme = prevScheme
+      body.style.background  = prevBg
+    }
+  }, [xArticle])
 
   useEffect(() => {
+    setXArticle(false)
     fetchEntryDetail(archiveId, entryUid)
       .then(d => { setDetail(d); setLoading(false) })
       .catch(e => { setError(e?.message || 'Failed to load entry'); setLoading(false) })
@@ -24,28 +44,33 @@ export default function PreviewPage({ archiveId, entryUid }) {
       minHeight: '100vh',
       display: 'flex',
       flexDirection: 'column',
-      background: 'var(--paper)',
+      background: xArticle ? '#000' : 'var(--paper)',
       fontFamily: 'var(--sans)',
     }}>
-      {/* Minimal topbar */}
+      {/* Topbar — sticky + blur when showing an X article, matching a-topbar in the renderer */}
       <div style={{
         display: 'flex',
         alignItems: 'center',
         gap: '10px',
-        padding: '10px 16px',
-        borderBottom: '1px solid var(--line)',
+        padding: xArticle ? '8px 12px' : '10px 16px',
+        borderBottom: xArticle ? 'none' : '1px solid var(--line)',
         flexShrink: 0,
-        background: 'var(--paper-2)',
+        position: xArticle ? 'sticky' : 'relative',
+        top: 0,
+        zIndex: 20,
+        background: xArticle ? 'rgba(0,0,0,0.82)' : 'var(--paper-2)',
+        backdropFilter: xArticle ? 'blur(12px)' : 'none',
+        WebkitBackdropFilter: xArticle ? 'blur(12px)' : 'none',
       }}>
         <a
           href="/"
-          style={{ color: 'var(--accent)', textDecoration: 'none', fontSize: '13px', flexShrink: 0 }}
+          style={{ color: xArticle ? '#1d9bf0' : 'var(--accent)', textDecoration: 'none', fontSize: '13px', flexShrink: 0 }}
         >← Archive</a>
         <span style={{
           flex: 1,
           fontSize: '14px',
           fontWeight: 600,
-          color: 'var(--ink)',
+          color: xArticle ? '#e7e9ea' : 'var(--ink)',
           overflow: 'hidden',
           textOverflow: 'ellipsis',
           whiteSpace: 'nowrap',
@@ -55,13 +80,15 @@ export default function PreviewPage({ archiveId, entryUid }) {
             href={originalUrl}
             target="_blank"
             rel="noopener noreferrer"
-            style={{ color: 'var(--muted)', textDecoration: 'none', fontSize: '13px', flexShrink: 0 }}
+            style={{ color: xArticle ? '#71767b' : 'var(--muted)', textDecoration: 'none', fontSize: '13px', flexShrink: 0 }}
           >Original ↗</a>
         )}
       </div>
 
       {/* Content */}
-      <div style={{ flex: 1, minHeight: 0, overflow: 'auto', display: 'flex', flexDirection: 'column' }}>
+      <div style={xArticle
+        ? { flex: 1 }
+        : { flex: 1, minHeight: 0, overflow: 'auto', display: 'flex', flexDirection: 'column' }}>
         {loading && (
           <div style={{ padding: '48px', textAlign: 'center', color: 'var(--muted)', fontSize: '14px' }}>
             Loading…
@@ -77,6 +104,8 @@ export default function PreviewPage({ archiveId, entryUid }) {
             archiveId={archiveId}
             entry={detail.summary}
             detail={detail}
+            fullPage
+            onXArticle={setXArticle}
           />
         )}
       </div>

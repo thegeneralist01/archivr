@@ -415,6 +415,84 @@ const S = {
   },
 };
 
+// ── X dark palette (mirroring x-article-renderer) ──────────────────────────────
+const X = {
+  bg:      '#000000',
+  border:  '#2f3336',
+  text:    '#e7e9ea',
+  dim:     '#71767b',
+  accent:  '#1d9bf0',
+  codeBg:  '#16181c',
+};
+
+// ── Full-page X article styles (mirrors x-article-renderer CSS) ──────────────────
+// Used only when ArticleRenderer is rendered from PreviewPage (fullPage=true).
+// Colors are hard-coded to X's dark palette; layout matches the standalone renderer.
+const SF = {
+  // Article container — fills the scrollable page area, dark bg
+  article: {
+    background: X.bg,
+    color: X.text,
+    minHeight: '100%',
+    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
+  },
+  // Inner content — constrained to 598px, matches #article-content in renderer
+  articleInner: {
+    maxWidth: '598px',
+    margin: '0 auto',
+    paddingBottom: '80px',
+  },
+  aCover:  { width: '100%', display: 'block', objectFit: 'cover', maxHeight: '420px' },
+  aMeta:   { padding: '20px 16px 0' },
+  aTweetTitle: {
+    fontSize: '34px', fontWeight: '800', letterSpacing: '-0.5px',
+    color: X.text, lineHeight: '44px', marginBottom: '16px',
+  },
+  aAuthorRow: { display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' },
+  aAvatar:    { width: '40px', height: '40px', borderRadius: '50%', objectFit: 'cover', flexShrink: 0, display: 'block' },
+  aAvatarPh:  { width: '40px', height: '40px', borderRadius: '50%', background: X.border, flexShrink: 0 },
+  aAuthorName: { fontSize: '15px', fontWeight: '700', color: X.text,  lineHeight: '1.3' },
+  aAuthorSub:  { fontSize: '15px', color: X.dim,  lineHeight: '1.3' },
+  aDivider:    { border: 'none', borderTop: `1px solid ${X.border}`, margin: '0' },
+  aBody:       { padding: '4px 16px 0' },
+  // Block styles
+  bH1: {
+    fontSize: '26px', fontWeight: '800', letterSpacing: '-0.4px',
+    color: X.text, lineHeight: '36px', margin: '24px 0 10px',
+  },
+  bH2: {
+    fontSize: '26px', fontWeight: '800', letterSpacing: '-0.4px',
+    color: X.text, lineHeight: '36px', margin: '24px 0 10px',
+  },
+  bP:      { fontSize: '17px', color: X.text, lineHeight: '1.5', marginBottom: '16px', marginTop: '0' },
+  bSpacer: { height: '6px', display: 'block' },
+  bQuote:  { borderLeft: `3px solid ${X.border}`, padding: '2px 14px', margin: '14px 0', color: X.dim, fontSize: '17px', lineHeight: '1.5' },
+  bHr:     { border: 'none', borderTop: `1px solid ${X.border}`, margin: '28px 0' },
+  bImg:    { width: '100%', display: 'block', borderRadius: '12px', margin: '16px 0' },
+  bUl:     { margin: '10px 0 16px', paddingLeft: '28px' },
+  bOl:     { margin: '10px 0 16px', paddingLeft: '28px' },
+  bLi:     { fontSize: '17px', color: X.text, lineHeight: '1.5', marginBottom: '6px' },
+  bTweet:  {
+    display: 'flex', alignItems: 'center', gap: '12px',
+    border: `1px solid ${X.border}`, borderRadius: '12px',
+    padding: '14px 16px', margin: '14px 0',
+    color: X.dim, fontSize: '15px', textDecoration: 'none',
+  },
+  bMdPre:  { borderRadius: '12px', margin: '12px 0', overflow: 'auto', background: '#1e2029' },
+  bMdCode: {
+    fontFamily: "ui-monospace, 'Cascadia Code', 'Fira Code', Menlo, Consolas, monospace",
+    fontSize: '13px', lineHeight: '1.65',
+    padding: '18px 20px', display: 'block',
+    color: X.text, background: 'transparent',
+  },
+  iCode: {
+    fontFamily: "ui-monospace, 'Cascadia Code', Menlo, Consolas, monospace",
+    fontSize: '0.875em', background: X.codeBg,
+    padding: '2px 6px', borderRadius: '4px', color: '#e6edf3',
+  },
+  link: { color: X.accent, textDecoration: 'none' },
+};
+
 // ── Artifact URL helpers ────────────────────────────────────────────────────────
 // Build relpath → artifact API URL map from the artifacts array so archived
 // copies are preferred over CDN URLs (avatars, media, cover images).
@@ -590,7 +668,7 @@ function renderTweetTextJSX(fullText, entities, skipSpans = []) {
 // Splits block text at style-range, URL, and mention boundaries, returning
 // an array of React nodes with the appropriate wrappers applied.
 
-function renderInlineJSX(text, styleRanges, urls, mentions) {
+function renderInlineJSX(text, styleRanges, urls, mentions, st = S) {
   if (!text) return null;
   styleRanges = styleRanges || [];
   urls = urls || [];
@@ -610,7 +688,7 @@ function renderInlineJSX(text, styleRanges, urls, mentions) {
     if (ann) anns.push(ann);
   }
 
-  if (anns.length === 0) return linkifyText(text, S.link);
+  if (anns.length === 0) return linkifyText(text, st.link);
 
   const pts = new Set([0, text.length]);
   for (const a of anns) {
@@ -637,7 +715,7 @@ function renderInlineJSX(text, styleRanges, urls, mentions) {
 
     // Apply inline styles innermost first (matching Draft.js precedence).
     if (active.some(a => a.kind === 'style' && a.style === 'Code'))
-      content = <code style={S.iCode}>{content}</code>;
+      content = <code style={st.iCode}>{content}</code>;
     if (active.some(a => a.kind === 'style' && a.style === 'Bold'))
       content = <strong>{content}</strong>;
     if (active.some(a => a.kind === 'style' && a.style === 'Italic'))
@@ -654,7 +732,7 @@ function renderInlineJSX(text, styleRanges, urls, mentions) {
       // human-readable display URL; otherwise keep the styled anchor text.
       const isTco = /^https?:\/\/t\.co\//i.test(content);
       content = (
-        <a href={url.href} target="_blank" rel="noopener noreferrer" style={S.link}>
+        <a href={url.href} target="_blank" rel="noopener noreferrer" style={st.link}>
           {isTco ? url.display : content}
         </a>
       );
@@ -667,14 +745,14 @@ function renderInlineJSX(text, styleRanges, urls, mentions) {
           href={`https://x.com/${mention.screen_name}`}
           target="_blank"
           rel="noopener noreferrer"
-          style={S.link}
+          style={st.link}
         >
           {content}
         </a>
       );
     }
 
-    return <span key={i}>{typeof content === 'string' ? linkifyText(content, S.link) : content}</span>;
+    return <span key={i}>{typeof content === 'string' ? linkifyText(content, st.link) : content}</span>;
   });
 }
 
@@ -682,13 +760,14 @@ function renderInlineJSX(text, styleRanges, urls, mentions) {
 // Port of renderAtomic() from x-article-renderer.
 
 function renderAtomicJSX(block, artifactMap, opts) {
+  const st = opts?.st || S;
   const entities = block.resolved_entities || [];
   if (entities.length === 0) return null;
 
   return entities.map((e, i) => {
     switch (e.type) {
       case 'divider':
-        return <hr key={i} style={S.bHr} />;
+        return <hr key={i} style={st.bHr} />;
 
       case 'media': {
         const src = resolveUrl(e.local_path, e.url, artifactMap);
@@ -707,7 +786,7 @@ function renderAtomicJSX(block, artifactMap, opts) {
               }
             }}
           >
-            <img src={src} style={S.bImg} loading="lazy" alt="" />
+            <img src={src} style={st.bImg} loading="lazy" alt="" />
           </a>
         );
       }
@@ -719,7 +798,7 @@ function renderAtomicJSX(block, artifactMap, opts) {
             href={`https://x.com/i/status/${e.tweet_id}`}
             target="_blank"
             rel="noopener noreferrer"
-            style={S.bTweet}
+            style={st.bTweet}
           >
             <XLogo />
             View post on X
@@ -728,8 +807,8 @@ function renderAtomicJSX(block, artifactMap, opts) {
 
       case 'link':
         return e.url ? (
-          <p key={i} style={S.bP}>
-            <a href={e.url} target="_blank" rel="noopener noreferrer" style={S.link}>
+          <p key={i} style={st.bP}>
+            <a href={e.url} target="_blank" rel="noopener noreferrer" style={st.link}>
               {e.url}
             </a>
           </p>
@@ -738,8 +817,8 @@ function renderAtomicJSX(block, artifactMap, opts) {
       case 'markdown': {
         const md = e.markdown ?? e.data?.markdown ?? '';
         return (
-          <pre key={i} style={S.bMdPre}>
-            <code style={S.bMdCode}>{md}</code>
+          <pre key={i} style={st.bMdPre}>
+            <code style={st.bMdCode}>{md}</code>
           </pre>
         );
       }
@@ -764,15 +843,16 @@ function renderAtomicJSX(block, artifactMap, opts) {
 // Port of renderBlock() from x-article-renderer.
 
 function renderBlockJSX(block, key, artifactMap, opts) {
+  const st = opts?.st || S;
   const type = block.type || '';
   const text = block.text || '';
   const styleRanges = block.inline_style_ranges || [];
   const data = block.data || {};
-  const inner = renderInlineJSX(text, styleRanges, data.urls || [], data.mentions || []);
+  const inner = renderInlineJSX(text, styleRanges, data.urls || [], data.mentions || [], st);
 
   switch (type) {
     case 'header-one':
-      return <h1 key={key} style={S.bH1}>{inner}</h1>;
+      return <h1 key={key} style={st.bH1}>{inner}</h1>;
 
     case 'header-two': {
       const m = text.match(/(?:x\.com|twitter\.com)\/i\/status\/(\d+)/);
@@ -783,32 +863,32 @@ function renderBlockJSX(block, key, artifactMap, opts) {
             href={`https://x.com/i/status/${m[1]}`}
             target="_blank"
             rel="noopener noreferrer"
-            style={S.bTweet}
+            style={st.bTweet}
           >
             <XLogo />
             View post on X
           </a>
         );
       }
-      return <h2 key={key} style={S.bH2}>{inner}</h2>;
+      return <h2 key={key} style={st.bH2}>{inner}</h2>;
     }
 
     case 'unstyled':
-      if (!text.trim()) return <span key={key} style={S.bSpacer} />;
-      return <p key={key} style={S.bP}>{inner}</p>;
+      if (!text.trim()) return <span key={key} style={st.bSpacer} />;
+      return <p key={key} style={st.bP}>{inner}</p>;
 
     case 'blockquote':
-      return <blockquote key={key} style={S.bQuote}>{inner}</blockquote>;
+      return <blockquote key={key} style={st.bQuote}>{inner}</blockquote>;
 
     case 'unordered-list-item':
     case 'ordered-list-item':
-      return <li key={key} style={S.bLi}>{inner}</li>;
+      return <li key={key} style={st.bLi}>{inner}</li>;
 
     case 'atomic':
       return <span key={key}>{renderAtomicJSX(block, artifactMap, opts)}</span>;
 
     default:
-      return text ? <p key={key} style={S.bP}>{inner}</p> : null;
+      return text ? <p key={key} style={st.bP}>{inner}</p> : null;
   }
 }
 
@@ -817,6 +897,7 @@ function renderBlockJSX(block, key, artifactMap, opts) {
 // Groups consecutive same-type list items into a single ul/ol.
 
 function renderBlocksJSX(blocks, artifactMap, opts) {
+  const st = opts?.st || S;
   const items = [];
   let i = 0;
 
@@ -830,7 +911,7 @@ function renderBlocksJSX(blocks, artifactMap, opts) {
         listItems.push(renderBlockJSX(blocks[i], i, artifactMap, opts));
         i++;
       }
-      items.push(<ul key={`ul-${startIdx}`} style={S.bUl}>{listItems}</ul>);
+      items.push(<ul key={`ul-${startIdx}`} style={st.bUl}>{listItems}</ul>);
     } else if (b.type === 'ordered-list-item') {
       const startIdx = i;
       const listItems = [];
@@ -838,7 +919,7 @@ function renderBlocksJSX(blocks, artifactMap, opts) {
         listItems.push(renderBlockJSX(blocks[i], i, artifactMap, opts));
         i++;
       }
-      items.push(<ol key={`ol-${startIdx}`} style={S.bOl}>{listItems}</ol>);
+      items.push(<ol key={`ol-${startIdx}`} style={st.bOl}>{listItems}</ol>);
     } else {
       items.push(renderBlockJSX(b, i, artifactMap, opts));
       i++;
@@ -850,9 +931,15 @@ function renderBlocksJSX(blocks, artifactMap, opts) {
 
 // ── Article renderer ───────────────────────────────────────────────────────────
 
-function ArticleRenderer({ article, tweetAuthor, artifactMap }) {
+function ArticleRenderer({ article, tweetAuthor, artifactMap, fullPage, onXArticle }) {
   const [lightboxSrc, setLightboxSrc] = useState(null);
 
+  // Notify the page shell (PreviewPage) that it should switch to X dark palette.
+  useEffect(() => {
+    if (fullPage) onXArticle?.(true);
+  }, [fullPage, onXArticle]);
+
+  const st = fullPage ? SF : S;
   const cover = article.cover_media || {};
   const author = article.author || tweetAuthor || {};
   const date = article.first_published_at_secs
@@ -864,8 +951,8 @@ function ArticleRenderer({ article, tweetAuthor, artifactMap }) {
   const coverSrc = resolveUrl(cover.local_path, cover.url, artifactMap);
   const avatarSrc = resolveUrl(author.avatar_local_path, author.avatar_url, artifactMap);
 
-  return (
-    <div style={S.article}>
+  const body = (
+    <>
       {lightboxSrc && (
         <MediaLightbox
           items={[{ src: lightboxSrc, alt: '' }]}
@@ -881,34 +968,44 @@ function ArticleRenderer({ article, tweetAuthor, artifactMap }) {
           style={{ display: 'block', cursor: 'zoom-in' }}
           onClick={e => { if (!e.metaKey && !e.ctrlKey) { e.preventDefault(); setLightboxSrc(coverSrc); } }}
         >
-          <img src={coverSrc} style={S.aCover} alt="Article cover" />
+          <img src={coverSrc} style={st.aCover} alt="Article cover" />
         </a>
       )}
-      <div style={S.aMeta}>
+      <div style={st.aMeta}>
         {article.title && (
-          <div style={S.aTweetTitle}>{article.title}</div>
+          <div style={st.aTweetTitle}>{article.title}</div>
         )}
-        <div style={S.aAuthorRow}>
+        <div style={st.aAuthorRow}>
           {avatarSrc
-            ? <img src={avatarSrc} style={S.aAvatar} alt={author.name || ''} />
-            : <div style={S.aAvatarPh} />
+            ? <img src={avatarSrc} style={st.aAvatar} alt={author.name || ''} />
+            : <div style={st.aAvatarPh} />
           }
           <div>
-            <div style={S.aAuthorName}>
+            <div style={st.aAuthorName}>
               {author.name || author.screen_name || 'Unknown'}
             </div>
             {subLine && (
-              <div style={S.aAuthorSub}>{subLine}</div>
+              <div style={st.aAuthorSub}>{subLine}</div>
             )}
           </div>
         </div>
       </div>
-      <hr style={S.aDivider} />
-      <div style={S.aBody}>
-        {renderBlocksJSX(article.blocks || [], artifactMap, { onImgClick: setLightboxSrc })}
+      <hr style={st.aDivider} />
+      <div style={st.aBody}>
+        {renderBlocksJSX(article.blocks || [], artifactMap, { onImgClick: setLightboxSrc, st })}
       </div>
-    </div>
+    </>
   );
+
+  if (fullPage) {
+    return (
+      <div style={SF.article}>
+        <div style={SF.articleInner}>{body}</div>
+      </div>
+    );
+  }
+
+  return <div style={S.article}>{body}</div>;
 }
 
 // ── Tweet card ─────────────────────────────────────────────────────────────────
@@ -1148,7 +1245,7 @@ function TweetCard({ tweet, isInThread, isLast, artifactMap }) {
 
 // ── TweetPreview ───────────────────────────────────────────────────────────────
 
-export default function TweetPreview({ archiveId, entryUid, artifacts, entityKind }) {
+export default function TweetPreview({ archiveId, entryUid, artifacts, entityKind, fullPage, onXArticle }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [tweets, setTweets] = useState([]);
@@ -1258,7 +1355,7 @@ export default function TweetPreview({ archiveId, entryUid, artifacts, entityKin
 
   const tweet = tweets[0];
   if (tweet.is_article && tweet.article) {
-    return <ArticleRenderer article={tweet.article} tweetAuthor={tweet.author} artifactMap={artifactMap} />;
+    return <ArticleRenderer article={tweet.article} tweetAuthor={tweet.author} artifactMap={artifactMap} fullPage={fullPage} onXArticle={onXArticle} />;
   }
 
   return (
