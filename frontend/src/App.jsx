@@ -464,6 +464,23 @@ export default function App() {
     setPreviewEntryUid(null)
   }, [selectedEntry])
 
+  // Esc: deselect current entry/entries, unless a modal or input has focus.
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.key !== 'Escape') return
+      if (captureDialogOpen || previewEntryUid) return
+      const tag = document.activeElement?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+      if (selectedUids.size > 0) {
+        e.preventDefault()
+        setSelectedUids(new Set())
+        document.activeElement?.blur?.()
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [captureDialogOpen, previewEntryUid, selectedUids])
+
   // Toggle body class so fixed AudioBar doesn't obscure scrollable content
   useEffect(() => {
     document.body.classList.toggle('has-audio-bar', !!currentAudio)

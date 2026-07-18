@@ -23,6 +23,8 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
   const [rearchiveState, setRearchiveState] = useState('idle') // 'idle' | 'running' | 'done' | 'error'
   const [rearchiveError, setRearchiveError] = useState('')
   const rearchivePollRef = useRef(null)
+  const [fontsOpen, setFontsOpen] = useState(false)
+  useEffect(() => { setFontsOpen(false) }, [detail?.summary?.entry_uid])
 
   // ── Bulk-panel state ────────────────────────────────────────────────────
   const isBulk = selectedUids?.size >= 2
@@ -399,30 +401,63 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
             ))}
           </div>
 
-          {detail.artifacts.length > 0 && (
-            <div className="rail-section">
-              <div className="rail-section-heading">
-                Artifacts <span className="num">{detail.artifacts.length}</span>
+          {detail.artifacts.length > 0 && (() => {
+            const indexed = detail.artifacts.map((a, i) => ({ ...a, _idx: i }))
+            const fonts = indexed.filter(a => a.artifact_role === 'font')
+            const others = indexed.filter(a => a.artifact_role !== 'font')
+            const fontTotalBytes = fonts.reduce((s, a) => s + (a.byte_size || 0), 0)
+            const entryUid = detail.summary.entry_uid
+            const renderRow = (artifact) => (
+              <li key={artifact._idx}>
+                <a
+                  href={`/api/archives/${archiveId}/entries/${entryUid}/artifacts/${artifact._idx}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="artifact-link"
+                >
+                  <span className="artifact-name">
+                    {artifact.artifact_role === 'font'
+                      ? artifact.relpath.split('/').pop()
+                      : artifact.artifact_role.replace(/_/g, ' ')}
+                  </span>
+                  <span className="artifact-size">
+                    {artifact.byte_size != null ? formatBytes(artifact.byte_size) : '—'}
+                  </span>
+                </a>
+              </li>
+            )
+            return (
+              <div className="rail-section">
+                <div className="rail-section-heading">
+                  Artifacts <span className="num">{detail.artifacts.length}</span>
+                </div>
+                <ul className="artifact-list">
+                  {others.map(renderRow)}
+                  {fonts.length > 0 && (
+                    <li className="artifact-group">
+                      <button
+                        type="button"
+                        className="artifact-group-header artifact-link"
+                        aria-expanded={fontsOpen}
+                        onClick={() => setFontsOpen(o => !o)}
+                      >
+                        <span className="artifact-name">
+                          <span aria-hidden="true" className={`artifact-group-chevron${fontsOpen ? ' open' : ''}`}>›</span>
+                          {` fonts (${fonts.length})`}
+                        </span>
+                        <span className="artifact-size">{formatBytes(fontTotalBytes)}</span>
+                      </button>
+                      {fontsOpen && (
+                        <ul className="artifact-list artifact-group-body">
+                          {fonts.map(renderRow)}
+                        </ul>
+                      )}
+                    </li>
+                  )}
+                </ul>
               </div>
-              <ul className="artifact-list">
-                {detail.artifacts.map((artifact, index) => (
-                  <li key={index}>
-                    <a
-                      href={`/api/archives/${archiveId}/entries/${detail.summary.entry_uid}/artifacts/${index}`}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="artifact-link"
-                    >
-                      <span className="artifact-name">{artifact.artifact_role.replace(/_/g, ' ')}</span>
-                      <span className="artifact-size">
-                        {artifact.byte_size != null ? formatBytes(artifact.byte_size) : '—'}
-                      </span>
-                    </a>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
+            )
+          })()}
         </>
       )}
 
