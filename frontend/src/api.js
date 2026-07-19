@@ -142,12 +142,13 @@ export async function fetchTags(archiveId) {
 export async function submitCapture(archiveId, locator, quality = null, extensions = null) {
   const payload = { locator }
   if (quality && quality !== 'best') payload.quality = quality
-  // extensions: { ublock_enabled?: bool, reader_mode?: bool, cookie_ext_enabled?: bool, modal_closer_enabled?: bool }
+  // extensions: { ublock_enabled?: bool, reader_mode?: bool, cookie_ext_enabled?: bool, modal_closer_enabled?: bool, via_freedium?: bool }
   if (extensions) {
     if (typeof extensions.ublock_enabled === 'boolean') payload.ublock_enabled = extensions.ublock_enabled
     if (typeof extensions.reader_mode === 'boolean') payload.reader_mode = extensions.reader_mode
     if (typeof extensions.cookie_ext_enabled === 'boolean') payload.cookie_ext_enabled = extensions.cookie_ext_enabled
     if (typeof extensions.modal_closer_enabled === 'boolean') payload.modal_closer_enabled = extensions.modal_closer_enabled
+    if (typeof extensions.via_freedium === 'boolean') payload.via_freedium = extensions.via_freedium
   }
   const res = await fetch(`/api/archives/${archiveId}/captures`, {
     method: "POST",
