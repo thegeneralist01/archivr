@@ -1279,6 +1279,135 @@ select {
   outline: none;
 }
 
+/* entry count badge next to tag name */
+.tag-node-label { flex-shrink: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tag-node-count {
+  font-size: 11px;
+  color: var(--muted-2);
+  font-weight: 400;
+  flex-shrink: 0;
+  margin-left: 3px;
+}
+
+/* header action buttons (+ New, Move) */
+.tag-tree-header { align-items: center; }
+.tag-tree-actions { margin-left: auto; display: flex; gap: 4px; }
+.tag-tree-action-btn {
+  font-size: 11px;
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  line-height: 1.5;
+  white-space: nowrap;
+  transition: background 0.1s, color 0.1s;
+}
+.tag-tree-action-btn:hover:not(:disabled) { background: var(--paper-2); color: var(--ink); }
+.tag-tree-action-btn:disabled { opacity: 0.4; cursor: default; }
+.tag-tree-action-btn--cancel { border-color: var(--accent); color: var(--accent); }
+.tag-tree-action-btn--cancel:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.tag-tree-title--move { font-style: italic; color: var(--accent-2); }
+
+/* move source-select mode: nodes act as clickable targets */
+.tag-node-row--move-select .tag-node-btn { cursor: crosshair; color: var(--ink); }
+.tag-node-row--move-select .tag-node-btn:hover {
+  background: color-mix(in srgb, var(--link) 10%, transparent);
+  text-decoration: none;
+  border-radius: var(--r);
+}
+
+/* ── Tag picker modal (create/move destination) ──────────────────────────── */
+.tag-picker-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.tag-picker-modal {
+  background: var(--paper);
+  border-radius: var(--r3);
+  box-shadow: 0 16px 56px rgba(0, 0, 0, 0.24);
+  width: 300px;
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  max-height: 60vh;
+}
+.tag-picker-header {
+  display: flex;
+  align-items: center;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+  gap: 8px;
+}
+.tag-picker-title {
+  flex: 1;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tag-picker-close {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: var(--muted-2);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.tag-picker-close:hover { background: var(--paper-2); color: var(--ink); }
+.tag-picker-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px 12px 12px;
+}
+.tag-picker-root-btn {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 5px 8px;
+  margin-bottom: 6px;
+  border: 1px dashed var(--line);
+  border-radius: var(--r);
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.tag-picker-root-btn:hover { background: var(--paper-2); color: var(--ink); border-color: var(--muted-2); }
+.tag-picker-tree { border-top: 1px solid var(--line-soft); padding-top: 6px; margin-top: 2px; }
+.tag-picker-node-btn {
+  border: 0;
+  background: transparent;
+  color: var(--link);
+  cursor: pointer;
+  padding: 3px 6px;
+  text-align: left;
+  font-size: 13px;
+  display: block;
+  width: 100%;
+  border-radius: var(--r);
+}
+.tag-picker-node-btn:hover { background: var(--paper-2); text-decoration: none; }
+.tag-picker-empty { font-size: 13px; color: var(--muted-2); margin: 6px 0 0; }
+
 /* ── Collections page (sidebar layout) ──────────────────────────────────── */
 .collections-view {
   padding: 24px;

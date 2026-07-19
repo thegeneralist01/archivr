@@ -111,6 +111,26 @@ export async function deleteTag(archiveId, tagUid) {
   if (!res.ok) throw new Error(await res.text());
 }
 
+export async function createTag(archiveId, path) {
+  const res = await fetch(`/api/archives/${archiveId}/tags`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function moveTag(archiveId, tagUid, parentUid) {
+  const res = await fetch(`/api/archives/${archiveId}/tags/${tagUid}/move`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ parent_uid: parentUid ?? null }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
 export async function fetchRuns(archiveId) {
   return getJson(`/api/archives/${archiveId}/runs`);
 }
