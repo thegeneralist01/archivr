@@ -135,7 +135,7 @@ pub struct RoleRecord {
 pub struct InstanceSettings {
     pub public_index_enabled: bool,
     pub public_entry_content_enabled: bool,
-    pub open_registration_enabled: bool,  // maps to public_archive_submission_enabled column
+    pub open_registration_enabled: bool, // maps to public_archive_submission_enabled column
     pub default_entry_visibility: u32,
     /// Global default for ad-blocking via uBlock Origin Lite during WebPage captures.
     /// Per-capture requests can override this.
@@ -532,13 +532,11 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
 
 pub fn open_auth_db(auth_db_path: &Path) -> Result<Connection> {
     if let Some(parent) = auth_db_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create auth DB directory {}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create auth DB directory {}", parent.display()))?;
     }
-    let conn = Connection::open(auth_db_path).with_context(|| {
-        format!("failed to open auth database at {}", auth_db_path.display())
-    })?;
+    let conn = Connection::open(auth_db_path)
+        .with_context(|| format!("failed to open auth database at {}", auth_db_path.display()))?;
     initialize_auth_schema(&conn)?;
     Ok(conn)
 }
@@ -566,11 +564,10 @@ pub fn create_owner(conn: &Connection, username: &str, password_hash: &str) -> R
     )?;
     let user_id = conn.last_insert_rowid();
     for slug in &["user", "admin", "owner"] {
-        let role_id: i64 = conn.query_row(
-            "SELECT id FROM roles WHERE slug = ?1",
-            [slug],
-            |row| row.get(0),
-        )?;
+        let role_id: i64 =
+            conn.query_row("SELECT id FROM roles WHERE slug = ?1", [slug], |row| {
+                row.get(0)
+            })?;
         conn.execute(
             "INSERT OR IGNORE INTO user_roles (user_id, role_id, assigned_at)
              VALUES (?1, ?2, ?3)",
@@ -804,12 +801,12 @@ pub fn list_cookie_rules(conn: &Connection) -> Result<Vec<CookieRule>> {
     let records = stmt
         .query_map([], |row| {
             Ok(CookieRule {
-                rule_uid:     row.get(0)?,
-                url_pattern:  row.get(1)?,
+                rule_uid: row.get(0)?,
+                url_pattern: row.get(1)?,
                 pattern_kind: row.get(2)?,
                 cookies_json: row.get(3)?,
-                ordinal:      row.get(4)?,
-                created_at:   row.get(5)?,
+                ordinal: row.get(4)?,
+                created_at: row.get(5)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -865,10 +862,7 @@ pub fn update_cookie_rule(
 }
 
 pub fn delete_cookie_rule(conn: &Connection, rule_uid: &str) -> Result<()> {
-    let rows = conn.execute(
-        "DELETE FROM cookie_rules WHERE rule_uid = ?1",
-        [rule_uid],
-    )?;
+    let rows = conn.execute("DELETE FROM cookie_rules WHERE rule_uid = ?1", [rule_uid])?;
     if rows == 0 {
         anyhow::bail!("cookie rule not found: {rule_uid}");
     }
@@ -893,7 +887,11 @@ pub fn update_user_password(conn: &Connection, user_id: i64, new_hash: &str) -> 
     Ok(())
 }
 
-pub fn update_user_display_name(conn: &Connection, user_id: i64, display_name: Option<&str>) -> Result<()> {
+pub fn update_user_display_name(
+    conn: &Connection,
+    user_id: i64,
+    display_name: Option<&str>,
+) -> Result<()> {
     conn.execute(
         "UPDATE users SET display_name = ?1 WHERE id = ?2",
         params![display_name, user_id],
@@ -937,9 +935,13 @@ pub fn invalidate_user_sessions(conn: &Connection, user_id: i64) -> Result<usize
 
 /// Returns the integer id for a user_uid, or None if not found.
 pub fn get_user_id_by_uid(conn: &Connection, user_uid: &str) -> Result<Option<i64>> {
-    conn.query_row("SELECT id FROM users WHERE user_uid = ?1", [user_uid], |r| r.get(0))
-        .optional()
-        .map_err(Into::into)
+    conn.query_row(
+        "SELECT id FROM users WHERE user_uid = ?1",
+        [user_uid],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 /// Lists all users with their assigned roles and computed role_bits.
@@ -948,7 +950,16 @@ pub fn list_users(conn: &Connection) -> Result<Vec<UserSummary>> {
         "SELECT id, user_uid, username, email, status, created_at FROM users ORDER BY created_at ASC",
     )?;
     let rows: Vec<(i64, String, String, Option<String>, String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })?
         .collect::<Result<_, _>>()?;
 
     rows.into_iter()
@@ -958,9 +969,18 @@ pub fn list_users(conn: &Connection) -> Result<Vec<UserSummary>> {
                 "SELECT r.slug FROM user_roles ur JOIN roles r ON r.id = ur.role_id
                  WHERE ur.user_id = ?1 ORDER BY r.level, r.bit_position",
             )?;
-            let role_slugs: Vec<String> =
-                rs.query_map([id], |r| r.get(0))?.collect::<Result<_, _>>()?;
-            Ok(UserSummary { user_uid, username, email, status, created_at, role_slugs, role_bits })
+            let role_slugs: Vec<String> = rs
+                .query_map([id], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            Ok(UserSummary {
+                user_uid,
+                username,
+                email,
+                status,
+                created_at,
+                role_slugs,
+                role_bits,
+            })
         })
         .collect()
 }
@@ -982,9 +1002,18 @@ pub fn get_user_by_uid(conn: &Connection, user_uid: &str) -> Result<Option<UserS
                 "SELECT r.slug FROM user_roles ur JOIN roles r ON r.id = ur.role_id
                  WHERE ur.user_id = ?1 ORDER BY r.level, r.bit_position",
             )?;
-            let role_slugs: Vec<String> =
-                rs.query_map([id], |r| r.get(0))?.collect::<Result<_, _>>()?;
-            Ok(Some(UserSummary { user_uid, username, email, status, created_at, role_slugs, role_bits }))
+            let role_slugs: Vec<String> = rs
+                .query_map([id], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            Ok(Some(UserSummary {
+                user_uid,
+                username,
+                email,
+                status,
+                created_at,
+                role_slugs,
+                role_bits,
+            }))
         }
     }
 }
@@ -1005,11 +1034,8 @@ pub fn create_user(
         params![user_uid, username, email, password_hash, now_timestamp()],
     )?;
     let user_id = conn.last_insert_rowid();
-    let role_id: i64 = conn.query_row(
-        "SELECT id FROM roles WHERE slug = 'user'",
-        [],
-        |r| r.get(0),
-    )?;
+    let role_id: i64 =
+        conn.query_row("SELECT id FROM roles WHERE slug = 'user'", [], |r| r.get(0))?;
     conn.execute(
         "INSERT OR IGNORE INTO user_roles (user_id, role_id, assigned_at, assigned_by_user_id)
          VALUES (?1, ?2, ?3, ?4)",
@@ -1023,7 +1049,11 @@ pub fn create_user(
 pub fn set_user_status(conn: &Connection, user_uid: &str, status: &str) -> Result<bool> {
     if status == "disabled" {
         let id: Option<i64> = conn
-            .query_row("SELECT id FROM users WHERE user_uid = ?1", [user_uid], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM users WHERE user_uid = ?1",
+                [user_uid],
+                |r| r.get(0),
+            )
             .optional()?;
         if let Some(id) = id {
             invalidate_user_sessions(conn, id)?;
@@ -1045,16 +1075,24 @@ pub fn assign_role(
     assigned_by_user_id: i64,
 ) -> Result<()> {
     let role_id: i64 = conn
-        .query_row("SELECT id FROM roles WHERE slug = ?1", [role_slug], |r| r.get(0))
+        .query_row("SELECT id FROM roles WHERE slug = ?1", [role_slug], |r| {
+            r.get(0)
+        })
         .map_err(|_| anyhow::anyhow!("role '{}' not found", role_slug))?;
     conn.execute(
         "INSERT OR IGNORE INTO user_roles (user_id, role_id, assigned_at, assigned_by_user_id)
          VALUES (?1, ?2, ?3, ?4)",
-        params![target_user_id, role_id, now_timestamp(), assigned_by_user_id],
+        params![
+            target_user_id,
+            role_id,
+            now_timestamp(),
+            assigned_by_user_id
+        ],
     )?;
     // Cumulative: ensure 'user' whenever any non-guest role is assigned
     if role_slug != "user" && role_slug != "guest" {
-        let uid: i64 = conn.query_row("SELECT id FROM roles WHERE slug = 'user'", [], |r| r.get(0))?;
+        let uid: i64 =
+            conn.query_row("SELECT id FROM roles WHERE slug = 'user'", [], |r| r.get(0))?;
         conn.execute(
             "INSERT OR IGNORE INTO user_roles (user_id, role_id, assigned_at, assigned_by_user_id)
              VALUES (?1, ?2, ?3, ?4)",
@@ -1063,7 +1101,9 @@ pub fn assign_role(
     }
     // Also ensure 'admin' when assigning 'owner'
     if role_slug == "owner" {
-        let aid: i64 = conn.query_row("SELECT id FROM roles WHERE slug = 'admin'", [], |r| r.get(0))?;
+        let aid: i64 = conn.query_row("SELECT id FROM roles WHERE slug = 'admin'", [], |r| {
+            r.get(0)
+        })?;
         conn.execute(
             "INSERT OR IGNORE INTO user_roles (user_id, role_id, assigned_at, assigned_by_user_id)
              VALUES (?1, ?2, ?3, ?4)",
@@ -1088,7 +1128,9 @@ pub fn remove_role(conn: &Connection, target_user_id: i64, role_slug: &str) -> R
         }
     }
     let role_id: i64 = conn
-        .query_row("SELECT id FROM roles WHERE slug = ?1", [role_slug], |r| r.get(0))
+        .query_row("SELECT id FROM roles WHERE slug = ?1", [role_slug], |r| {
+            r.get(0)
+        })
         .map_err(|_| anyhow::anyhow!("role '{}' not found", role_slug))?;
     conn.execute(
         "DELETE FROM user_roles WHERE user_id = ?1 AND role_id = ?2",
@@ -1122,7 +1164,9 @@ pub fn list_roles(conn: &Connection) -> Result<Vec<RoleRecord>> {
 /// Returns the created RoleRecord.
 pub fn create_custom_role(conn: &Connection, slug: &str, name: &str) -> Result<RoleRecord> {
     if slug.is_empty() || !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        anyhow::bail!("role slug must be non-empty and contain only ASCII letters, digits, or hyphens");
+        anyhow::bail!(
+            "role slug must be non-empty and contain only ASCII letters, digits, or hyphens"
+        );
     }
     let next_bit: i64 = conn.query_row(
         "SELECT COALESCE(MAX(bit_position) + 1, 4) FROM roles WHERE bit_position >= 4",
@@ -1509,10 +1553,7 @@ pub fn cascade_cached_bytes_after_delete(conn: &Connection, entry_id: i64) -> Re
 /// "still there" during the recalculation.
 ///
 /// Must be called before any subtree rows are deleted so the `entry_artifacts` JOIN resolves.
-fn cascade_cached_bytes_after_subtree_delete(
-    conn: &Connection,
-    subtree_ids: &[i64],
-) -> Result<()> {
+fn cascade_cached_bytes_after_subtree_delete(conn: &Connection, subtree_ids: &[i64]) -> Result<()> {
     if subtree_ids.is_empty() {
         return Ok(());
     }
@@ -1588,9 +1629,7 @@ pub fn delete_entry(conn: &Connection, entry_uid: &str) -> Result<bool> {
 
     // Collect the full subtree while rows still exist.
     let subtree_ids: Vec<i64> = {
-        let mut stmt = conn.prepare(
-            "SELECT id FROM archived_entries WHERE root_entry_id = ?1",
-        )?;
+        let mut stmt = conn.prepare("SELECT id FROM archived_entries WHERE root_entry_id = ?1")?;
         stmt.query_map([entry_id], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?
     };
@@ -1615,10 +1654,7 @@ pub fn delete_entry(conn: &Connection, entry_uid: &str) -> Result<bool> {
     )?;
 
     // Root entry: CASCADE handles entry_artifacts, entry_tag_assignments, collection_entries.
-    conn.execute(
-        "DELETE FROM archived_entries WHERE id = ?1",
-        [entry_id],
-    )?;
+    conn.execute("DELETE FROM archived_entries WHERE id = ?1", [entry_id])?;
 
     Ok(true)
 }
@@ -1703,7 +1739,9 @@ pub fn list_orphaned_blob_rows(conn: &Connection) -> Result<Vec<(i64, String, i6
 /// referenced by at least one live entry_artifact, either directly via
 /// `entry_artifacts.relpath` or indirectly via a live blob's `raw_relpath`.
 /// Any disk file whose relpath is in this set must NOT be deleted.
-pub fn all_referenced_file_relpaths(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+pub fn all_referenced_file_relpaths(
+    conn: &Connection,
+) -> Result<std::collections::HashSet<String>> {
     let mut set = std::collections::HashSet::new();
     {
         let mut stmt = conn.prepare("SELECT DISTINCT relpath FROM entry_artifacts")?;
@@ -1809,11 +1847,7 @@ pub fn add_entry_artifact(conn: &Connection, artifact: &NewArtifact) -> Result<i
     Ok(conn.last_insert_rowid())
 }
 
-pub fn remove_entry_tag_assignment(
-    conn: &Connection,
-    entry_id: i64,
-    tag_id: i64,
-) -> Result<()> {
+pub fn remove_entry_tag_assignment(conn: &Connection, entry_id: i64, tag_id: i64) -> Result<()> {
     conn.execute(
         "DELETE FROM entry_tag_assignments WHERE entry_id = ?1 AND tag_id = ?2",
         params![entry_id, tag_id],
@@ -1955,12 +1989,18 @@ pub fn main_archive_entry_count(conn: &Connection) -> Result<i64> {
 }
 
 pub fn create_tag_path(conn: &Connection, full_path: &str) -> Result<i64> {
-    let segments = normalized_tag_segments(full_path)?;
-    let mut parent_tag_id = None;
-    let mut current_path = String::new();
-    let mut current_id = 0;
+    let raw_segments = normalized_tag_segments(full_path)?;
+    // Slugify each segment consistently with rename_tag.
+    let segments: Vec<String> = raw_segments
+        .into_iter()
+        .map(slugify_segment)
+        .collect::<Result<Vec<_>>>()?;
 
-    for segment in segments {
+    let mut parent_tag_id: Option<i64> = None;
+    let mut current_path = String::new();
+    let mut current_id: i64 = 0;
+
+    for segment in &segments {
         current_path.push('/');
         current_path.push_str(segment);
 
@@ -1984,7 +2024,7 @@ pub fn create_tag_path(conn: &Connection, full_path: &str) -> Result<i64> {
                 public_id("tag"),
                 parent_tag_id,
                 humanize_slug(segment),
-                segment,
+                segment.as_str(),
                 current_path
             ],
         )?;
@@ -2027,30 +2067,7 @@ pub fn rename_tag(
     tag_uid: &str,
     new_segment: &str,
 ) -> Result<Option<TagRecord>> {
-    // Slugify: spaces→hyphens, keep alphanumeric and hyphens (case preserved), collapse runs, strip edges.
-    let trimmed = new_segment.trim();
-    let hyphenated: String = trimmed.chars().map(|c| if c == ' ' { '-' } else { c }).collect();
-    let filtered: String = hyphenated
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-')
-        .collect();
-    let mut new_slug = String::new();
-    let mut prev_hyphen = false;
-    for c in filtered.chars() {
-        if c == '-' {
-            if !prev_hyphen {
-                new_slug.push(c);
-            }
-            prev_hyphen = true;
-        } else {
-            new_slug.push(c);
-            prev_hyphen = false;
-        }
-    }
-    let new_slug = new_slug.trim_matches('-').to_string();
-    if new_slug.is_empty() {
-        bail!("new segment slugifies to empty string");
-    }
+    let new_slug = slugify_segment(new_segment)?;
 
     // Fetch existing tag.
     let tag = match get_tag_by_uid(conn, tag_uid)? {
@@ -2084,15 +2101,18 @@ pub fn rename_tag(
         )?;
         let old_prefix_slash = format!("{}/", old_prefix);
         let new_prefix_slash = format!("{}/", new_full_path);
-        // Use hierarchy (recursive CTE over parent_tag_id) instead of LIKE to avoid
-        // treating '_'/'%' in historical slugs as wildcards.
+        // Replace the leading old_prefix_slash with new_prefix_slash across all
+        // descendants. REPLACE(full_path, old, new) would corrupt paths where the
+        // old prefix string appears again deeper in the tree (e.g. /foo/other/foo/bar).
+        // Use prefix-anchored substitution instead: keep everything after the prefix
+        // and prepend the new prefix.
         conn.execute(
             "WITH RECURSIVE descendants(id) AS (\
                 SELECT id FROM tags WHERE parent_tag_id = ?1 \
                 UNION ALL \
                 SELECT t.id FROM tags t JOIN descendants d ON t.parent_tag_id = d.id \
             ) \
-            UPDATE tags SET full_path = REPLACE(full_path, ?2, ?3) \
+            UPDATE tags SET full_path = ?3 || substr(full_path, length(?2) + 1) \
             WHERE id IN (SELECT id FROM descendants)",
             params![tag.id, old_prefix_slash, new_prefix_slash],
         )?;
@@ -2127,6 +2147,97 @@ pub fn delete_tag(conn: &Connection, tag_uid: &str) -> Result<bool> {
         [tag_uid],
     )?;
     Ok(deleted > 0)
+}
+
+/// Moves a tag and its entire subtree to a new parent.
+///
+/// `new_parent_uid = None` promotes the tag to root level.
+/// Returns `Ok(None)` if `tag_uid` is not found.
+/// Returns an error if:
+/// - `new_parent_uid` refers to the tag itself or a descendant of it
+/// - the resulting path would collide with an existing tag
+/// - `new_parent_uid` is provided but not found
+pub fn move_tag(
+    conn: &Connection,
+    tag_uid: &str,
+    new_parent_uid: Option<&str>,
+) -> Result<Option<TagRecord>> {
+    let tag = match get_tag_by_uid(conn, tag_uid)? {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    let new_parent: Option<TagRecord> = match new_parent_uid {
+        Some(uid) => {
+            let parent = match get_tag_by_uid(conn, uid)? {
+                Some(p) => p,
+                None => bail!("parent tag not found"),
+            };
+            if parent.tag_uid == tag.tag_uid {
+                bail!("cannot move a tag under itself");
+            }
+            // Reject if the proposed parent is a descendant of the tag being moved.
+            if parent.full_path.starts_with(&format!("{}/", tag.full_path)) {
+                bail!("cannot move a tag under one of its own descendants");
+            }
+            Some(parent)
+        }
+        None => None,
+    };
+
+    let new_full_path = match &new_parent {
+        Some(p) => format!("{}/{}", p.full_path, tag.slug),
+        None => format!("/{}", tag.slug),
+    };
+
+    // No-op when the path would not change.
+    if new_full_path == tag.full_path {
+        return Ok(Some(tag));
+    }
+
+    // Collision check.
+    if let Some(existing) = get_tag_by_path(conn, &new_full_path)? {
+        if existing.tag_uid != tag_uid {
+            bail!("a tag already exists at path: {new_full_path}");
+        }
+    }
+
+    let new_parent_id: Option<i64> = new_parent.as_ref().map(|p| p.id);
+    let tag_id = tag.id;
+    let old_prefix_slash = format!("{}/", tag.full_path);
+    let new_prefix_slash = format!("{}/", new_full_path);
+
+    let result = (|| -> Result<()> {
+        conn.execute_batch("BEGIN")?;
+        // Update the moved tag itself: new parent and new full_path.
+        conn.execute(
+            "UPDATE tags SET parent_tag_id = ?1, full_path = ?2 WHERE tag_uid = ?3",
+            params![new_parent_id, new_full_path, tag_uid],
+        )?;
+        // Cascade the full_path prefix change to every descendant.
+        // Use prefix-anchored substitution: ?3 || substr(full_path, length(?2) + 1)
+        // rather than REPLACE, which would corrupt paths where the old prefix slug
+        // appears again at a non-overlapping position deeper in the tree.
+        conn.execute(
+            "WITH RECURSIVE descendants(id) AS (\
+                 SELECT id FROM tags WHERE parent_tag_id = ?1 \
+                 UNION ALL \
+                 SELECT t.id FROM tags t JOIN descendants d ON t.parent_tag_id = d.id \
+             ) \
+             UPDATE tags SET full_path = ?3 || substr(full_path, length(?2) + 1) \
+             WHERE id IN (SELECT id FROM descendants)",
+            params![tag_id, old_prefix_slash, new_prefix_slash],
+        )?;
+        conn.execute_batch("COMMIT")?;
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e);
+    }
+
+    get_tag_by_uid(conn, tag_uid)
 }
 
 fn refresh_run_counters(conn: &Connection, run_id: i64) -> Result<()> {
@@ -2182,7 +2293,13 @@ pub fn create_collection(
     conn.execute(
         "INSERT INTO collections (collection_uid, name, slug, default_visibility_bits, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![collection_uid, name, slug, default_visibility_bits as i64, now],
+        params![
+            collection_uid,
+            name,
+            slug,
+            default_visibility_bits as i64,
+            now
+        ],
     )?;
     let id = conn.last_insert_rowid();
     Ok(CollectionRecord {
@@ -2216,10 +2333,7 @@ pub fn list_collections(conn: &Connection) -> Result<Vec<CollectionRecord>> {
 }
 
 /// Returns a collection by its uid, or None if not found.
-pub fn get_collection_by_uid(
-    conn: &Connection,
-    uid: &str,
-) -> Result<Option<CollectionRecord>> {
+pub fn get_collection_by_uid(conn: &Connection, uid: &str) -> Result<Option<CollectionRecord>> {
     conn.query_row(
         "SELECT id, collection_uid, name, slug, default_visibility_bits, created_at \
          FROM collections WHERE collection_uid = ?1",
@@ -2327,10 +2441,7 @@ pub fn update_collection(
 /// Deletes a collection and cascades to collection_entries.
 /// Returns true if deleted, false if not found.
 /// Refuses to delete the '_default_' collection.
-pub fn delete_collection(
-    conn: &Connection,
-    collection_uid: &str,
-) -> Result<bool> {
+pub fn delete_collection(conn: &Connection, collection_uid: &str) -> Result<bool> {
     let coll = get_collection_by_uid(conn, collection_uid)?;
     let Some(coll) = coll else { return Ok(false) };
     if coll.slug == "_default_" {
@@ -2401,6 +2512,39 @@ fn humanize_slug(slug: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Converts a raw input string into a valid tag slug:
+/// spaces → hyphens, strip non-(alphanumeric|hyphen), collapse runs, trim edge hyphens.
+/// Returns an error if the result is empty.
+fn slugify_segment(input: &str) -> Result<String> {
+    let hyphenated: String = input
+        .trim()
+        .chars()
+        .map(|c| if c == ' ' { '-' } else { c })
+        .collect();
+    let filtered: String = hyphenated
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-')
+        .collect();
+    let mut slug = String::new();
+    let mut prev_hyphen = false;
+    for c in filtered.chars() {
+        if c == '-' {
+            if !prev_hyphen {
+                slug.push(c);
+            }
+            prev_hyphen = true;
+        } else {
+            slug.push(c);
+            prev_hyphen = false;
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        bail!("segment slugifies to empty string");
+    }
+    Ok(slug)
 }
 
 /// A minimal view of an archived entry needed for re-archiving.
@@ -2779,7 +2923,11 @@ mod tests {
     #[test]
     fn get_blob_by_sha256_returns_none_for_unknown() {
         let conn = conn();
-        let result = get_blob_by_sha256(&conn, "0000000000000000000000000000000000000000000000000000000000000000").unwrap();
+        let result = get_blob_by_sha256(
+            &conn,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
         assert!(result.is_none());
     }
 
@@ -2788,11 +2936,17 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         initialize_auth_schema(&conn).unwrap();
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM roles WHERE is_builtin = 1", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM roles WHERE is_builtin = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(count, 4);
         let owner_bits: i64 = conn
-            .query_row("SELECT bit_position FROM roles WHERE slug = 'owner'", [], |r| r.get(0))
+            .query_row(
+                "SELECT bit_position FROM roles WHERE slug = 'owner'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(owner_bits, 3);
     }
@@ -2892,7 +3046,8 @@ mod tests {
         let conn = conn();
         let job_uid = create_capture_job(&conn, "test").unwrap();
         update_capture_job_status(&conn, &job_uid, "running", None, None, None).unwrap();
-        update_capture_job_status(&conn, &job_uid, "completed", Some("run_abc"), None, None).unwrap();
+        update_capture_job_status(&conn, &job_uid, "completed", Some("run_abc"), None, None)
+            .unwrap();
         let job = get_capture_job(&conn, &job_uid).unwrap().unwrap();
         assert_eq!(job.status, "completed");
         assert_eq!(job.run_uid.as_deref(), Some("run_abc"));
@@ -2910,7 +3065,17 @@ mod tests {
         // (covers the case where run_uid was never written back before the crash).
         let user_id = ensure_default_user(&conn).unwrap();
         let run = create_archive_run(&conn, user_id, 1).unwrap();
-        create_archive_run_item(&conn, run.id, None, 0, "https://example.com", None, "web", "file").unwrap();
+        create_archive_run_item(
+            &conn,
+            run.id,
+            None,
+            0,
+            "https://example.com",
+            None,
+            "web",
+            "file",
+        )
+        .unwrap();
 
         let n = fail_stalled_capture_jobs(&conn).unwrap();
         assert_eq!(n, 1); // one capture_job updated
@@ -2921,19 +3086,23 @@ mod tests {
         assert!(job.error_text.as_deref().unwrap().contains("interrupted"));
 
         // archive_run is failed
-        let updated_run: String = conn.query_row(
-            "SELECT status FROM archive_runs WHERE id = ?1",
-            [run.id],
-            |r| r.get(0),
-        ).unwrap();
+        let updated_run: String = conn
+            .query_row(
+                "SELECT status FROM archive_runs WHERE id = ?1",
+                [run.id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(updated_run, "failed");
 
         // archive_run_item is failed
-        let item_status: String = conn.query_row(
-            "SELECT status FROM archive_run_items WHERE run_id = ?1",
-            [run.id],
-            |r| r.get(0),
-        ).unwrap();
+        let item_status: String = conn
+            .query_row(
+                "SELECT status FROM archive_run_items WHERE run_id = ?1",
+                [run.id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(item_status, "failed");
     }
 
@@ -2947,7 +3116,8 @@ mod tests {
     fn user_create_and_list() {
         let conn = make_auth_conn_for_mgmt();
         let owner_id = create_owner(&conn, "owner", "hash").unwrap();
-        let uid = create_user(&conn, "alice", Some("alice@example.com"), "hash2", owner_id).unwrap();
+        let uid =
+            create_user(&conn, "alice", Some("alice@example.com"), "hash2", owner_id).unwrap();
         let users = list_users(&conn).unwrap();
         assert_eq!(users.len(), 2);
         let alice = users.iter().find(|u| u.username == "alice").unwrap();
@@ -2961,10 +3131,20 @@ mod tests {
         let conn = make_auth_conn_for_mgmt();
         let owner_id = create_owner(&conn, "owner", "hash").unwrap();
         let uid = create_user(&conn, "bob", None, "hash", owner_id).unwrap();
-        let bob_id: i64 = conn.query_row("SELECT id FROM users WHERE user_uid = ?1", [&uid], |r| r.get(0)).unwrap();
+        let bob_id: i64 = conn
+            .query_row("SELECT id FROM users WHERE user_uid = ?1", [&uid], |r| {
+                r.get(0)
+            })
+            .unwrap();
         create_session(&conn, bob_id, 3, None).unwrap();
         set_user_status(&conn, &uid, "disabled").unwrap();
-        let sess_count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions WHERE user_id = ?1", [bob_id], |r| r.get(0)).unwrap();
+        let sess_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE user_id = ?1",
+                [bob_id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(sess_count, 0, "sessions should be cleared on disable");
         let u = get_user_by_uid(&conn, &uid).unwrap().unwrap();
         assert_eq!(u.status, "disabled");
@@ -3011,16 +3191,18 @@ mod tests {
         let _ = create_tag_path(&conn, "science/cs/algorithms").unwrap();
 
         let science = get_tag_by_path(&conn, "/science").unwrap().unwrap();
-        let cs      = get_tag_by_path(&conn, "/science/cs").unwrap().unwrap();
-        let algo    = get_tag_by_path(&conn, "/science/cs/algorithms").unwrap().unwrap();
+        let cs = get_tag_by_path(&conn, "/science/cs").unwrap().unwrap();
+        let algo = get_tag_by_path(&conn, "/science/cs/algorithms")
+            .unwrap()
+            .unwrap();
 
         // Rename "science" → "natural-science"
         let updated = rename_tag(&conn, &science.tag_uid, "natural-science")
             .unwrap()
             .expect("should return updated tag");
 
-        assert_eq!(updated.slug,      "natural-science");
-        assert_eq!(updated.name,      "Natural Science");
+        assert_eq!(updated.slug, "natural-science");
+        assert_eq!(updated.name, "Natural Science");
         assert_eq!(updated.full_path, "/natural-science");
 
         // /science must no longer exist
@@ -3032,7 +3214,11 @@ mod tests {
         assert_eq!(cs_new.full_path, "/natural-science/cs");
 
         // /science/cs/algorithms must have moved
-        assert!(get_tag_by_path(&conn, "/science/cs/algorithms").unwrap().is_none());
+        assert!(
+            get_tag_by_path(&conn, "/science/cs/algorithms")
+                .unwrap()
+                .is_none()
+        );
         let algo_new = get_tag_by_uid(&conn, &algo.tag_uid).unwrap().unwrap();
         assert_eq!(algo_new.full_path, "/natural-science/cs/algorithms");
     }
@@ -3048,7 +3234,11 @@ mod tests {
 
         // Renaming /science → natural-science should collide
         let result = rename_tag(&conn, &science.tag_uid, "natural-science");
-        assert!(result.is_err(), "expected collision error, got {:?}", result);
+        assert!(
+            result.is_err(),
+            "expected collision error, got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -3074,7 +3264,7 @@ mod tests {
     fn delete_tag_removes_subtree_and_cascades_assignments() {
         let conn = conn();
         // Build /science/cs and /science/math
-        let cs_id   = create_tag_path(&conn, "science/cs").unwrap();
+        let cs_id = create_tag_path(&conn, "science/cs").unwrap();
         let math_id = create_tag_path(&conn, "science/math").unwrap();
         let science = get_tag_by_path(&conn, "/science").unwrap().unwrap();
 
@@ -3114,12 +3304,16 @@ mod tests {
         // Verify by uid too (subtree ids: science, cs, math)
         assert!(get_tag_by_uid(&conn, &science.tag_uid).unwrap().is_none());
         let cs_tag = conn
-            .query_row("SELECT tag_uid FROM tags WHERE id = ?1", [cs_id], |r| r.get::<_, String>(0))
+            .query_row("SELECT tag_uid FROM tags WHERE id = ?1", [cs_id], |r| {
+                r.get::<_, String>(0)
+            })
             .optional()
             .unwrap();
         assert!(cs_tag.is_none(), "/science/cs should be deleted");
         let math_tag = conn
-            .query_row("SELECT tag_uid FROM tags WHERE id = ?1", [math_id], |r| r.get::<_, String>(0))
+            .query_row("SELECT tag_uid FROM tags WHERE id = ?1", [math_id], |r| {
+                r.get::<_, String>(0)
+            })
             .optional()
             .unwrap();
         assert!(math_tag.is_none(), "/science/math should be deleted");
@@ -3139,6 +3333,207 @@ mod tests {
         assert_eq!(updated.full_path, "/Natural-Science");
     }
 
+    // ── move_tag tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn move_tag_unknown_uid_returns_none() {
+        let conn = conn();
+        let result = move_tag(&conn, "tag_doesnotexist", None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn move_tag_to_root_clears_parent_and_updates_path() {
+        let conn = conn();
+        // Build /science/cs/algorithms
+        let _ = create_tag_path(&conn, "science/cs/algorithms").unwrap();
+        let cs = get_tag_by_path(&conn, "/science/cs").unwrap().unwrap();
+        let algo = get_tag_by_path(&conn, "/science/cs/algorithms")
+            .unwrap()
+            .unwrap();
+
+        // Move /science/cs to root — new path should be /cs
+        let updated = move_tag(&conn, &cs.tag_uid, None)
+            .unwrap()
+            .expect("should return updated tag");
+
+        assert_eq!(updated.full_path, "/cs");
+        assert!(updated.parent_tag_id.is_none());
+
+        // /science/cs must no longer exist at old path
+        assert!(get_tag_by_path(&conn, "/science/cs").unwrap().is_none());
+
+        // Descendant /science/cs/algorithms must have its path updated
+        let algo_updated = get_tag_by_uid(&conn, &algo.tag_uid).unwrap().unwrap();
+        assert_eq!(algo_updated.full_path, "/cs/algorithms");
+    }
+
+    #[test]
+    fn move_tag_to_new_parent_updates_subtree_paths() {
+        let conn = conn();
+        // Build /science/cs/algorithms and /archive
+        let _ = create_tag_path(&conn, "science/cs/algorithms").unwrap();
+        let _ = create_tag_path(&conn, "archive").unwrap();
+
+        let cs = get_tag_by_path(&conn, "/science/cs").unwrap().unwrap();
+        let algo = get_tag_by_path(&conn, "/science/cs/algorithms")
+            .unwrap()
+            .unwrap();
+        let archive = get_tag_by_path(&conn, "/archive").unwrap().unwrap();
+
+        // Move /science/cs under /archive
+        let updated = move_tag(&conn, &cs.tag_uid, Some(&archive.tag_uid))
+            .unwrap()
+            .expect("should return updated tag");
+
+        assert_eq!(updated.full_path, "/archive/cs");
+        assert_eq!(updated.parent_tag_id, Some(archive.id));
+
+        // Old path must be gone
+        assert!(get_tag_by_path(&conn, "/science/cs").unwrap().is_none());
+
+        // Descendant must have cascaded path
+        let algo_updated = get_tag_by_uid(&conn, &algo.tag_uid).unwrap().unwrap();
+        assert_eq!(algo_updated.full_path, "/archive/cs/algorithms");
+    }
+
+    #[test]
+    fn move_tag_noop_when_parent_unchanged() {
+        let conn = conn();
+        let _ = create_tag_path(&conn, "science/cs").unwrap();
+        let science = get_tag_by_path(&conn, "/science").unwrap().unwrap();
+        let cs = get_tag_by_path(&conn, "/science/cs").unwrap().unwrap();
+
+        // Moving /science/cs under /science again is a no-op
+        let updated = move_tag(&conn, &cs.tag_uid, Some(&science.tag_uid))
+            .unwrap()
+            .expect("should return tag");
+        assert_eq!(updated.full_path, "/science/cs");
+    }
+
+    #[test]
+    fn move_tag_rejects_self_move() {
+        let conn = conn();
+        let _ = create_tag_path(&conn, "science").unwrap();
+        let science = get_tag_by_path(&conn, "/science").unwrap().unwrap();
+        let result = move_tag(&conn, &science.tag_uid, Some(&science.tag_uid));
+        assert!(
+            result.is_err(),
+            "expected error when moving tag under itself"
+        );
+    }
+
+    #[test]
+    fn move_tag_rejects_descendant_as_parent() {
+        let conn = conn();
+        let _ = create_tag_path(&conn, "science/cs/algorithms").unwrap();
+        let science = get_tag_by_path(&conn, "/science").unwrap().unwrap();
+        let algo = get_tag_by_path(&conn, "/science/cs/algorithms")
+            .unwrap()
+            .unwrap();
+
+        // Moving /science under one of its own descendants must be rejected
+        let result = move_tag(&conn, &science.tag_uid, Some(&algo.tag_uid));
+        assert!(
+            result.is_err(),
+            "expected error when moving tag under a descendant"
+        );
+    }
+
+    #[test]
+    fn move_tag_rejects_path_collision() {
+        let conn = conn();
+        // /archive/cs and /science/cs both exist; moving /science/cs under /archive collides
+        let _ = create_tag_path(&conn, "science/cs").unwrap();
+        let _ = create_tag_path(&conn, "archive/cs").unwrap();
+        let science_cs = get_tag_by_path(&conn, "/science/cs").unwrap().unwrap();
+        let archive = get_tag_by_path(&conn, "/archive").unwrap().unwrap();
+
+        let result = move_tag(&conn, &science_cs.tag_uid, Some(&archive.tag_uid));
+        assert!(
+            result.is_err(),
+            "expected collision error; /archive/cs already exists"
+        );
+    }
+
+    #[test]
+    fn move_tag_rejects_unknown_parent_uid() {
+        let conn = conn();
+        let _ = create_tag_path(&conn, "science").unwrap();
+        let science = get_tag_by_path(&conn, "/science").unwrap().unwrap();
+        let result = move_tag(&conn, &science.tag_uid, Some("uid_does_not_exist"));
+        assert!(result.is_err(), "expected error for unknown parent uid");
+    }
+
+    #[test]
+    fn move_tag_cascade_only_replaces_leading_prefix() {
+        // Regression: SQLite REPLACE(full_path, old_prefix, new_prefix) rewrites
+        // every non-overlapping occurrence of the pattern in the string, not just
+        // the leading one. /foo/foo/bar is NOT a triggering case (the overlapping
+        // '/' hides the second match), but /foo/other/foo/bar has a second /foo/
+        // at a non-overlapping position and does expose the bug.
+        let conn = conn();
+        let _ = create_tag_path(&conn, "foo/other/foo/bar").unwrap();
+        let foo = get_tag_by_path(&conn, "/foo").unwrap().unwrap();
+        let other = get_tag_by_path(&conn, "/foo/other").unwrap().unwrap();
+        let other_foo = get_tag_by_path(&conn, "/foo/other/foo").unwrap().unwrap();
+        let bar = get_tag_by_path(&conn, "/foo/other/foo/bar")
+            .unwrap()
+            .unwrap();
+
+        let _ = create_tag_path(&conn, "dest").unwrap();
+        let dest = get_tag_by_path(&conn, "/dest").unwrap().unwrap();
+
+        let updated = move_tag(&conn, &foo.tag_uid, Some(&dest.tag_uid))
+            .unwrap()
+            .expect("should return updated tag");
+        assert_eq!(updated.full_path, "/dest/foo");
+
+        let other_new = get_tag_by_uid(&conn, &other.tag_uid).unwrap().unwrap();
+        assert_eq!(other_new.full_path, "/dest/foo/other");
+
+        // /foo/other/foo must become /dest/foo/other/foo — REPLACE gives /dest/foo/other/dest/foo.
+        let other_foo_new = get_tag_by_uid(&conn, &other_foo.tag_uid).unwrap().unwrap();
+        assert_eq!(
+            other_foo_new.full_path, "/dest/foo/other/foo",
+            "cascade must only replace the leading /foo/ prefix, not every occurrence"
+        );
+
+        let bar_new = get_tag_by_uid(&conn, &bar.tag_uid).unwrap().unwrap();
+        assert_eq!(bar_new.full_path, "/dest/foo/other/foo/bar");
+    }
+
+    #[test]
+    fn rename_tag_cascade_only_replaces_leading_prefix() {
+        // Same REPLACE bug applies to rename_tag's cascade.
+        let conn = conn();
+        let _ = create_tag_path(&conn, "foo/other/foo/bar").unwrap();
+        let foo = get_tag_by_path(&conn, "/foo").unwrap().unwrap();
+        let other = get_tag_by_path(&conn, "/foo/other").unwrap().unwrap();
+        let other_foo = get_tag_by_path(&conn, "/foo/other/foo").unwrap().unwrap();
+        let bar = get_tag_by_path(&conn, "/foo/other/foo/bar")
+            .unwrap()
+            .unwrap();
+
+        let updated = rename_tag(&conn, &foo.tag_uid, "renamed")
+            .unwrap()
+            .expect("should return updated tag");
+        assert_eq!(updated.full_path, "/renamed");
+
+        let other_new = get_tag_by_uid(&conn, &other.tag_uid).unwrap().unwrap();
+        assert_eq!(other_new.full_path, "/renamed/other");
+
+        // /foo/other/foo must become /renamed/other/foo — REPLACE gives /renamed/other/renamed.
+        let other_foo_new = get_tag_by_uid(&conn, &other_foo.tag_uid).unwrap().unwrap();
+        assert_eq!(
+            other_foo_new.full_path, "/renamed/other/foo",
+            "cascade must only replace the leading /foo/ prefix, not every occurrence"
+        );
+
+        let bar_new = get_tag_by_uid(&conn, &bar.tag_uid).unwrap().unwrap();
+        assert_eq!(bar_new.full_path, "/renamed/other/foo/bar");
+    }
+
     // ── delete_entry tests ────────────────────────────────────────────────────
 
     /// Helper: attach a shared blob to an entry and return the blob id.
@@ -3151,15 +3546,19 @@ mod tests {
             raw_relpath: format!("raw/{sha256}"),
         };
         let blob_id = upsert_blob(conn, &blob).unwrap();
-        add_entry_artifact(conn, &NewArtifact {
-            entry_id,
-            artifact_role: "main".to_string(),
-            storage_area: "raw".to_string(),
-            relpath: format!("raw/{sha256}"),
-            blob_id: Some(blob_id),
-            logical_path: None,
-            metadata_json: None,
-        }).unwrap();
+        add_entry_artifact(
+            conn,
+            &NewArtifact {
+                entry_id,
+                artifact_role: "main".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: format!("raw/{sha256}"),
+                blob_id: Some(blob_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
         blob_id
     }
 
@@ -3178,11 +3577,21 @@ mod tests {
         delete_entry(&conn, &root.entry_uid).unwrap();
 
         let root_gone: Option<i64> = conn
-            .query_row("SELECT id FROM archived_entries WHERE id = ?1", [root.id], |r| r.get(0))
-            .optional().unwrap();
+            .query_row(
+                "SELECT id FROM archived_entries WHERE id = ?1",
+                [root.id],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
         let child_gone: Option<i64> = conn
-            .query_row("SELECT id FROM archived_entries WHERE id = ?1", [child.id], |r| r.get(0))
-            .optional().unwrap();
+            .query_row(
+                "SELECT id FROM archived_entries WHERE id = ?1",
+                [child.id],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
         assert!(root_gone.is_none(), "root should be gone");
         assert!(child_gone.is_none(), "child should be gone");
     }
@@ -3194,8 +3603,16 @@ mod tests {
         let root = create_entry_fixture(&conn, "private", None, None);
         let run = create_archive_run(&conn, user_id, 1).unwrap();
         let item = create_archive_run_item(
-            &conn, run.id, None, 0, "https://example.com", None, "web", "page",
-        ).unwrap();
+            &conn,
+            run.id,
+            None,
+            0,
+            "https://example.com",
+            None,
+            "web",
+            "page",
+        )
+        .unwrap();
         complete_archive_run_item(&conn, item.id, root.id).unwrap();
 
         delete_entry(&conn, &root.entry_uid).unwrap();
@@ -3207,7 +3624,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(produced.is_none(), "produced_entry_id should be NULL after delete");
+        assert!(
+            produced.is_none(),
+            "produced_entry_id should be NULL after delete"
+        );
     }
 
     #[test]
@@ -3230,17 +3650,31 @@ mod tests {
         // Compute external.cached_bytes before delete — root and child are older by id.
         refresh_entry_cached_bytes(&conn, external.id).unwrap();
         let before: i64 = conn
-            .query_row("SELECT cached_bytes FROM archived_entries WHERE id = ?1", [external.id], |r| r.get(0))
+            .query_row(
+                "SELECT cached_bytes FROM archived_entries WHERE id = ?1",
+                [external.id],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(before, 100, "external should see blob as cached before delete");
+        assert_eq!(
+            before, 100,
+            "external should see blob as cached before delete"
+        );
 
         delete_entry(&conn, &root.entry_uid).unwrap();
 
         // external must still exist but with cached_bytes = 0.
         let after: i64 = conn
-            .query_row("SELECT cached_bytes FROM archived_entries WHERE id = ?1", [external.id], |r| r.get(0))
+            .query_row(
+                "SELECT cached_bytes FROM archived_entries WHERE id = ?1",
+                [external.id],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(after, 0, "cached_bytes must be 0 after whole subtree is deleted");
+        assert_eq!(
+            after, 0,
+            "cached_bytes must be 0 after whole subtree is deleted"
+        );
     }
 
     // ── Orphan blob cleanup ───────────────────────────────────────────────────────
@@ -3286,29 +3720,39 @@ mod tests {
             raw_relpath: "raw/a/a/aaa111.mp4".to_string(),
         };
         let blob_id = upsert_blob(&conn, &blob).unwrap();
-        add_entry_artifact(&conn, &NewArtifact {
-            entry_id: entry.id,
-            artifact_role: "main".to_string(),
-            storage_area: "raw".to_string(),
-            relpath: blob.raw_relpath.clone(),
-            blob_id: Some(blob_id),
-            logical_path: None,
-            metadata_json: None,
-        }).unwrap();
-        assert!(list_orphaned_blob_rows(&conn).unwrap().is_empty(),
-            "referenced blob must not appear as orphan");
+        add_entry_artifact(
+            &conn,
+            &NewArtifact {
+                entry_id: entry.id,
+                artifact_role: "main".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: blob.raw_relpath.clone(),
+                blob_id: Some(blob_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            list_orphaned_blob_rows(&conn).unwrap().is_empty(),
+            "referenced blob must not appear as orphan"
+        );
     }
 
     #[test]
     fn list_orphaned_blob_rows_finds_unreferenced_blob() {
         let conn = conn();
-        upsert_blob(&conn, &BlobRecord {
-            sha256: "bbb222".to_string(),
-            byte_size: 200,
-            mime_type: None,
-            extension: Some("jpg".to_string()),
-            raw_relpath: "raw/b/b/bbb222.jpg".to_string(),
-        }).unwrap();
+        upsert_blob(
+            &conn,
+            &BlobRecord {
+                sha256: "bbb222".to_string(),
+                byte_size: 200,
+                mime_type: None,
+                extension: Some("jpg".to_string()),
+                raw_relpath: "raw/b/b/bbb222.jpg".to_string(),
+            },
+        )
+        .unwrap();
         let orphans = list_orphaned_blob_rows(&conn).unwrap();
         assert_eq!(orphans.len(), 1, "unreferenced blob must appear as orphan");
         assert_eq!(orphans[0].1, "raw/b/b/bbb222.jpg");
@@ -3320,31 +3764,49 @@ mod tests {
         let entry = create_entry_fixture(&conn, "private", None, None);
         // Live blob: linked via blob_id
         let blob = BlobRecord {
-            sha256: "live1".to_string(), byte_size: 50,
-            mime_type: None, extension: None,
+            sha256: "live1".to_string(),
+            byte_size: 50,
+            mime_type: None,
+            extension: None,
             raw_relpath: "raw/l/i/live1".to_string(),
         };
         let blob_id = upsert_blob(&conn, &blob).unwrap();
-        add_entry_artifact(&conn, &NewArtifact {
-            entry_id: entry.id,
-            artifact_role: "main".to_string(),
-            storage_area: "raw".to_string(),
-            relpath: blob.raw_relpath.clone(),
-            blob_id: Some(blob_id),
-            logical_path: None, metadata_json: None,
-        }).unwrap();
+        add_entry_artifact(
+            &conn,
+            &NewArtifact {
+                entry_id: entry.id,
+                artifact_role: "main".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: blob.raw_relpath.clone(),
+                blob_id: Some(blob_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
         // Artifact referencing a file directly (no blob_id)
-        add_entry_artifact(&conn, &NewArtifact {
-            entry_id: entry.id,
-            artifact_role: "sidecar".to_string(),
-            storage_area: "raw".to_string(),
-            relpath: "raw/s/i/sidecar.vtt".to_string(),
-            blob_id: None,
-            logical_path: None, metadata_json: None,
-        }).unwrap();
+        add_entry_artifact(
+            &conn,
+            &NewArtifact {
+                entry_id: entry.id,
+                artifact_role: "sidecar".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: "raw/s/i/sidecar.vtt".to_string(),
+                blob_id: None,
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
         let refs = all_referenced_file_relpaths(&conn).unwrap();
-        assert!(refs.contains("raw/l/i/live1"), "live blob relpath must be protected");
-        assert!(refs.contains("raw/s/i/sidecar.vtt"), "direct artifact relpath must be protected");
+        assert!(
+            refs.contains("raw/l/i/live1"),
+            "live blob relpath must be protected"
+        );
+        assert!(
+            refs.contains("raw/s/i/sidecar.vtt"),
+            "direct artifact relpath must be protected"
+        );
     }
 
     #[test]
@@ -3353,29 +3815,47 @@ mod tests {
         let entry = create_entry_fixture(&conn, "private", None, None);
         // Referenced blob
         let live = BlobRecord {
-            sha256: "live9999".to_string(), byte_size: 10,
-            mime_type: None, extension: None,
+            sha256: "live9999".to_string(),
+            byte_size: 10,
+            mime_type: None,
+            extension: None,
             raw_relpath: "raw/l/v/live9999".to_string(),
         };
         let live_id = upsert_blob(&conn, &live).unwrap();
-        add_entry_artifact(&conn, &NewArtifact {
-            entry_id: entry.id,
-            artifact_role: "main".to_string(),
-            storage_area: "raw".to_string(),
-            relpath: live.raw_relpath.clone(),
-            blob_id: Some(live_id),
-            logical_path: None, metadata_json: None,
-        }).unwrap();
+        add_entry_artifact(
+            &conn,
+            &NewArtifact {
+                entry_id: entry.id,
+                artifact_role: "main".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: live.raw_relpath.clone(),
+                blob_id: Some(live_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
         // Orphaned blob
-        upsert_blob(&conn, &BlobRecord {
-            sha256: "dead0000".to_string(), byte_size: 20,
-            mime_type: None, extension: None,
-            raw_relpath: "raw/d/e/dead0000".to_string(),
-        }).unwrap();
+        upsert_blob(
+            &conn,
+            &BlobRecord {
+                sha256: "dead0000".to_string(),
+                byte_size: 20,
+                mime_type: None,
+                extension: None,
+                raw_relpath: "raw/d/e/dead0000".to_string(),
+            },
+        )
+        .unwrap();
         let deleted = delete_orphaned_blob_rows(&conn).unwrap();
-        assert_eq!(deleted, 1, "only the unreferenced blob row should be deleted");
-        assert!(get_blob_by_sha256(&conn, "live9999").unwrap().is_some(),
-            "referenced blob row must be preserved");
+        assert_eq!(
+            deleted, 1,
+            "only the unreferenced blob row should be deleted"
+        );
+        assert!(
+            get_blob_by_sha256(&conn, "live9999").unwrap().is_some(),
+            "referenced blob row must be preserved"
+        );
     }
 
     #[test]
@@ -3386,26 +3866,34 @@ mod tests {
         let conn = conn();
         let entry = create_entry_fixture(&conn, "private", None, None);
         let blob = BlobRecord {
-            sha256: "edgecase".to_string(), byte_size: 30,
-            mime_type: None, extension: None,
+            sha256: "edgecase".to_string(),
+            byte_size: 30,
+            mime_type: None,
+            extension: None,
             raw_relpath: "raw/e/d/edgecase".to_string(),
         };
         upsert_blob(&conn, &blob).unwrap();
         // artifact uses same relpath but no blob_id
-        add_entry_artifact(&conn, &NewArtifact {
-            entry_id: entry.id,
-            artifact_role: "sidecar".to_string(),
-            storage_area: "raw".to_string(),
-            relpath: blob.raw_relpath.clone(),
-            blob_id: None,
-            logical_path: None, metadata_json: None,
-        }).unwrap();
+        add_entry_artifact(
+            &conn,
+            &NewArtifact {
+                entry_id: entry.id,
+                artifact_role: "sidecar".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: blob.raw_relpath.clone(),
+                blob_id: None,
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
         // blob row is orphaned (no blob_id reference)
         assert_eq!(list_orphaned_blob_rows(&conn).unwrap().len(), 1);
         // but the file relpath is still protected
         let refs = all_referenced_file_relpaths(&conn).unwrap();
-        assert!(refs.contains(&blob.raw_relpath),
-            "file must be protected because artifact.relpath references it directly");
+        assert!(
+            refs.contains(&blob.raw_relpath),
+            "file must be protected because artifact.relpath references it directly"
+        );
     }
-
 }
