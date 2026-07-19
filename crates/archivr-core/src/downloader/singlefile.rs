@@ -95,6 +95,14 @@ const READER_MODE_SCRIPT: &str = concat!(
         try { lazySrc = new URL(lazySrc, _base).href; } catch(e) {}
         img.setAttribute('data-archivr-src', lazySrc);
         img.removeAttribute('loading');
+        // Remove lazy attrs so _archivrResolveLazyImgs (called below) cannot
+        // rewrite src to a CDN URL that SingleFile cannot fetch from the proxy
+        // context — Rust owns these images via data-archivr-src instead.
+        img.removeAttribute('data-src');
+        img.removeAttribute('data-lazy-src');
+        img.removeAttribute('data-zoom-src');
+        img.removeAttribute('data-original');
+        img.removeAttribute('data-lazy');
       });
       var _post = _archivrResolveLazyImgs(_base);
       if (article.title) document.title = article.title;
