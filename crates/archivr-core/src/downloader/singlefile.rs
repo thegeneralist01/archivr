@@ -108,13 +108,13 @@ const READER_MODE_SCRIPT: &str = concat!(
       if (article.title) document.title = article.title;
       var hdr = document.createElement('header');
       hdr.innerHTML =
-        '<h1 style="margin:0 0 .3em;font-family:-apple-system,sans-serif">' +
+        '<h1 style="margin:0 0 .4em;font-family:-apple-system,sans-serif;font-size:2em;line-height:1.2;font-weight:700">' +
           (article.title || '') + '</h1>' +
         (article.byline
-          ? '<p style="margin:0;color:#666;font-size:14px">' + article.byline + '</p>'
+          ? '<p style="margin:.3em 0 0;color:#666;font-size:15px;line-height:1.5">' + article.byline + '</p>'
           : '') +
         (article.siteName
-          ? '<p style="margin:.2em 0 0;color:#999;font-size:12px">' + article.siteName + '</p>'
+          ? '<p style="margin:.3em 0 0;color:#999;font-size:13px">' + article.siteName + '</p>'
           : '');
       hdr.style.cssText = 'margin-bottom:2em;padding-bottom:1em;border-bottom:1px solid #ddd';
       document.body.insertBefore(hdr, document.body.firstChild);
@@ -124,12 +124,14 @@ const READER_MODE_SCRIPT: &str = concat!(
         'font-family:Georgia,"Times New Roman",serif;font-size:18px;',
         'line-height:1.75;color:#1a1a1a;background:#fafaf8}',
         'h1,h2,h3,h4,h5,h6{font-family:-apple-system,BlinkMacSystemFont,sans-serif;',
-        'line-height:1.3;margin-top:1.5em}',
-        'img,figure,video{max-width:100%;height:auto;display:block;margin:1em 0}',
+        'line-height:1.3;margin-top:1.6em}',
+        'p{margin:0 0 1.15em}',
+        'img,figure,video{max-width:100%;height:auto;display:block;margin:1.5em 0}',
+        'figcaption{font-size:14px;color:#666;margin:.5em 0 0;font-style:italic;line-height:1.5}',
         'a{color:#0055cc}',
         'pre{background:#f4f4f4;padding:1em;border-radius:4px;overflow-x:auto;font-size:14px}',
         'code{background:#f4f4f4;padding:.1em .3em;border-radius:3px;font-size:14px}',
-        'blockquote{border-left:3px solid #ccc;margin:1em 0;padding-left:1.2em;color:#555}',
+        'blockquote{border-left:3px solid #ccc;margin:1.2em 0;padding-left:1.2em;color:#555}',
       ].join('');
       document.head.appendChild(style);
       _archivrReaderMark('applied');
