@@ -747,6 +747,8 @@ struct CaptureBody {
     reader_mode: Option<bool>,
     cookie_ext_enabled: Option<bool>,
     modal_closer_enabled: Option<bool>,
+    /// Route through Freedium mirror for WebPage captures. Absent = true (on by default).
+    via_freedium: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -860,6 +862,7 @@ async fn capture_handler(
         cookie_ext_enabled: Some(effective_cookie_ext),
         modal_closer_enabled: Some(effective_modal_closer),
         reader_mode: body.reader_mode.unwrap_or(false),
+        via_freedium: body.via_freedium.unwrap_or(true),
     };
 
     // Spawn background capture.
@@ -977,6 +980,7 @@ async fn rearchive_handler(
         cookie_ext_enabled: None,
         modal_closer_enabled: None,
         reader_mode: false,
+        via_freedium: false,
     };
 
     let job_uid_bg = job_uid.clone();
