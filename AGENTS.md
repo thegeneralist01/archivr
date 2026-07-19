@@ -2,9 +2,9 @@
 
 ## Project Overview
 
-Archivr is a self-hosted archival tool that captures and preserves digital content — YouTube/Twitter/Instagram/TikTok/Reddit posts, arbitrary URLs, full web pages (via SingleFile + Chromium), and local files — into self-contained, SQLite-backed archive directories with blob deduplication, hierarchical tags, collections, and role-based auth. Rust workspace + React frontend.
+Archivr is a self-hosted archival tool that captures and preserves digital content — YouTube/Twitter/Instagram/TikTok/Reddit posts, arbitrary URLs, full web pages (via SingleFile + Chromium, optionally through a Freedium mirror for paywalled articles), and local files — into self-contained, SQLite-backed archive directories with blob deduplication, hierarchical tags, collections, and role-based auth. Rust workspace + React frontend.
 
-Read `ARCHIVR-MENTAL-MODEL.md` before making structural changes; `NEXT.md` tracks the roadmap (Tracks 1–7 done, Track 8 = Collections UI is next).
+Read `ARCHIVR-MENTAL-MODEL.md` before making structural changes.
 
 ## Architecture & Data Flow
 
@@ -14,7 +14,7 @@ Three crates with a strict ownership split — **core owns truth; CLI and server
 - `crates/archivr-server` — Axum HTTP API + auth + static frontend serving.
 - `crates/archivr-cli` — clap-based CLI (`archivr` binary): `init`, `archive` subcommands.
 
-Capture flow: locator → `determine_source()` (`crates/archivr-core/src/capture.rs`) routes by platform/shorthand (`yt:`, `x:`, `tweet:` …) → platform downloader (`downloader/ytdlp.rs`, `tweets.rs`, `singlefile.rs`, `http.rs`, `local.rs`) stages into `temp/` → SHA3-256 dedup (`hash.rs`, `downloader/store.rs`) moves blobs to `raw/A/B/HASH.EXT` → rows written to `archivr.sqlite` (runs, entries, artifacts, blobs) → served via `/api/archives/:id/...`.
+Capture flow: locator → `determine_source()` (`crates/archivr-core/src/capture.rs`) routes by platform/shorthand (`yt:`, `x:`, `tweet:` …) → platform downloader (`downloader/ytdlp.rs`, `tweets.rs`, `singlefile.rs`, `http.rs`, `local.rs`) stages into `temp/` → SHA3-256 dedup (`hash.rs`, `downloader/store.rs`) moves blobs to `raw/A/B/HASH.EXT` → rows written to `archivr.sqlite` (runs, entries, artifacts, blobs) → served via `/api/archives/:id/...`. `CaptureConfig` carries per-request toggles (uBlock, reader mode, Freedium mirror, etc.); when `via_freedium` is set, the fetch URL is rewritten through `freedium-mirror.cfd` while the canonical DB URL stays the original locator.
 
 Per-archive layout (created by `archivr init`): `.archivr/` (name, store_path, `archivr.sqlite`) + sibling `store/` (`raw/`, `raw_tweets/`, `structured/`, `temp/`). Server-level auth lives in a **separate** `archivr-auth.sqlite` (users, sessions, API tokens, role bits GUEST=1/USER=2/ADMIN=4/OWNER=8).
 
@@ -31,6 +31,7 @@ The server mounts multiple archives from a TOML registry (`crates/archivr-server
 | `docs/` | User docs (`README.md`), `superpowers/plans/` and `superpowers/specs/` (dated design docs — write plans there before large features) |
 | `modules/nixos/` | NixOS module (`services.archivr-server`) |
 | `vendor/twitter/` | Vendored Twitter scraper (active; the Python the server shells out to). Don't refactor casually. |
+| `vendor/readability/` | Mozilla `Readability.js`, concatenated into the SingleFile reader-mode browser script by `downloader/singlefile.rs`. |
 | `testing/` | Legacy scraping scripts + sample data. `testing/creds.txt` holds real tokens — never read, commit, or print it. |
 
 ## Development Commands
