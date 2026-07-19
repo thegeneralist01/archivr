@@ -47,6 +47,18 @@ const READER_MODE_SCRIPT: &str = concat!(
         _archivrReaderMark('failed:no-readability');
         return;
       }
+      // Resolve lazy-loaded images (src="data:," placeholders) before Readability
+      // clones the document so figures/photos are preserved in the article output.
+      document.querySelectorAll('img').forEach(function(img) {
+        var lazySrc = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') ||
+                      img.getAttribute('data-zoom-src') || img.getAttribute('data-original') ||
+                      img.getAttribute('data-lazy');
+        var curSrc  = img.getAttribute('src') || '';
+        if (lazySrc && (!curSrc || curSrc === 'data:,' || curSrc.startsWith('data:,'))) {
+          img.setAttribute('src', lazySrc);
+          img.removeAttribute('loading');
+        }
+      });
       var article = new Readability(document.cloneNode(true)).parse();
       if (!article || !article.content || article.content.length < 100) {
         _archivrReaderMark('failed:no-article');
@@ -236,6 +248,7 @@ pub fn save(
     cookie_ext_enabled: Option<bool>,
     reader_mode: bool,
     modal_closer_enabled: Option<bool>,
+    freedium_cleanup: bool,
 ) -> Result<SaveResult> {
     let single_file =
         env::var("ARCHIVR_SINGLE_FILE").unwrap_or_else(|_| "single-file".to_string());
@@ -254,6 +267,7 @@ pub fn save(
         cookie_ext.as_deref(),
         reader_mode,
         modal_closer,
+        freedium_cleanup,
     )?;
     result.ublock_skipped = ublock_skipped;
     result.cookie_ext_skipped = cookie_ext_skipped;
@@ -378,6 +392,7 @@ fn save_with(
     cookie_ext: Option<&Path>,
     reader_mode: bool,
     modal_closer: bool,
+    freedium_cleanup: bool,
 ) -> Result<SaveResult> {
     let temp_dir = store_path.join("temp").join(timestamp);
     std::fs::create_dir_all(&temp_dir).context("failed to create temp dir")?;
@@ -462,6 +477,16 @@ fn save_with(
                _archivr_mc_interval=null;\
              }\
              _archivr_mc_run();"
+        );
+    }
+    if freedium_cleanup {
+        // Remove Freedium's notification/toast overlay (Sonner library) before
+        // SingleFile serialises the DOM. Target the data attribute, not class
+        // names, to stay stable across Freedium updates.
+        strip_scripts.push_str(
+            "document.querySelectorAll('[data-sonner-toaster]').forEach(function(el){\
+               var s=el.closest('section')||el;s.remove();\
+             });",
         );
     }
     strip_scripts.push_str("});");
@@ -653,18 +678,20 @@ fn base_single_file_cmd(
 
 // ── HTML helpers ──────────────────────────────────────────────────────────────
 
-/// Reads the first 8 KiB of `path` and extracts the content of the first
+/// Reads up to 256 KiB of `path` and extracts the content of the first
 /// `<title>…</title>` element. Returns `None` if absent or empty.
 ///
 /// Uses `to_ascii_lowercase` for case-insensitive tag matching. ASCII-only
 /// lowercasing is byte-length-preserving, so byte offsets derived from the
 /// lowercased buffer are valid indices into the original buffer.
+///
+/// Uses `take().read_to_end()` rather than a single `read()` call so the
+/// full 256 KiB is always consumed even when the OS short-reads.
 fn extract_html_title(path: &Path) -> Option<String> {
     let mut f = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; 8192];
-    let n = f.read(&mut buf).ok()?;
-    let buf = &buf[..n];
-    let lower = String::from_utf8_lossy(buf).to_ascii_lowercase();
+    let mut buf = Vec::new();
+    f.take(256 * 1024).read_to_end(&mut buf).ok()?;
+    let lower = String::from_utf8_lossy(&buf).to_ascii_lowercase();
     let start = lower.find("<title>")? + "<title>".len();
     let end = lower[start..].find("</title>")? + start;
     let title = String::from_utf8_lossy(&buf[start..end])
@@ -775,6 +802,19 @@ mod tests {
     }
 
     #[test]
+    fn extract_html_title_after_100kb_preamble() {
+        // Freedium / SingleFile pages can embed large CSS blocks before <title>.
+        // Verify take().read_to_end() reads the full 256 KiB window.
+        let mut f = NamedTempFile::new().unwrap();
+        let padding = " ".repeat(100 * 1024); // 100 KiB of whitespace
+        write!(f, "{}<html><head><title>Deep Title</title></head></html>", padding).unwrap();
+        assert_eq!(
+            extract_html_title(f.path()),
+            Some("Deep Title".to_string())
+        );
+    }
+
+    #[test]
     fn save_with_missing_binary_returns_clear_error() {
         // Calls save_with directly — no env mutation, safe in parallel test runs.
         let tmp = tempfile::tempdir().unwrap();
@@ -789,6 +829,7 @@ mod tests {
             None,  // no cookie ext
             false, // reader mode off
             false, // modal closer off
+            false, // freedium cleanup off
         );
         let err = result.unwrap_err();
         let msg = format!("{err:#}");

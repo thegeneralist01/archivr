@@ -1051,7 +1051,10 @@ pub fn perform_capture(
             } else {
                 (locator.to_string(), cookies.clone())
             };
-        match downloader::singlefile::save(&fetch_url, store_path, &timestamp, &fetch_cookies, config.ublock_enabled, config.cookie_ext_enabled, config.reader_mode, config.modal_closer_enabled) {
+        // Key cleanup/title-stripping off the actual fetch host so that
+        // user-supplied freedium-mirror.cfd URLs are also handled correctly.
+        let is_freedium_fetch = fetch_url.starts_with("https://freedium-mirror.cfd/");
+        match downloader::singlefile::save(&fetch_url, store_path, &timestamp, &fetch_cookies, config.ublock_enabled, config.cookie_ext_enabled, config.reader_mode, config.modal_closer_enabled, is_freedium_fetch) {
             Ok(result) => {
                 let file_extension = ".html".to_string();
                 let temp_html = store_path
@@ -1115,6 +1118,17 @@ pub fn perform_capture(
                 let _ = fs::remove_dir_all(store_path.join("temp").join(&timestamp));
 
                 // 4. Create the entry + primary_media artifact.
+                // Strip mirror branding from title when fetched via Freedium.
+                let entry_title = if is_freedium_fetch {
+                    result.title.as_deref().map(|t| {
+                        t.trim_end_matches(" - Freedium")
+                         .trim_end_matches(" \u{2014} Freedium")
+                         .trim()
+                         .to_string()
+                    })
+                } else {
+                    result.title
+                };
                 let entry = record_media_entry(
                     &conn,
                     store_path,
@@ -1127,7 +1141,7 @@ pub fn perform_capture(
                     &html_hash,
                     &file_extension,
                     byte_size,
-                    result.title,
+                    entry_title,
                 )?;
 
                 // 5. Add favicon artifact if we captured one.
