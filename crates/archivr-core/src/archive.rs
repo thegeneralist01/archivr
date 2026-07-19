@@ -85,6 +85,8 @@ pub struct Tag {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TagNode {
     pub tag: Tag,
+    pub entry_count: i64,
+    pub subtree_count: i64,
     pub children: Vec<TagNode>,
 }
 
@@ -196,7 +198,10 @@ pub fn initialize_store_directories(store_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn list_root_entries(conn: &rusqlite::Connection, caller_bits: u32) -> Result<Vec<EntrySummary>> {
+pub fn list_root_entries(
+    conn: &rusqlite::Connection,
+    caller_bits: u32,
+) -> Result<Vec<EntrySummary>> {
     let mut stmt = conn.prepare(
         "SELECT
             e.entry_uid,
@@ -336,16 +341,18 @@ pub fn get_capture_job(
     conn: &rusqlite::Connection,
     job_uid: &str,
 ) -> Result<Option<CaptureJobSummary>> {
-    Ok(database::get_capture_job(conn, job_uid)?.map(|r| CaptureJobSummary {
-        job_uid: r.job_uid,
-        archive_id: r.archive_id,
-        run_uid: r.run_uid,
-        status: r.status,
-        error_text: r.error_text,
-        notes_json: r.notes_json,
-        created_at: r.created_at,
-        updated_at: r.updated_at,
-    }))
+    Ok(
+        database::get_capture_job(conn, job_uid)?.map(|r| CaptureJobSummary {
+            job_uid: r.job_uid,
+            archive_id: r.archive_id,
+            run_uid: r.run_uid,
+            status: r.status,
+            error_text: r.error_text,
+            notes_json: r.notes_json,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }),
+    )
 }
 
 /// Lists all collections in the archive.
@@ -413,8 +420,7 @@ pub fn list_entries_for_collection(
               OR (ce.visibility_bits & CAST(?2 AS INTEGER)) != 0) \
          GROUP BY e.id \
          ORDER BY e.archived_at DESC, e.id DESC",
-        ENTRY_SELECT_COLS,
-        ENTRY_FROM_JOINS,
+        ENTRY_SELECT_COLS, ENTRY_FROM_JOINS,
     );
     let mut stmt = conn.prepare(&sql)?;
     let entries = stmt
@@ -448,9 +454,12 @@ pub fn resolve_artifact_path(
     artifact: &EntryArtifactSummary,
 ) -> Result<PathBuf> {
     let joined = store_path.join(&artifact.relpath);
-    let canonical_store = store_path
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize store path: {}", store_path.display()))?;
+    let canonical_store = store_path.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize store path: {}",
+            store_path.display()
+        )
+    })?;
     let canonical_artifact = joined
         .canonicalize()
         .with_context(|| format!("artifact path does not exist: {}", joined.display()))?;
@@ -522,13 +531,13 @@ pub fn parse_search_query(raw: &str) -> Result<SearchEntriesQuery, String> {
 
             match prefix {
                 "source" => query.source_kind = Some(value),
-                "type"   => query.entity_kind = Some(value),
-                "url"    => query.url = Some(value),
-                "title"  => query.title = Some(value),
-                "after"  => query.after = Some(value),
+                "type" => query.entity_kind = Some(value),
+                "url" => query.url = Some(value),
+                "title" => query.title = Some(value),
+                "after" => query.after = Some(value),
                 "before" => query.before = Some(value),
-                "tag"    => query.tag = Some(value),
-                other    => return Err(other.to_string()),
+                "tag" => query.tag = Some(value),
+                other => return Err(other.to_string()),
             }
         } else {
             free_text_tokens.push(token);
@@ -541,16 +550,14 @@ pub fn parse_search_query(raw: &str) -> Result<SearchEntriesQuery, String> {
     Ok(query)
 }
 
-const ENTRY_SELECT_COLS: &str =
-    "SELECT e.entry_uid, e.archived_at, e.source_kind, e.entity_kind, e.title, \
+const ENTRY_SELECT_COLS: &str = "SELECT e.entry_uid, e.archived_at, e.source_kind, e.entity_kind, e.title, \
     e.visibility, si.canonical_url, COUNT(ea.id) AS artifact_count, \
     COALESCE(SUM(b.byte_size), 0) AS total_artifact_bytes, \
     parent.entry_uid AS parent_entry_uid, \
     EXISTS(SELECT 1 FROM entry_artifacts fav WHERE fav.entry_id = e.id AND fav.artifact_role = 'favicon') AS has_favicon, \
     e.cached_bytes";
 
-const ENTRY_FROM_JOINS: &str =
-    "FROM archived_entries e \
+const ENTRY_FROM_JOINS: &str = "FROM archived_entries e \
     JOIN source_identities si ON si.id = e.source_identity_id \
     LEFT JOIN entry_artifacts ea ON ea.entry_id = e.id \
     LEFT JOIN blobs b ON b.id = ea.blob_id \
@@ -579,14 +586,12 @@ pub fn search_entries(
             JOIN entry_tag_assignments eta ON eta.entry_id = e.id \
             JOIN descendants d ON eta.tag_id = d.id \
             WHERE 1=1",
-            ENTRY_SELECT_COLS,
-            ENTRY_FROM_JOINS,
+            ENTRY_SELECT_COLS, ENTRY_FROM_JOINS,
         );
     } else {
         sql = format!(
             "{} {} WHERE e.parent_entry_id IS NULL",
-            ENTRY_SELECT_COLS,
-            ENTRY_FROM_JOINS,
+            ENTRY_SELECT_COLS, ENTRY_FROM_JOINS,
         );
     }
 
@@ -687,19 +692,65 @@ pub fn create_tag(conn: &rusqlite::Connection, full_path: &str) -> Result<Tag> {
 }
 
 /// Returns the full tag tree with root nodes at the top level and children nested.
+/// Each node includes a direct entry count and a subtree count (unique entries
+/// assigned to the tag itself or any descendant).
 pub fn list_tag_tree(conn: &rusqlite::Connection) -> Result<Vec<TagNode>> {
     use std::collections::HashMap;
 
     let records = database::list_all_tags(conn)?;
 
+    // Fetch direct entry counts for all tags in a single query.
+    let mut counts: HashMap<String, i64> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT t.tag_uid, COUNT(eta.entry_id) \
+             FROM tags t \
+             LEFT JOIN entry_tag_assignments eta ON eta.tag_id = t.id \
+             GROUP BY t.id",
+        )?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+            let (uid, cnt) = row?;
+            counts.insert(uid, cnt);
+        }
+    }
+
+    // Fetch subtree entry counts: for each tag, count distinct entries assigned
+    // to it or any descendant.  COUNT(DISTINCT) ensures an entry tagged at both
+    // a parent and a child is counted only once.
+    let mut subtree_counts: HashMap<String, i64> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "WITH RECURSIVE descendants(ancestor_id, descendant_id) AS ( \
+                 SELECT id, id FROM tags \
+                 UNION ALL \
+                 SELECT d.ancestor_id, t.id \
+                 FROM tags t JOIN descendants d ON t.parent_tag_id = d.descendant_id \
+             ) \
+             SELECT t.tag_uid, COUNT(DISTINCT eta.entry_id) \
+             FROM tags t \
+             JOIN descendants d ON d.ancestor_id = t.id \
+             LEFT JOIN entry_tag_assignments eta ON eta.tag_id = d.descendant_id \
+             GROUP BY t.id",
+        )?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+            let (uid, cnt) = row?;
+            subtree_counts.insert(uid, cnt);
+        }
+    }
+
     let mut by_parent: HashMap<Option<i64>, Vec<database::TagRecord>> = HashMap::new();
     for record in records {
-        by_parent.entry(record.parent_tag_id).or_default().push(record);
+        by_parent
+            .entry(record.parent_tag_id)
+            .or_default()
+            .push(record);
     }
 
     fn build_nodes(
         parent_id: Option<i64>,
         by_parent: &HashMap<Option<i64>, Vec<database::TagRecord>>,
+        counts: &HashMap<String, i64>,
+        subtree_counts: &HashMap<String, i64>,
     ) -> Vec<TagNode> {
         let Some(children) = by_parent.get(&parent_id) else {
             return Vec::new();
@@ -713,22 +764,21 @@ pub fn list_tag_tree(conn: &rusqlite::Connection) -> Result<Vec<TagNode>> {
                     slug: r.slug.clone(),
                     full_path: r.full_path.clone(),
                 },
-                children: build_nodes(Some(r.id), by_parent),
+                entry_count: counts.get(&r.tag_uid).copied().unwrap_or(0),
+                subtree_count: subtree_counts.get(&r.tag_uid).copied().unwrap_or(0),
+                children: build_nodes(Some(r.id), by_parent, counts, subtree_counts),
             })
             .collect()
     }
 
-    Ok(build_nodes(None, &by_parent))
+    Ok(build_nodes(None, &by_parent, &counts, &subtree_counts))
 }
 
 /// Returns the tags assigned to an entry.
 ///
 /// Returns `Ok(None)` if the entry_uid does not exist (caller maps to 404).
 /// Returns `Ok(Some([]))` if the entry exists but has no tags.
-pub fn get_entry_tags(
-    conn: &rusqlite::Connection,
-    entry_uid: &str,
-) -> Result<Option<Vec<Tag>>> {
+pub fn get_entry_tags(conn: &rusqlite::Connection, entry_uid: &str) -> Result<Option<Vec<Tag>>> {
     let Some(entry_id) = conn
         .query_row(
             "SELECT id FROM archived_entries WHERE entry_uid = ?1",
@@ -1111,10 +1161,14 @@ mod tests {
 
         // Entry 1: tweet by source x
         let si1 = database::upsert_source_identity(
-            &conn, "x", "tweet", Some("t-1"),
+            &conn,
+            "x",
+            "tweet",
+            Some("t-1"),
             Some("https://x.com/user/status/1"),
             "https://x.com/user/status/1",
-        ).unwrap();
+        )
+        .unwrap();
         database::create_archived_entry(
             &conn,
             &database::NewEntry {
@@ -1132,14 +1186,19 @@ mod tests {
                 source_metadata_json: "{}".to_string(),
                 display_metadata_json: None,
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         // Entry 2: web page
         let si2 = database::upsert_source_identity(
-            &conn, "web", "page", Some("page-1"),
+            &conn,
+            "web",
+            "page",
+            Some("page-1"),
             Some("https://medium.com/article"),
             "https://medium.com/article",
-        ).unwrap();
+        )
+        .unwrap();
         database::create_archived_entry(
             &conn,
             &database::NewEntry {
@@ -1157,7 +1216,8 @@ mod tests {
                 source_metadata_json: "{}".to_string(),
                 display_metadata_json: None,
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         conn
     }
@@ -1173,10 +1233,14 @@ mod tests {
     #[test]
     fn search_q_filters_on_title() {
         let conn = make_test_db_with_entries();
-        let results = search_entries(&conn, &SearchEntriesQuery {
-            q: Some("polymarket".to_string()),
-            ..Default::default()
-        }).unwrap();
+        let results = search_entries(
+            &conn,
+            &SearchEntriesQuery {
+                q: Some("polymarket".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entity_kind, "tweet");
     }
@@ -1184,10 +1248,14 @@ mod tests {
     #[test]
     fn search_entity_kind_exact_match() {
         let conn = make_test_db_with_entries();
-        let results = search_entries(&conn, &SearchEntriesQuery {
-            entity_kind: Some("page".to_string()),
-            ..Default::default()
-        }).unwrap();
+        let results = search_entries(
+            &conn,
+            &SearchEntriesQuery {
+                entity_kind: Some("page".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].source_kind, "web");
     }
@@ -1195,10 +1263,14 @@ mod tests {
     #[test]
     fn search_url_like_filter() {
         let conn = make_test_db_with_entries();
-        let results = search_entries(&conn, &SearchEntriesQuery {
-            url: Some("medium.com".to_string()),
-            ..Default::default()
-        }).unwrap();
+        let results = search_entries(
+            &conn,
+            &SearchEntriesQuery {
+                url: Some("medium.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title.as_deref(), Some("Resume Templates"));
     }
@@ -1206,21 +1278,29 @@ mod tests {
     #[test]
     fn search_no_match_returns_empty() {
         let conn = make_test_db_with_entries();
-        let results = search_entries(&conn, &SearchEntriesQuery {
-            q: Some("zzznonexistent".to_string()),
-            ..Default::default()
-        }).unwrap();
+        let results = search_entries(
+            &conn,
+            &SearchEntriesQuery {
+                q: Some("zzznonexistent".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(results.is_empty());
     }
 
     #[test]
     fn search_multiple_filters_compound() {
         let conn = make_test_db_with_entries();
-        let results = search_entries(&conn, &SearchEntriesQuery {
-            source_kind: Some("x".to_string()),
-            entity_kind: Some("tweet".to_string()),
-            ..Default::default()
-        }).unwrap();
+        let results = search_entries(
+            &conn,
+            &SearchEntriesQuery {
+                source_kind: Some("x".to_string()),
+                entity_kind: Some("tweet".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -1243,9 +1323,8 @@ mod tests {
         title: &str,
         url: &str,
     ) -> database::ArchivedEntry {
-        let si = database::upsert_source_identity(
-            conn, "web", "page", None, Some(url), url,
-        ).unwrap();
+        let si =
+            database::upsert_source_identity(conn, "web", "page", None, Some(url), url).unwrap();
         database::create_archived_entry(
             conn,
             &database::NewEntry {
@@ -1263,7 +1342,8 @@ mod tests {
                 source_metadata_json: "{}".to_string(),
                 display_metadata_json: None,
             },
-        ).unwrap()
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1275,32 +1355,143 @@ mod tests {
         let tree = list_tag_tree(&conn).unwrap();
         assert_eq!(tree.len(), 2, "expected two root nodes");
 
-        let science = tree.iter().find(|n| n.tag.slug == "science").expect("science root missing");
+        let science = tree
+            .iter()
+            .find(|n| n.tag.slug == "science")
+            .expect("science root missing");
         assert_eq!(science.children.len(), 1, "science should have one child");
         assert_eq!(science.children[0].tag.slug, "cs");
 
-        let art = tree.iter().find(|n| n.tag.slug == "art").expect("art root missing");
+        let art = tree
+            .iter()
+            .find(|n| n.tag.slug == "art")
+            .expect("art root missing");
         assert!(art.children.is_empty(), "art should have no children");
+    }
+
+    #[test]
+    fn tag_tree_entry_counts_direct_and_subtree() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        // Tree: /science -> /science/cs -> /science/cs/algorithms
+        create_tag(&conn, "/science/cs/algorithms").unwrap();
+
+        let e1 = make_entry_in_db(
+            &conn,
+            user_id,
+            run_id,
+            None,
+            None,
+            "E1",
+            "https://example.com/e1",
+        );
+        let e2 = make_entry_in_db(
+            &conn,
+            user_id,
+            run_id,
+            None,
+            None,
+            "E2",
+            "https://example.com/e2",
+        );
+
+        // e1 → /science/cs/algorithms (leaf), e2 → /science (root)
+        assign_entry_tag(&conn, &e1.entry_uid, "/science/cs/algorithms").unwrap();
+        assign_entry_tag(&conn, &e2.entry_uid, "/science").unwrap();
+
+        let tree = list_tag_tree(&conn).unwrap();
+        let science = tree.iter().find(|n| n.tag.slug == "science").unwrap();
+        let cs = science
+            .children
+            .iter()
+            .find(|n| n.tag.slug == "cs")
+            .unwrap();
+        let algo = cs
+            .children
+            .iter()
+            .find(|n| n.tag.slug == "algorithms")
+            .unwrap();
+
+        assert_eq!(science.entry_count, 1, "science direct = 1");
+        assert_eq!(
+            science.subtree_count, 2,
+            "science subtree = 2 (e1 via algo, e2 direct)"
+        );
+        assert_eq!(cs.entry_count, 0, "cs direct = 0");
+        assert_eq!(cs.subtree_count, 1, "cs subtree = 1 (e1 via algo)");
+        assert_eq!(algo.entry_count, 1, "algo direct = 1");
+        assert_eq!(algo.subtree_count, 1, "algo subtree = 1");
+    }
+
+    #[test]
+    fn tag_tree_subtree_count_deduplicates_shared_entry() {
+        // Regression: an entry assigned to both a parent and a child must count
+        // as 1 in the parent's subtree_count, not 2.
+        let (conn, user_id, run_id) = make_tag_test_db();
+        create_tag(&conn, "/science/cs").unwrap();
+
+        let e = make_entry_in_db(
+            &conn,
+            user_id,
+            run_id,
+            None,
+            None,
+            "E",
+            "https://example.com/ded",
+        );
+        assign_entry_tag(&conn, &e.entry_uid, "/science").unwrap();
+        assign_entry_tag(&conn, &e.entry_uid, "/science/cs").unwrap();
+
+        let tree = list_tag_tree(&conn).unwrap();
+        let science = tree.iter().find(|n| n.tag.slug == "science").unwrap();
+
+        assert_eq!(
+            science.subtree_count, 1,
+            "entry assigned to both parent and child must not be double-counted"
+        );
+        assert_eq!(science.entry_count, 1, "science direct = 1");
+        assert_eq!(science.children[0].subtree_count, 1, "cs subtree = 1");
     }
 
     #[test]
     fn assign_entry_tag_is_idempotent() {
         let (conn, user_id, run_id) = make_tag_test_db();
-        let entry = make_entry_in_db(&conn, user_id, run_id, None, None, "Test", "https://example.com/t1");
+        let entry = make_entry_in_db(
+            &conn,
+            user_id,
+            run_id,
+            None,
+            None,
+            "Test",
+            "https://example.com/t1",
+        );
 
         assign_entry_tag(&conn, &entry.entry_uid, "/science").unwrap();
         assign_entry_tag(&conn, &entry.entry_uid, "/science").unwrap();
 
         let tags = get_entry_tags(&conn, &entry.entry_uid).unwrap().unwrap();
-        assert_eq!(tags.len(), 1, "idempotent assign should yield exactly one tag");
+        assert_eq!(
+            tags.len(),
+            1,
+            "idempotent assign should yield exactly one tag"
+        );
     }
 
     #[test]
     fn remove_entry_tag_clears_assignment() {
         let (conn, user_id, run_id) = make_tag_test_db();
-        let entry = make_entry_in_db(&conn, user_id, run_id, None, None, "Test", "https://example.com/t2");
+        let entry = make_entry_in_db(
+            &conn,
+            user_id,
+            run_id,
+            None,
+            None,
+            "Test",
+            "https://example.com/t2",
+        );
 
-        let tag = assign_entry_tag(&conn, &entry.entry_uid, "/science").unwrap().unwrap();
+        let tag = assign_entry_tag(&conn, &entry.entry_uid, "/science")
+            .unwrap()
+            .unwrap();
         remove_entry_tag(&conn, &entry.entry_uid, &tag.tag_uid).unwrap();
 
         let tags = get_entry_tags(&conn, &entry.entry_uid).unwrap().unwrap();
@@ -1310,7 +1501,15 @@ mod tests {
     #[test]
     fn entries_for_tag_includes_descendants() {
         let (conn, user_id, run_id) = make_tag_test_db();
-        let entry = make_entry_in_db(&conn, user_id, run_id, None, None, "Compilers Paper", "https://example.com/c1");
+        let entry = make_entry_in_db(
+            &conn,
+            user_id,
+            run_id,
+            None,
+            None,
+            "Compilers Paper",
+            "https://example.com/c1",
+        );
 
         assign_entry_tag(&conn, &entry.entry_uid, "/science/cs/compilers").unwrap();
 
@@ -1322,11 +1521,23 @@ mod tests {
     #[test]
     fn entries_for_tag_includes_child_entries() {
         let (conn, user_id, run_id) = make_tag_test_db();
-        let parent = make_entry_in_db(&conn, user_id, run_id, None, None, "Playlist", "https://example.com/pl");
+        let parent = make_entry_in_db(
+            &conn,
+            user_id,
+            run_id,
+            None,
+            None,
+            "Playlist",
+            "https://example.com/pl",
+        );
         let child = make_entry_in_db(
-            &conn, user_id, run_id,
-            Some(parent.id), Some(parent.id),
-            "Video 1", "https://example.com/pl/v1",
+            &conn,
+            user_id,
+            run_id,
+            Some(parent.id),
+            Some(parent.id),
+            "Video 1",
+            "https://example.com/pl/v1",
         );
 
         assign_entry_tag(&conn, &child.entry_uid, "/science").unwrap();
@@ -1334,42 +1545,77 @@ mod tests {
         let results = entries_for_tag(&conn, "/science").unwrap();
         assert_eq!(results.len(), 1, "only the tagged child should appear");
         assert_eq!(results[0].entry_uid, child.entry_uid);
-        assert_eq!(results[0].parent_entry_uid.as_deref(), Some(parent.entry_uid.as_str()));
+        assert_eq!(
+            results[0].parent_entry_uid.as_deref(),
+            Some(parent.entry_uid.as_str())
+        );
     }
 
     #[test]
     fn search_with_tag_filter_works() {
         let (conn, user_id, run_id) = make_tag_test_db();
-        let entry = make_entry_in_db(&conn, user_id, run_id, None, None, "Science Article", "https://example.com/s1");
+        let entry = make_entry_in_db(
+            &conn,
+            user_id,
+            run_id,
+            None,
+            None,
+            "Science Article",
+            "https://example.com/s1",
+        );
 
         assign_entry_tag(&conn, &entry.entry_uid, "/science").unwrap();
 
-        let results = search_entries(&conn, &SearchEntriesQuery {
-            tag: Some("/science".to_string()),
-            ..Default::default()
-        }).unwrap();
+        let results = search_entries(
+            &conn,
+            &SearchEntriesQuery {
+                tag: Some("/science".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry_uid, entry.entry_uid);
 
-        let empty = search_entries(&conn, &SearchEntriesQuery {
-            tag: Some("/art".to_string()),
-            ..Default::default()
-        }).unwrap();
+        let empty = search_entries(
+            &conn,
+            &SearchEntriesQuery {
+                tag: Some("/art".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(empty.is_empty(), "no entries under /art");
     }
 
     #[test]
     fn search_without_tag_returns_roots_only() {
         let (conn, user_id, run_id) = make_tag_test_db();
-        let parent = make_entry_in_db(&conn, user_id, run_id, None, None, "Parent", "https://example.com/par");
+        let parent = make_entry_in_db(
+            &conn,
+            user_id,
+            run_id,
+            None,
+            None,
+            "Parent",
+            "https://example.com/par",
+        );
         let _child = make_entry_in_db(
-            &conn, user_id, run_id,
-            Some(parent.id), Some(parent.id),
-            "Child", "https://example.com/par/c",
+            &conn,
+            user_id,
+            run_id,
+            Some(parent.id),
+            Some(parent.id),
+            "Child",
+            "https://example.com/par/c",
         );
 
         let results = search_entries(&conn, &SearchEntriesQuery::default()).unwrap();
-        assert_eq!(results.len(), 1, "plain search should return root entries only");
+        assert_eq!(
+            results.len(),
+            1,
+            "plain search should return root entries only"
+        );
         assert_eq!(results[0].entry_uid, parent.entry_uid);
     }
 }

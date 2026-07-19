@@ -20,6 +20,7 @@
 //                   GET/PATCH /api/admin/instance-settings
 // ────────────────────────────────────────────────────────────────────────────
 
+use parking_lot::Mutex;
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
@@ -27,7 +28,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use parking_lot::Mutex;
 
 use archivr_core::{archive, capture, database, downloader};
 use axum::{
@@ -38,12 +38,12 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
 };
-use tower_http::services::{ServeDir, ServeFile};
 use tower::ServiceExt;
+use tower_http::services::{ServeDir, ServeFile};
 
-use crate::registry::{MountedArchive, ServerRegistry};
 use crate::auth;
 pub use crate::auth::{AuthUser, ROLE_ADMIN, ROLE_GUEST, ROLE_OWNER, ROLE_USER};
+use crate::registry::{MountedArchive, ServerRegistry};
 use axum_extra::extract::CookieJar;
 use rusqlite::OptionalExtension;
 
@@ -64,11 +64,7 @@ pub struct EntrySearchParams {
 }
 
 /// Tower middleware: returns 503 on all non-exempt routes if setup hasn't been completed.
-async fn setup_guard(
-    State(state): State<AppState>,
-    req: Request,
-    next: Next,
-) -> Response {
+async fn setup_guard(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let path = req.uri().path().to_owned();
     let exempt = path.starts_with("/api/auth/")
         || path.starts_with("/assets")
@@ -105,7 +101,9 @@ async fn security_headers(req: Request, next: Next) -> Response {
     );
     headers.insert(
         axum::http::header::HeaderName::from_static("permissions-policy"),
-        axum::http::HeaderValue::from_static("camera=(), microphone=(), geolocation=(), autoplay=()"),
+        axum::http::HeaderValue::from_static(
+            "camera=(), microphone=(), geolocation=(), autoplay=()",
+        ),
     );
     if is_artifact {
         // Artifact responses are iframed by the preview modal (sandboxed, no allow-scripts).
@@ -149,11 +147,7 @@ async fn security_headers(req: Request, next: Next) -> Response {
     response
 }
 
-async fn login_rate_limit(
-    State(state): State<AppState>,
-    req: Request,
-    next: Next,
-) -> Response {
+async fn login_rate_limit(State(state): State<AppState>, req: Request, next: Next) -> Response {
     if req.method() != axum::http::Method::POST || req.uri().path() != "/api/auth/login" {
         return next.run(req).await;
     }
@@ -237,10 +231,15 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/health", get(|| async { "ok" }))
         .route("/api/archives", get(list_archives))
         .route("/api/archives/:archive_id/entries", get(list_entries))
-        .route("/api/archives/:archive_id/entries/search", get(search_entries_handler))
+        .route(
+            "/api/archives/:archive_id/entries/search",
+            get(search_entries_handler),
+        )
         .route(
             "/api/archives/:archive_id/entries/:entry_uid",
-            get(entry_detail).patch(patch_entry_handler).delete(delete_entry_handler),
+            get(entry_detail)
+                .patch(patch_entry_handler)
+                .delete(delete_entry_handler),
         )
         .route(
             "/api/archives/:archive_id/entries/:entry_uid/artifacts/:artifact_index",
@@ -254,21 +253,28 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/archives/:archive_id/entries/:entry_uid/favicon",
             get(serve_entry_favicon),
         )
-        .route(
-            "/api/archives/:archive_id/blobs/:sha256",
-            get(serve_blob),
-        )
+        .route("/api/archives/:archive_id/blobs/:sha256", get(serve_blob))
         .route("/api/archives/:archive_id/runs", get(list_runs))
         .route("/api/archives/:archive_id/captures", post(capture_handler))
-        .route("/api/archives/:archive_id/captures/probe", get(probe_handler))
+        .route(
+            "/api/archives/:archive_id/captures/probe",
+            get(probe_handler),
+        )
         .route(
             "/api/archives/:archive_id/capture_jobs/:job_uid",
             get(get_capture_job_handler),
         )
-        .route("/api/archives/:archive_id/tags", get(list_tags).post(create_tag_handler))
+        .route(
+            "/api/archives/:archive_id/tags",
+            get(list_tags).post(create_tag_handler),
+        )
         .route(
             "/api/archives/:archive_id/tags/:tag_uid",
             patch(patch_tag_handler).delete(delete_tag_handler),
+        )
+        .route(
+            "/api/archives/:archive_id/tags/:tag_uid/move",
+            post(move_tag_handler),
         )
         .route(
             "/api/archives/:archive_id/entries/:entry_uid/tags",
@@ -278,17 +284,41 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/archives/:archive_id/entries/:entry_uid/tags/:tag_uid",
             delete(remove_entry_tag_handler),
         )
-        .route("/api/auth/setup",  axum::routing::get(auth_setup_status).post(auth_setup))
-        .route("/api/auth/login",  axum::routing::post(auth_login))
+        .route(
+            "/api/auth/setup",
+            axum::routing::get(auth_setup_status).post(auth_setup),
+        )
+        .route("/api/auth/login", axum::routing::post(auth_login))
         .route("/api/auth/logout", axum::routing::post(auth_logout))
-        .route("/api/auth/me",     axum::routing::get(auth_me).patch(patch_me))
-        .route("/api/auth/tokens", axum::routing::get(list_tokens).post(create_token))
-        .route("/api/auth/tokens/:token_uid", axum::routing::delete(delete_token))
-        .route("/api/admin/users", get(admin_list_users).post(admin_create_user))
-        .route("/api/admin/users/:uid/status", axum::routing::patch(admin_set_user_status))
-        .route("/api/admin/users/:uid/roles", axum::routing::post(admin_assign_role))
-        .route("/api/admin/users/:uid/roles/:role_slug", axum::routing::delete(admin_remove_role))
-        .route("/api/admin/roles", get(admin_list_roles).post(admin_create_role))
+        .route("/api/auth/me", axum::routing::get(auth_me).patch(patch_me))
+        .route(
+            "/api/auth/tokens",
+            axum::routing::get(list_tokens).post(create_token),
+        )
+        .route(
+            "/api/auth/tokens/:token_uid",
+            axum::routing::delete(delete_token),
+        )
+        .route(
+            "/api/admin/users",
+            get(admin_list_users).post(admin_create_user),
+        )
+        .route(
+            "/api/admin/users/:uid/status",
+            axum::routing::patch(admin_set_user_status),
+        )
+        .route(
+            "/api/admin/users/:uid/roles",
+            axum::routing::post(admin_assign_role),
+        )
+        .route(
+            "/api/admin/users/:uid/roles/:role_slug",
+            axum::routing::delete(admin_remove_role),
+        )
+        .route(
+            "/api/admin/roles",
+            get(admin_list_roles).post(admin_create_role),
+        )
         .route(
             "/api/admin/instance-settings",
             get(get_instance_settings_handler).patch(update_instance_settings_handler),
@@ -317,8 +347,7 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route(
             "/api/archives/:archive_id/collections/:coll_uid/entries/:entry_uid",
-            delete(remove_entry_from_collection_handler)
-                .patch(update_entry_visibility_handler),
+            delete(remove_entry_from_collection_handler).patch(update_entry_visibility_handler),
         )
         .route(
             "/api/archives/:archive_id/entries/:entry_uid/collections",
@@ -331,8 +360,14 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/util/resolve-tco", post(resolve_tco_handler))
         .nest_service("/assets", ServeDir::new(static_dir.join("assets")))
         .fallback_service(ServeFile::new(static_dir.join("index.html")))
-        .layer(axum::middleware::from_fn_with_state(state.clone(), setup_guard))
-        .layer(axum::middleware::from_fn_with_state(state.clone(), login_rate_limit))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            setup_guard,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            login_rate_limit,
+        ))
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
 }
@@ -509,7 +544,9 @@ struct CreateCollectionBody {
     default_visibility_bits: u32,
 }
 
-fn default_user_visibility() -> u32 { 2 }
+fn default_user_visibility() -> u32 {
+    2
+}
 
 #[derive(Debug, serde::Deserialize)]
 struct AddEntryBody {
@@ -638,6 +675,26 @@ async fn delete_tag_handler(
     }
 }
 
+async fn move_tag_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((archive_id, tag_uid)): Path<(String, String)>,
+    Json(body): Json<MoveTagBody>,
+) -> Result<Json<archive::Tag>, ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    match database::move_tag(&conn, &tag_uid, body.parent_uid.as_deref())? {
+        Some(record) => Ok(Json(archive::Tag {
+            tag_uid: record.tag_uid,
+            name: record.name,
+            slug: record.slug,
+            full_path: record.full_path,
+        })),
+        None => Err(ApiError::not_found("tag not found")),
+    }
+}
+
 async fn patch_entry_handler(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -647,10 +704,14 @@ async fn patch_entry_handler(
     auth_user.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
-    let title = body.title.as_deref().map(|s| {
-        let t = s.trim();
-        if t.is_empty() { None } else { Some(t) }
-    }).flatten();
+    let title = body
+        .title
+        .as_deref()
+        .map(|s| {
+            let t = s.trim();
+            if t.is_empty() { None } else { Some(t) }
+        })
+        .flatten();
     if database::update_entry_title(&conn, &entry_uid, title)? {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -721,6 +782,12 @@ struct PatchTagBody {
 }
 
 #[derive(Debug, serde::Deserialize)]
+struct MoveTagBody {
+    /// `None` promotes the tag to root; `Some(uid)` sets a new parent.
+    parent_uid: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct CreateCookieRuleBody {
     url_pattern: Option<String>,
     pattern_kind: String,
@@ -758,8 +825,8 @@ async fn capture_handler(
         }
     }
     let mounted = mounted_archive(&state, &archive_id)?;
-    let archive_paths = archive::read_archive_paths(&mounted.archive_path)
-        .map_err(ApiError::from)?;
+    let archive_paths =
+        archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;
 
     // Create job record in the archive DB.
     let conn = database::open_or_initialize(&mounted.archive_path)?;
@@ -772,7 +839,10 @@ async fn capture_handler(
                 let rules = database::list_cookie_rules(&conn).unwrap_or_default();
                 let settings = database::get_instance_settings(&conn);
                 let ublock = settings.as_ref().map(|s| s.ublock_enabled).unwrap_or(true);
-                let cookie_ext = settings.as_ref().map(|s| s.cookie_ext_enabled).unwrap_or(true);
+                let cookie_ext = settings
+                    .as_ref()
+                    .map(|s| s.cookie_ext_enabled)
+                    .unwrap_or(true);
                 let modal_closer = settings.map(|s| s.modal_closer_enabled).unwrap_or(true);
                 (rules, ublock, cookie_ext, modal_closer)
             }
@@ -807,7 +877,13 @@ async fn capture_handler(
             }
         };
         database::update_capture_job_status(&conn, &job_uid_bg, "running", None, None, None).ok();
-        match capture::perform_capture(&archive_paths, &locator, Some(&archive_id_bg), quality.as_deref(), &capture_config) {
+        match capture::perform_capture(
+            &archive_paths,
+            &locator,
+            Some(&archive_id_bg),
+            quality.as_deref(),
+            &capture_config,
+        ) {
             Ok(result) => {
                 let mut notes_map = serde_json::Map::new();
                 if result.ublock_skipped {
@@ -882,8 +958,8 @@ async fn rearchive_handler(
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     auth_user.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
-    let archive_paths = archive::read_archive_paths(&mounted.archive_path)
-        .map_err(ApiError::from)?;
+    let archive_paths =
+        archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;
 
     // Create a capture job record so the client can poll for completion.
     let conn = database::open_or_initialize(&mounted.archive_path)?;
@@ -918,22 +994,38 @@ async fn rearchive_handler(
             Ok(result) => {
                 if result.status == "completed" {
                     database::update_capture_job_status(
-                        &conn, &job_uid_bg, "completed", None, None, None,
-                    ).ok();
+                        &conn,
+                        &job_uid_bg,
+                        "completed",
+                        None,
+                        None,
+                        None,
+                    )
+                    .ok();
                 } else {
                     // "not_a_tweet" or "scraper_failed" — surface as a job failure
                     // so the client sees a meaningful error message.
                     database::update_capture_job_status(
-                        &conn, &job_uid_bg, "failed",
-                        None, Some(&result.message), None,
-                    ).ok();
+                        &conn,
+                        &job_uid_bg,
+                        "failed",
+                        None,
+                        Some(&result.message),
+                        None,
+                    )
+                    .ok();
                 }
             }
             Err(e) => {
                 database::update_capture_job_status(
-                    &conn, &job_uid_bg, "failed",
-                    None, Some(&format!("{e:#}")), None,
-                ).ok();
+                    &conn,
+                    &job_uid_bg,
+                    "failed",
+                    None,
+                    Some(&format!("{e:#}")),
+                    None,
+                )
+                .ok();
             }
         }
     });
@@ -974,7 +1066,9 @@ async fn probe_handler(
 
     // Resolve to a yt-dlp URL; return empty result immediately for non-video sources.
     let Some(ytdlp_url) = capture::locator_to_ytdlp_url(&locator) else {
-        return Ok(Json(serde_json::json!({ "has_video": false, "has_audio": false, "qualities": [] })));
+        return Ok(Json(
+            serde_json::json!({ "has_video": false, "has_audio": false, "qualities": [] }),
+        ));
     };
 
     // fetch_metadata shells out and can take several seconds — keep the async runtime free.
@@ -999,7 +1093,11 @@ async fn probe_handler(
         message: "yt-dlp metadata fetch failed".to_string(),
     })?;
 
-    let qualities: Vec<String> = result.video_heights.iter().map(|h| format!("{h}p")).collect();
+    let qualities: Vec<String> = result
+        .video_heights
+        .iter()
+        .map(|h| format!("{h}p"))
+        .collect();
     Ok(Json(serde_json::json!({
         "has_video": !qualities.is_empty(),
         "qualities": qualities,
@@ -1027,16 +1125,21 @@ async fn auth_setup(
         });
     }
     if body.username.trim().is_empty() || body.password.len() < 8 {
-        return Err(ApiError::bad_request("username required and password must be at least 8 characters"));
+        return Err(ApiError::bad_request(
+            "username required and password must be at least 8 characters",
+        ));
     }
     let hash = auth::hash_password(&body.password).map_err(ApiError::from)?;
     database::create_owner(&conn, &body.username, &hash)?;
     let user = database::get_user_by_username(&conn, &body.username)?
         .ok_or_else(|| ApiError::internal("user not found after creation"))?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!({
-        "user_uid": user.user_uid,
-        "username": user.username,
-    }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "user_uid": user.user_uid,
+            "username": user.username,
+        })),
+    ))
 }
 
 async fn auth_login(
@@ -1048,9 +1151,7 @@ async fn auth_login(
     let user = database::get_user_by_username(&conn, &body.username)?
         .filter(|u| u.status == "active")
         .ok_or_else(|| ApiError::unauthorized("invalid_credentials"))?;
-    if !auth::verify_password(&body.password, &user.password_hash)
-        .map_err(ApiError::from)?
-    {
+    if !auth::verify_password(&body.password, &user.password_hash).map_err(ApiError::from)? {
         return Err(ApiError::unauthorized("invalid_credentials"));
     }
     let role_bits = database::compute_role_bits(&conn, user.id)?;
@@ -1070,14 +1171,20 @@ async fn auth_login(
     let mut resp_headers = axum::http::HeaderMap::new();
     resp_headers.insert(
         axum::http::header::SET_COOKIE,
-        cookie_value.parse().map_err(|_| ApiError::internal("cookie error"))?,
+        cookie_value
+            .parse()
+            .map_err(|_| ApiError::internal("cookie error"))?,
     );
 
-    Ok((StatusCode::OK, resp_headers, Json(serde_json::json!({
-        "user_uid": user.user_uid,
-        "username": user.username,
-        "role_bits": role_bits,
-    }))))
+    Ok((
+        StatusCode::OK,
+        resp_headers,
+        Json(serde_json::json!({
+            "user_uid": user.user_uid,
+            "username": user.username,
+            "role_bits": role_bits,
+        })),
+    ))
 }
 
 async fn auth_logout(
@@ -1108,7 +1215,7 @@ async fn auth_me(
         .query_row(
             "SELECT username, display_name, COALESCE(humanize_slugs, 0) FROM users WHERE id = ?1",
             [user_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .map_err(|e| ApiError::from(anyhow::anyhow!("db error: {e}")))?;
     let humanize_slugs = humanize_slugs_int != 0;
@@ -1143,7 +1250,11 @@ async fn patch_me(
     }
 
     if let Some(ref dn) = body.display_name {
-        let v: Option<&str> = if dn.trim().is_empty() { None } else { Some(dn.as_str()) };
+        let v: Option<&str> = if dn.trim().is_empty() {
+            None
+        } else {
+            Some(dn.as_str())
+        };
         database::update_user_display_name(&conn, user_id, v)?;
     }
 
@@ -1173,8 +1284,14 @@ async fn get_instance_settings_handler(
         .unwrap_or(false);
     let mut val = serde_json::to_value(&settings).unwrap_or_default();
     if let Some(obj) = val.as_object_mut() {
-        obj.insert("ublock_ext_available".into(), serde_json::Value::Bool(ublock_ext_available));
-        obj.insert("cookie_ext_available".into(), serde_json::Value::Bool(cookie_ext_available));
+        obj.insert(
+            "ublock_ext_available".into(),
+            serde_json::Value::Bool(ublock_ext_available),
+        );
+        obj.insert(
+            "cookie_ext_available".into(),
+            serde_json::Value::Bool(cookie_ext_available),
+        );
     }
     Ok(Json(val))
 }
@@ -1187,13 +1304,27 @@ async fn update_instance_settings_handler(
     auth_user.require_role(ROLE_ADMIN)?;
     let conn = database::open_auth_db(&state.auth_db_path)?;
     let mut settings = database::get_instance_settings(&conn)?;
-    if let Some(v) = body.public_index_enabled { settings.public_index_enabled = v; }
-    if let Some(v) = body.public_entry_content_enabled { settings.public_entry_content_enabled = v; }
-    if let Some(v) = body.open_registration_enabled { settings.open_registration_enabled = v; }
-    if let Some(v) = body.default_entry_visibility { settings.default_entry_visibility = v; }
-    if let Some(v) = body.ublock_enabled { settings.ublock_enabled = v; }
-    if let Some(v) = body.cookie_ext_enabled { settings.cookie_ext_enabled = v; }
-    if let Some(v) = body.modal_closer_enabled { settings.modal_closer_enabled = v; }
+    if let Some(v) = body.public_index_enabled {
+        settings.public_index_enabled = v;
+    }
+    if let Some(v) = body.public_entry_content_enabled {
+        settings.public_entry_content_enabled = v;
+    }
+    if let Some(v) = body.open_registration_enabled {
+        settings.open_registration_enabled = v;
+    }
+    if let Some(v) = body.default_entry_visibility {
+        settings.default_entry_visibility = v;
+    }
+    if let Some(v) = body.ublock_enabled {
+        settings.ublock_enabled = v;
+    }
+    if let Some(v) = body.cookie_ext_enabled {
+        settings.cookie_ext_enabled = v;
+    }
+    if let Some(v) = body.modal_closer_enabled {
+        settings.modal_closer_enabled = v;
+    }
     database::update_instance_settings(&conn, &settings)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1220,13 +1351,14 @@ async fn create_cookie_rule_handler(
             "pattern_kind must be 'global', 'wildcard', or 'regex'",
         ));
     }
-    if serde_json::from_str::<std::collections::HashMap<String, String>>(&body.cookies_json).is_err() {
+    if serde_json::from_str::<std::collections::HashMap<String, String>>(&body.cookies_json)
+        .is_err()
+    {
         return Err(ApiError::bad_request(
             "cookies_json must be a JSON object whose values are all strings, e.g. {\"name\": \"value\"}",
         ));
     }
-    if body.pattern_kind != "global"
-        && body.url_pattern.as_deref().unwrap_or("").trim().is_empty()
+    if body.pattern_kind != "global" && body.url_pattern.as_deref().unwrap_or("").trim().is_empty()
     {
         return Err(ApiError::bad_request(
             "url_pattern is required for non-global rules",
@@ -1239,11 +1371,9 @@ async fn create_cookie_rule_handler(
         }
     }
     let conn = database::open_auth_db(&state.auth_db_path)?;
-    let url_pattern = body
-        .url_pattern
-        .as_deref()
-        .filter(|s| !s.trim().is_empty());
-    let rule = database::create_cookie_rule(&conn, url_pattern, &body.pattern_kind, &body.cookies_json)?;
+    let url_pattern = body.url_pattern.as_deref().filter(|s| !s.trim().is_empty());
+    let rule =
+        database::create_cookie_rule(&conn, url_pattern, &body.pattern_kind, &body.cookies_json)?;
     Ok((StatusCode::CREATED, Json(rule)))
 }
 
@@ -1386,7 +1516,6 @@ async fn blob_cleanup_delete_handler(
         ));
     }
 
-
     // Delete orphaned blob rows from the database.
     let deleted_blob_rows = database::delete_orphaned_blob_rows(&conn)?;
 
@@ -1406,7 +1535,11 @@ async fn blob_cleanup_delete_handler(
 
     eprintln!(
         "info: blob cleanup for '{}': {} blob rows, {} files deleted, {} bytes freed, {} errors",
-        archive_id, deleted_blob_rows, deleted_files, freed_bytes, errors.len()
+        archive_id,
+        deleted_blob_rows,
+        deleted_files,
+        freed_bytes,
+        errors.len()
     );
 
     Ok(Json(serde_json::json!({
@@ -1467,11 +1600,14 @@ async fn create_token(
     let token_hash = auth::hash_token(&raw_token);
     let conn = database::open_auth_db(&state.auth_db_path)?;
     let token_uid = database::create_api_token(&conn, user_id, &token_hash, &body.name)?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!({
-        "token_uid": token_uid,
-        "raw_token": raw_token,
-        "name": body.name,
-    }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "token_uid": token_uid,
+            "raw_token": raw_token,
+            "name": body.name,
+        })),
+    ))
 }
 
 async fn list_tokens(
@@ -1498,16 +1634,27 @@ async fn delete_token(
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct AdminCreateUserBody { username: String, password: String, email: Option<String> }
+struct AdminCreateUserBody {
+    username: String,
+    password: String,
+    email: Option<String>,
+}
 
 #[derive(Debug, serde::Deserialize)]
-struct AdminSetStatusBody { status: String }
+struct AdminSetStatusBody {
+    status: String,
+}
 
 #[derive(Debug, serde::Deserialize)]
-struct AdminAssignRoleBody { role_slug: String }
+struct AdminAssignRoleBody {
+    role_slug: String,
+}
 
 #[derive(Debug, serde::Deserialize)]
-struct AdminCreateRoleBody { slug: String, name: String }
+struct AdminCreateRoleBody {
+    slug: String,
+    name: String,
+}
 
 #[derive(Debug, serde::Deserialize)]
 struct UpdateProfileBody {
@@ -1545,12 +1692,23 @@ async fn admin_create_user(
     auth_user.require_role(ROLE_ADMIN)?;
     let (caller_id, _) = auth_user.require_auth()?;
     if body.username.trim().is_empty() || body.password.len() < 8 {
-        return Err(ApiError::bad_request("username required, password >= 8 chars"));
+        return Err(ApiError::bad_request(
+            "username required, password >= 8 chars",
+        ));
     }
     let conn = database::open_auth_db(&state.auth_db_path)?;
     let hash = auth::hash_password(&body.password).map_err(ApiError::from)?;
-    let uid = database::create_user(&conn, &body.username, body.email.as_deref(), &hash, caller_id)?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!({ "user_uid": uid, "username": body.username }))))
+    let uid = database::create_user(
+        &conn,
+        &body.username,
+        body.email.as_deref(),
+        &hash,
+        caller_id,
+    )?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "user_uid": uid, "username": body.username })),
+    ))
 }
 
 async fn admin_set_user_status(
@@ -1561,13 +1719,17 @@ async fn admin_set_user_status(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     auth_user.require_role(ROLE_ADMIN)?;
     if body.status != "active" && body.status != "disabled" {
-        return Err(ApiError::bad_request("status must be 'active' or 'disabled'"));
+        return Err(ApiError::bad_request(
+            "status must be 'active' or 'disabled'",
+        ));
     }
     let conn = database::open_auth_db(&state.auth_db_path)?;
     if !database::set_user_status(&conn, &uid, &body.status)? {
         return Err(ApiError::not_found("user not found"));
     }
-    Ok(Json(serde_json::json!({ "user_uid": uid, "status": body.status })))
+    Ok(Json(
+        serde_json::json!({ "user_uid": uid, "status": body.status }),
+    ))
 }
 
 async fn admin_assign_role(
@@ -1614,8 +1776,8 @@ async fn admin_create_role(
 ) -> Result<(StatusCode, Json<database::RoleRecord>), ApiError> {
     auth_user.require_role(ROLE_ADMIN)?;
     let conn = database::open_auth_db(&state.auth_db_path)?;
-    let role = database::create_custom_role(&conn, &body.slug, &body.name)
-        .map_err(ApiError::from)?;
+    let role =
+        database::create_custom_role(&conn, &body.slug, &body.name).map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(role)))
 }
 
@@ -1667,15 +1829,24 @@ impl ApiError {
     }
 
     pub fn unauthorized(message: &str) -> Self {
-        Self { status: StatusCode::UNAUTHORIZED, message: message.to_string() }
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.to_string(),
+        }
     }
 
     pub fn forbidden(message: &str) -> Self {
-        Self { status: StatusCode::FORBIDDEN, message: message.to_string() }
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.to_string(),
+        }
     }
 
     fn conflict(message: &str) -> Self {
-        Self { status: StatusCode::CONFLICT, message: message.to_string() }
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.to_string(),
+        }
     }
 }
 
@@ -1723,19 +1894,25 @@ async fn create_collection_handler(
         return Err(ApiError::bad_request("collection name must not be empty"));
     }
     if body.slug.trim().is_empty() || body.slug.starts_with('_') {
-        return Err(ApiError::bad_request("collection slug must not be empty or start with underscore"));
+        return Err(ApiError::bad_request(
+            "collection slug must not be empty or start with underscore",
+        ));
     }
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
-    let record = database::create_collection(&conn, &body.name, &body.slug, body.default_visibility_bits)
-        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
-    Ok((StatusCode::CREATED, Json(archive::CollectionSummary {
-        collection_uid: record.collection_uid,
-        name: record.name,
-        slug: record.slug,
-        default_visibility_bits: record.default_visibility_bits,
-        created_at: record.created_at,
-    })))
+    let record =
+        database::create_collection(&conn, &body.name, &body.slug, body.default_visibility_bits)
+            .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(archive::CollectionSummary {
+            collection_uid: record.collection_uid,
+            name: record.name,
+            slug: record.slug,
+            default_visibility_bits: record.default_visibility_bits,
+            created_at: record.created_at,
+        }),
+    ))
 }
 
 async fn get_collection_handler(
@@ -1768,16 +1945,22 @@ async fn get_collection_handler(
             }
         }
     }
-    let entries_json: Vec<serde_json::Value> = entries.iter().map(|e| {
-        let vis = vis_map.get(&e.entry_uid).copied().unwrap_or(record.default_visibility_bits);
-        serde_json::json!({
-            "entry_uid": e.entry_uid,
-            "title": e.title,
-            "source_kind": e.source_kind,
-            "archived_at": e.archived_at,
-            "collection_visibility_bits": vis,
+    let entries_json: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            let vis = vis_map
+                .get(&e.entry_uid)
+                .copied()
+                .unwrap_or(record.default_visibility_bits);
+            serde_json::json!({
+                "entry_uid": e.entry_uid,
+                "title": e.title,
+                "source_kind": e.source_kind,
+                "archived_at": e.archived_at,
+                "collection_visibility_bits": vis,
+            })
         })
-    }).collect();
+        .collect();
     Ok(Json(serde_json::json!({
         "collection_uid": record.collection_uid,
         "name": record.name,
@@ -1800,7 +1983,9 @@ async fn add_entry_to_collection_handler(
     let coll = database::get_collection_by_uid(&conn, &coll_uid)?
         .ok_or(ApiError::not_found("collection not found"))?;
     if coll.slug == "_default_" {
-        return Err(ApiError::bad_request("cannot manually add entries to the default collection"));
+        return Err(ApiError::bad_request(
+            "cannot manually add entries to the default collection",
+        ));
     }
     let entry_id: i64 = conn
         .query_row(
@@ -1825,7 +2010,9 @@ async fn remove_entry_from_collection_handler(
     let coll = database::get_collection_by_uid(&conn, &coll_uid)?
         .ok_or(ApiError::not_found("collection not found"))?;
     if coll.slug == "_default_" {
-        return Err(ApiError::bad_request("cannot manually remove entries from the default collection"));
+        return Err(ApiError::bad_request(
+            "cannot manually remove entries from the default collection",
+        ));
     }
     let entry_id: i64 = conn
         .query_row(
@@ -1861,7 +2048,8 @@ async fn update_entry_visibility_handler(
         )
         .optional()?
         .ok_or(ApiError::not_found("entry not found"))?;
-    if database::update_collection_entry_visibility(&conn, coll.id, entry_id, body.visibility_bits)? {
+    if database::update_collection_entry_visibility(&conn, coll.id, entry_id, body.visibility_bits)?
+    {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found("entry not in collection"))
@@ -1892,7 +2080,8 @@ async fn patch_collection_handler(
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let name_ref: Option<&str> = body.name.as_deref();
-    let updated = database::update_collection(&conn, &coll_uid, name_ref, body.default_visibility_bits)?;
+    let updated =
+        database::update_collection(&conn, &coll_uid, name_ref, body.default_visibility_bits)?;
     if updated {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -1928,9 +2117,8 @@ async fn delete_collection_handler(
 // - 3 s timeout, 1-hop max.
 // - No auth required (t.co is public; no data exposed).
 
-static TCO_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"^https://t\.co/[A-Za-z0-9]+$").unwrap()
-});
+static TCO_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^https://t\.co/[A-Za-z0-9]+$").unwrap());
 
 async fn resolve_tco_handler(
     Json(urls): Json<Vec<String>>,
@@ -1949,31 +2137,34 @@ async fn resolve_tco_handler(
         .map_err(|e| ApiError::internal(&format!("http client: {e}")))?;
 
     let mut map = std::collections::HashMap::new();
-    let futs: Vec<_> = urls.iter().map(|url| {
-        let client = client.clone();
-        let url = url.clone();
-        tokio::spawn(async move {
-            // Try HEAD first; fall back to GET if HEAD returns no Location.
-            // Neither follows redirects (Policy::none), so the server only
-            // ever connects to t.co itself — never to the destination.
-            // Only accept http/https destinations — never javascript:, data:, etc.
-            let safe_location = |resp: reqwest::Response| {
-                resp.headers()
-                    .get(reqwest::header::LOCATION)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string())
-                    .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
-            };
-            let expanded = match client.head(&url).send().await.ok().and_then(safe_location) {
-                Some(loc) => loc,
-                None => match client.get(&url).send().await.ok().and_then(safe_location) {
+    let futs: Vec<_> = urls
+        .iter()
+        .map(|url| {
+            let client = client.clone();
+            let url = url.clone();
+            tokio::spawn(async move {
+                // Try HEAD first; fall back to GET if HEAD returns no Location.
+                // Neither follows redirects (Policy::none), so the server only
+                // ever connects to t.co itself — never to the destination.
+                // Only accept http/https destinations — never javascript:, data:, etc.
+                let safe_location = |resp: reqwest::Response| {
+                    resp.headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string())
+                        .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+                };
+                let expanded = match client.head(&url).send().await.ok().and_then(safe_location) {
                     Some(loc) => loc,
-                    None => url.clone(),
-                },
-            };
-            (url, expanded)
+                    None => match client.get(&url).send().await.ok().and_then(safe_location) {
+                        Some(loc) => loc,
+                        None => url.clone(),
+                    },
+                };
+                (url, expanded)
+            })
         })
-    }).collect();
+        .collect();
 
     for fut in futs {
         if let Ok((k, v)) = fut.await {
@@ -1999,7 +2190,11 @@ mod tests {
             let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
             archivr_core::database::create_owner(&conn, "testowner", "test_hash_not_real").unwrap();
         }
-        let registry = ServerRegistry { archives: vec![], bind: None, auth_db_path: None };
+        let registry = ServerRegistry {
+            archives: vec![],
+            bind: None,
+            auth_db_path: None,
+        };
         (app(registry, auth_path), dir)
     }
 
@@ -2007,17 +2202,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let auth_path = dir.path().join("auth.sqlite");
         // NO owner seeded - for testing setup-required behavior
-        let registry = ServerRegistry { archives: vec![], bind: None, auth_db_path: None };
+        let registry = ServerRegistry {
+            archives: vec![],
+            bind: None,
+            auth_db_path: None,
+        };
         (app(registry, auth_path), dir)
     }
 
-    fn make_test_registry(dir: &tempfile::TempDir) -> (ServerRegistry, std::path::PathBuf, std::path::PathBuf) {
+    fn make_test_registry(
+        dir: &tempfile::TempDir,
+    ) -> (ServerRegistry, std::path::PathBuf, std::path::PathBuf) {
         let paths = archivr_core::archive::initialize_archive(
             dir.path(),
             &dir.path().join("store"),
             "test",
             false,
-        ).unwrap();
+        )
+        .unwrap();
         let auth_path = dir.path().join("auth.sqlite");
         {
             let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
@@ -2039,7 +2241,11 @@ mod tests {
     fn make_test_session(auth_path: &std::path::Path) -> String {
         let conn = archivr_core::database::open_auth_db(auth_path).unwrap();
         let user_id: i64 = conn
-            .query_row("SELECT id FROM users WHERE username = 'testowner'", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM users WHERE username = 'testowner'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         let role_bits = archivr_core::database::compute_role_bits(&conn, user_id).unwrap();
         let sess_uid =
@@ -2052,7 +2258,10 @@ mod tests {
         let user_id = database::ensure_default_user(&conn).unwrap();
         let run = database::create_archive_run(&conn, user_id, 1).unwrap();
         let si = database::upsert_source_identity(
-            &conn, "web", "page", None,
+            &conn,
+            "web",
+            "page",
+            None,
             Some("https://example.com/test"),
             "https://example.com/test",
         )
@@ -2123,12 +2332,26 @@ mod tests {
     async fn missing_archive_returns_404() {
         let dir = tempfile::tempdir().unwrap();
         let auth_path = dir.path().join("auth.sqlite");
-        { let conn = archivr_core::database::open_auth_db(&auth_path).unwrap(); archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap(); }
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
         let session_cookie = make_test_session(&auth_path);
-        let registry = ServerRegistry { archives: vec![], bind: None, auth_db_path: None };
+        let registry = ServerRegistry {
+            archives: vec![],
+            bind: None,
+            auth_db_path: None,
+        };
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/missing/entries").header("cookie", &session_cookie).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/missing/entries")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -2136,12 +2359,26 @@ mod tests {
     async fn artifact_missing_archive_returns_404() {
         let dir = tempfile::tempdir().unwrap();
         let auth_path = dir.path().join("auth.sqlite");
-        { let conn = archivr_core::database::open_auth_db(&auth_path).unwrap(); archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap(); }
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
         let session_cookie = make_test_session(&auth_path);
-        let registry = ServerRegistry { archives: vec![], bind: None, auth_db_path: None };
+        let registry = ServerRegistry {
+            archives: vec![],
+            bind: None,
+            auth_db_path: None,
+        };
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/nope/entries/entry_abc/artifacts/0").header("cookie", &session_cookie).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/nope/entries/entry_abc/artifacts/0")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -2311,12 +2548,15 @@ mod tests {
             bind: None,
             auth_db_path: None,
         };
-        let uri = format!(
-            "/api/archives/test/entries/{}/artifacts/0",
-            entry.entry_uid
-        );
+        let uri = format!("/api/archives/test/entries/{}/artifacts/0", entry.entry_uid);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri(&uri).header("cookie", &session_cookie).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -2326,12 +2566,26 @@ mod tests {
     async fn search_missing_archive_returns_404() {
         let dir = tempfile::tempdir().unwrap();
         let auth_path = dir.path().join("auth.sqlite");
-        { let conn = archivr_core::database::open_auth_db(&auth_path).unwrap(); archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap(); }
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
         let session_cookie = make_test_session(&auth_path);
-        let registry = ServerRegistry { archives: vec![], bind: None, auth_db_path: None };
+        let registry = ServerRegistry {
+            archives: vec![],
+            bind: None,
+            auth_db_path: None,
+        };
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/nope/entries/search?q=anything").header("cookie", &session_cookie).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/nope/entries/search?q=anything")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -2341,8 +2595,15 @@ mod tests {
         let (registry, _, auth_path) = make_test_registry(&dir);
         let session_cookie = make_test_session(&auth_path);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/test/entries/search").header("cookie", &session_cookie).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/entries/search")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -2352,8 +2613,15 @@ mod tests {
         let (registry, _, auth_path) = make_test_registry(&dir);
         let session_cookie = make_test_session(&auth_path);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/test/entries/search?q=unknownprefix%3Aval").header("cookie", &session_cookie).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/entries/search?q=unknownprefix%3Aval")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -2363,12 +2631,26 @@ mod tests {
     async fn test_list_tags_unknown_archive() {
         let dir = tempfile::tempdir().unwrap();
         let auth_path = dir.path().join("auth.sqlite");
-        { let conn = archivr_core::database::open_auth_db(&auth_path).unwrap(); archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap(); }
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
         let session_cookie = make_test_session(&auth_path);
-        let registry = ServerRegistry { archives: vec![], bind: None, auth_db_path: None };
+        let registry = ServerRegistry {
+            archives: vec![],
+            bind: None,
+            auth_db_path: None,
+        };
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/ghost/tags").header("cookie", &session_cookie).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/ghost/tags")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -2444,7 +2726,10 @@ mod tests {
             .iter()
             .map(|n| n["tag"]["slug"].as_str().unwrap())
             .collect();
-        assert!(slugs.contains(&"science"), "expected 'science' in tag tree, got {slugs:?}");
+        assert!(
+            slugs.contains(&"science"),
+            "expected 'science' in tag tree, got {slugs:?}"
+        );
     }
 
     #[tokio::test]
@@ -2516,7 +2801,10 @@ mod tests {
             .unwrap();
         assert_eq!(list2_response.status(), StatusCode::OK);
         let tags2 = body_json(list2_response).await;
-        assert!(tags2.as_array().unwrap().is_empty(), "tags should be empty after removal");
+        assert!(
+            tags2.as_array().unwrap().is_empty(),
+            "tags should be empty after removal"
+        );
     }
 
     #[tokio::test]
@@ -2540,7 +2828,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(assign_resp.status(), StatusCode::CREATED, "assign tag should return 201");
+        assert_eq!(
+            assign_resp.status(),
+            StatusCode::CREATED,
+            "assign tag should return 201"
+        );
 
         // Search with ?tag=/science — entry should appear (requires auth since entry is private)
         let response = app(registry.clone(), auth_path.clone())
@@ -2587,8 +2879,15 @@ mod tests {
         let (registry, _, auth_path) = make_test_registry(&dir);
         let session_cookie = make_test_session(&auth_path);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/test/entries/ghost_uid/tags").header("cookie", &session_cookie).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/entries/ghost_uid/tags")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -2724,10 +3023,18 @@ mod tests {
     async fn setup_required_before_owner_created() {
         let (test_app, _dir) = make_setup_test_app();
         let response = test_app
-            .oneshot(Request::builder().uri("/api/auth/setup").body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/setup")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["setup_required"], true);
     }
@@ -2741,14 +3048,23 @@ mod tests {
             let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
             archivr_core::database::create_owner(&conn, "owner", "dummy").unwrap();
         }
-        let registry = ServerRegistry { archives: vec![], bind: None, auth_db_path: None };
+        let registry = ServerRegistry {
+            archives: vec![],
+            bind: None,
+            auth_db_path: None,
+        };
         let second_app = app(registry, auth_path);
         let r2 = second_app
-            .oneshot(Request::builder().method("POST").uri("/api/auth/setup")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"username":"owner2","password":"hunter2!"}"#))
-                .unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/setup")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"username":"owner2","password":"hunter2!"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(r2.status(), StatusCode::CONFLICT);
     }
 
@@ -2761,13 +3077,22 @@ mod tests {
             let hash = crate::auth::hash_password("correct_password").unwrap();
             archivr_core::database::create_owner(&conn, "owner", &hash).unwrap();
         }
-        let registry = ServerRegistry { archives: vec![], bind: None, auth_db_path: None };
+        let registry = ServerRegistry {
+            archives: vec![],
+            bind: None,
+            auth_db_path: None,
+        };
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().method("POST").uri("/api/auth/login")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"username":"owner","password":"wrong"}"#))
-                .unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"username":"owner","password":"wrong"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -2775,11 +3100,16 @@ mod tests {
     async fn create_token_requires_auth() {
         let (test_app, _dir) = make_test_app();
         let response = test_app
-            .oneshot(Request::builder().method("POST").uri("/api/auth/tokens")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"name":"my token"}"#))
-                .unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"my token"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -2787,15 +3117,18 @@ mod tests {
     async fn capture_returns_401_for_unauthenticated() {
         let (test_app, _dir) = make_test_app();
         let response = test_app
-            .oneshot(Request::builder().method("POST")
-                .uri("/api/archives/test/captures")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"locator":"https://example.com"}"#))
-                .unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"locator":"https://example.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
-
 
     #[tokio::test]
     async fn capture_post_returns_accepted_with_job_uid() {
@@ -2815,9 +3148,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["job_uid"].as_str().is_some(), "response must have job_uid");
+        assert!(
+            json["job_uid"].as_str().is_some(),
+            "response must have job_uid"
+        );
         assert_eq!(json["status"], "pending");
     }
 
@@ -2833,15 +3171,22 @@ mod tests {
                     .uri("/api/archives/test/captures")
                     .header("content-type", "application/json")
                     .header("cookie", &session_cookie)
-                    .body(Body::from(r#"{"locator":"local:/nonexistent","quality":"720p"}"#))
+                    .body(Body::from(
+                        r#"{"locator":"local:/nonexistent","quality":"720p"}"#,
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["job_uid"].as_str().is_some(), "response must have job_uid");
+        assert!(
+            json["job_uid"].as_str().is_some(),
+            "response must have job_uid"
+        );
         assert_eq!(json["status"], "pending");
     }
 
@@ -2857,15 +3202,23 @@ mod tests {
                     .uri("/api/archives/test/captures")
                     .header("content-type", "application/json")
                     .header("cookie", &session_cookie)
-                    .body(Body::from(r#"{"locator":"local:/nonexistent","quality":"4K"}"#))
+                    .body(Body::from(
+                        r#"{"locator":"local:/nonexistent","quality":"4K"}"#,
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["error"].as_str().is_some_and(|e| e.contains("invalid quality")));
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("invalid quality"))
+        );
     }
 
     #[tokio::test]
@@ -2901,7 +3254,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["has_video"], false);
         assert_eq!(json["qualities"], serde_json::json!([]));
@@ -2911,9 +3266,15 @@ mod tests {
     #[tokio::test]
     async fn admin_users_requires_admin_role() {
         let (test_app, _dir) = make_test_app();
-        let response = test_app.oneshot(
-            Request::builder().uri("/api/admin/users").body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let response = test_app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/users")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -2922,11 +3283,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
         let session_cookie = make_test_session(&auth_path);
-        let response = app(registry, auth_path).oneshot(
-            Request::builder().uri("/api/admin/users")
-                .header("cookie", &session_cookie)
-                .body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/users")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -2935,15 +3301,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
         let session_cookie = make_test_session(&auth_path);
-        let response = app(registry, auth_path).oneshot(
-            Request::builder().uri("/api/auth/me")
-                .header("cookie", &session_cookie)
-                .body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/me")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json.get("display_name").is_some(), "auth/me must include display_name field");
+        assert!(
+            json.get("display_name").is_some(),
+            "auth/me must include display_name field"
+        );
         assert!(json.get("username").is_some());
     }
 
@@ -2952,25 +3328,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
         let session_cookie = make_test_session(&auth_path);
-        let response = app(registry, auth_path).oneshot(
-            Request::builder().method("PATCH").uri("/api/auth/me")
-                .header("content-type", "application/json")
-                .header("cookie", &session_cookie)
-                .body(Body::from(r#"{"display_name":"Test Owner"}"#))
-                .unwrap()
-        ).await.unwrap();
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/auth/me")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(r#"{"display_name":"Test Owner"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
     async fn patch_me_requires_auth() {
         let (test_app, _dir) = make_test_app();
-        let response = test_app.oneshot(
-            Request::builder().method("PATCH").uri("/api/auth/me")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"display_name":"anon"}"#))
-                .unwrap()
-        ).await.unwrap();
+        let response = test_app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/auth/me")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"display_name":"anon"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -2982,29 +3368,45 @@ mod tests {
         {
             let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
             let hash = crate::auth::hash_password("real_password").unwrap();
-            let user_id: i64 = conn.query_row(
-                "SELECT id FROM users WHERE username = 'testowner'", [], |r| r.get(0)
-            ).unwrap();
+            let user_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM users WHERE username = 'testowner'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
             archivr_core::database::update_user_password(&conn, user_id, &hash).unwrap();
         }
         let session_cookie = make_test_session(&auth_path);
-        let response = app(registry, auth_path).oneshot(
-            Request::builder().method("PATCH").uri("/api/auth/me")
-                .header("content-type", "application/json")
-                .header("cookie", &session_cookie)
-                .body(Body::from(r#"{"current_password":"wrong","new_password":"newpass"}"#))
-                .unwrap()
-        ).await.unwrap();
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/auth/me")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(
+                        r#"{"current_password":"wrong","new_password":"newpass"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn instance_settings_requires_admin() {
         let (test_app, _dir) = make_test_app();
-        let response = test_app.oneshot(
-            Request::builder().uri("/api/admin/instance-settings")
-                .body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let response = test_app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/instance-settings")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3013,13 +3415,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
         let session_cookie = make_test_session(&auth_path);
-        let response = app(registry, auth_path).oneshot(
-            Request::builder().uri("/api/admin/instance-settings")
-                .header("cookie", &session_cookie)
-                .body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/instance-settings")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["public_index_enabled"], false);
         assert_eq!(json["open_registration_enabled"], false);
@@ -3030,13 +3439,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
         let session_cookie = make_test_session(&auth_path);
-        let response = app(registry, auth_path).oneshot(
-            Request::builder().method("PATCH").uri("/api/admin/instance-settings")
-                .header("content-type", "application/json")
-                .header("cookie", &session_cookie)
-                .body(Body::from(r#"{"open_registration_enabled":true}"#))
-                .unwrap()
-        ).await.unwrap();
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/admin/instance-settings")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(r#"{"open_registration_enabled":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
     #[tokio::test]
@@ -3044,7 +3458,12 @@ mod tests {
         // Non-admin (no session) should get 401.
         let (test_app, _dir) = make_test_app();
         let response = test_app
-            .oneshot(Request::builder().uri("/api/admin/cookie-rules").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/cookie-rules")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -3067,15 +3486,20 @@ mod tests {
                     .uri("/api/admin/cookie-rules")
                     .header("content-type", "application/json")
                     .header("cookie", &session)
-                    .body(Body::from(r#"{"pattern_kind":"global","cookies_json":"{\"session\":\"abc\"}"}"#))
+                    .body(Body::from(
+                        r#"{"pattern_kind":"global","cookies_json":"{\"session\":\"abc\"}"}"#,
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(create_resp.status(), StatusCode::CREATED);
         let body: serde_json::Value = serde_json::from_slice(
-            &axum::body::to_bytes(create_resp.into_body(), usize::MAX).await.unwrap(),
-        ).unwrap();
+            &axum::body::to_bytes(create_resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         let rule_uid = body["rule_uid"].as_str().unwrap().to_string();
         assert_eq!(body["pattern_kind"], "global");
 
@@ -3093,8 +3517,11 @@ mod tests {
             .unwrap();
         assert_eq!(list_resp.status(), StatusCode::OK);
         let list: serde_json::Value = serde_json::from_slice(
-            &axum::body::to_bytes(list_resp.into_body(), usize::MAX).await.unwrap(),
-        ).unwrap();
+            &axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(list.as_array().unwrap().len(), 1);
 
         // Delete.
@@ -3127,7 +3554,9 @@ mod tests {
                     .uri("/api/admin/cookie-rules")
                     .header("content-type", "application/json")
                     .header("cookie", &session)
-                    .body(Body::from(r#"{"pattern_kind":"global","cookies_json":"{\"session\":123}"}"#))
+                    .body(Body::from(
+                        r#"{"pattern_kind":"global","cookies_json":"{\"session\":123}"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -3172,10 +3601,7 @@ mod tests {
             response.headers().get("x-content-type-options").unwrap(),
             "nosniff"
         );
-        assert_eq!(
-            response.headers().get("x-frame-options").unwrap(),
-            "DENY"
-        );
+        assert_eq!(response.headers().get("x-frame-options").unwrap(), "DENY");
         assert_eq!(
             response.headers().get("referrer-policy").unwrap(),
             "strict-origin-when-cross-origin"
@@ -3241,7 +3667,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "attempt within limit should reach handler");
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "attempt within limit should reach handler"
+            );
         }
         let resp = app_with_state(state)
             .oneshot(
@@ -3255,8 +3685,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "attempt over limit must be 429");
-        assert!(resp.headers().contains_key("retry-after"), "429 must carry Retry-After header");
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "attempt over limit must be 429"
+        );
+        assert!(
+            resp.headers().contains_key("retry-after"),
+            "429 must carry Retry-After header"
+        );
         let body = body_json(resp).await;
         assert_eq!(body["error"], "rate_limited");
         assert!(body["retry_after_secs"].as_i64().unwrap() > 0);
@@ -3271,7 +3708,11 @@ mod tests {
             archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
         }
         let state = AppState {
-            registry: Arc::new(ServerRegistry { archives: vec![], bind: None, auth_db_path: None }),
+            registry: Arc::new(ServerRegistry {
+                archives: vec![],
+                bind: None,
+                auth_db_path: None,
+            }),
             auth_db_path: Arc::new(auth_path),
             login_attempts: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -3291,7 +3732,12 @@ mod tests {
                 .unwrap();
         }
         let resp = app_with_state(state)
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "/health must be unaffected");
@@ -3304,8 +3750,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/test/entries/fake_uid").body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/entries/fake_uid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3317,8 +3769,15 @@ mod tests {
         let session_cookie = make_test_session(&auth_path);
         let uri = format!("/api/archives/test/entries/{}", entry.entry_uid);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri(&uri).header("cookie", &session_cookie).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -3327,8 +3786,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/test/runs").body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3338,8 +3803,15 @@ mod tests {
         let (registry, _, auth_path) = make_test_registry(&dir);
         let session_cookie = make_test_session(&auth_path);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/test/runs").header("cookie", &session_cookie).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/runs")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -3348,8 +3820,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/test/entries/fake_uid/artifacts/0").body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/entries/fake_uid/artifacts/0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3357,41 +3835,96 @@ mod tests {
     async fn serve_artifact_with_auth_returns_ok() {
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join("store");
-        let paths = archivr_core::archive::initialize_archive(dir.path(), &store_path, "test", false).unwrap();
+        let paths =
+            archivr_core::archive::initialize_archive(dir.path(), &store_path, "test", false)
+                .unwrap();
         let artifact_relpath = "raw/a/u/page.html";
         let artifact_dir = store_path.join("raw").join("a").join("u");
         std::fs::create_dir_all(&artifact_dir).unwrap();
         std::fs::write(artifact_dir.join("page.html"), b"<html>auth test</html>").unwrap();
         let conn = database::open_or_initialize(&paths.archive_path).unwrap();
         let user_id = database::ensure_default_user(&conn).unwrap();
-        let sid = database::upsert_source_identity(&conn, "web", "page", Some("auth-page"), Some("https://example.com/auth"), "https://example.com/auth").unwrap();
+        let sid = database::upsert_source_identity(
+            &conn,
+            "web",
+            "page",
+            Some("auth-page"),
+            Some("https://example.com/auth"),
+            "https://example.com/auth",
+        )
+        .unwrap();
         let run = database::create_archive_run(&conn, user_id, 1).unwrap();
-        let entry = database::create_archived_entry(&conn, &database::NewEntry {
-            source_identity_id: sid, archive_run_id: run.id, parent_entry_id: None, root_entry_id: None,
-            created_by_user_id: user_id, owned_by_user_id: user_id,
-            source_kind: "web".to_string(), entity_kind: "page".to_string(),
-            title: Some("Auth Test Page".to_string()), visibility: "private".to_string(),
-            representation_kind: "html".to_string(), source_metadata_json: "{}".to_string(), display_metadata_json: None,
-        }).unwrap();
-        let blob_id = database::upsert_blob(&conn, &database::BlobRecord {
-            sha256: "aaaa1111bbbb2222cccc3333dddd4444aaaa1111bbbb2222cccc3333dddd4444".to_string(),
-            byte_size: 21, mime_type: Some("text/html".to_string()), extension: Some("html".to_string()),
-            raw_relpath: artifact_relpath.to_string(),
-        }).unwrap();
-        database::add_entry_artifact(&conn, &database::NewArtifact {
-            entry_id: entry.id, artifact_role: "primary_media".to_string(),
-            storage_area: "raw".to_string(), relpath: artifact_relpath.to_string(),
-            blob_id: Some(blob_id), logical_path: None, metadata_json: None,
-        }).unwrap();
+        let entry = database::create_archived_entry(
+            &conn,
+            &database::NewEntry {
+                source_identity_id: sid,
+                archive_run_id: run.id,
+                parent_entry_id: None,
+                root_entry_id: None,
+                created_by_user_id: user_id,
+                owned_by_user_id: user_id,
+                source_kind: "web".to_string(),
+                entity_kind: "page".to_string(),
+                title: Some("Auth Test Page".to_string()),
+                visibility: "private".to_string(),
+                representation_kind: "html".to_string(),
+                source_metadata_json: "{}".to_string(),
+                display_metadata_json: None,
+            },
+        )
+        .unwrap();
+        let blob_id = database::upsert_blob(
+            &conn,
+            &database::BlobRecord {
+                sha256: "aaaa1111bbbb2222cccc3333dddd4444aaaa1111bbbb2222cccc3333dddd4444"
+                    .to_string(),
+                byte_size: 21,
+                mime_type: Some("text/html".to_string()),
+                extension: Some("html".to_string()),
+                raw_relpath: artifact_relpath.to_string(),
+            },
+        )
+        .unwrap();
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id: entry.id,
+                artifact_role: "primary_media".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: artifact_relpath.to_string(),
+                blob_id: Some(blob_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
         drop(conn);
         let auth_path = dir.path().join("auth.sqlite");
-        { let conn = archivr_core::database::open_auth_db(&auth_path).unwrap(); archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap(); }
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
         let session_cookie = make_test_session(&auth_path);
-        let registry = ServerRegistry { archives: vec![MountedArchive { id: "test".to_string(), label: "Test".to_string(), archive_path: paths.archive_path.clone() }], bind: None, auth_db_path: None };
+        let registry = ServerRegistry {
+            archives: vec![MountedArchive {
+                id: "test".to_string(),
+                label: "Test".to_string(),
+                archive_path: paths.archive_path.clone(),
+            }],
+            bind: None,
+            auth_db_path: None,
+        };
         let uri = format!("/api/archives/test/entries/{}/artifacts/0", entry.entry_uid);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri(&uri).header("cookie", &session_cookie).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -3400,8 +3933,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/test/entries/fake_uid/favicon").body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/entries/fake_uid/favicon")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3409,41 +3948,100 @@ mod tests {
     async fn serve_entry_favicon_with_auth_returns_ok() {
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join("store");
-        let paths = archivr_core::archive::initialize_archive(dir.path(), &store_path, "test", false).unwrap();
+        let paths =
+            archivr_core::archive::initialize_archive(dir.path(), &store_path, "test", false)
+                .unwrap();
         let favicon_relpath = "raw/f/a/favicon.png";
         let favicon_dir = store_path.join("raw").join("f").join("a");
         std::fs::create_dir_all(&favicon_dir).unwrap();
-        std::fs::write(favicon_dir.join("favicon.png"), &[0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        std::fs::write(
+            favicon_dir.join("favicon.png"),
+            &[0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+        )
+        .unwrap();
         let conn = database::open_or_initialize(&paths.archive_path).unwrap();
         let user_id = database::ensure_default_user(&conn).unwrap();
-        let sid = database::upsert_source_identity(&conn, "web", "page", Some("fav-page"), Some("https://example.com/fav"), "https://example.com/fav").unwrap();
+        let sid = database::upsert_source_identity(
+            &conn,
+            "web",
+            "page",
+            Some("fav-page"),
+            Some("https://example.com/fav"),
+            "https://example.com/fav",
+        )
+        .unwrap();
         let run = database::create_archive_run(&conn, user_id, 1).unwrap();
-        let entry = database::create_archived_entry(&conn, &database::NewEntry {
-            source_identity_id: sid, archive_run_id: run.id, parent_entry_id: None, root_entry_id: None,
-            created_by_user_id: user_id, owned_by_user_id: user_id,
-            source_kind: "web".to_string(), entity_kind: "page".to_string(),
-            title: Some("Favicon Test".to_string()), visibility: "private".to_string(),
-            representation_kind: "html".to_string(), source_metadata_json: "{}".to_string(), display_metadata_json: None,
-        }).unwrap();
-        let blob_id = database::upsert_blob(&conn, &database::BlobRecord {
-            sha256: "ffffffffffff1111ffffffffffff1111ffffffffffff1111ffffffffffff1111".to_string(),
-            byte_size: 8, mime_type: Some("image/png".to_string()), extension: Some("png".to_string()),
-            raw_relpath: favicon_relpath.to_string(),
-        }).unwrap();
-        database::add_entry_artifact(&conn, &database::NewArtifact {
-            entry_id: entry.id, artifact_role: "favicon".to_string(),
-            storage_area: "raw".to_string(), relpath: favicon_relpath.to_string(),
-            blob_id: Some(blob_id), logical_path: None, metadata_json: None,
-        }).unwrap();
+        let entry = database::create_archived_entry(
+            &conn,
+            &database::NewEntry {
+                source_identity_id: sid,
+                archive_run_id: run.id,
+                parent_entry_id: None,
+                root_entry_id: None,
+                created_by_user_id: user_id,
+                owned_by_user_id: user_id,
+                source_kind: "web".to_string(),
+                entity_kind: "page".to_string(),
+                title: Some("Favicon Test".to_string()),
+                visibility: "private".to_string(),
+                representation_kind: "html".to_string(),
+                source_metadata_json: "{}".to_string(),
+                display_metadata_json: None,
+            },
+        )
+        .unwrap();
+        let blob_id = database::upsert_blob(
+            &conn,
+            &database::BlobRecord {
+                sha256: "ffffffffffff1111ffffffffffff1111ffffffffffff1111ffffffffffff1111"
+                    .to_string(),
+                byte_size: 8,
+                mime_type: Some("image/png".to_string()),
+                extension: Some("png".to_string()),
+                raw_relpath: favicon_relpath.to_string(),
+            },
+        )
+        .unwrap();
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id: entry.id,
+                artifact_role: "favicon".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: favicon_relpath.to_string(),
+                blob_id: Some(blob_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
         drop(conn);
         let auth_path = dir.path().join("auth.sqlite");
-        { let conn = archivr_core::database::open_auth_db(&auth_path).unwrap(); archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap(); }
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
         let session_cookie = make_test_session(&auth_path);
-        let registry = ServerRegistry { archives: vec![MountedArchive { id: "test".to_string(), label: "Test".to_string(), archive_path: paths.archive_path.clone() }], bind: None, auth_db_path: None };
+        let registry = ServerRegistry {
+            archives: vec![MountedArchive {
+                id: "test".to_string(),
+                label: "Test".to_string(),
+                archive_path: paths.archive_path.clone(),
+            }],
+            bind: None,
+            auth_db_path: None,
+        };
         let uri = format!("/api/archives/test/entries/{}/favicon", entry.entry_uid);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri(&uri).header("cookie", &session_cookie).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -3453,8 +4051,14 @@ mod tests {
         let (registry, _, auth_path) = make_test_registry(&dir);
         let sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri(&format!("/api/archives/test/blobs/{sha256}")).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri(&format!("/api/archives/test/blobs/{sha256}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3462,26 +4066,52 @@ mod tests {
     async fn serve_blob_with_auth_returns_ok() {
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join("store");
-        let paths = archivr_core::archive::initialize_archive(dir.path(), &store_path, "test", false).unwrap();
+        let paths =
+            archivr_core::archive::initialize_archive(dir.path(), &store_path, "test", false)
+                .unwrap();
         let blob_relpath = "raw/b/l/data.bin";
         let blob_dir = store_path.join("raw").join("b").join("l");
         std::fs::create_dir_all(&blob_dir).unwrap();
         std::fs::write(blob_dir.join("data.bin"), b"blob content here").unwrap();
         let sha256 = "bbbb2222cccc4444bbbb2222cccc4444bbbb2222cccc4444bbbb2222cccc4444";
         let conn = database::open_or_initialize(&paths.archive_path).unwrap();
-        database::upsert_blob(&conn, &database::BlobRecord {
-            sha256: sha256.to_string(), byte_size: 17,
-            mime_type: Some("application/octet-stream".to_string()), extension: Some("bin".to_string()),
-            raw_relpath: blob_relpath.to_string(),
-        }).unwrap();
+        database::upsert_blob(
+            &conn,
+            &database::BlobRecord {
+                sha256: sha256.to_string(),
+                byte_size: 17,
+                mime_type: Some("application/octet-stream".to_string()),
+                extension: Some("bin".to_string()),
+                raw_relpath: blob_relpath.to_string(),
+            },
+        )
+        .unwrap();
         drop(conn);
         let auth_path = dir.path().join("auth.sqlite");
-        { let conn = archivr_core::database::open_auth_db(&auth_path).unwrap(); archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap(); }
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
         let session_cookie = make_test_session(&auth_path);
-        let registry = ServerRegistry { archives: vec![MountedArchive { id: "test".to_string(), label: "Test".to_string(), archive_path: paths.archive_path.clone() }], bind: None, auth_db_path: None };
+        let registry = ServerRegistry {
+            archives: vec![MountedArchive {
+                id: "test".to_string(),
+                label: "Test".to_string(),
+                archive_path: paths.archive_path.clone(),
+            }],
+            bind: None,
+            auth_db_path: None,
+        };
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri(&format!("/api/archives/test/blobs/{sha256}")).header("cookie", &session_cookie).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri(&format!("/api/archives/test/blobs/{sha256}"))
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -3490,8 +4120,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/test/tags").body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/tags")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3501,8 +4137,15 @@ mod tests {
         let (registry, _, auth_path) = make_test_registry(&dir);
         let session_cookie = make_test_session(&auth_path);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/test/tags").header("cookie", &session_cookie).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/tags")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -3511,8 +4154,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/test/entries/fake_uid/tags").body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/entries/fake_uid/tags")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3524,8 +4173,15 @@ mod tests {
         let session_cookie = make_test_session(&auth_path);
         let uri = format!("/api/archives/test/entries/{}/tags", entry.entry_uid);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri(&uri).header("cookie", &session_cookie).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -3534,8 +4190,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/test/collections").body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/collections")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3545,8 +4207,15 @@ mod tests {
         let (registry, _, auth_path) = make_test_registry(&dir);
         let session_cookie = make_test_session(&auth_path);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/test/collections").header("cookie", &session_cookie).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/collections")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -3555,8 +4224,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/test/entries/fake_uid/collections").body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/entries/fake_uid/collections")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3568,8 +4243,15 @@ mod tests {
         let session_cookie = make_test_session(&auth_path);
         let uri = format!("/api/archives/test/entries/{}/collections", entry.entry_uid);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri(&uri).header("cookie", &session_cookie).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -3578,8 +4260,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/test/collections/coll_notexist").body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/collections/coll_notexist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3598,8 +4286,15 @@ mod tests {
         let coll_uid = coll["collection_uid"].as_str().unwrap().to_string();
         let uri = format!("/api/archives/test/collections/{coll_uid}");
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri(&uri).header("cookie", &session_cookie).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -3610,8 +4305,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/test/entries").body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/entries")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3621,8 +4322,15 @@ mod tests {
         let (registry, _, auth_path) = make_test_registry(&dir);
         let session_cookie = make_test_session(&auth_path);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/test/entries").header("cookie", &session_cookie).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/entries")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -3631,8 +4339,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/test/entries/search").body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/entries/search")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3642,8 +4356,15 @@ mod tests {
         let (registry, _, auth_path) = make_test_registry(&dir);
         let session_cookie = make_test_session(&auth_path);
         let response = app(registry, auth_path)
-            .oneshot(Request::builder().uri("/api/archives/test/entries/search").header("cookie", &session_cookie).body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/api/archives/test/entries/search")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -3755,7 +4476,11 @@ mod tests {
             archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
         }
         let state = AppState {
-            registry: Arc::new(ServerRegistry { archives: vec![], bind: None, auth_db_path: None }),
+            registry: Arc::new(ServerRegistry {
+                archives: vec![],
+                bind: None,
+                auth_db_path: None,
+            }),
             auth_db_path: Arc::new(auth_path.clone()),
             login_attempts: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -3947,9 +4672,9 @@ mod tests {
     async fn blob_cleanup_delete_removes_orphan_and_preserves_referenced() {
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join("store");
-        let paths = archivr_core::archive::initialize_archive(
-            dir.path(), &store_path, "test", false,
-        ).unwrap();
+        let paths =
+            archivr_core::archive::initialize_archive(dir.path(), &store_path, "test", false)
+                .unwrap();
         let auth_path = dir.path().join("auth.sqlite");
         {
             let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
@@ -3965,25 +4690,44 @@ mod tests {
         {
             let conn = database::open_or_initialize(&paths.archive_path).unwrap();
             // Referenced blob
-            let live_id = database::upsert_blob(&conn, &database::BlobRecord {
-                sha256: "aaaa1111bbbb2222cccc3333dddd4444aaaa1111bbbb2222cccc3333dddd4444".to_string(),
-                byte_size: 10, mime_type: None, extension: Some("bin".to_string()),
-                raw_relpath: live_relpath.to_string(),
-            }).unwrap();
-            database::add_entry_artifact(&conn, &database::NewArtifact {
-                entry_id: entry.id,
-                artifact_role: "main".to_string(),
-                storage_area: "raw".to_string(),
-                relpath: live_relpath.to_string(),
-                blob_id: Some(live_id),
-                logical_path: None, metadata_json: None,
-            }).unwrap();
+            let live_id = database::upsert_blob(
+                &conn,
+                &database::BlobRecord {
+                    sha256: "aaaa1111bbbb2222cccc3333dddd4444aaaa1111bbbb2222cccc3333dddd4444"
+                        .to_string(),
+                    byte_size: 10,
+                    mime_type: None,
+                    extension: Some("bin".to_string()),
+                    raw_relpath: live_relpath.to_string(),
+                },
+            )
+            .unwrap();
+            database::add_entry_artifact(
+                &conn,
+                &database::NewArtifact {
+                    entry_id: entry.id,
+                    artifact_role: "main".to_string(),
+                    storage_area: "raw".to_string(),
+                    relpath: live_relpath.to_string(),
+                    blob_id: Some(live_id),
+                    logical_path: None,
+                    metadata_json: None,
+                },
+            )
+            .unwrap();
             // Orphaned blob (no artifact references it)
-            database::upsert_blob(&conn, &database::BlobRecord {
-                sha256: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
-                byte_size: 20, mime_type: None, extension: Some("bin".to_string()),
-                raw_relpath: orphan_relpath.to_string(),
-            }).unwrap();
+            database::upsert_blob(
+                &conn,
+                &database::BlobRecord {
+                    sha256: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+                        .to_string(),
+                    byte_size: 20,
+                    mime_type: None,
+                    extension: Some("bin".to_string()),
+                    raw_relpath: orphan_relpath.to_string(),
+                },
+            )
+            .unwrap();
         }
 
         // Write all three files to disk
@@ -4018,12 +4762,23 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
         assert_eq!(body["deleted_blob_rows"], 1, "one orphaned DB row removed");
-        assert_eq!(body["deleted_files"], 2, "orphan blob file and extra disk file removed");
+        assert_eq!(
+            body["deleted_files"], 2,
+            "orphan blob file and extra disk file removed"
+        );
         assert!(body["errors"].as_array().unwrap().is_empty());
 
-        assert!(store_path.join(live_relpath).exists(), "referenced file must be preserved");
-        assert!(!store_path.join(orphan_relpath).exists(), "orphaned blob file must be deleted");
-        assert!(!store_path.join(extra_relpath).exists(), "extra disk-only file must be deleted");
+        assert!(
+            store_path.join(live_relpath).exists(),
+            "referenced file must be preserved"
+        );
+        assert!(
+            !store_path.join(orphan_relpath).exists(),
+            "orphaned blob file must be deleted"
+        );
+        assert!(
+            !store_path.join(extra_relpath).exists(),
+            "extra disk-only file must be deleted"
+        );
     }
-
 }
