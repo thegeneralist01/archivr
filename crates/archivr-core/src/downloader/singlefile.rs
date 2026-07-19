@@ -691,7 +691,20 @@ fn extract_html_title(path: &Path) -> Option<String> {
     let mut f = std::fs::File::open(path).ok()?;
     let mut buf = Vec::new();
     f.take(256 * 1024).read_to_end(&mut buf).ok()?;
-    let lower = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+    extract_html_title_from_buf(&buf)
+}
+
+/// Extracts the `<title>` content from an HTML string.
+///
+/// Used in the server capture path where the font-extracted HTML is already
+/// in memory — avoids a re-read and operates on the smaller post-extraction
+/// content where the title is guaranteed to be within range.
+pub fn extract_html_title_str(html: &str) -> Option<String> {
+    extract_html_title_from_buf(html.as_bytes())
+}
+
+fn extract_html_title_from_buf(buf: &[u8]) -> Option<String> {
+    let lower = String::from_utf8_lossy(buf).to_ascii_lowercase();
     let start = lower.find("<title>")? + "<title>".len();
     let end = lower[start..].find("</title>")? + start;
     let title = String::from_utf8_lossy(&buf[start..end])

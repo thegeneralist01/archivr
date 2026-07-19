@@ -1065,23 +1065,26 @@ pub fn perform_capture(
                 // Font extraction: rewrite the HTML in-place before hashing.
                 // Only runs when archive_id is known (server context). CLI passes
                 // None and keeps fonts embedded — no behaviour change for CLI.
-                let (html_hash, byte_size, extracted_fonts) =
+                let (html_hash, byte_size, extracted_fonts, html_title) =
                     if let Some(aid) = archive_id {
                         let content = fs::read_to_string(&temp_html)
                             .with_context(|| format!("failed to read {}", temp_html.display()))?;
                         let (rewritten, fonts) =
                             downloader::font_extractor::extract_and_rewrite(&content, store_path, aid)
                                 .unwrap_or_else(|_| (content.clone(), vec![])); // non-fatal
+                        // Extract title after font-stripping so the title tag is not buried
+                        // behind multi-MB embedded font data that would exceed the 256 KiB window.
+                        let title = downloader::singlefile::extract_html_title_str(&rewritten);
                         fs::write(&temp_html, rewritten.as_bytes())
                             .with_context(|| "failed to write rewritten HTML")?;
                         let size = rewritten.len() as i64;
                         let new_hash = crate::hash::hash_bytes(rewritten.as_bytes());
-                        (new_hash, size, fonts)
+                        (new_hash, size, fonts, title)
                     } else {
                         let size = fs::metadata(&temp_html)
                             .with_context(|| format!("failed to stat {}", temp_html.display()))?
                             .len() as i64;
-                        (result.html_hash.clone(), size, vec![])
+                        (result.html_hash.clone(), size, vec![], result.title.clone())
                     };
 
                 // 1. Move HTML to raw store (if this hash hasn't been seen before).
@@ -1120,14 +1123,14 @@ pub fn perform_capture(
                 // 4. Create the entry + primary_media artifact.
                 // Strip mirror branding from title when fetched via Freedium.
                 let entry_title = if is_freedium_fetch {
-                    result.title.as_deref().map(|t| {
+                    html_title.as_deref().map(|t| {
                         t.trim_end_matches(" - Freedium")
                          .trim_end_matches(" \u{2014} Freedium")
                          .trim()
                          .to_string()
                     })
                 } else {
-                    result.title
+                    html_title
                 };
                 let entry = record_media_entry(
                     &conn,
