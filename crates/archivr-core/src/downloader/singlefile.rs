@@ -841,6 +841,46 @@ fn mime_to_favicon_ext(mime: &str) -> Option<&'static str> {
     }
 }
 
+/// Decodes the minimal set of HTML character references that browsers encode
+/// in attribute values during serialisation.  Covers the four characters
+/// browsers must escape (`&`, `<`, `>`, `"`) — sufficient for URL query
+/// strings and signed CDN parameters embedded in `data-*` attributes.
+fn html_attr_decode(s: &str) -> String {
+    // Decode &amp; LAST so a value like `&amp;lt;` becomes `&lt;` (one layer
+    // removed) rather than `<` (two layers).  If `&amp;` ran first it would
+    // produce `&lt;` from the remainder, which the subsequent `&lt;` pass
+    // would then incorrectly collapse to `<`.
+    s.replace("&lt;",   "<")
+     .replace("&gt;",   ">")
+     .replace("&quot;", "\"")
+     .replace("&amp;",  "&")
+}
+
+/// Returns a `Cookie: …` header value when `img_url` is same-domain as
+/// `capture_url` and `cookies` is non-empty; `None` otherwise.
+/// Uses `domain_from_url` for consistency with the SingleFile cookie-file writer.
+fn same_origin_cookie_header(
+    capture_url: &str,
+    img_url: &str,
+    cookies: &HashMap<String, String>,
+) -> Option<String> {
+    if cookies.is_empty() {
+        return None;
+    }
+    let cap = domain_from_url(capture_url);
+    let img = domain_from_url(img_url);
+    if cap.is_empty() || img.is_empty() || cap != img {
+        return None;
+    }
+    Some(
+        cookies
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
 /// Scans a reader-mode HTML file for `<img data-archivr-src="…">` elements whose
 /// `src` is not already a large inlined image, fetches those URLs with blocking
 /// reqwest, and replaces `src` with `data:<mime>;base64,…`.  Non-fatal: any failure
@@ -869,7 +909,6 @@ fn inline_archivr_img_srcs(path: &Path, capture_url: &str, cookies: &HashMap<Str
         Err(_) => return,
     };
 
-    let capture_domain = domain_from_url(capture_url);
 
     let re_img        = Regex::new(r"(?si)<img\b[^>]*>").unwrap();
     let re_archivr    = Regex::new(r#"(?i)\bdata-archivr-src="([^"]+)""#).unwrap();
@@ -887,13 +926,9 @@ fn inline_archivr_img_srcs(path: &Path, capture_url: &str, cookies: &HashMap<Str
             Some(u) => u,
             None => continue,
         };
-        // HTML-decode common entities that the browser's serialiser encodes in
-        // attribute values (e.g. & → &amp; in CDN signed/query URLs).
-        let img_url = raw_url
-            .replace("&amp;", "&")
-            .replace("&lt;",  "<")
-            .replace("&gt;",  ">")
-            .replace("&quot;", "\"");
+        // HTML-decode entities the browser's serialiser encodes in attribute values
+        // (e.g. & → &amp; in CDN signed/query URLs).
+        let img_url = html_attr_decode(&raw_url);
 
         // Already a large inlined image — leave it alone.
         let cur_src = re_src.captures(tag).map(|c| c[1].to_string()).unwrap_or_default();
@@ -901,24 +936,7 @@ fn inline_archivr_img_srcs(path: &Path, capture_url: &str, cookies: &HashMap<Str
             continue;
         }
 
-        // Forward cookies only when the image host exactly matches the captured
-        // page's domain.  Avoids leaking credentials to third-party image hosts.
-        let img_domain = domain_from_url(&img_url);
-        let cookie_header = if !capture_domain.is_empty()
-            && !img_domain.is_empty()
-            && img_domain == capture_domain
-            && !cookies.is_empty()
-        {
-            Some(
-                cookies
-                    .iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            )
-        } else {
-            None
-        };
+        let cookie_header = same_origin_cookie_header(capture_url, &img_url, cookies);
 
         let data_uri = match fetch_image_as_data_uri(&client, &img_url, MAX_BYTES, cookie_header) {
             Ok(u) => u,
@@ -1101,9 +1119,125 @@ mod tests {
             enabled.eq_ignore_ascii_case("false") || enabled == "0";
         assert!(is_disabled);
 
+
         let enabled = "0";
         let is_disabled =
             enabled.eq_ignore_ascii_case("false") || enabled == "0";
         assert!(is_disabled);
+    }
+
+    // ── html_attr_decode ─────────────────────────────────────────────────────
+
+    #[test]
+    fn html_attr_decode_plain_url_unchanged() {
+        assert_eq!(
+            html_attr_decode("https://cdn.example.com/img.jpg"),
+            "https://cdn.example.com/img.jpg",
+        );
+    }
+
+    #[test]
+    fn html_attr_decode_ampersand_in_query() {
+        // CDN signed URL with & encoded as &amp; by the browser's HTML serialiser.
+        assert_eq!(
+            html_attr_decode("https://cdn.example.com/img.jpg?a=1&amp;b=2&amp;sig=abc"),
+            "https://cdn.example.com/img.jpg?a=1&b=2&sig=abc",
+        );
+    }
+
+    #[test]
+    fn html_attr_decode_single_layer_only() {
+        // &amp;lt; → &lt;  (one browser-serialisation layer removed, not two).
+        // If &amp; ran first it would produce &lt; then < — wrong.
+        assert_eq!(html_attr_decode("&amp;lt;"), "&lt;");
+    }
+
+    #[test]
+    fn html_attr_decode_double_encoded_amp() {
+        // &amp;amp; → &amp; (the attribute value is a literal &amp;).
+        assert_eq!(html_attr_decode("&amp;amp;"), "&amp;");
+    }
+
+    #[test]
+    fn html_attr_decode_lt_gt_quot_direct() {
+        // Directly encoded entities (no surrounding &amp;) decode normally.
+        assert_eq!(html_attr_decode("&lt;tag&gt;"), "<tag>");
+        assert_eq!(html_attr_decode("say &quot;hi&quot;"), "say \"hi\"");
+    }
+
+    // ── same_origin_cookie_header ─────────────────────────────────────────────
+
+    #[test]
+    fn same_origin_cookie_header_same_host_attaches_cookies() {
+        let mut cookies = HashMap::new();
+        cookies.insert("session".to_string(), "abc".to_string());
+        cookies.insert("tok".to_string(), "xyz".to_string());
+        let h = same_origin_cookie_header(
+            "https://example.com/article",
+            "https://example.com/img/photo.jpg",
+            &cookies,
+        ).expect("expected Some for same host");
+        assert!(h.contains("session=abc"), "missing session: {h}");
+        assert!(h.contains("tok=xyz"),     "missing tok: {h}");
+    }
+
+    #[test]
+    fn same_origin_cookie_header_third_party_returns_none() {
+        let mut cookies = HashMap::new();
+        cookies.insert("session".to_string(), "abc".to_string());
+        assert!(same_origin_cookie_header(
+            "https://example.com/article",
+            "https://cdn.third-party.com/img.jpg",
+            &cookies,
+        ).is_none(), "should not forward cookies to third-party host");
+    }
+
+    #[test]
+    fn same_origin_cookie_header_empty_cookies_returns_none() {
+        assert!(same_origin_cookie_header(
+            "https://example.com/article",
+            "https://example.com/img.jpg",
+            &HashMap::new(),
+        ).is_none());
+    }
+
+    #[test]
+    fn same_origin_cookie_header_freedium_empty_cookies_noop() {
+        // capture.rs passes empty cookies for Freedium fetches — confirm no-op.
+        assert!(same_origin_cookie_header(
+            "https://freedium-mirror.cfd/https://example.com/",
+            "https://freedium-mirror.cfd/img/example.com/photo.jpg",
+            &HashMap::new(),
+        ).is_none());
+    }
+
+    // ── bounded read (size cap) ───────────────────────────────────────────────
+
+    #[test]
+    fn bounded_read_stops_at_limit() {
+        // Exercises the same Read::take logic used in fetch_image_as_data_uri.
+        let max: usize = 10;
+        let data: Vec<u8> = (0u8..100).collect();
+        let mut buf = Vec::new();
+        std::io::Cursor::new(&data)
+            .take((max as u64) + 1)
+            .read_to_end(&mut buf)
+            .unwrap();
+        assert!(buf.len() > max,      "take should read up to max+1");
+        assert!(buf.len() <= max + 1, "take should not exceed max+1");
+    }
+
+    #[test]
+    fn bounded_read_allows_at_limit() {
+        let max: usize = 10;
+        let data: Vec<u8> = vec![0u8; max];
+        let mut buf = Vec::new();
+        std::io::Cursor::new(&data)
+            .take((max as u64) + 1)
+            .read_to_end(&mut buf)
+            .unwrap();
+        // Exactly at cap: buf.len() == max, guard does NOT fire.
+        assert_eq!(buf.len(), max);
+        assert!(buf.len() <= max);
     }
 }
