@@ -87,6 +87,9 @@ pub struct CaptureConfig {
     pub reader_mode: bool,
     /// Override for modal-closer browser-script behavior during WebPage captures.
     pub modal_closer_enabled: Option<bool>,
+    /// Route WebPage captures through the Freedium mirror to bypass paywalls.
+    /// The original locator is still recorded in the DB; only the fetch URL changes.
+    pub via_freedium: bool,
 }
 
 /// Resolves which cookies apply to `url` by evaluating all rules in ordinal order.
@@ -1038,7 +1041,20 @@ pub fn perform_capture(
 
     // Source: web page — archive as a self-contained HTML snapshot via single-file-cli
     if source == Source::WebPage {
-        match downloader::singlefile::save(locator, store_path, &timestamp, &cookies, config.ublock_enabled, config.cookie_ext_enabled, config.reader_mode, config.modal_closer_enabled) {
+        // When via_freedium is enabled and the URL is not already a freedium mirror,
+        // fetch through the mirror to bypass paywalls. Store the original locator in DB.
+        // Use an empty cookie jar for the mirror URL: cookies resolved for the original
+        // domain (e.g. NYT, Medium) must not be sent to freedium-mirror.cfd.
+        let (fetch_url, fetch_cookies): (String, HashMap<String, String>) =
+            if config.via_freedium && !locator.starts_with("https://freedium-mirror.cfd/") {
+                (format!("https://freedium-mirror.cfd/{}", locator), HashMap::new())
+            } else {
+                (locator.to_string(), cookies.clone())
+            };
+        // Key cleanup/title-stripping off the actual fetch host so that
+        // user-supplied freedium-mirror.cfd URLs are also handled correctly.
+        let is_freedium_fetch = fetch_url.starts_with("https://freedium-mirror.cfd/");
+        match downloader::singlefile::save(&fetch_url, store_path, &timestamp, &fetch_cookies, config.ublock_enabled, config.cookie_ext_enabled, config.reader_mode, config.modal_closer_enabled, is_freedium_fetch) {
             Ok(result) => {
                 let file_extension = ".html".to_string();
                 let temp_html = store_path
@@ -1049,23 +1065,26 @@ pub fn perform_capture(
                 // Font extraction: rewrite the HTML in-place before hashing.
                 // Only runs when archive_id is known (server context). CLI passes
                 // None and keeps fonts embedded — no behaviour change for CLI.
-                let (html_hash, byte_size, extracted_fonts) =
+                let (html_hash, byte_size, extracted_fonts, html_title) =
                     if let Some(aid) = archive_id {
                         let content = fs::read_to_string(&temp_html)
                             .with_context(|| format!("failed to read {}", temp_html.display()))?;
                         let (rewritten, fonts) =
                             downloader::font_extractor::extract_and_rewrite(&content, store_path, aid)
                                 .unwrap_or_else(|_| (content.clone(), vec![])); // non-fatal
+                        // Extract title after font-stripping so the title tag is not buried
+                        // behind multi-MB embedded font data that would exceed the 256 KiB window.
+                        let title = downloader::singlefile::extract_html_title_str(&rewritten);
                         fs::write(&temp_html, rewritten.as_bytes())
                             .with_context(|| "failed to write rewritten HTML")?;
                         let size = rewritten.len() as i64;
                         let new_hash = crate::hash::hash_bytes(rewritten.as_bytes());
-                        (new_hash, size, fonts)
+                        (new_hash, size, fonts, title)
                     } else {
                         let size = fs::metadata(&temp_html)
                             .with_context(|| format!("failed to stat {}", temp_html.display()))?
                             .len() as i64;
-                        (result.html_hash.clone(), size, vec![])
+                        (result.html_hash.clone(), size, vec![], result.title.clone())
                     };
 
                 // 1. Move HTML to raw store (if this hash hasn't been seen before).
@@ -1102,6 +1121,17 @@ pub fn perform_capture(
                 let _ = fs::remove_dir_all(store_path.join("temp").join(&timestamp));
 
                 // 4. Create the entry + primary_media artifact.
+                // Strip mirror branding from title when fetched via Freedium.
+                let entry_title = if is_freedium_fetch {
+                    html_title.as_deref().map(|t| {
+                        t.trim_end_matches(" - Freedium")
+                         .trim_end_matches(" \u{2014} Freedium")
+                         .trim()
+                         .to_string()
+                    })
+                } else {
+                    html_title
+                };
                 let entry = record_media_entry(
                     &conn,
                     store_path,
@@ -1114,7 +1144,7 @@ pub fn perform_capture(
                     &html_hash,
                     &file_extension,
                     byte_size,
-                    result.title,
+                    entry_title,
                 )?;
 
                 // 5. Add favicon artifact if we captured one.

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use regex::Regex;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use std::{
@@ -47,12 +48,63 @@ const READER_MODE_SCRIPT: &str = concat!(
         _archivrReaderMark('failed:no-readability');
         return;
       }
+      // Helper: resolve lazy-loaded images (src="data:," placeholders) to absolute URLs.
+      // Called before the Readability clone so the clone has real src values, and again
+      // after body replacement because Readability serialises src attributes as-is from
+      // the clone — any remaining placeholders in article.content must also be fixed.
+      function _archivrResolveLazyImgs(base) {
+        var seen=0,lazy=0,placeholders=0,fixed=0;
+        document.querySelectorAll('img').forEach(function(img) {
+          seen++;
+          var lazySrc = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') ||
+                        img.getAttribute('data-zoom-src') || img.getAttribute('data-original') ||
+                        img.getAttribute('data-lazy');
+          if(lazySrc) lazy++;
+          var curSrc = img.getAttribute('src') || '';
+          var _isPlaceholder = !curSrc || curSrc === 'data:,' ||
+            (curSrc.startsWith('data:') && curSrc.length < 512);
+          if(_isPlaceholder) placeholders++;
+          if (lazySrc && _isPlaceholder) {
+            try { lazySrc = new URL(lazySrc, base).href; } catch(e) {}
+            img.setAttribute('src', lazySrc);
+            img.removeAttribute('loading');
+            fixed++;
+          }
+        });
+        return {seen:seen,lazy:lazy,placeholders:placeholders,fixed:fixed};
+      }
+      var _base = document.baseURI || location.href;
+      var _pre = _archivrResolveLazyImgs(_base);
       var article = new Readability(document.cloneNode(true)).parse();
       if (!article || !article.content || article.content.length < 100) {
         _archivrReaderMark('failed:no-article');
         return;
       }
       document.body.innerHTML = article.content;
+      // Post-Readability pass: stamp data-archivr-src on article images so the Rust
+      // post-processor can fetch and inline them after SingleFile writes the file.
+      // SingleFile cannot inline resources introduced at before-capture time; don't
+      // touch src here — Rust replaces it from the marker. Skip already-inlined images.
+      document.querySelectorAll('img').forEach(function(img) {
+        var lazySrc = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') ||
+                      img.getAttribute('data-zoom-src') || img.getAttribute('data-original') ||
+                      img.getAttribute('data-lazy');
+        if (!lazySrc) return;
+        var curSrc = img.getAttribute('src') || '';
+        if (curSrc.startsWith('data:image/') && curSrc.length > 1000) return;
+        try { lazySrc = new URL(lazySrc, _base).href; } catch(e) {}
+        img.setAttribute('data-archivr-src', lazySrc);
+        img.removeAttribute('loading');
+        // Remove lazy attrs so _archivrResolveLazyImgs (called below) cannot
+        // rewrite src to a CDN URL that SingleFile cannot fetch from the proxy
+        // context — Rust owns these images via data-archivr-src instead.
+        img.removeAttribute('data-src');
+        img.removeAttribute('data-lazy-src');
+        img.removeAttribute('data-zoom-src');
+        img.removeAttribute('data-original');
+        img.removeAttribute('data-lazy');
+      });
+      var _post = _archivrResolveLazyImgs(_base);
       if (article.title) document.title = article.title;
       var hdr = document.createElement('header');
       hdr.innerHTML =
@@ -236,6 +288,7 @@ pub fn save(
     cookie_ext_enabled: Option<bool>,
     reader_mode: bool,
     modal_closer_enabled: Option<bool>,
+    freedium_cleanup: bool,
 ) -> Result<SaveResult> {
     let single_file =
         env::var("ARCHIVR_SINGLE_FILE").unwrap_or_else(|_| "single-file".to_string());
@@ -254,6 +307,7 @@ pub fn save(
         cookie_ext.as_deref(),
         reader_mode,
         modal_closer,
+        freedium_cleanup,
     )?;
     result.ublock_skipped = ublock_skipped;
     result.cookie_ext_skipped = cookie_ext_skipped;
@@ -378,6 +432,7 @@ fn save_with(
     cookie_ext: Option<&Path>,
     reader_mode: bool,
     modal_closer: bool,
+    freedium_cleanup: bool,
 ) -> Result<SaveResult> {
     let temp_dir = store_path.join("temp").join(timestamp);
     std::fs::create_dir_all(&temp_dir).context("failed to create temp dir")?;
@@ -462,6 +517,36 @@ fn save_with(
                _archivr_mc_interval=null;\
              }\
              _archivr_mc_run();"
+        );
+    }
+    if freedium_cleanup {
+        strip_scripts.push_str(
+            // Sonner toast overlay (data attribute is stable across Freedium updates).
+            "document.querySelectorAll('[data-sonner-toaster]').forEach(function(el){\
+               var s=el.closest('section')||el;s.remove();\
+             });\
+             document.querySelectorAll('nav#header').forEach(function(el){el.remove();});\
+             document.querySelectorAll('nav').forEach(function(el){\
+               if(el.querySelector('[aria-label=\"Go back\"]'))el.remove();\
+             });\
+             document.querySelectorAll('nav').forEach(function(el){\
+               if(el.querySelector('a[href*=\"freedium-mirror.cfd/\"]'))el.remove();\
+             });\
+             document.querySelectorAll('footer').forEach(function(el){\
+               if(el.querySelector('a[href*=\"freedium-mirror.cfd/\"]')||\
+                 el.textContent.toLowerCase().indexOf('freedium')>-1)el.remove();\
+             });\
+             var _pr=document.getElementById('progress');if(_pr)_pr.remove();\
+             document.querySelectorAll('[data-nosnippet]').forEach(function(el){\
+               if(!el.firstElementChild&&!el.textContent.trim())el.remove();\
+             });\
+             document.querySelectorAll('[data-slot=\"dropdown-menu-trigger\"]').forEach(function(btn){\
+               if(!/download/i.test(btn.textContent||''))return;\
+               var sec=btn.closest('section');if(!sec)return;\
+               var prev=sec.previousElementSibling;\
+               if(prev&&prev.tagName==='HEADER')prev.remove();\
+               sec.remove();\
+             });",
         );
     }
     strip_scripts.push_str("});");
@@ -584,6 +669,10 @@ fn save_with(
             stderr.trim(),
         );
     }
+    // Post-process: fetch and inline images that SingleFile couldn't inline from the
+    // page resource cache (resources introduced via DOM manipulation at before-capture
+    // time are not tracked). Browser script stamped data-archivr-src on those images.
+    inline_archivr_img_srcs(&out_file, url, cookies);
 
     let title = extract_html_title(&out_file);
     let html_hash = hash_file(&out_file)?;
@@ -653,17 +742,32 @@ fn base_single_file_cmd(
 
 // ── HTML helpers ──────────────────────────────────────────────────────────────
 
-/// Reads the first 8 KiB of `path` and extracts the content of the first
+/// Reads up to 256 KiB of `path` and extracts the content of the first
 /// `<title>…</title>` element. Returns `None` if absent or empty.
 ///
 /// Uses `to_ascii_lowercase` for case-insensitive tag matching. ASCII-only
 /// lowercasing is byte-length-preserving, so byte offsets derived from the
 /// lowercased buffer are valid indices into the original buffer.
+///
+/// Uses `take().read_to_end()` rather than a single `read()` call so the
+/// full 256 KiB is always consumed even when the OS short-reads.
 fn extract_html_title(path: &Path) -> Option<String> {
     let mut f = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; 8192];
-    let n = f.read(&mut buf).ok()?;
-    let buf = &buf[..n];
+    let mut buf = Vec::new();
+    f.take(256 * 1024).read_to_end(&mut buf).ok()?;
+    extract_html_title_from_buf(&buf)
+}
+
+/// Extracts the `<title>` content from an HTML string.
+///
+/// Used in the server capture path where the font-extracted HTML is already
+/// in memory — avoids a re-read and operates on the smaller post-extraction
+/// content where the title is guaranteed to be within range.
+pub fn extract_html_title_str(html: &str) -> Option<String> {
+    extract_html_title_from_buf(html.as_bytes())
+}
+
+fn extract_html_title_from_buf(buf: &[u8]) -> Option<String> {
     let lower = String::from_utf8_lossy(buf).to_ascii_lowercase();
     let start = lower.find("<title>")? + "<title>".len();
     let end = lower[start..].find("</title>")? + start;
@@ -737,6 +841,177 @@ fn mime_to_favicon_ext(mime: &str) -> Option<&'static str> {
     }
 }
 
+/// Decodes the minimal set of HTML character references that browsers encode
+/// in attribute values during serialisation.  Covers the four characters
+/// browsers must escape (`&`, `<`, `>`, `"`) — sufficient for URL query
+/// strings and signed CDN parameters embedded in `data-*` attributes.
+fn html_attr_decode(s: &str) -> String {
+    // Decode &amp; LAST so a value like `&amp;lt;` becomes `&lt;` (one layer
+    // removed) rather than `<` (two layers).  If `&amp;` ran first it would
+    // produce `&lt;` from the remainder, which the subsequent `&lt;` pass
+    // would then incorrectly collapse to `<`.
+    s.replace("&lt;",   "<")
+     .replace("&gt;",   ">")
+     .replace("&quot;", "\"")
+     .replace("&amp;",  "&")
+}
+
+/// Returns a `Cookie: …` header value when `img_url` is same-domain as
+/// `capture_url` and `cookies` is non-empty; `None` otherwise.
+/// Uses `domain_from_url` for consistency with the SingleFile cookie-file writer.
+fn same_origin_cookie_header(
+    capture_url: &str,
+    img_url: &str,
+    cookies: &HashMap<String, String>,
+) -> Option<String> {
+    if cookies.is_empty() {
+        return None;
+    }
+    let cap = domain_from_url(capture_url);
+    let img = domain_from_url(img_url);
+    if cap.is_empty() || img.is_empty() || cap != img {
+        return None;
+    }
+    Some(
+        cookies
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
+/// Scans a reader-mode HTML file for `<img data-archivr-src="…">` elements whose
+/// `src` is not already a large inlined image, fetches those URLs with blocking
+/// reqwest, and replaces `src` with `data:<mime>;base64,…`.  Non-fatal: any failure
+/// is logged and the image is left as-is.  Guardrails: 10 s timeout, 5 redirects,
+/// `Content-Type: image/*` required, 20 MiB body cap (enforced via `Content-Length`
+/// and a bounded read).  Cookies are forwarded only when the image host matches the
+/// captured page's domain; Freedium fetches pass empty cookies so this is a no-op.
+fn inline_archivr_img_srcs(path: &Path, capture_url: &str, cookies: &HashMap<String, String>) {
+    const MAX_BYTES: usize = 20 * 1024 * 1024;
+
+    let html = match std::fs::read_to_string(path) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    if !html.contains("data-archivr-src=") {
+        return;
+    }
+
+    let client = match reqwest::blocking::Client::builder()
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+
+    let re_img        = Regex::new(r"(?si)<img\b[^>]*>").unwrap();
+    let re_archivr    = Regex::new(r#"(?i)\bdata-archivr-src="([^"]+)""#).unwrap();
+    let re_src        = Regex::new(r#"(?i)\bsrc="([^"]*)""#).unwrap();
+    let re_rm_archivr = Regex::new(r#"(?i)\s*data-archivr-src="[^"]*""#).unwrap();
+    let re_set_src    = Regex::new(r#"(?i)\bsrc="[^"]*""#).unwrap();
+
+    // Collect (start, end, replacement) in document order, then apply in reverse
+    // so earlier byte positions are still valid when we reach them.
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+
+    for m in re_img.find_iter(&html) {
+        let tag = m.as_str();
+        let raw_url = match re_archivr.captures(tag).map(|c| c[1].to_string()) {
+            Some(u) => u,
+            None => continue,
+        };
+        // HTML-decode entities the browser's serialiser encodes in attribute values
+        // (e.g. & → &amp; in CDN signed/query URLs).
+        let img_url = html_attr_decode(&raw_url);
+
+        // Already a large inlined image — leave it alone.
+        let cur_src = re_src.captures(tag).map(|c| c[1].to_string()).unwrap_or_default();
+        if cur_src.starts_with("data:image/") && cur_src.len() > 1000 {
+            continue;
+        }
+
+        let cookie_header = same_origin_cookie_header(capture_url, &img_url, cookies);
+
+        let data_uri = match fetch_image_as_data_uri(&client, &img_url, MAX_BYTES, cookie_header) {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("warn: reader image inline ({img_url}): {e}");
+                continue;
+            }
+        };
+        let new_tag = if re_src.is_match(tag) {
+            re_set_src.replace(tag, format!("src=\"{}\"", data_uri)).into_owned()
+        } else {
+            tag.replacen("<img", &format!("<img src=\"{}\"", data_uri), 1)
+        };
+        let new_tag = re_rm_archivr.replace(&new_tag, "").into_owned();
+        replacements.push((m.start(), m.end(), new_tag));
+    }
+
+    if replacements.is_empty() {
+        return;
+    }
+    let mut html = html;
+    for (start, end, new_tag) in replacements.into_iter().rev() {
+        html.replace_range(start..end, &new_tag);
+    }
+    if let Err(e) = std::fs::write(path, html.as_bytes()) {
+        eprintln!("warn: reader image inline write {}: {e}", path.display());
+    }
+}
+
+/// Fetches `url` and returns a `data:<mime>;base64,…` URI.
+/// Requires `Content-Type: image/*`, enforces `max_bytes` cap via `Content-Length`
+/// rejection and a bounded streaming read.  Attaches `cookie_header` when supplied.
+fn fetch_image_as_data_uri(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    max_bytes: usize,
+    cookie_header: Option<String>,
+) -> Result<String> {
+    let mut req = client.get(url);
+    if let Some(cookie) = cookie_header {
+        req = req.header(reqwest::header::COOKIE, cookie);
+    }
+    let resp = req.send().context("request failed")?;
+    if !resp.status().is_success() {
+        bail!("HTTP {}", resp.status());
+    }
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let mime = ct.split(';').next().unwrap_or("").trim().to_string();
+    if !mime.starts_with("image/") {
+        bail!("non-image Content-Type: {mime}");
+    }
+    // Reject early when the server advertises a body larger than the cap.
+    if let Some(cl) = resp.content_length() {
+        if cl as usize > max_bytes {
+            bail!("Content-Length {} exceeds {} MiB cap", cl, max_bytes / (1024 * 1024));
+        }
+    }
+    // Stream at most max_bytes + 1 bytes so we never buffer an unbounded body.
+    // Reading one byte past the limit lets us distinguish "exactly at cap" from
+    // "over cap" without a separate Content-Length check.
+    let mut buf = Vec::new();
+    resp.take((max_bytes as u64) + 1)
+        .read_to_end(&mut buf)
+        .context("reading body")?;
+    if buf.len() > max_bytes {
+        bail!("image too large: > {} MiB", max_bytes / (1024 * 1024));
+    }
+    Ok(format!("data:{};base64,{}", mime, B64.encode(&buf)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,6 +1050,19 @@ mod tests {
     }
 
     #[test]
+    fn extract_html_title_after_100kb_preamble() {
+        // Freedium / SingleFile pages can embed large CSS blocks before <title>.
+        // Verify take().read_to_end() reads the full 256 KiB window.
+        let mut f = NamedTempFile::new().unwrap();
+        let padding = " ".repeat(100 * 1024); // 100 KiB of whitespace
+        write!(f, "{}<html><head><title>Deep Title</title></head></html>", padding).unwrap();
+        assert_eq!(
+            extract_html_title(f.path()),
+            Some("Deep Title".to_string())
+        );
+    }
+
+    #[test]
     fn save_with_missing_binary_returns_clear_error() {
         // Calls save_with directly — no env mutation, safe in parallel test runs.
         let tmp = tempfile::tempdir().unwrap();
@@ -789,6 +1077,7 @@ mod tests {
             None,  // no cookie ext
             false, // reader mode off
             false, // modal closer off
+            false, // freedium cleanup off
         );
         let err = result.unwrap_err();
         let msg = format!("{err:#}");
@@ -830,9 +1119,125 @@ mod tests {
             enabled.eq_ignore_ascii_case("false") || enabled == "0";
         assert!(is_disabled);
 
+
         let enabled = "0";
         let is_disabled =
             enabled.eq_ignore_ascii_case("false") || enabled == "0";
         assert!(is_disabled);
+    }
+
+    // ── html_attr_decode ─────────────────────────────────────────────────────
+
+    #[test]
+    fn html_attr_decode_plain_url_unchanged() {
+        assert_eq!(
+            html_attr_decode("https://cdn.example.com/img.jpg"),
+            "https://cdn.example.com/img.jpg",
+        );
+    }
+
+    #[test]
+    fn html_attr_decode_ampersand_in_query() {
+        // CDN signed URL with & encoded as &amp; by the browser's HTML serialiser.
+        assert_eq!(
+            html_attr_decode("https://cdn.example.com/img.jpg?a=1&amp;b=2&amp;sig=abc"),
+            "https://cdn.example.com/img.jpg?a=1&b=2&sig=abc",
+        );
+    }
+
+    #[test]
+    fn html_attr_decode_single_layer_only() {
+        // &amp;lt; → &lt;  (one browser-serialisation layer removed, not two).
+        // If &amp; ran first it would produce &lt; then < — wrong.
+        assert_eq!(html_attr_decode("&amp;lt;"), "&lt;");
+    }
+
+    #[test]
+    fn html_attr_decode_double_encoded_amp() {
+        // &amp;amp; → &amp; (the attribute value is a literal &amp;).
+        assert_eq!(html_attr_decode("&amp;amp;"), "&amp;");
+    }
+
+    #[test]
+    fn html_attr_decode_lt_gt_quot_direct() {
+        // Directly encoded entities (no surrounding &amp;) decode normally.
+        assert_eq!(html_attr_decode("&lt;tag&gt;"), "<tag>");
+        assert_eq!(html_attr_decode("say &quot;hi&quot;"), "say \"hi\"");
+    }
+
+    // ── same_origin_cookie_header ─────────────────────────────────────────────
+
+    #[test]
+    fn same_origin_cookie_header_same_host_attaches_cookies() {
+        let mut cookies = HashMap::new();
+        cookies.insert("session".to_string(), "abc".to_string());
+        cookies.insert("tok".to_string(), "xyz".to_string());
+        let h = same_origin_cookie_header(
+            "https://example.com/article",
+            "https://example.com/img/photo.jpg",
+            &cookies,
+        ).expect("expected Some for same host");
+        assert!(h.contains("session=abc"), "missing session: {h}");
+        assert!(h.contains("tok=xyz"),     "missing tok: {h}");
+    }
+
+    #[test]
+    fn same_origin_cookie_header_third_party_returns_none() {
+        let mut cookies = HashMap::new();
+        cookies.insert("session".to_string(), "abc".to_string());
+        assert!(same_origin_cookie_header(
+            "https://example.com/article",
+            "https://cdn.third-party.com/img.jpg",
+            &cookies,
+        ).is_none(), "should not forward cookies to third-party host");
+    }
+
+    #[test]
+    fn same_origin_cookie_header_empty_cookies_returns_none() {
+        assert!(same_origin_cookie_header(
+            "https://example.com/article",
+            "https://example.com/img.jpg",
+            &HashMap::new(),
+        ).is_none());
+    }
+
+    #[test]
+    fn same_origin_cookie_header_freedium_empty_cookies_noop() {
+        // capture.rs passes empty cookies for Freedium fetches — confirm no-op.
+        assert!(same_origin_cookie_header(
+            "https://freedium-mirror.cfd/https://example.com/",
+            "https://freedium-mirror.cfd/img/example.com/photo.jpg",
+            &HashMap::new(),
+        ).is_none());
+    }
+
+    // ── bounded read (size cap) ───────────────────────────────────────────────
+
+    #[test]
+    fn bounded_read_stops_at_limit() {
+        // Exercises the same Read::take logic used in fetch_image_as_data_uri.
+        let max: usize = 10;
+        let data: Vec<u8> = (0u8..100).collect();
+        let mut buf = Vec::new();
+        std::io::Cursor::new(&data)
+            .take((max as u64) + 1)
+            .read_to_end(&mut buf)
+            .unwrap();
+        assert!(buf.len() > max,      "take should read up to max+1");
+        assert!(buf.len() <= max + 1, "take should not exceed max+1");
+    }
+
+    #[test]
+    fn bounded_read_allows_at_limit() {
+        let max: usize = 10;
+        let data: Vec<u8> = vec![0u8; max];
+        let mut buf = Vec::new();
+        std::io::Cursor::new(&data)
+            .take((max as u64) + 1)
+            .read_to_end(&mut buf)
+            .unwrap();
+        // Exactly at cap: buf.len() == max, guard does NOT fire.
+        assert_eq!(buf.len(), max);
+        assert!(buf.len() <= max);
     }
 }

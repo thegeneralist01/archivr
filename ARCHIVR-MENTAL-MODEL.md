@@ -117,6 +117,16 @@ sequenceDiagram
   CLI->>User: terminal result
 ```
 
+## Web Capture Pipeline
+
+Web pages (`Source::WebPage`) take a longer path than yt-dlp or tweets:
+
+1. **Fetch URL selection.** If `via_freedium` is set and the locator isn't already a Freedium URL, the downloader fetches the page through `freedium-mirror.cfd` with no forwarded cookies. The canonical DB URL stays the original locator.
+2. **Browser capture.** `downloader/singlefile.rs` shells out to `single-file-cli` driving headless Chromium. Extensions (uBlock, cookie-consent) and injected browser scripts (modal closer, reader mode) attach per `CaptureConfig`.
+3. **Reader mode** (optional) concatenates Mozilla's `Readability.js` from `vendor/readability/` into the SingleFile browser script and stamps absolute URLs on lazy images so the serialised DOM points to fetchable sources.
+4. **Freedium cleanup** strips mirror UI (nav, footer, toaster, author header, download control) using multi-signal selectors so article-authored controls aren't hit.
+5. **Rust post-processing.** After SingleFile writes the HTML, a Rust pass fetches any images the browser couldn't inline (bounded reads, same-origin cookie forwarding) and embeds them as data URIs. Title extraction runs after embedded font blocks are stripped so large fonts don't push `<title>` beyond the read window.
+
 ## Read Data Flow
 
 When opening the web UI:
@@ -142,14 +152,17 @@ sequenceDiagram
 | Feature kind | Edit here |
 |---|---|
 | DB schema, inserts, archive runs, entries, tags | `crates/archivr-core/src/database.rs` |
+| Capture orchestration, `Source` routing, `CaptureConfig` | `crates/archivr-core/src/capture.rs` |
 | Archive opening, listing entries, entry detail, runs | `crates/archivr-core/src/archive.rs` |
 | Download/save behavior | `crates/archivr-core/src/downloader/` |
 | CLI commands, argument parsing, terminal output | `crates/archivr-cli/src/main.rs` |
 | Server API routes | `crates/archivr-server/src/routes.rs` |
+| Auth model (users, sessions, tokens, roles) | `crates/archivr-server/src/auth.rs` |
 | Mounted archive config model | `crates/archivr-server/src/registry.rs` |
-| Browser UI behavior | `crates/archivr-server/static/app.js` |
-| Browser UI layout | `crates/archivr-server/static/index.html` |
-| Browser UI styling | `crates/archivr-server/static/styles.css` |
+| Frontend root state + routing | `frontend/src/App.jsx` |
+| Frontend API client | `frontend/src/api.js` |
+| Frontend components | `frontend/src/components/` |
+| Frontend styling | `frontend/src/styles.css` |
 
 ## Practical Feature Rule
 
@@ -165,12 +178,13 @@ If a browser feature needs new data, the usual order is:
 2. Expose it in `archivr-server`.
 3. Render it in the static UI.
 
-## Current Limitations
+## Server Capabilities
 
-The web server reads archive data and serves the UI. It does not yet implement capture.
+The server both reads and writes archive data. Capture jobs are asynchronous: `POST /api/archives/:id/captures` inserts a job row, spawns a blocking task, and returns immediately; the frontend polls until the job completes or fails. Heavy work stays synchronous inside `archivr-core`.
 
-Search is currently simple client-side filtering.
+**Auth model.** A separate `archivr-auth.sqlite` (path derived from the server config directory) holds users, sessions, and API tokens. Role bits are `u32` flags (`GUEST`, `USER`, `ADMIN`, `OWNER`) so a single bitmask value covers assignment, checks, and visibility. The middleware stack is `setup_guard` → `login_rate_limit` → `security_headers`; route families are classified `READ / ADMIN / WRITE / STATIC` in `routes.rs`.
 
-**Auth and session model:** The server binds to `127.0.0.1` by default and has no authentication middleware. This is intentional — Archivr is a local tool. The bind address is configurable via the TOML `bind` field or `ARCHIVR_BIND` env var; a non-loopback address triggers a startup warning. Route families are classified (READ / ADMIN / WRITE / STATIC) in `crates/archivr-server/src/routes.rs` as the decision record for when middleware is eventually added. See the "Security and Deployment" section in `docs/README.md`.
+**Search** is client-side filtering over entries the frontend has already fetched.
 
-Admin is a mounted-archives view, not a management system.
+**Admin view** covers mounted archives, users, sessions, and API tokens.
+
