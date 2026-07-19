@@ -87,6 +87,9 @@ pub struct CaptureConfig {
     pub reader_mode: bool,
     /// Override for modal-closer browser-script behavior during WebPage captures.
     pub modal_closer_enabled: Option<bool>,
+    /// Route WebPage captures through the Freedium mirror to bypass paywalls.
+    /// The original locator is still recorded in the DB; only the fetch URL changes.
+    pub via_freedium: bool,
 }
 
 /// Resolves which cookies apply to `url` by evaluating all rules in ordinal order.
@@ -1038,7 +1041,17 @@ pub fn perform_capture(
 
     // Source: web page — archive as a self-contained HTML snapshot via single-file-cli
     if source == Source::WebPage {
-        match downloader::singlefile::save(locator, store_path, &timestamp, &cookies, config.ublock_enabled, config.cookie_ext_enabled, config.reader_mode, config.modal_closer_enabled) {
+        // When via_freedium is enabled and the URL is not already a freedium mirror,
+        // fetch through the mirror to bypass paywalls. Store the original locator in DB.
+        // Use an empty cookie jar for the mirror URL: cookies resolved for the original
+        // domain (e.g. NYT, Medium) must not be sent to freedium-mirror.cfd.
+        let (fetch_url, fetch_cookies): (String, HashMap<String, String>) =
+            if config.via_freedium && !locator.starts_with("https://freedium-mirror.cfd/") {
+                (format!("https://freedium-mirror.cfd/{}", locator), HashMap::new())
+            } else {
+                (locator.to_string(), cookies.clone())
+            };
+        match downloader::singlefile::save(&fetch_url, store_path, &timestamp, &fetch_cookies, config.ublock_enabled, config.cookie_ext_enabled, config.reader_mode, config.modal_closer_enabled) {
             Ok(result) => {
                 let file_extension = ".html".to_string();
                 let temp_html = store_path
