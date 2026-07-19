@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use regex::Regex;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use std::{
@@ -47,24 +48,55 @@ const READER_MODE_SCRIPT: &str = concat!(
         _archivrReaderMark('failed:no-readability');
         return;
       }
-      // Resolve lazy-loaded images (src="data:," placeholders) before Readability
-      // clones the document so figures/photos are preserved in the article output.
-      document.querySelectorAll('img').forEach(function(img) {
-        var lazySrc = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') ||
-                      img.getAttribute('data-zoom-src') || img.getAttribute('data-original') ||
-                      img.getAttribute('data-lazy');
-        var curSrc  = img.getAttribute('src') || '';
-        if (lazySrc && (!curSrc || curSrc === 'data:,' || curSrc.startsWith('data:,'))) {
-          img.setAttribute('src', lazySrc);
-          img.removeAttribute('loading');
-        }
-      });
+      // Helper: resolve lazy-loaded images (src="data:," placeholders) to absolute URLs.
+      // Called before the Readability clone so the clone has real src values, and again
+      // after body replacement because Readability serialises src attributes as-is from
+      // the clone — any remaining placeholders in article.content must also be fixed.
+      function _archivrResolveLazyImgs(base) {
+        var seen=0,lazy=0,placeholders=0,fixed=0;
+        document.querySelectorAll('img').forEach(function(img) {
+          seen++;
+          var lazySrc = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') ||
+                        img.getAttribute('data-zoom-src') || img.getAttribute('data-original') ||
+                        img.getAttribute('data-lazy');
+          if(lazySrc) lazy++;
+          var curSrc = img.getAttribute('src') || '';
+          var _isPlaceholder = !curSrc || curSrc === 'data:,' ||
+            (curSrc.startsWith('data:') && curSrc.length < 512);
+          if(_isPlaceholder) placeholders++;
+          if (lazySrc && _isPlaceholder) {
+            try { lazySrc = new URL(lazySrc, base).href; } catch(e) {}
+            img.setAttribute('src', lazySrc);
+            img.removeAttribute('loading');
+            fixed++;
+          }
+        });
+        return {seen:seen,lazy:lazy,placeholders:placeholders,fixed:fixed};
+      }
+      var _base = document.baseURI || location.href;
+      var _pre = _archivrResolveLazyImgs(_base);
       var article = new Readability(document.cloneNode(true)).parse();
       if (!article || !article.content || article.content.length < 100) {
         _archivrReaderMark('failed:no-article');
         return;
       }
       document.body.innerHTML = article.content;
+      // Post-Readability pass: stamp data-archivr-src on article images so the Rust
+      // post-processor can fetch and inline them after SingleFile writes the file.
+      // SingleFile cannot inline resources introduced at before-capture time; don't
+      // touch src here — Rust replaces it from the marker. Skip already-inlined images.
+      document.querySelectorAll('img').forEach(function(img) {
+        var lazySrc = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') ||
+                      img.getAttribute('data-zoom-src') || img.getAttribute('data-original') ||
+                      img.getAttribute('data-lazy');
+        if (!lazySrc) return;
+        var curSrc = img.getAttribute('src') || '';
+        if (curSrc.startsWith('data:image/') && curSrc.length > 1000) return;
+        try { lazySrc = new URL(lazySrc, _base).href; } catch(e) {}
+        img.setAttribute('data-archivr-src', lazySrc);
+        img.removeAttribute('loading');
+      });
+      var _post = _archivrResolveLazyImgs(_base);
       if (article.title) document.title = article.title;
       var hdr = document.createElement('header');
       hdr.innerHTML =
@@ -92,7 +124,7 @@ const READER_MODE_SCRIPT: &str = concat!(
         'blockquote{border-left:3px solid #ccc;margin:1em 0;padding-left:1.2em;color:#555}',
       ].join('');
       document.head.appendChild(style);
-      _archivrReaderMark('applied');
+      _archivrReaderMark('applied:pre_s='+_pre.seen+',pre_l='+_pre.lazy+',pre_p='+_pre.placeholders+',pre_f='+_pre.fixed+':post_s='+_post.seen+',post_l='+_post.lazy+',post_p='+_post.placeholders+',post_f='+_post.fixed);
     } catch (e) {
       _archivrReaderMark('failed:exception:' + (e && e.message ? e.message : String(e)));
     }
@@ -480,12 +512,25 @@ fn save_with(
         );
     }
     if freedium_cleanup {
-        // Remove Freedium's notification/toast overlay (Sonner library) before
-        // SingleFile serialises the DOM. Target the data attribute, not class
-        // names, to stay stable across Freedium updates.
         strip_scripts.push_str(
+            // Sonner toast overlay (data attribute is stable across Freedium updates).
             "document.querySelectorAll('[data-sonner-toaster]').forEach(function(el){\
                var s=el.closest('section')||el;s.remove();\
+             });\
+             document.querySelectorAll('nav#header').forEach(function(el){el.remove();});\
+             document.querySelectorAll('nav').forEach(function(el){\
+               if(el.querySelector('[aria-label=\"Go back\"]'))el.remove();\
+             });\
+             document.querySelectorAll('nav').forEach(function(el){\
+               if(el.querySelector('a[href*=\"freedium-mirror.cfd/\"]'))el.remove();\
+             });\
+             document.querySelectorAll('footer').forEach(function(el){\
+               if(el.querySelector('a[href*=\"freedium-mirror.cfd/\"]')||\
+                 el.textContent.toLowerCase().indexOf('freedium')>-1)el.remove();\
+             });\
+             var _pr=document.getElementById('progress');if(_pr)_pr.remove();\
+             document.querySelectorAll('[data-nosnippet]').forEach(function(el){\
+               if(!el.firstElementChild&&!el.textContent.trim())el.remove();\
              });",
         );
     }
@@ -609,6 +654,10 @@ fn save_with(
             stderr.trim(),
         );
     }
+    // Post-process: fetch and inline images that SingleFile couldn't inline from the
+    // page resource cache (resources introduced via DOM manipulation at before-capture
+    // time are not tracked). Browser script stamped data-archivr-src on those images.
+    inline_archivr_img_srcs(&out_file);
 
     let title = extract_html_title(&out_file);
     let html_hash = hash_file(&out_file)?;
@@ -775,6 +824,109 @@ fn mime_to_favicon_ext(mime: &str) -> Option<&'static str> {
         "image/webp" => Some(".webp"),
         _ => None,
     }
+}
+
+/// Scans a reader-mode HTML file for `<img data-archivr-src="…">` elements whose
+/// `src` is not already a large inlined image, fetches those URLs with blocking
+/// reqwest, and replaces `src` with `data:<mime>;base64,…`.  Non-fatal: any failure
+/// is logged and the image is left as-is.  Guardrails: 10 s timeout, 5 redirects,
+/// `Content-Type: image/*` required, 20 MiB body cap.
+fn inline_archivr_img_srcs(path: &Path) {
+    const MAX_BYTES: usize = 20 * 1024 * 1024;
+
+    let html = match std::fs::read_to_string(path) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    if !html.contains("data-archivr-src=") {
+        return;
+    }
+
+    let client = match reqwest::blocking::Client::builder()
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let re_img     = Regex::new(r"(?si)<img\b[^>]*>").unwrap();
+    let re_archivr = Regex::new(r#"(?i)\bdata-archivr-src="([^"]+)""#).unwrap();
+    let re_src     = Regex::new(r#"(?i)\bsrc="([^"]*)""#).unwrap();
+    let re_rm_archivr = Regex::new(r#"(?i)\s*data-archivr-src="[^"]*""#).unwrap();
+    let re_set_src    = Regex::new(r#"(?i)\bsrc="[^"]*""#).unwrap();
+
+    // Collect (start, end, replacement) in document order, then apply in reverse
+    // so earlier byte positions are still valid when we reach them.
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+
+    for m in re_img.find_iter(&html) {
+        let tag = m.as_str();
+        let img_url = match re_archivr.captures(tag).map(|c| c[1].to_string()) {
+            Some(u) => u,
+            None => continue,
+        };
+        // Already a large inlined image — leave it alone.
+        let cur_src = re_src.captures(tag).map(|c| c[1].to_string()).unwrap_or_default();
+        if cur_src.starts_with("data:image/") && cur_src.len() > 1000 {
+            continue;
+        }
+        let data_uri = match fetch_image_as_data_uri(&client, &img_url, MAX_BYTES) {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("warn: reader image inline ({img_url}): {e}");
+                continue;
+            }
+        };
+        let new_tag = if re_src.is_match(tag) {
+            re_set_src.replace(tag, format!("src=\"{}\"", data_uri)).into_owned()
+        } else {
+            tag.replacen("<img", &format!("<img src=\"{}\"", data_uri), 1)
+        };
+        let new_tag = re_rm_archivr.replace(&new_tag, "").into_owned();
+        replacements.push((m.start(), m.end(), new_tag));
+    }
+
+    if replacements.is_empty() {
+        return;
+    }
+    let mut html = html;
+    for (start, end, new_tag) in replacements.into_iter().rev() {
+        html.replace_range(start..end, &new_tag);
+    }
+    if let Err(e) = std::fs::write(path, html.as_bytes()) {
+        eprintln!("warn: reader image inline write {}: {e}", path.display());
+    }
+}
+
+/// Fetches `url` and returns a `data:<mime>;base64,…` URI.
+/// Requires `Content-Type: image/*`, enforces `max_bytes` cap and 5-redirect limit.
+fn fetch_image_as_data_uri(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    max_bytes: usize,
+) -> Result<String> {
+    let resp = client.get(url).send().context("request failed")?;
+    if !resp.status().is_success() {
+        bail!("HTTP {}", resp.status());
+    }
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let mime = ct.split(';').next().unwrap_or("").trim().to_string();
+    if !mime.starts_with("image/") {
+        bail!("non-image Content-Type: {mime}");
+    }
+    let bytes = resp.bytes().context("reading body")?;
+    if bytes.len() > max_bytes {
+        bail!("image too large: {} bytes", bytes.len());
+    }
+    Ok(format!("data:{};base64,{}", mime, B64.encode(&bytes)))
 }
 
 #[cfg(test)]
