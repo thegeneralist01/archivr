@@ -540,12 +540,12 @@ fn save_with(
              document.querySelectorAll('[data-nosnippet]').forEach(function(el){\
                if(!el.firstElementChild&&!el.textContent.trim())el.remove();\
              });\
-             document.querySelectorAll('[data-slot=\"dropdown-menu-trigger\"]').forEach(function(btn){\
-               if(!/download/i.test(btn.textContent||''))return;\
-               var sec=btn.closest('section');if(!sec)return;\
-               var prev=sec.previousElementSibling;\
-               if(prev&&prev.tagName==='HEADER')prev.remove();\
-               sec.remove();\
+             document.querySelectorAll('section>.flex.justify-end>button[data-slot=\"dropdown-menu-trigger\"][type=\"button\"].flex.items-center>span').forEach(function(span){\
+               if(span.textContent.trim()!=='Download article')return;\
+               var wrap=span.closest('.flex.justify-end');\
+               var sec=wrap.closest('section');\
+               wrap.remove();\
+               if(sec&&sec.children.length===0)sec.remove();\
              });",
         );
     }
