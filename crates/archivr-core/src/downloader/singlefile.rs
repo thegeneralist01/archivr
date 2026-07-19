@@ -672,7 +672,7 @@ fn save_with(
     // Post-process: fetch and inline images that SingleFile couldn't inline from the
     // page resource cache (resources introduced via DOM manipulation at before-capture
     // time are not tracked). Browser script stamped data-archivr-src on those images.
-    inline_archivr_img_srcs(&out_file);
+    inline_archivr_img_srcs(&out_file, url, cookies);
 
     let title = extract_html_title(&out_file);
     let html_hash = hash_file(&out_file)?;
@@ -845,8 +845,10 @@ fn mime_to_favicon_ext(mime: &str) -> Option<&'static str> {
 /// `src` is not already a large inlined image, fetches those URLs with blocking
 /// reqwest, and replaces `src` with `data:<mime>;base64,…`.  Non-fatal: any failure
 /// is logged and the image is left as-is.  Guardrails: 10 s timeout, 5 redirects,
-/// `Content-Type: image/*` required, 20 MiB body cap.
-fn inline_archivr_img_srcs(path: &Path) {
+/// `Content-Type: image/*` required, 20 MiB body cap (enforced via `Content-Length`
+/// and a bounded read).  Cookies are forwarded only when the image host matches the
+/// captured page's domain; Freedium fetches pass empty cookies so this is a no-op.
+fn inline_archivr_img_srcs(path: &Path, capture_url: &str, cookies: &HashMap<String, String>) {
     const MAX_BYTES: usize = 20 * 1024 * 1024;
 
     let html = match std::fs::read_to_string(path) {
@@ -867,9 +869,11 @@ fn inline_archivr_img_srcs(path: &Path) {
         Err(_) => return,
     };
 
-    let re_img     = Regex::new(r"(?si)<img\b[^>]*>").unwrap();
-    let re_archivr = Regex::new(r#"(?i)\bdata-archivr-src="([^"]+)""#).unwrap();
-    let re_src     = Regex::new(r#"(?i)\bsrc="([^"]*)""#).unwrap();
+    let capture_domain = domain_from_url(capture_url);
+
+    let re_img        = Regex::new(r"(?si)<img\b[^>]*>").unwrap();
+    let re_archivr    = Regex::new(r#"(?i)\bdata-archivr-src="([^"]+)""#).unwrap();
+    let re_src        = Regex::new(r#"(?i)\bsrc="([^"]*)""#).unwrap();
     let re_rm_archivr = Regex::new(r#"(?i)\s*data-archivr-src="[^"]*""#).unwrap();
     let re_set_src    = Regex::new(r#"(?i)\bsrc="[^"]*""#).unwrap();
 
@@ -879,16 +883,44 @@ fn inline_archivr_img_srcs(path: &Path) {
 
     for m in re_img.find_iter(&html) {
         let tag = m.as_str();
-        let img_url = match re_archivr.captures(tag).map(|c| c[1].to_string()) {
+        let raw_url = match re_archivr.captures(tag).map(|c| c[1].to_string()) {
             Some(u) => u,
             None => continue,
         };
+        // HTML-decode common entities that the browser's serialiser encodes in
+        // attribute values (e.g. & → &amp; in CDN signed/query URLs).
+        let img_url = raw_url
+            .replace("&amp;", "&")
+            .replace("&lt;",  "<")
+            .replace("&gt;",  ">")
+            .replace("&quot;", "\"");
+
         // Already a large inlined image — leave it alone.
         let cur_src = re_src.captures(tag).map(|c| c[1].to_string()).unwrap_or_default();
         if cur_src.starts_with("data:image/") && cur_src.len() > 1000 {
             continue;
         }
-        let data_uri = match fetch_image_as_data_uri(&client, &img_url, MAX_BYTES) {
+
+        // Forward cookies only when the image host exactly matches the captured
+        // page's domain.  Avoids leaking credentials to third-party image hosts.
+        let img_domain = domain_from_url(&img_url);
+        let cookie_header = if !capture_domain.is_empty()
+            && !img_domain.is_empty()
+            && img_domain == capture_domain
+            && !cookies.is_empty()
+        {
+            Some(
+                cookies
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+        } else {
+            None
+        };
+
+        let data_uri = match fetch_image_as_data_uri(&client, &img_url, MAX_BYTES, cookie_header) {
             Ok(u) => u,
             Err(e) => {
                 eprintln!("warn: reader image inline ({img_url}): {e}");
@@ -917,13 +949,19 @@ fn inline_archivr_img_srcs(path: &Path) {
 }
 
 /// Fetches `url` and returns a `data:<mime>;base64,…` URI.
-/// Requires `Content-Type: image/*`, enforces `max_bytes` cap and 5-redirect limit.
+/// Requires `Content-Type: image/*`, enforces `max_bytes` cap via `Content-Length`
+/// rejection and a bounded streaming read.  Attaches `cookie_header` when supplied.
 fn fetch_image_as_data_uri(
     client: &reqwest::blocking::Client,
     url: &str,
     max_bytes: usize,
+    cookie_header: Option<String>,
 ) -> Result<String> {
-    let resp = client.get(url).send().context("request failed")?;
+    let mut req = client.get(url);
+    if let Some(cookie) = cookie_header {
+        req = req.header(reqwest::header::COOKIE, cookie);
+    }
+    let resp = req.send().context("request failed")?;
     if !resp.status().is_success() {
         bail!("HTTP {}", resp.status());
     }
@@ -937,11 +975,23 @@ fn fetch_image_as_data_uri(
     if !mime.starts_with("image/") {
         bail!("non-image Content-Type: {mime}");
     }
-    let bytes = resp.bytes().context("reading body")?;
-    if bytes.len() > max_bytes {
-        bail!("image too large: {} bytes", bytes.len());
+    // Reject early when the server advertises a body larger than the cap.
+    if let Some(cl) = resp.content_length() {
+        if cl as usize > max_bytes {
+            bail!("Content-Length {} exceeds {} MiB cap", cl, max_bytes / (1024 * 1024));
+        }
     }
-    Ok(format!("data:{};base64,{}", mime, B64.encode(&bytes)))
+    // Stream at most max_bytes + 1 bytes so we never buffer an unbounded body.
+    // Reading one byte past the limit lets us distinguish "exactly at cap" from
+    // "over cap" without a separate Content-Length check.
+    let mut buf = Vec::new();
+    resp.take((max_bytes as u64) + 1)
+        .read_to_end(&mut buf)
+        .context("reading body")?;
+    if buf.len() > max_bytes {
+        bail!("image too large: > {} MiB", max_bytes / (1024 * 1024));
+    }
+    Ok(format!("data:{};base64,{}", mime, B64.encode(&buf)))
 }
 
 #[cfg(test)]
