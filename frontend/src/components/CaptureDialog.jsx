@@ -124,8 +124,17 @@ function makeItem(locator = '') {
 }
 
 function applyPlaylistQuality(newQ, currentItems) {
-  if (newQ === 'best' || newQ === 'audio') {
-    return currentItems.map(item => ({ ...item, quality: newQ }))
+  if (newQ === 'best') {
+    return currentItems.map(item => ({ ...item, quality: 'best' }))
+  }
+  if (newQ === 'audio') {
+    return currentItems.map(item => {
+      if (item.has_audio) return { ...item, quality: 'audio' }
+      // No audio track — same conflict rule as unsupported height:
+      // keep a prior selection if one exists, otherwise leave null (blocks archive).
+      if (item.quality !== null) return item
+      return { ...item, quality: null }
+    })
   }
   const newHeight = parseInt(newQ)
   return currentItems.map(item => {
@@ -698,7 +707,7 @@ function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemov
         const allHeights = [...new Set(
           item.playlistItems.flatMap(pi => pi.qualities.map(q => parseInt(q)))
         )].sort((a, b) => b - a)
-        const hasAnyAudio = item.playlistItems.some(pi => pi.has_audio)
+        const allHaveAudio = item.playlistItems.every(pi => pi.has_audio)
         const conflictCount = item.playlistItems.filter(pi => pi.quality === null).length
         return (
           <>
@@ -711,7 +720,7 @@ function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemov
               {!item.playlistQuality && <option value="" disabled>Select quality…</option>}
               <option value="best">Best quality</option>
               {allHeights.map(h => <option key={h} value={`${h}p`}>{h}p</option>)}
-              {hasAnyAudio && <option value="audio">Audio only</option>}
+              {allHaveAudio && <option value="audio">Audio only</option>}
             </select>
             {conflictCount > 0 && (
               <span className="capture-conflict-badge">{conflictCount} need selection</span>
