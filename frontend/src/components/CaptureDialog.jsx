@@ -744,7 +744,11 @@ function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemov
         )
       }
       if (item.playlistProbeState === 'error') {
-        return <span className="capture-quality-hint">Probe failed — using best quality</span>
+        return (
+          <span className="capture-quality-hint capture-quality-hint--error">
+            Probe failed — edit URL to retry
+          </span>
+        )
       }
       return null
     }

@@ -890,6 +890,7 @@ select {
   color: var(--muted);
   font-style: italic;
 }
+.capture-quality-hint--error { color: #c05000; font-style: normal; }
 
 /* Status dot */
 .cap-dot {
