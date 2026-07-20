@@ -1176,12 +1176,19 @@ pub fn perform_capture(
                 None => playlist_item.title.clone(),
             };
 
-            // Per-item quality override keyed by yt-dlp video ID; fall back to playlist-level.
-            let effective_child_quality: Option<&str> = config
-                .per_item_quality
-                .get(&playlist_item.id)
-                .map(String::as_str)
-                .or(child_quality);
+            // Per-item quality override keyed by yt-dlp video ID; fall back to
+            // playlist-level quality. YTM playlists are always audio-only —
+            // per_item_quality overrides are ignored so the audio-only guarantee
+            // cannot be bypassed by a caller sending e.g. "best".
+            let effective_child_quality: Option<&str> = if is_audio {
+                Some("audio")
+            } else {
+                config
+                    .per_item_quality
+                    .get(&playlist_item.id)
+                    .map(String::as_str)
+                    .or(child_quality)
+            };
 
             // Download the media.
             match downloader::ytdlp::download(
