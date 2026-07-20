@@ -436,7 +436,7 @@ export default function App() {
 
   const handleCaptured = useCallback(() => {
     if (!archiveId) return
-    return Promise.all([
+    return Promise.allSettled([
       loadEntries(archiveId, searchQuery, tagFilter),
       fetchRuns(archiveId).then(setRuns),
     ])
