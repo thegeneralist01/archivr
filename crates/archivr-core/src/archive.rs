@@ -552,8 +552,7 @@ pub fn get_archived_playlist_child_urls(
     )?;
     let urls = stmt
         .query_map([playlist_canonical_url], |row| row.get::<_, String>(0))?
-        .filter_map(|r| r.ok())
-        .collect::<std::collections::HashSet<_>>();
+        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
     Ok(urls)
 }
 
@@ -1760,4 +1759,87 @@ mod tests {
         );
         assert_eq!(results[0].entry_uid, parent.entry_uid);
     }
+    // ── sync helper tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn find_container_entry_id_returns_none_when_absent() {
+        let (conn, _, _) = make_tag_test_db();
+        let result = find_container_entry_id_by_canonical_url(
+            &conn,
+            "https://www.youtube.com/playlist?list=PLnobody",
+        )
+        .unwrap();
+        assert!(result.is_none(), "should return None when no entry exists");
+    }
+
+    #[test]
+    fn find_container_entry_id_returns_root_entry() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        let playlist_url = "https://www.youtube.com/playlist?list=PLtest";
+        let container = make_entry_in_db(&conn, user_id, run_id, None, None, "My Playlist", playlist_url);
+        let result = find_container_entry_id_by_canonical_url(&conn, playlist_url)
+            .unwrap()
+            .expect("should find the container");
+        assert_eq!(result, container.id);
+    }
+
+    #[test]
+    fn find_container_entry_id_ignores_child_entries() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        let child_url = "https://www.youtube.com/watch?v=abc123";
+        // Create a parent container and a child whose canonical URL happens to be
+        // what we're querying — should NOT be returned since it has parent_entry_id set.
+        let parent = make_entry_in_db(&conn, user_id, run_id, None, None, "PL", "https://example.com/pl");
+        let _child = make_entry_in_db(&conn, user_id, run_id, Some(parent.id), Some(parent.id), "Vid", child_url);
+        let result = find_container_entry_id_by_canonical_url(&conn, child_url).unwrap();
+        assert!(result.is_none(), "child entry should not be returned as a container");
+    }
+
+    #[test]
+    fn get_archived_playlist_child_urls_empty_when_no_playlist() {
+        let (conn, _, _) = make_tag_test_db();
+        let urls = get_archived_playlist_child_urls(
+            &conn,
+            "https://www.youtube.com/playlist?list=PLnone",
+        )
+        .unwrap();
+        assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn get_archived_playlist_child_urls_returns_children() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        let playlist_url = "https://www.youtube.com/playlist?list=PLchildren";
+        let container = make_entry_in_db(&conn, user_id, run_id, None, None, "Playlist", playlist_url);
+
+        let child1_url = "https://www.youtube.com/watch?v=vid1";
+        let child2_url = "https://www.youtube.com/watch?v=vid2";
+        make_entry_in_db(&conn, user_id, run_id, Some(container.id), Some(container.id), "Vid 1", child1_url);
+        make_entry_in_db(&conn, user_id, run_id, Some(container.id), Some(container.id), "Vid 2", child2_url);
+
+        let urls = get_archived_playlist_child_urls(&conn, playlist_url).unwrap();
+        assert_eq!(urls.len(), 2);
+        assert!(urls.contains(child1_url), "should contain vid1");
+        assert!(urls.contains(child2_url), "should contain vid2");
+    }
+
+    #[test]
+    fn get_archived_playlist_child_urls_excludes_other_playlists() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        let pl_a = "https://www.youtube.com/playlist?list=PLA";
+        let pl_b = "https://www.youtube.com/playlist?list=PLB";
+        let container_a = make_entry_in_db(&conn, user_id, run_id, None, None, "PL A", pl_a);
+        let container_b = make_entry_in_db(&conn, user_id, run_id, None, None, "PL B", pl_b);
+
+        let vid_a = "https://www.youtube.com/watch?v=forA";
+        let vid_b = "https://www.youtube.com/watch?v=forB";
+        make_entry_in_db(&conn, user_id, run_id, Some(container_a.id), Some(container_a.id), "A Vid", vid_a);
+        make_entry_in_db(&conn, user_id, run_id, Some(container_b.id), Some(container_b.id), "B Vid", vid_b);
+
+        let urls_a = get_archived_playlist_child_urls(&conn, pl_a).unwrap();
+        assert_eq!(urls_a.len(), 1);
+        assert!(urls_a.contains(vid_a));
+        assert!(!urls_a.contains(vid_b), "should not include children of other playlists");
+    }
+
 }

@@ -1089,8 +1089,13 @@ pub fn perform_capture(
                             &format!("Failed to complete run item for existing container: {e:#}"),
                         ));
                     }
-                    let archived = archive::get_archived_playlist_child_urls(&conn, &canonical_url)
-                        .unwrap_or_default();
+                    let archived = match archive::get_archived_playlist_child_urls(&conn, &canonical_url) {
+                        Ok(set) => set,
+                        Err(e) => return Err(fail_run(
+                            &conn, &run, &item,
+                            &format!("Failed to query archived playlist children: {e:#}"),
+                        )),
+                    };
                     (existing_id, archived)
                 }
                 Ok(None) => {
@@ -2619,6 +2624,43 @@ mod tests {
             generate_entry_title(Source::WebPage, &meta),
             "Archived Web Page"
         );
+    }
+
+    #[test]
+    fn locator_to_playlist_url_accepts_playlist_shorthands() {
+        // yt: playlist shorthand
+        assert_eq!(
+            locator_to_playlist_url("yt:playlist/PLtest123"),
+            Some("https://www.youtube.com/playlist?list=PLtest123".to_string()),
+        );
+        // YouTube Music playlist shorthand
+        assert_eq!(
+            locator_to_playlist_url("ytm:playlist/PLmus456"),
+            Some("https://music.youtube.com/playlist?list=PLmus456".to_string()),
+        );
+        // Full YT playlist URL passes through (expand_shorthand_to_url is identity for full URLs)
+        let full = "https://www.youtube.com/playlist?list=PLabc";
+        assert_eq!(locator_to_playlist_url(full), Some(full.to_string()));
+    }
+
+    #[test]
+    fn locator_to_playlist_url_accepts_channel_shorthands() {
+        let url = locator_to_playlist_url("yt:@MyChan");
+        assert!(url.is_some(), "channel @ shorthand should return Some");
+        let u = url.unwrap();
+        assert!(u.contains("youtube.com"), "should be a youtube URL: {u}");
+    }
+
+    #[test]
+    fn locator_to_playlist_url_rejects_non_playlist_sources() {
+        // Single video
+        assert_eq!(locator_to_playlist_url("yt:dQw4w9WgXcQ"), None);
+        // Tweet
+        assert_eq!(locator_to_playlist_url("tweet:1234567890"), None);
+        // YTM track
+        assert_eq!(locator_to_playlist_url("ytm:MntbN1DdEP0"), None);
+        // Plain web URL
+        assert_eq!(locator_to_playlist_url("https://example.com/page"), None);
     }
 
 }
