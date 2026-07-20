@@ -1,6 +1,7 @@
 export default function SkeletonEntryRow() {
   return (
     <div className="skeleton-row">
+      <div className="col-check" aria-hidden="true" />
       <div className="col-added">
         <span className="skeleton-cell" style={{ width: 108, height: 13 }} />
       </div>

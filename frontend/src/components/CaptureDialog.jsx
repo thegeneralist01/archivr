@@ -206,8 +206,8 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
         if (updated.status === 'completed') {
           clearInterval(pollIntervals.current.get(jobUid))
           pollIntervals.current.delete(jobUid)
+          await Promise.resolve(onCapturedRef.current?.())
           onJobSettledRef.current?.(bgJobId)
-          onCapturedRef.current()
           try {
             const notes = updated.notes_json ? JSON.parse(updated.notes_json) : null
             if (notes?.ublock_skipped || notes?.cookie_ext_skipped) {
