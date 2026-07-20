@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState, useCallback } from 'react'
-import { submitCapture, pollCaptureJob, probeCapture, getInstanceSettings } from '../api'
+import { submitCapture, pollCaptureJob, probeCapture, probePlaylist, getInstanceSettings } from '../api'
 
 let nextItemId = 1
 
@@ -63,6 +63,43 @@ function isVideoSource(locator) {
   return false
 }
 
+function isPlaylistSource(locator) {
+  const l = locator.trim()
+  const ll = l.toLowerCase()
+
+  // yt: / youtube: shorthands — playlist, channel, @ handles
+  for (const scheme of ['yt:', 'youtube:']) {
+    if (ll.startsWith(scheme)) {
+      const after = ll.slice(scheme.length)
+      return after.startsWith('playlist/') || after.startsWith('@') ||
+             after.startsWith('channel/') || after.startsWith('c/')
+    }
+  }
+
+  // ytm: shorthand — playlist
+  if (ll.startsWith('ytm:')) {
+    return ll.slice(4).startsWith('playlist/')
+  }
+
+  // HTTP/HTTPS URLs
+  if (ll.startsWith('http://') || ll.startsWith('https://')) {
+    try {
+      const url = new URL(l)
+      const host = url.hostname
+      if (host === 'youtube.com' || host === 'www.youtube.com' || host === 'm.youtube.com') {
+        if (url.searchParams.has('list')) return true
+        if (url.pathname.startsWith('/@') || url.pathname.startsWith('/channel/') ||
+            url.pathname.startsWith('/c/') || url.pathname.startsWith('/user/')) return true
+      }
+      if (host === 'music.youtube.com') {
+        if (url.pathname.startsWith('/playlist') || url.searchParams.has('list')) return true
+      }
+    } catch {}
+  }
+
+  return false
+}
+
 function makeItem(locator = '') {
   return {
     id: nextItemId++, locator, quality: 'best',
@@ -71,7 +108,37 @@ function makeItem(locator = '') {
     probeQualities: null,  // null | string[] when done, e.g. ["1080p","720p","480p"]
     probeHasAudio: false,  // true when probe confirms at least one audio track
     status: 'idle', error: null, jobUid: null, archiveId: null,
+    // playlist probe state
+    playlistProbeState: 'idle',  // 'idle' | 'probing' | 'done' | 'error'
+    playlistInfo: null,          // raw API response or null
+    playlistItems: null,         // [{id, url, title, qualities, has_audio, quality}] or null
+    playlistQuality: null,       // selected playlist-level quality string or null
+    playlistExpanded: false,     // whether per-video list is expanded
+    syncEnabled: false,          // sync mode toggle
   }
+}
+
+function applyPlaylistQuality(newQ, currentItems) {
+  if (newQ === 'best' || newQ === 'audio') {
+    return currentItems.map(item => ({ ...item, quality: newQ }))
+  }
+  const newHeight = parseInt(newQ)
+  return currentItems.map(item => {
+    if (item.qualities.length === 0) {
+      return item
+    }
+    const maxHeight = Math.max(...item.qualities.map(q => parseInt(q)))
+    if (maxHeight >= newHeight) {
+      return { ...item, quality: newQ }
+    } else {
+      if (item.quality !== null) return item
+      return { ...item, quality: null }
+    }
+  })
+}
+
+function hasConflict(item) {
+  return item.playlistItems !== null && item.playlistItems.some(pi => pi.quality === null)
 }
 
 export default function CaptureDialog({ open, archiveId, onClose, onCaptured, onToast, onJobStarted, onJobSettled, activeJobs = [] }) {
@@ -283,7 +350,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     onToastRef.current(text, null, type, headline)
   }
 
-  async function submitBgJob(locator, quality, batchId) {
+  async function submitBgJob(locator, quality, batchId, extraExtensions = {}) {
     const aid = archiveIdRef.current
     const id = crypto.randomUUID?.() ?? `job-${Date.now()}-${Math.random()}`
     // Capture session options at call time (synchronous — before first await)
@@ -293,6 +360,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
       cookie_ext_enabled: cookieExtEnabled,
       modal_closer_enabled: modalCloserEnabled,
       via_freedium: freediumEnabled,
+      ...extraExtensions,
     }
     try {
       const job = await submitCapture(aid, locator, quality, extensions)
@@ -315,13 +383,21 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     if (batchId) {
       batchRef.current.set(batchId, { total: toSubmit.length, archived: 0, warnings: 0, failed: 0, failedLocators: [], warningLocators: [] })
     }
-    // Capture options at call time before any state changes
-    const capturedQuality = toSubmit.map(it => it.quality || 'best')
+    // Capture all submission data before any state changes
+    const submissions = toSubmit.map(it => ({
+      locator: it.locator.trim(),
+      quality: it.playlistItems !== null ? null : (it.quality || 'best'),
+      extraExtensions: it.playlistItems !== null
+        ? { per_item_quality: Object.fromEntries(it.playlistItems.map(pi => [pi.id, pi.quality])), sync: it.syncEnabled }
+        : {},
+    }))
     // Reset form and close dialog immediately
     setItems([makeItem()])
     dialogRef.current?.close()
     // Submit each in background
-    toSubmit.forEach((it, i) => submitBgJob(it.locator.trim(), capturedQuality[i], batchId))
+    submissions.forEach(({ locator, quality, extraExtensions }) =>
+      submitBgJob(locator, quality, batchId, extraExtensions)
+    )
   }
 
   function addRow() {
@@ -340,45 +416,92 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   function updateLocator(id, val) {
     // Cancel any in-flight debounce and immediately clear stale probe results.
     // This prevents old qualities from being visible (and submittable) while
-    // the 600ms debounce is pending for the new URL.
+    // the debounce is pending for the new URL.
     clearTimeout(probeTimers.current.get(id))
     setItems(prev => prev.map(it =>
       it.id === id
-        ? { ...it, locator: val, probeState: 'idle', probeQualities: null, probeHasAudio: false, quality: 'best' }
+        ? { ...it, locator: val, probeState: 'idle', probeQualities: null, probeHasAudio: false, quality: 'best',
+            playlistProbeState: 'idle', playlistInfo: null, playlistItems: null, playlistQuality: null, playlistExpanded: false }
         : it
     ))
 
-    if (!isVideoSource(val)) return
-
-    // Schedule a fresh probe after the user stops typing
-    const timer = setTimeout(async () => {
-      probeTimers.current.delete(id)
-      setItems(prev => prev.map(it => it.id === id ? { ...it, probeState: 'probing' } : it))
-      try {
-        const result = await probeCapture(archiveIdRef.current, val.trim())
-        setItems(prev => prev.map(it => {
-          if (it.id !== id || it.locator !== val) return it // stale — locator changed again
-          const qualities = result.qualities ?? []
-          const hasAudio = result.has_audio ?? false
-          // Audio-only source: no video heights but audio confirmed — force audio mode
-          const quality = (qualities.length === 0 && hasAudio) ? 'audio' : 'best'
-          return { ...it, probeState: 'done', probeQualities: qualities, probeHasAudio: hasAudio, quality }
-        }))
-      } catch {
-        // Probe failed (network error, etc.) — clear silently; user can still submit
-        setItems(prev => prev.map(it =>
-          it.id === id ? { ...it, probeState: 'idle', probeQualities: null } : it
-        ))
-      }
-    }, 600)
-    probeTimers.current.set(id, timer)
+    if (isVideoSource(val)) {
+      // Schedule a fresh probe after the user stops typing
+      const timer = setTimeout(async () => {
+        probeTimers.current.delete(id)
+        setItems(prev => prev.map(it => it.id === id ? { ...it, probeState: 'probing' } : it))
+        try {
+          const result = await probeCapture(archiveIdRef.current, val.trim())
+          setItems(prev => prev.map(it => {
+            if (it.id !== id || it.locator !== val) return it // stale — locator changed again
+            const qualities = result.qualities ?? []
+            const hasAudio = result.has_audio ?? false
+            // Audio-only source: no video heights but audio confirmed — force audio mode
+            const quality = (qualities.length === 0 && hasAudio) ? 'audio' : 'best'
+            return { ...it, probeState: 'done', probeQualities: qualities, probeHasAudio: hasAudio, quality }
+          }))
+        } catch {
+          // Probe failed (network error, etc.) — clear silently; user can still submit
+          setItems(prev => prev.map(it =>
+            it.id === id ? { ...it, probeState: 'idle', probeQualities: null } : it
+          ))
+        }
+      }, 600)
+      probeTimers.current.set(id, timer)
+    } else if (isPlaylistSource(val)) {
+      // Schedule a playlist probe (playlists are slower — 800ms debounce)
+      const timer = setTimeout(async () => {
+        probeTimers.current.delete(id)
+        setItems(prev => prev.map(it => it.id === id ? { ...it, playlistProbeState: 'probing' } : it))
+        try {
+          const result = await probePlaylist(archiveIdRef.current, val.trim())
+          setItems(prev => prev.map(it => {
+            if (it.id !== id || it.locator !== val) return it // stale — locator changed again
+            return {
+              ...it,
+              playlistProbeState: 'done',
+              playlistInfo: result,
+              playlistItems: result.items.map(pi => ({ ...pi, quality: null })),
+              playlistQuality: null,
+            }
+          }))
+        } catch {
+          setItems(prev => prev.map(it =>
+            it.id === id ? { ...it, playlistProbeState: 'error' } : it
+          ))
+        }
+      }, 800)
+      probeTimers.current.set(id, timer)
+    }
   }
 
   function updateQuality(id, val) {
     setItems(prev => prev.map(it => it.id === id ? { ...it, quality: val } : it))
   }
 
+  function updatePlaylistQuality(id, q) {
+    setItems(prev => prev.map(it => {
+      if (it.id !== id) return it
+      const newItems = applyPlaylistQuality(q, it.playlistItems)
+      return { ...it, playlistQuality: q, playlistItems: newItems }
+    }))
+  }
+  function updatePlaylistItemQuality(id, videoId, q) {
+    setItems(prev => prev.map(it => {
+      if (it.id !== id) return it
+      return { ...it, playlistItems: it.playlistItems.map(pi => pi.id === videoId ? { ...pi, quality: q } : pi) }
+    }))
+  }
+  function togglePlaylistExpanded(id) {
+    setItems(prev => prev.map(it => it.id === id ? { ...it, playlistExpanded: !it.playlistExpanded } : it))
+  }
+  function updateSync(id, val) {
+    setItems(prev => prev.map(it => it.id === id ? { ...it, syncEnabled: val } : it))
+  }
+
   const pendingCount = items.filter(it => it.locator.trim()).length
+  const anyConflict = items.some(it => hasConflict(it))
+  const anyProbing = items.some(it => it.playlistProbeState === 'probing' || it.probeState === 'probing')
 
   return (
     <dialog ref={dialogRef} className="capture-dialog">
@@ -407,6 +530,10 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
               onQualityChange={val => updateQuality(item.id, val)}
               onRemove={() => removeRow(item.id)}
               onSubmit={handleArchive}
+              onPlaylistQualityChange={q => updatePlaylistQuality(item.id, q)}
+              onPlaylistItemQualityChange={(vid, q) => updatePlaylistItemQuality(item.id, vid, q)}
+              onPlaylistToggle={() => togglePlaylistExpanded(item.id)}
+              onSyncChange={val => updateSync(item.id, val)}
             />
           ))}
         </div>
@@ -530,7 +657,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
             type="button"
             className="capture-submit"
             onClick={handleArchive}
-            disabled={pendingCount === 0}
+            disabled={pendingCount === 0 || anyConflict || anyProbing}
           >
             {pendingCount > 1 ? `Archive ${pendingCount}` : 'Archive'}
           </button>
@@ -543,7 +670,8 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   )
 }
 
-function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemove, onSubmit }) {
+function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemove, onSubmit,
+  onPlaylistQualityChange, onPlaylistItemQualityChange, onPlaylistToggle, onSyncChange }) {
   const inputRef = useRef(null)
 
   useEffect(() => {
@@ -554,6 +682,52 @@ function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemov
 
   // Quality control shown right of the input
   const qualityEl = (() => {
+    // Playlist source handling
+    if (isPlaylistSource(item.locator)) {
+      if (item.playlistProbeState === 'probing') {
+        return <span className="capture-quality-probing" aria-label="Probing playlist…">…</span>
+      }
+      if (item.playlistProbeState === 'done') {
+        const allHeights = [...new Set(
+          item.playlistItems.flatMap(pi => pi.qualities.map(q => parseInt(q)))
+        )].sort((a, b) => b - a)
+        const hasAnyAudio = item.playlistItems.some(pi => pi.has_audio)
+        const conflictCount = item.playlistItems.filter(pi => pi.quality === null).length
+        return (
+          <>
+            <select
+              className="capture-quality"
+              value={item.playlistQuality ?? ''}
+              onChange={e => onPlaylistQualityChange(e.target.value)}
+              aria-label="Playlist quality"
+            >
+              {!item.playlistQuality && <option value="" disabled>Select quality…</option>}
+              <option value="best">Best quality</option>
+              {allHeights.map(h => <option key={h} value={`${h}p`}>{h}p</option>)}
+              {hasAnyAudio && <option value="audio">Audio only</option>}
+            </select>
+            {conflictCount > 0 && (
+              <span className="capture-conflict-badge">{conflictCount} need selection</span>
+            )}
+            <button
+              type="button"
+              className="capture-playlist-toggle"
+              onClick={onPlaylistToggle}
+              aria-label={item.playlistExpanded ? 'Collapse video list' : 'Expand video list'}
+              aria-expanded={item.playlistExpanded}
+            >
+              {item.playlistExpanded ? '▲' : '▼'}
+            </button>
+          </>
+        )
+      }
+      if (item.playlistProbeState === 'error') {
+        return <span className="capture-quality-hint">Probe failed — using best quality</span>
+      }
+      return null
+    }
+
+    // Video source handling (unchanged)
     if (!isVideoSource(item.locator)) return null
     if (item.probeState === 'probing') {
       return <span className="capture-quality-probing" aria-label="Checking available qualities">…</span>
@@ -565,8 +739,6 @@ function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemov
         return <span className="capture-quality-hint">No media detected</span>
       }
       if (qualities.length === 0 && hasAudio) {
-        // Audio-only source: no video tracks, only audio available.
-        // Don't offer "Best quality" — it would request a video format and fail.
         return (
           <select
             className="capture-quality"
@@ -594,6 +766,13 @@ function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemov
     return null // probeState === 'idle', debounce not yet fired
   })()
 
+  const syncToggle = isPlaylistSource(item.locator) && item.playlistProbeState === 'done' ? (
+    <label className="capture-sync-row">
+      <input type="checkbox" checked={item.syncEnabled} onChange={e => onSyncChange(e.target.checked)} />
+      <span>Sync — skip already-archived videos</span>
+    </label>
+  ) : null
+
   return (
     <div className="capture-row">
       <div className="capture-row-main">
@@ -618,6 +797,33 @@ function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemov
       {item.error && (
         <p className="capture-row-error">{item.error}</p>
       )}
+      {isPlaylistSource(item.locator) && item.playlistProbeState === 'done' && item.playlistExpanded ? (
+        <div className="capture-playlist-items">
+          {item.playlistItems.map(pi => (
+            <div
+              key={pi.id}
+              className={`capture-playlist-item${pi.quality === null ? ' capture-playlist-item--conflict' : ''}`}
+            >
+              <span className="capture-playlist-item-title">{pi.title || pi.url}</span>
+              <select
+                className="capture-item-quality"
+                value={pi.quality ?? ''}
+                onChange={e => onPlaylistItemQualityChange(pi.id, e.target.value)}
+                aria-label={`Quality for ${pi.title || pi.url}`}
+              >
+                {pi.quality === null && <option value="" disabled>Choose…</option>}
+                <option value="best">Best quality</option>
+                {pi.qualities.map(q => <option key={q} value={q}>{q}</option>)}
+                {pi.has_audio && <option value="audio">Audio only</option>}
+              </select>
+              {pi.quality === null && (
+                <span className="capture-playlist-conflict-badge">Choose quality</span>
+              )}
+            </div>
+          ))}
+          {syncToggle}
+        </div>
+      ) : syncToggle}
     </div>
   )
 }

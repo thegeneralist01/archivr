@@ -153,6 +153,8 @@ export async function submitCapture(archiveId, locator, quality = null, extensio
     if (typeof extensions.cookie_ext_enabled === 'boolean') payload.cookie_ext_enabled = extensions.cookie_ext_enabled
     if (typeof extensions.modal_closer_enabled === 'boolean') payload.modal_closer_enabled = extensions.modal_closer_enabled
     if (typeof extensions.via_freedium === 'boolean') payload.via_freedium = extensions.via_freedium
+    if (extensions.per_item_quality && typeof extensions.per_item_quality === 'object' && Object.keys(extensions.per_item_quality).length > 0) payload.per_item_quality = extensions.per_item_quality
+    if (extensions.sync === true) payload.sync = true
   }
   const res = await fetch(`/api/archives/${archiveId}/captures`, {
     method: "POST",
@@ -170,6 +172,19 @@ export async function submitCapture(archiveId, locator, quality = null, extensio
 // Throws on network error; returns { has_video: false, qualities: [] } on non-video locators.
 export async function probeCapture(archiveId, locator) {
   return getJson(`/api/archives/${archiveId}/captures/probe?locator=${encodeURIComponent(locator)}`);
+}
+
+export async function probePlaylist(archiveId, locator) {
+  const res = await fetch(`/api/archives/${archiveId}/captures/probe-playlist`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ locator }),
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.error || `HTTP ${res.status}`)
+  }
+  return res.json()
 }
 
 export async function pollCaptureJob(archiveId, jobUid) {
