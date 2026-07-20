@@ -392,7 +392,8 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     const toSubmit = items.filter(it => it.locator.trim())
     if (toSubmit.length === 0) return
     if (toSubmit.some(it => hasConflict(it))) return
-    if (toSubmit.some(it => it.playlistProbeState === 'probing' || it.probeState === 'probing')) return
+    if (toSubmit.some(it => it.probeState === 'probing' ||
+        (isPlaylistSource(it.locator) && it.playlistProbeState !== 'done'))) return
     const batchId = toSubmit.length > 1
       ? (crypto.randomUUID?.() ?? `batch-${Date.now()}`)
       : null
@@ -517,7 +518,12 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
 
   const pendingCount = items.filter(it => it.locator.trim()).length
   const anyConflict = items.some(it => hasConflict(it))
-  const anyProbing = items.some(it => it.playlistProbeState === 'probing' || it.probeState === 'probing')
+  const anyProbing = items.some(it =>
+    it.probeState === 'probing' ||
+    // For playlist sources block unless probe completed successfully:
+    // idle = debounce not yet fired; probing = in flight; error = no quality data.
+    (isPlaylistSource(it.locator) && it.playlistProbeState !== 'done')
+  )
 
   return (
     <dialog ref={dialogRef} className="capture-dialog">
