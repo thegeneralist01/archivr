@@ -86,7 +86,7 @@ function isPlaylistSource(locator) {
     try {
       const url = new URL(l)
       const host = url.hostname
-      if (host === 'youtube.com' || host === 'www.youtube.com' || host === 'm.youtube.com') {
+      if (host === 'youtube.com' || host === 'www.youtube.com') {
         // Mirror determine_source exactly:
         // - /playlist?list=... → YouTubePlaylist
         // - /@handle, /channel/, /c/, /user/ → YouTubeChannel
