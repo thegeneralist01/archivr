@@ -872,6 +872,13 @@ async fn capture_handler(
             )));
         }
     }
+    // NOTE: the server does not enforce that every playlist item has a per_item_quality
+    // entry. Items without an override receive the global `quality` value, which
+    // yt-dlp applies as a format-selector cap (e.g. bestvideo[height<=1080]) and
+    // falls back gracefully to the best available format below that cap. The
+    // "must choose quality for unsupported videos" invariant is enforced by the
+    // frontend before submission; a direct API caller bypassing the UI accepts
+    // yt-dlp's standard cap-and-fallback behavior.
     let mounted = mounted_archive(&state, &archive_id)?;
     let archive_paths =
         archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;
