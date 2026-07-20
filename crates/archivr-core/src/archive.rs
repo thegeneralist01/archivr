@@ -529,6 +529,59 @@ pub fn list_child_entries(
     Ok(entries)
 }
 
+/// Returns the set of canonical URLs for all child entries archived under
+/// **any** container entry whose own canonical URL matches `playlist_canonical_url`.
+///
+/// Used in sync mode so the playlist capture path can skip videos that were
+/// already downloaded in a previous run of the same playlist.
+pub fn get_archived_playlist_child_urls(
+    conn: &rusqlite::Connection,
+    playlist_canonical_url: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT si_child.canonical_url \
+         FROM archived_entries child \
+         JOIN source_identities si_child ON si_child.id = child.source_identity_id \
+         WHERE child.parent_entry_id IN ( \
+             SELECT e.id \
+             FROM archived_entries e \
+             JOIN source_identities si ON si.id = e.source_identity_id \
+             WHERE si.canonical_url = ?1 \
+               AND e.parent_entry_id IS NULL \
+         )",
+    )?;
+    let urls = stmt
+        .query_map([playlist_canonical_url], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect::<std::collections::HashSet<_>>();
+    Ok(urls)
+}
+
+/// Finds the most recent container entry (parent_entry_id IS NULL) whose
+/// canonical URL matches `canonical_url`. Returns its row id, or None if
+/// no such entry exists.
+///
+/// Used in sync mode to reuse an existing playlist/channel container instead
+/// of creating a duplicate root entry on every sync run.
+pub fn find_container_entry_id_by_canonical_url(
+    conn: &rusqlite::Connection,
+    canonical_url: &str,
+) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.id \
+         FROM archived_entries e \
+         JOIN source_identities si ON si.id = e.source_identity_id \
+         WHERE si.canonical_url = ?1 \
+           AND e.parent_entry_id IS NULL \
+         ORDER BY e.archived_at DESC \
+         LIMIT 1",
+    )?;
+    let id = stmt
+        .query_row([canonical_url], |row| row.get::<_, i64>(0))
+        .optional()?;
+    Ok(id)
+}
+
 /// Resolves an artifact to its absolute on-disk path under `store_path`.
 ///
 /// `artifact.relpath` is a store-relative path (e.g. `raw/a/b/abc.pdf`).

@@ -29,6 +29,27 @@ pub struct PlaylistInfo {
     pub items: Vec<PlaylistItem>,
 }
 
+/// Per-item quality data returned by `probe_playlist_qualities`.
+#[derive(Debug, serde::Serialize)]
+pub struct PlaylistItemProbe {
+    pub id: String,
+    pub url: String,
+    pub title: Option<String>,
+    /// Available video heights as strings (e.g. "1080p"), sorted highest-first.
+    /// Empty vec means audio-only (no video track).
+    pub qualities: Vec<String>,
+    pub has_audio: bool,
+}
+
+/// Full playlist probe result with per-item quality data.
+#[derive(Debug, serde::Serialize)]
+pub struct PlaylistProbeResult {
+    pub playlist_id: String,
+    pub title: Option<String>,
+    pub uploader: Option<String>,
+    pub items: Vec<PlaylistItemProbe>,
+}
+
 /// Returns the yt-dlp `-f` format selector for `quality`.
 ///
 /// - `"audio"` → prefers native Opus/WebM (most efficient), then native
@@ -87,6 +108,23 @@ pub fn available_video_heights(json: &str) -> Vec<u32> {
             let h = f.get("height")?.as_u64()?;
             if h == 0 { None } else { Some(h as u32) }
         })
+        .collect();
+    heights.sort_unstable_by(|a, b| b.cmp(a));
+    heights.dedup();
+    heights
+}
+
+/// Extracts distinct video heights from a serde_json entry Value's `formats` array,
+/// sorted highest-first. Audio-only formats (vcodec == "none") are excluded.
+fn available_video_heights_from_value(entry: &serde_json::Value) -> Vec<u32> {
+    let Some(fmts) = entry.get("formats").and_then(|v| v.as_array()) else {
+        return vec![];
+    };
+    let mut heights: Vec<u32> = fmts
+        .iter()
+        .filter(|f| f.get("vcodec").and_then(|c| c.as_str()).unwrap_or("none") != "none")
+        .filter_map(|f| f.get("height").and_then(|h| h.as_u64()).map(|h| h as u32))
+        .filter(|&h| h > 0)
         .collect();
     heights.sort_unstable_by(|a, b| b.cmp(a));
     heights.dedup();
@@ -363,6 +401,98 @@ pub fn fetch_playlist_info(url: &str, cookies: &HashMap<String, String>) -> Resu
     }
 
     Ok(PlaylistInfo { playlist_id, title, uploader, items })
+}
+
+/// Runs `yt-dlp -J <url>` (full metadata, NOT --flat-playlist) and returns
+/// per-item quality data for every entry in the playlist.
+///
+/// This makes one yt-dlp subprocess call that fetches full format data for
+/// all videos — expensive for large playlists but gives accurate per-video
+/// quality lists. Intended for pre-capture quality selection only.
+pub fn probe_playlist_qualities(
+    url: &str,
+    cookies: &HashMap<String, String>,
+) -> Result<PlaylistProbeResult> {
+    let ytdlp = std::env::var("ARCHIVR_YT_DLP").unwrap_or_else(|_| "yt-dlp".to_string());
+
+    let cookie_file: Option<PathBuf> = if !cookies.is_empty() {
+        let domain = domain_from_url(url);
+        let p = std::env::temp_dir()
+            .join(format!("archivr-cookies-{}.txt", Uuid::new_v4().simple()));
+        write_netscape_cookie_file(cookies, &domain, &p)
+            .context("failed to write yt-dlp cookie file")?;
+        Some(p)
+    } else {
+        None
+    };
+
+    let mut cmd = std::process::Command::new(&ytdlp);
+    cmd.arg("-J"); // full metadata — NOT --flat-playlist
+    if let Some(cf) = &cookie_file {
+        cmd.arg("--cookies").arg(cf);
+    }
+    cmd.arg(url);
+
+    let out = cmd.output();
+    if let Some(cf) = &cookie_file {
+        let _ = std::fs::remove_file(cf);
+    }
+    let out = out.with_context(|| format!("failed to spawn {ytdlp}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!("yt-dlp -J failed for {url}: {stderr}");
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .context("yt-dlp -J output is not valid JSON")?;
+
+    let ty = json.get("_type").and_then(|v| v.as_str()).unwrap_or("");
+    if ty != "playlist" {
+        bail!("yt-dlp output _type is {ty:?}, expected \"playlist\"");
+    }
+
+    let playlist_id = json.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let title = json.get("title").and_then(|v| v.as_str()).map(str::to_owned);
+    let uploader = json.get("uploader").and_then(|v| v.as_str()).map(str::to_owned);
+
+    // Same URL normalization as fetch_playlist_info
+    let fallback_host = if url.contains("music.youtube.com") {
+        "music.youtube.com"
+    } else {
+        "www.youtube.com"
+    };
+    let is_absolute = |s: &str| s.starts_with("http://") || s.starts_with("https://");
+
+    let raw_entries = json
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+
+    let mut items = Vec::with_capacity(raw_entries.len());
+    for entry in raw_entries {
+        if entry.is_null() { continue; }
+        let id = match entry.get("id").and_then(|v| v.as_str()) {
+            Some(s) => s.to_owned(),
+            None => continue,
+        };
+        let item_url = entry
+            .get("webpage_url").and_then(|v| v.as_str()).filter(|s| is_absolute(s)).map(str::to_owned)
+            .or_else(|| entry.get("url").and_then(|v| v.as_str()).filter(|s| is_absolute(s)).map(str::to_owned))
+            .unwrap_or_else(|| format!("https://{fallback_host}/watch?v={id}"));
+        let item_title = entry.get("title").and_then(|v| v.as_str()).map(str::to_owned);
+        let heights = available_video_heights_from_value(entry);
+        let qualities: Vec<String> = heights.iter().map(|h| format!("{h}p")).collect();
+        let has_audio = entry
+            .get("formats").and_then(|v| v.as_array())
+            .map(|fmts| fmts.iter().any(|f| {
+                f.get("acodec").and_then(|c| c.as_str()).unwrap_or("none") != "none"
+            }))
+            .unwrap_or(false);
+        items.push(PlaylistItemProbe { id, url: item_url, title: item_title, qualities, has_audio });
+    }
+
+    Ok(PlaylistProbeResult { playlist_id, title, uploader, items })
 }
 
 #[cfg(test)]

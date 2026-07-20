@@ -7,7 +7,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use crate::{archive::ArchivePaths, database, downloader, twitter::parse_tweet_id};
+use crate::{archive::{self, ArchivePaths}, database, downloader, twitter::parse_tweet_id};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Source {
@@ -90,6 +90,14 @@ pub struct CaptureConfig {
     /// Route WebPage captures through the Freedium mirror to bypass paywalls.
     /// The original locator is still recorded in the DB; only the fetch URL changes.
     pub via_freedium: bool,
+    /// Per-item quality overrides for playlist captures.
+    /// Keys are yt-dlp video IDs (e.g. "dQw4w9WgXcQ"); values are quality strings
+    /// accepted by `quality_format` ("best", "audio", "1080p", etc.).
+    /// Empty map = apply the global `quality` to all items.
+    pub per_item_quality: HashMap<String, String>,
+    /// When true, skip playlist items whose URL is already archived as a child
+    /// of any container entry with the same canonical playlist URL.
+    pub sync: bool,
 }
 
 /// Resolves which cookies apply to `url` by evaluating all rules in ordinal order.
@@ -532,6 +540,19 @@ pub fn locator_to_ytdlp_url(locator: &str) -> Option<String> {
         | Source::TikTok
         | Source::Reddit
         | Source::Snapchat => Some(expand_shorthand_to_url(locator, &source)),
+        _ => None,
+    }
+}
+
+/// Returns the canonical URL for playlist/channel locators that yt-dlp can
+/// expand with `--flat-playlist`, or `None` for non-playlist sources.
+/// Intentionally separate from `locator_to_ytdlp_url`, which excludes playlists.
+pub fn locator_to_playlist_url(locator: &str) -> Option<String> {
+    let source = determine_source(locator);
+    match source {
+        Source::YouTubePlaylist | Source::YouTubeChannel | Source::YouTubeMusicPlaylist => {
+            Some(expand_shorthand_to_url(locator, &source))
+        }
         _ => None,
     }
 }
@@ -1049,28 +1070,58 @@ pub fn perform_capture(
             .clone()
             .or_else(|| playlist_info.uploader.clone().map(|u| format!("{u} (channel)")));
 
-        let container_entry = match record_container_entry(
-            &conn,
-            store_path,
-            user_id,
-            &run,
-            &item,
-            locator,
-            &canonical_url,
-            source,
-            container_title,
-            &playlist_info.playlist_id,
-            playlist_info.uploader.as_deref(),
-        ) {
-            Ok(e) => e,
-            Err(e) => {
-                return Err(fail_run(
-                    &conn,
-                    &run,
-                    &item,
-                    &format!("Failed to create container entry: {e:#}"),
-                ));
+        // Sync mode: reuse an existing container so we don't create a duplicate
+        // root entry on every sync run. Non-sync always creates a fresh container.
+        let (container_id, already_archived) = if config.sync {
+            match archive::find_container_entry_id_by_canonical_url(&conn, &canonical_url) {
+                Err(e) => {
+                    return Err(fail_run(
+                        &conn, &run, &item,
+                        &format!("Failed to query existing container: {e:#}"),
+                    ));
+                }
+                Ok(Some(existing_id)) => {
+                    // Container already exists — mark the run item done pointing at it;
+                    // don't call record_container_entry (that would create a duplicate).
+                    if let Err(e) = database::complete_archive_run_item(&conn, item.id, existing_id) {
+                        return Err(fail_run(
+                            &conn, &run, &item,
+                            &format!("Failed to complete run item for existing container: {e:#}"),
+                        ));
+                    }
+                    let archived = archive::get_archived_playlist_child_urls(&conn, &canonical_url)
+                        .unwrap_or_default();
+                    (existing_id, archived)
+                }
+                Ok(None) => {
+                    // First sync run for this playlist — create the container normally.
+                    let e = match record_container_entry(
+                        &conn, store_path, user_id, &run, &item, locator, &canonical_url,
+                        source, container_title, &playlist_info.playlist_id,
+                        playlist_info.uploader.as_deref(),
+                    ) {
+                        Ok(e) => e,
+                        Err(e) => return Err(fail_run(
+                            &conn, &run, &item,
+                            &format!("Failed to create container entry: {e:#}"),
+                        )),
+                    };
+                    (e.id, std::collections::HashSet::new())
+                }
             }
+        } else {
+            let e = match record_container_entry(
+                &conn, store_path, user_id, &run, &item, locator, &canonical_url,
+                source, container_title, &playlist_info.playlist_id,
+                playlist_info.uploader.as_deref(),
+            ) {
+                Ok(e) => e,
+                Err(e) => return Err(fail_run(
+                    &conn, &run, &item,
+                    &format!("Failed to create container entry: {e:#}"),
+                )),
+            };
+            (e.id, std::collections::HashSet::new())
         };
 
         let is_audio = source == Source::YouTubeMusicPlaylist;
@@ -1078,6 +1129,12 @@ pub fn perform_capture(
         let child_entity_kind = if is_audio { "music" } else { "video" };
 
         for (ordinal, playlist_item) in playlist_info.items.iter().enumerate() {
+            // Sync: skip items already archived — no run item created, so
+            // refresh_run_counters sees only newly-attempted items.
+            if config.sync && already_archived.contains(&playlist_item.url) {
+                continue;
+            }
+
             let child_timestamp = format!(
                 "{}-{}",
                 Local::now().format("%Y-%m-%dT%H-%M-%S%.3f"),
@@ -1114,12 +1171,19 @@ pub fn perform_capture(
                 None => playlist_item.title.clone(),
             };
 
+            // Per-item quality override keyed by yt-dlp video ID; fall back to playlist-level.
+            let effective_child_quality: Option<&str> = config
+                .per_item_quality
+                .get(&playlist_item.id)
+                .map(String::as_str)
+                .or(child_quality);
+
             // Download the media.
             match downloader::ytdlp::download(
                 playlist_item.url.clone(),
                 store_path,
                 &child_timestamp,
-                child_quality,
+                effective_child_quality,
                 &cookies,
             ) {
                 Ok((hash, file_extension)) => {
@@ -1165,8 +1229,8 @@ pub fn perform_capture(
                         &file_extension,
                         byte_size,
                         child_title,
-                        Some(container_entry.id),
-                        Some(container_entry.id),
+                        Some(container_id),
+                        Some(container_id),
                     ) {
                         Ok(child_entry) => {
                             let _ = database::refresh_entry_cached_bytes(&conn, child_entry.id);
@@ -1191,7 +1255,7 @@ pub fn perform_capture(
             }
         }
 
-        database::refresh_entry_cached_bytes(&conn, container_entry.id)?;
+        database::refresh_entry_cached_bytes(&conn, container_id)?;
         database::finish_archive_run(&conn, run.id)?;
 
         let run_status: String = conn
