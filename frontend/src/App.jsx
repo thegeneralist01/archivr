@@ -107,6 +107,18 @@ export default function App() {
 
   const [toasts, setToasts] = useState([])
   const toastIdRef = useRef(0)
+  const [pendingCaptures, setPendingCaptures] = useState(() => {
+    try {
+      const saved = JSON.parse(sessionStorage.getItem('pendingCaptures') || '[]')
+      if (Array.isArray(saved)) return saved
+    } catch {}
+    return []
+  })
+
+  useEffect(() => {
+    sessionStorage.setItem('pendingCaptures', JSON.stringify(pendingCaptures))
+  }, [pendingCaptures])
+
   const [ublockWarningIgnored, setUblockWarningIgnored] = useState(
     () => sessionStorage.getItem('ublockWarningIgnored') === 'true'
   )
@@ -424,7 +436,7 @@ export default function App() {
 
   const handleCaptured = useCallback(() => {
     if (!archiveId) return
-    Promise.all([
+    return Promise.allSettled([
       loadEntries(archiveId, searchQuery, tagFilter),
       fetchRuns(archiveId).then(setRuns),
     ])
@@ -447,6 +459,15 @@ export default function App() {
     setUblockWarningIgnored(true)
     setToasts(prev => prev.filter(t => !(t.type === 'warning' && t.locator)))
   }, [])
+
+  const handleJobStarted = useCallback((record) => {
+    setPendingCaptures(prev => [...prev, record])
+  }, [])
+
+  const handleJobSettled = useCallback((id) => {
+    setPendingCaptures(prev => prev.filter(c => c.id !== id))
+  }, [])
+
   const [previewEntryUid, setPreviewEntryUid] = useState(null)
   const [currentAudio, setCurrentAudio] = useState(null)
 
@@ -541,6 +562,7 @@ export default function App() {
                 selectedUids={selectedUids}
                 onRowClick={handleRowClick}
                 archiveId={archiveId}
+                pendingCaptures={pendingCaptures}
               />
             )}
             {view === 'runs' && <RunsView runs={runs} />}
@@ -605,6 +627,9 @@ export default function App() {
           onClose={handleCaptureClose}
           onCaptured={handleCaptured}
           onToast={handleToast}
+          activeJobs={pendingCaptures}
+          onJobStarted={handleJobStarted}
+          onJobSettled={handleJobSettled}
         />
         <ToastStack toasts={toasts} onDismiss={handleDismissToast} onIgnoreUblock={handleIgnoreUblock} />
       </>

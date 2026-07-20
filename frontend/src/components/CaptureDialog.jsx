@@ -74,11 +74,7 @@ function makeItem(locator = '') {
   }
 }
 
-function hasActiveJobs(items) {
-  return items.some(it => it.status === 'submitting' || it.status === 'running')
-}
-
-export default function CaptureDialog({ open, archiveId, onClose, onCaptured, onToast }) {
+export default function CaptureDialog({ open, archiveId, onClose, onCaptured, onToast, onJobStarted, onJobSettled, activeJobs = [] }) {
   const dialogRef = useRef(null)
   const isFirstRenderRef = useRef(true)
   // jobUid → intervalId; survives dialog close since component stays mounted
@@ -97,13 +93,20 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   useEffect(() => { onCapturedRef.current = onCaptured }, [onCaptured])
   useEffect(() => { onToastRef.current = onToast }, [onToast])
 
+  const onJobStartedRef = useRef(onJobStarted)
+  const onJobSettledRef = useRef(onJobSettled)
+  useEffect(() => { onJobStartedRef.current = onJobStarted }, [onJobStarted])
+  useEffect(() => { onJobSettledRef.current = onJobSettled }, [onJobSettled])
+
   const [items, setItems] = useState(() => {
     try {
       const saved = JSON.parse(sessionStorage.getItem('captureItems') || 'null')
       if (Array.isArray(saved) && saved.length > 0) {
-        // Ensure nextItemId stays ahead of restored ids
-        saved.forEach(it => { if (it.id >= nextItemId) nextItemId = it.id + 1 })
-        return saved
+        const idle = saved.filter(it => !it.status || it.status === 'idle')
+        if (idle.length > 0) {
+          idle.forEach(it => { if (it.id >= nextItemId) nextItemId = it.id + 1 })
+          return idle
+        }
       }
     } catch {}
     return [makeItem()]
@@ -142,24 +145,20 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   // Reader mode: off by default, per-session only
   const [readerMode, setReaderMode] = useState(false)
 
-  // On mount: clean up old single-locator sessionStorage keys; reconnect running jobs
+  // On mount: clean up old single-locator sessionStorage keys; reconnect running bg jobs
   useEffect(() => {
     ;['captureDialogLocator','captureDialogError','captureDialogBusy',
       'captureDialogJobStatus','captureDialogJobUid'].forEach(k => sessionStorage.removeItem(k))
 
-    setItems(prev => prev.map(it =>
-      // 'submitting' means page was refreshed mid-fetch — reset to idle so user can retry
-      it.status === 'submitting' ? { ...it, status: 'idle', error: null } : it
-    ))
-
-    // Reconnect polling for any jobs still running from a previous session
-    items.forEach(it => {
-      if (it.status === 'running' && it.jobUid && it.archiveId && !pollIntervals.current.has(it.jobUid)) {
-        startPolling(it.id, it.jobUid, it.locator, it.archiveId)
+    // Reconnect polling for any bg jobs still running from a previous session.
+    // activeJobs is read from the initial prop value (App's sessionStorage-seeded state).
+    activeJobs.forEach(job => {
+      if (job.jobUid && !pollIntervals.current.has(job.jobUid)) {
+        startPolling(job.id, job.jobUid, job.locator, job.archiveId, null)
       }
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []) // intentionally runs once on mount with initial values
+  }, [])
 
   // Handle native dialog 'close' event (Escape key or programmatic .close())
   useEffect(() => {
@@ -174,12 +173,12 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     return () => dialog.removeEventListener('close', handler)
   }, [onClose])
 
-  // Open/close driven by parent; don't reset if active jobs are in flight
+  // Open/close driven by parent; always reset form on reopen
   useEffect(() => {
     const dialog = dialogRef.current
     if (!dialog) return
     if (open) {
-      if (!isFirstRenderRef.current && !hasActiveJobs(items)) {
+      if (!isFirstRenderRef.current) {
         setItems([makeItem()])
       }
       isFirstRenderRef.current = false
@@ -199,22 +198,16 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     }
   }, [])
 
-  function startPolling(itemId, jobUid, locator, aid, batchId = null) {
-    if (pollIntervals.current.has(jobUid)) return // already polling
+  function startPolling(bgJobId, jobUid, locator, aid, batchId = null) {
+    if (pollIntervals.current.has(jobUid)) return
     const intervalId = setInterval(async () => {
       try {
         const updated = await pollCaptureJob(aid, jobUid)
         if (updated.status === 'completed') {
           clearInterval(pollIntervals.current.get(jobUid))
           pollIntervals.current.delete(jobUid)
-          setItems(prev => prev.map(it => it.id === itemId ? { ...it, status: 'completed' } : it))
-          setTimeout(() => {
-            setItems(prev => {
-              const next = prev.filter(it => it.id !== itemId)
-              return next.length === 0 ? [makeItem()] : next
-            })
-          }, 1400)
-          onCapturedRef.current()
+          await Promise.resolve(onCapturedRef.current?.())
+          onJobSettledRef.current?.(bgJobId)
           try {
             const notes = updated.notes_json ? JSON.parse(updated.notes_json) : null
             if (notes?.ublock_skipped || notes?.cookie_ext_skipped) {
@@ -237,10 +230,8 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
         } else if (updated.status === 'failed') {
           clearInterval(pollIntervals.current.get(jobUid))
           pollIntervals.current.delete(jobUid)
+          onJobSettledRef.current?.(bgJobId)
           const errText = updated.error_text || 'Capture failed.'
-          setItems(prev => prev.map(it =>
-            it.id === itemId ? { ...it, status: 'failed', error: errText } : it
-          ))
           onToastRef.current(errText, locator)
           settleBatch(batchId, 'failed', locator)
         }
@@ -248,10 +239,8 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
       } catch (e) {
         clearInterval(pollIntervals.current.get(jobUid))
         pollIntervals.current.delete(jobUid)
+        onJobSettledRef.current?.(bgJobId)
         const msg = e.message || 'Network error'
-        setItems(prev => prev.map(it =>
-          it.id === itemId ? { ...it, status: 'failed', error: msg } : it
-        ))
         onToastRef.current(msg, locator)
         settleBatch(batchId, 'failed', locator)
       }
@@ -294,31 +283,31 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     onToastRef.current(text, null, type, headline)
   }
 
-
-  async function submitItem(item, batchId = null) {
-    if (!item.locator.trim()) return
-    const aid = archiveId
-    const loc = item.locator.trim()
-    const qual = item.quality || 'best'
-    setItems(prev => prev.map(it => it.id === item.id ? { ...it, status: 'submitting', error: null } : it))
+  async function submitBgJob(locator, quality, batchId) {
+    const aid = archiveIdRef.current
+    const id = crypto.randomUUID?.() ?? `job-${Date.now()}-${Math.random()}`
+    // Capture session options at call time (synchronous — before first await)
+    const extensions = {
+      ublock_enabled: ublockEnabled,
+      reader_mode: readerMode,
+      cookie_ext_enabled: cookieExtEnabled,
+      modal_closer_enabled: modalCloserEnabled,
+      via_freedium: freediumEnabled,
+    }
     try {
-      const extensions = { ublock_enabled: ublockEnabled, reader_mode: readerMode, cookie_ext_enabled: cookieExtEnabled, modal_closer_enabled: modalCloserEnabled, via_freedium: freediumEnabled }
-      const job = await submitCapture(aid, loc, qual, extensions)
-      setItems(prev => prev.map(it =>
-        it.id === item.id ? { ...it, status: 'running', jobUid: job.job_uid, archiveId: aid } : it
-      ))
-      startPolling(item.id, job.job_uid, loc, aid, batchId)
+      const job = await submitCapture(aid, locator, quality, extensions)
+      // Notify App to add skeleton + persist
+      onJobStartedRef.current?.({ id, jobUid: job.job_uid, locator, archiveId: aid })
+      startPolling(id, job.job_uid, locator, aid, batchId)
     } catch (e) {
       const msg = e.message || 'Submission failed.'
-      setItems(prev => prev.map(it => it.id === item.id ? { ...it, status: 'failed', error: msg } : it))
-      onToastRef.current(msg, loc)
-      settleBatch(batchId, 'failed', loc)
+      onToastRef.current(msg, locator)
+      settleBatch(batchId, 'failed', locator)
     }
   }
 
-
   function handleArchive() {
-    const toSubmit = items.filter(it => it.status === 'idle' && it.locator.trim())
+    const toSubmit = items.filter(it => it.locator.trim())
     if (toSubmit.length === 0) return
     const batchId = toSubmit.length > 1
       ? (crypto.randomUUID?.() ?? `batch-${Date.now()}`)
@@ -326,8 +315,13 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     if (batchId) {
       batchRef.current.set(batchId, { total: toSubmit.length, archived: 0, warnings: 0, failed: 0, failedLocators: [], warningLocators: [] })
     }
-    toSubmit.forEach(it => submitItem(it, batchId))
+    // Capture options at call time before any state changes
+    const capturedQuality = toSubmit.map(it => it.quality || 'best')
+    // Reset form and close dialog immediately
+    setItems([makeItem()])
     dialogRef.current?.close()
+    // Submit each in background
+    toSubmit.forEach((it, i) => submitBgJob(it.locator.trim(), capturedQuality[i], batchId))
   }
 
   function addRow() {
@@ -341,12 +335,6 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
       const next = prev.filter(it => it.id !== id)
       return next.length === 0 ? [makeItem()] : next
     })
-  }
-
-  function resetRow(id) {
-    setItems(prev => prev.map(it =>
-      it.id === id ? { ...it, status: 'idle', error: null } : it
-    ))
   }
 
   function updateLocator(id, val) {
@@ -390,8 +378,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     setItems(prev => prev.map(it => it.id === id ? { ...it, quality: val } : it))
   }
 
-  const pendingCount = items.filter(it => it.status === 'idle' && it.locator.trim()).length
-  const anyActive = hasActiveJobs(items)
+  const pendingCount = items.filter(it => it.locator.trim()).length
 
   return (
     <dialog ref={dialogRef} className="capture-dialog">
@@ -415,11 +402,10 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
             <CaptureRow
               key={item.id}
               item={item}
-              autoFocus={idx === items.length - 1 && item.status === 'idle'}
+              autoFocus={idx === items.length - 1}
               onLocatorChange={val => updateLocator(item.id, val)}
               onQualityChange={val => updateQuality(item.id, val)}
               onRemove={() => removeRow(item.id)}
-              onReset={() => resetRow(item.id)}
               onSubmit={handleArchive}
             />
           ))}
@@ -549,7 +535,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
             {pendingCount > 1 ? `Archive ${pendingCount}` : 'Archive'}
           </button>
           <button type="button" className="capture-cancel" onClick={() => dialogRef.current?.close()}>
-            {anyActive ? 'Close' : 'Cancel'}
+            Cancel
           </button>
         </div>
       </div>
@@ -557,19 +543,17 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   )
 }
 
-function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemove, onReset, onSubmit }) {
+function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemove, onSubmit }) {
   const inputRef = useRef(null)
-  const isActive = item.status === 'submitting' || item.status === 'running'
 
   useEffect(() => {
-    if (autoFocus && item.status === 'idle') {
+    if (autoFocus) {
       inputRef.current?.focus()
     }
   }, [autoFocus]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Quality control shown right of the input (hidden when active or completed)
+  // Quality control shown right of the input
   const qualityEl = (() => {
-    if (item.status === 'completed' || isActive) return null
     if (!isVideoSource(item.locator)) return null
     if (item.probeState === 'probing') {
       return <span className="capture-quality-probing" aria-label="Checking available qualities">…</span>
@@ -611,9 +595,8 @@ function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemov
   })()
 
   return (
-    <div className={`capture-row capture-row--${item.status}`}>
+    <div className="capture-row">
       <div className="capture-row-main">
-        <CapStatusDot status={item.status} />
         <input
           ref={inputRef}
           className="capture-input"
@@ -622,47 +605,19 @@ function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemov
           value={item.locator}
           onChange={e => onLocatorChange(e.target.value)}
           onKeyDown={e => { if (e.key === 'Enter') onSubmit() }}
-          disabled={isActive || item.status === 'completed'}
           autoComplete="off"
           spellCheck={false}
         />
         {qualityEl}
-        {item.status === 'failed' && (
-          <button type="button" className="capture-row-action" onClick={onReset} title="Retry">
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M13 2.5A7 7 0 1 1 6.5 1"/>
-              <polyline points="6.5 1 4 3.5 6.5 6"/>
-            </svg>
-          </button>
-        )}
-        {!isActive && item.status !== 'completed' && item.status !== 'failed' && (
-          <button type="button" className="capture-row-action capture-row-remove" onClick={onRemove} aria-label="Remove">
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-              <line x1="3" y1="3" x2="13" y2="13"/><line x1="13" y1="3" x2="3" y2="13"/>
-            </svg>
-          </button>
-        )}
+        <button type="button" className="capture-row-action capture-row-remove" onClick={onRemove} aria-label="Remove">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+            <line x1="3" y1="3" x2="13" y2="13"/><line x1="13" y1="3" x2="3" y2="13"/>
+          </svg>
+        </button>
       </div>
       {item.error && (
         <p className="capture-row-error">{item.error}</p>
       )}
     </div>
   )
-}
-
-function CapStatusDot({ status }) {
-  if (status === 'submitting' || status === 'running') {
-    return (
-      <span className="cap-dot cap-dot--running" aria-label="Running">
-        <span className="cap-spinner" />
-      </span>
-    )
-  }
-  if (status === 'completed') {
-    return <span className="cap-dot cap-dot--ok" aria-label="Done">✓</span>
-  }
-  if (status === 'failed') {
-    return <span className="cap-dot cap-dot--err" aria-label="Failed">✕</span>
-  }
-  return <span className="cap-dot cap-dot--idle" aria-hidden="true" />
 }

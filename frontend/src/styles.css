@@ -2694,3 +2694,35 @@ select {
 .preview-modal-newtab:hover { background: var(--field); color: var(--ink); }
 /* Push content above the fixed AudioBar when it is visible */
 body.has-audio-bar { padding-bottom: 56px; }
+
+/* ── Skeleton entry row ─────────────────────────────────────────────────── */
+@keyframes skeleton-shimmer {
+  0%   { background-position: 200% center; }
+  100% { background-position: -200% center; }
+}
+
+.skeleton-cell {
+  display: inline-block;
+  border-radius: 3px;
+  background: linear-gradient(90deg, var(--paper-2) 25%, var(--line-soft) 50%, var(--paper-2) 75%);
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.8s ease-in-out infinite;
+}
+
+/* Row container — flex row matching #entries-body > div layout */
+.skeleton-row {
+  display: flex;
+  align-items: center;
+  background: var(--paper-3);
+}
+.skeleton-row > div {
+  padding: 7px 10px;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+.skeleton-row .col-added { padding-left: 22px; }
+.skeleton-row > div:last-child { padding-right: 22px; }
+
+@media (pointer: coarse) {
+  .skeleton-row .col-added { padding-left: 10px; }
+}
