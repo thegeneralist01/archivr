@@ -136,18 +136,17 @@ function applyPlaylistQuality(newQ, currentItems) {
       return { ...item, quality: null }
     })
   }
-  const newHeight = parseInt(newQ)
   return currentItems.map(item => {
-    if (item.qualities.length === 0) {
-      return item
-    }
-    const maxHeight = Math.max(...item.qualities.map(q => parseInt(q)))
-    if (maxHeight >= newHeight) {
+    // Exact match only: the video must list this quality in its available formats.
+    // maxHeight >= newHeight would be a cap (yt-dlp silent fallback), not what
+    // the user selected; a video with [2160p, 1080p] does NOT support 1440p.
+    if (item.qualities.includes(newQ)) {
       return { ...item, quality: newQ }
-    } else {
-      if (item.quality !== null) return item
-      return { ...item, quality: null }
     }
+    // Quality not available for this item — keep prior selection if one exists,
+    // otherwise null (conflict, blocks archive until user picks manually).
+    if (item.quality !== null) return item
+    return { ...item, quality: null }
   })
 }
 
