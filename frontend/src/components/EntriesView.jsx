@@ -26,6 +26,7 @@ export default function EntriesView({ entries, selectedUids, onRowClick, archive
               isSelected={selectedUids.size === 1 && selectedUids.has(entry.entry_uid)}
               isMultiSelected={selectedUids.size >= 2 && selectedUids.has(entry.entry_uid)}
               onRowClick={onRowClick}
+              selectedUids={selectedUids}
             />
           ))}
         </div>

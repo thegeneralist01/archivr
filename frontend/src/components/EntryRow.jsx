@@ -2,9 +2,24 @@ import { useState } from 'react';
 import { formatTimestamp, formatBytes, valueText, sourceIconSvg } from '../utils';
 import { fetchEntryChildren } from '../api';
 
-function ChildRow({ entry }) {
+function ChildRow({ entry, onRowClick, selectedUids }) {
+  const isSelected = (selectedUids?.size === 1) && selectedUids.has(entry.entry_uid);
+  const isMultiSelected = (selectedUids?.size >= 2) && selectedUids.has(entry.entry_uid);
+
+  const cls = ['child-entry-row',
+    isSelected && 'is-selected',
+    isMultiSelected && 'is-multi-selected',
+  ].filter(Boolean).join(' ');
+
   return (
-    <div className="child-entry-row">
+    <div
+      className={cls}
+      tabIndex={0}
+      data-entry-uid={entry.entry_uid}
+      onMouseDown={e => { if (e.shiftKey) e.preventDefault(); }}
+      onClick={e => onRowClick(entry, e)}
+      onKeyDown={e => { if (e.key === 'Enter') onRowClick(entry, e); }}
+    >
       <div className="col-check" aria-hidden="true" />
       <div className="col-added">{formatTimestamp(entry.archived_at)}</div>
       <div className="col-title">
@@ -24,7 +39,7 @@ function ChildRow({ entry }) {
   );
 }
 
-export default function EntryRow({ entry, archiveId, isSelected, isMultiSelected, onRowClick }) {
+export default function EntryRow({ entry, archiveId, isSelected, isMultiSelected, onRowClick, selectedUids }) {
   const [favFailed, setFavFailed] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState(null);
@@ -78,9 +93,6 @@ export default function EntryRow({ entry, archiveId, isSelected, isMultiSelected
     }
   }
 
-  // Outer wrapper: display:block so child-entries lives below the flex row.
-  // One wrapper per entry → nth-child striping stays correct.
-  // is-selected/is-multi-selected go here so #entries-body > div.is-selected still matches.
   const outerClass = [
     'entry-row-outer',
     isSelected && 'is-selected',
@@ -89,7 +101,6 @@ export default function EntryRow({ entry, archiveId, isSelected, isMultiSelected
 
   return (
     <div className={outerClass} data-entry-uid={entry.entry_uid}>
-      {/* entry-row-main is the interactive flex row */}
       <div
         className="entry-row-main"
         tabIndex={0}
@@ -142,7 +153,12 @@ export default function EntryRow({ entry, archiveId, isSelected, isMultiSelected
         <div className="child-entries" aria-label={`${entry.child_count} child entries`}>
           {childrenLoading && <div className="child-entries-loading">Loading…</div>}
           {children && children.map(child => (
-            <ChildRow key={child.entry_uid} entry={child} />
+            <ChildRow
+              key={child.entry_uid}
+              entry={child}
+              onRowClick={onRowClick}
+              selectedUids={selectedUids}
+            />
           ))}
         </div>
       )}

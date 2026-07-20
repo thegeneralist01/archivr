@@ -2796,7 +2796,18 @@ body.has-audio-bar { padding-bottom: 56px; }
   border-bottom: 1px solid var(--line-soft);
   opacity: 0.88;
 }
+.child-entry-row:hover { opacity: 1; }
 .child-entry-row:last-child { border-bottom: none; }
+.child-entry-row.is-selected {
+  background: #eee2d2;
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  opacity: 1;
+}
+.child-entry-row.is-multi-selected {
+  background: #eee2d2;
+  opacity: 1;
+}
 .child-entry-row > div {
   padding: 6px 10px;
   flex-shrink: 0;
