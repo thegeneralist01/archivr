@@ -382,6 +382,8 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   function handleArchive() {
     const toSubmit = items.filter(it => it.locator.trim())
     if (toSubmit.length === 0) return
+    if (toSubmit.some(it => hasConflict(it))) return
+    if (toSubmit.some(it => it.playlistProbeState === 'probing' || it.probeState === 'probing')) return
     const batchId = toSubmit.length > 1
       ? (crypto.randomUUID?.() ?? `batch-${Date.now()}`)
       : null
