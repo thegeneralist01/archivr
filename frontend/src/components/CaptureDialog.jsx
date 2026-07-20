@@ -87,17 +87,17 @@ function isPlaylistSource(locator) {
       const url = new URL(l)
       const host = url.hostname
       if (host === 'youtube.com' || host === 'www.youtube.com' || host === 'm.youtube.com') {
-        // /watch?v=...&list=... is a single video — backend routes it to YouTubeVideo,
-        // not YouTubePlaylist, regardless of the list param.
-        if (url.pathname === '/watch') return false
-        if (url.searchParams.has('list')) return true
+        // Mirror determine_source exactly:
+        // - /playlist?list=... → YouTubePlaylist
+        // - /@handle, /channel/, /c/, /user/ → YouTubeChannel
+        // - everything else (incl. /watch&list=, /shorts?list=) → NOT a playlist
+        if (url.pathname === '/playlist' && url.searchParams.has('list')) return true
         if (url.pathname.startsWith('/@') || url.pathname.startsWith('/channel/') ||
             url.pathname.startsWith('/c/') || url.pathname.startsWith('/user/')) return true
       }
       if (host === 'music.youtube.com') {
-        // /watch is a single track even if it has a list param
-        if (url.pathname === '/watch') return false
-        if (url.pathname.startsWith('/playlist') || url.searchParams.has('list')) return true
+        // /watch is a single YTM track; only /playlist?list=... is a YTM playlist
+        if (url.pathname === '/playlist' && url.searchParams.has('list')) return true
       }
     } catch {}
   }
