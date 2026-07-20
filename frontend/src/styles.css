@@ -2881,6 +2881,16 @@ body.has-audio-bar { padding-bottom: 56px; }
   padding: 2px 6px;
 }
 .capture-playlist-toggle:hover { color: var(--text); }
+.capture-playlist-toggle--left {
+  flex-shrink: 0;
+  padding: 2px 4px;
+  font-size: 0.7rem;
+}
+.capture-playlist-toggle-placeholder {
+  display: inline-block;
+  width: 22px;
+  flex-shrink: 0;
+}
 
 .capture-conflict-badge {
   font-size: 0.7rem;

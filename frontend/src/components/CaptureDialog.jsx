@@ -730,15 +730,6 @@ function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemov
             {conflictCount > 0 && (
               <span className="capture-conflict-badge">{conflictCount} need selection</span>
             )}
-            <button
-              type="button"
-              className="capture-playlist-toggle"
-              onClick={onPlaylistToggle}
-              aria-label={item.playlistExpanded ? 'Collapse video list' : 'Expand video list'}
-              aria-expanded={item.playlistExpanded}
-            >
-              {item.playlistExpanded ? '▲' : '▼'}
-            </button>
           </>
         )
       }
@@ -801,6 +792,21 @@ function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemov
   return (
     <div className="capture-row">
       <div className="capture-row-main">
+        {isPlaylistSource(item.locator) ? (
+          item.playlistProbeState === 'done' ? (
+            <button
+              type="button"
+              className="capture-playlist-toggle capture-playlist-toggle--left"
+              onClick={onPlaylistToggle}
+              aria-label={item.playlistExpanded ? 'Collapse video list' : 'Expand video list'}
+              aria-expanded={item.playlistExpanded}
+            >
+              {item.playlistExpanded ? '▲' : '▼'}
+            </button>
+          ) : (
+            <span className="capture-playlist-toggle-placeholder" aria-hidden="true" />
+          )
+        ) : null}
         <input
           ref={inputRef}
           className="capture-input"
