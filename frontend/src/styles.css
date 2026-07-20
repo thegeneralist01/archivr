@@ -2726,3 +2726,132 @@ body.has-audio-bar { padding-bottom: 56px; }
 @media (pointer: coarse) {
   .skeleton-row .col-added { padding-left: 10px; }
 }
+
+/* ── Child entry expansion ───────────────────────────────────────────────── */
+
+/* Outer wrapper: one block per entry-group so nth-child stays correct.
+   #entries-body > .entry-row-outer beats #entries-body > div on specificity
+   (id + class > id + element) so display:flex is safely overridden. */
+#entries-body > .entry-row-outer {
+  display: block;
+  border-bottom: none;
+}
+
+/* Inner flex row: replicates the #entries-body > div row behaviour. */
+#entries-body > .entry-row-outer > .entry-row-main {
+  display: flex;
+  align-items: center;
+  cursor: default;
+  border-bottom: 1px solid var(--line-soft);
+  /* Reset padding that #entries-body > div > div would otherwise apply. */
+  padding: 0;
+  flex-shrink: unset;
+  overflow: visible;
+}
+
+/* Column cells inside the inner row. */
+#entries-body > .entry-row-outer > .entry-row-main > div {
+  padding: 7px 10px;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+#entries-body > .entry-row-outer > .entry-row-main > div:last-child { padding-right: 22px; }
+#entries-body > .entry-row-outer > .entry-row-main .col-added { padding-left: 22px; }
+
+/* Striping: one outer wrapper per entry, so nth-child alternation is preserved. */
+#entries-body > .entry-row-outer:nth-child(even) { background: #f2ede5; }
+#entries-body > .entry-row-outer:nth-child(odd)  { background: var(--paper-3); }
+
+/* Selection: class lives on outer wrapper, outline scoped to inner row. */
+#entries-body > .entry-row-outer.is-selected     { background: #eee2d2; outline: none; }
+#entries-body > .entry-row-outer.is-multi-selected { background: #eee2d2; outline: none; }
+#entries-body > .entry-row-outer.is-selected .entry-row-main {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+#entries-body > .entry-row-outer.is-multi-selected .entry-row-main {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* URL overflow on hover / selection — same semantics as original. */
+#entries-body > .entry-row-outer .url-cell:hover,
+#entries-body > .entry-row-outer.is-selected .url-cell { overflow: visible; white-space: normal; }
+
+/* child-entries container: reset the padding that #entries-body > div > div applies. */
+#entries-body > .entry-row-outer > .child-entries {
+  display: block;
+  padding: 0;
+  flex-shrink: unset;
+  overflow: visible;
+  border-left: 2px solid var(--line-soft);
+  margin-left: 32px;
+}
+
+/* Each child row reuses the same .col-* flex widths as normal rows. */
+.child-entry-row {
+  display: flex;
+  align-items: center;
+  cursor: default;
+  border-bottom: 1px solid var(--line-soft);
+  opacity: 0.88;
+}
+.child-entry-row:last-child { border-bottom: none; }
+.child-entry-row > div {
+  padding: 6px 10px;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+.child-entry-row .col-added { padding-left: 22px; }
+.child-entry-row > div:last-child { padding-right: 22px; }
+
+/* Expand chevron button */
+.entry-expand-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  padding: 0;
+  margin-right: 2px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  opacity: 0.45;
+  color: inherit;
+  transition: opacity 0.15s;
+}
+.entry-expand-btn::before {
+  content: '';
+  display: block;
+  width: 0;
+  height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 6px solid currentColor;
+  transition: transform 0.15s;
+}
+.entry-expand-btn:hover { opacity: 1; }
+.entry-expand-btn.is-expanded::before { transform: rotate(90deg); }
+
+/* Child count badge next to title */
+.child-count-badge {
+  display: inline-block;
+  margin-left: 5px;
+  padding: 0 5px;
+  font-size: 0.72em;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--line-soft) 60%, transparent);
+  border-radius: 10px;
+  opacity: 0.75;
+  vertical-align: middle;
+  line-height: 1.6;
+}
+
+/* Loading placeholder inside child-entries */
+.child-entries-loading {
+  padding: 8px 12px;
+  font-size: 0.85em;
+  opacity: 0.55;
+}

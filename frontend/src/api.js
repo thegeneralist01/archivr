@@ -25,6 +25,10 @@ export async function fetchEntryDetail(archiveId, entryUid) {
   return getJson(`/api/archives/${archiveId}/entries/${entryUid}`);
 }
 
+export async function fetchEntryChildren(archiveId, entryUid) {
+  return getJson(`/api/archives/${archiveId}/entries/${entryUid}/children`);
+}
+
 // Fetch multiple artifact JSON payloads for an entry in parallel.
 // Returns a Promise<Array> preserving index order.
 export function fetchEntryArtifacts(archiveId, entryUid, indices) {

@@ -242,6 +242,10 @@ pub fn app_with_state(state: AppState) -> Router {
                 .delete(delete_entry_handler),
         )
         .route(
+            "/api/archives/:archive_id/entries/:entry_uid/children",
+            get(list_entry_children),
+        )
+        .route(
             "/api/archives/:archive_id/entries/:entry_uid/artifacts/:artifact_index",
             get(serve_artifact),
         )
@@ -402,6 +406,18 @@ async fn list_entries(
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let caller_bits = auth_to_caller_bits(&auth);
     Ok(Json(archive::list_root_entries(&conn, caller_bits)?))
+}
+
+async fn list_entry_children(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((archive_id, entry_uid)): Path<(String, String)>,
+) -> Result<Json<Vec<archive::EntrySummary>>, ApiError> {
+    auth.require_auth()?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let caller_bits = auth_to_caller_bits(&auth);
+    Ok(Json(archive::list_child_entries(&conn, &entry_uid, caller_bits)?))
 }
 
 async fn search_entries_handler(
@@ -902,10 +918,11 @@ async fn capture_handler(
                     notes_str = serde_json::Value::Object(notes_map).to_string();
                     Some(&notes_str)
                 };
+                let job_status = if result.status == "completed" { "completed" } else { "failed" };
                 database::update_capture_job_status(
                     &conn,
                     &job_uid_bg,
-                    "completed",
+                    job_status,
                     Some(&result.run_uid),
                     None,
                     notes,
