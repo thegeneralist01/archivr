@@ -72,7 +72,7 @@ function isPlaylistSource(locator) {
     if (ll.startsWith(scheme)) {
       const after = ll.slice(scheme.length)
       return after.startsWith('playlist/') || after.startsWith('@') ||
-             after.startsWith('channel/') || after.startsWith('c/')
+             after.startsWith('channel/') || after.startsWith('c/') || after.startsWith('user/')
     }
   }
 
