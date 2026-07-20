@@ -30,6 +30,8 @@ pub struct EntrySummary {
     pub has_favicon: bool,
     /// Bytes of blobs already on disk from an earlier entry (precomputed at capture time).
     pub cached_bytes: i64,
+    /// Number of direct child entries; 0 for non-container entries.
+    pub child_count: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -215,7 +217,8 @@ pub fn list_root_entries(
             COALESCE(SUM(b.byte_size), 0) AS total_artifact_bytes,
             NULL AS parent_entry_uid,
             EXISTS(SELECT 1 FROM entry_artifacts fav WHERE fav.entry_id = e.id AND fav.artifact_role = 'favicon') AS has_favicon,
-            e.cached_bytes
+            e.cached_bytes,
+            (SELECT COUNT(*) FROM archived_entries child WHERE child.parent_entry_id = e.id) AS child_count
          FROM archived_entries e
          JOIN source_identities si ON si.id = e.source_identity_id
          LEFT JOIN entry_artifacts ea ON ea.entry_id = e.id
@@ -248,11 +251,45 @@ pub fn list_root_entries(
                 parent_entry_uid: row.get(9)?,
                 has_favicon: row.get::<_, i64>(10)? != 0,
                 cached_bytes: row.get(11)?,
+                child_count: row.get(12)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     Ok(entries)
+}
+
+/// Fetches one `EntrySummary` for any entry (root or child) by uid.
+/// Returns `None` if not found.
+fn get_entry_summary(
+    conn: &rusqlite::Connection,
+    entry_uid: &str,
+) -> Result<Option<EntrySummary>> {
+    let sql = format!(
+        "{} {} WHERE e.entry_uid = ?1 GROUP BY e.id",
+        ENTRY_SELECT_COLS, ENTRY_FROM_JOINS,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let result = stmt
+        .query_row([entry_uid], |row| {
+            Ok(EntrySummary {
+                entry_uid: row.get(0)?,
+                archived_at: row.get(1)?,
+                source_kind: row.get(2)?,
+                entity_kind: row.get(3)?,
+                title: row.get(4)?,
+                visibility: row.get(5)?,
+                original_url: row.get(6)?,
+                artifact_count: row.get(7)?,
+                total_artifact_bytes: row.get(8)?,
+                parent_entry_uid: row.get(9)?,
+                has_favicon: row.get::<_, i64>(10)? != 0,
+                cached_bytes: row.get(11)?,
+                child_count: row.get(12)?,
+            })
+        })
+        .optional()?;
+    Ok(result)
 }
 
 pub fn get_entry_detail(
@@ -279,9 +316,7 @@ pub fn get_entry_detail(
         return Ok(None);
     };
 
-    let summary = list_root_entries(conn, u32::MAX)?
-        .into_iter()
-        .find(|entry| entry.entry_uid == entry_uid)
+    let summary = get_entry_summary(conn, entry_uid)?
         .context("entry disappeared while loading detail")?;
 
     let mut stmt = conn.prepare(
@@ -438,8 +473,58 @@ pub fn list_entries_for_collection(
                 parent_entry_uid: row.get(9)?,
                 has_favicon: row.get::<_, i64>(10)? != 0,
                 cached_bytes: row.get(11)?,
+                child_count: row.get(12)?,
             })
         })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(entries)
+}
+
+/// Returns the direct children of the entry identified by `parent_entry_uid`,
+/// ordered ascending by `archived_at, id` (preserves playlist ordinal feel).
+/// Returns an empty vec if the parent has no children or does not exist.
+pub fn list_child_entries(
+    conn: &rusqlite::Connection,
+    parent_entry_uid: &str,
+    caller_bits: u32,
+) -> Result<Vec<EntrySummary>> {
+    let sql = format!(
+        "{} {} \
+         WHERE e.parent_entry_id = (SELECT id FROM archived_entries WHERE entry_uid = ?1) \
+         AND (\
+             CAST(?2 AS INTEGER) & 12 != 0 \
+             OR EXISTS (\
+                 SELECT 1 FROM collection_entries ce \
+                 WHERE ce.entry_id = e.id \
+                   AND ce.visibility_bits & CAST(?2 AS INTEGER) != 0\
+             )\
+         ) \
+         GROUP BY e.id \
+         ORDER BY e.archived_at ASC, e.id ASC",
+        ENTRY_SELECT_COLS, ENTRY_FROM_JOINS,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let entries = stmt
+        .query_map(
+            rusqlite::params![parent_entry_uid, caller_bits as i64],
+            |row| {
+                Ok(EntrySummary {
+                    entry_uid: row.get(0)?,
+                    archived_at: row.get(1)?,
+                    source_kind: row.get(2)?,
+                    entity_kind: row.get(3)?,
+                    title: row.get(4)?,
+                    visibility: row.get(5)?,
+                    original_url: row.get(6)?,
+                    artifact_count: row.get(7)?,
+                    total_artifact_bytes: row.get(8)?,
+                    parent_entry_uid: row.get(9)?,
+                    has_favicon: row.get::<_, i64>(10)? != 0,
+                    cached_bytes: row.get(11)?,
+                    child_count: row.get(12)?,
+                })
+            },
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(entries)
 }
@@ -555,7 +640,8 @@ const ENTRY_SELECT_COLS: &str = "SELECT e.entry_uid, e.archived_at, e.source_kin
     COALESCE(SUM(b.byte_size), 0) AS total_artifact_bytes, \
     parent.entry_uid AS parent_entry_uid, \
     EXISTS(SELECT 1 FROM entry_artifacts fav WHERE fav.entry_id = e.id AND fav.artifact_role = 'favicon') AS has_favicon, \
-    e.cached_bytes";
+    e.cached_bytes, \
+    (SELECT COUNT(*) FROM archived_entries child WHERE child.parent_entry_id = e.id) AS child_count";
 
 const ENTRY_FROM_JOINS: &str = "FROM archived_entries e \
     JOIN source_identities si ON si.id = e.source_identity_id \
@@ -663,6 +749,7 @@ pub fn search_entries(
                 parent_entry_uid: row.get(9)?,
                 has_favicon: row.get::<_, i64>(10)? != 0,
                 cached_bytes: row.get(11)?,
+                child_count: row.get(12)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -870,7 +957,8 @@ pub fn entries_for_tag(
                 COALESCE(SUM(b.byte_size), 0) AS total_artifact_bytes,
                 parent.entry_uid AS parent_entry_uid,
                 EXISTS(SELECT 1 FROM entry_artifacts fav WHERE fav.entry_id = e.id AND fav.artifact_role = 'favicon') AS has_favicon,
-                e.cached_bytes
+                e.cached_bytes,
+                (SELECT COUNT(*) FROM archived_entries child WHERE child.parent_entry_id = e.id) AS child_count
          FROM archived_entries e
          JOIN source_identities si ON si.id = e.source_identity_id
          LEFT JOIN entry_artifacts ea ON ea.entry_id = e.id
@@ -896,6 +984,7 @@ pub fn entries_for_tag(
                 parent_entry_uid: row.get(9)?,
                 has_favicon: row.get::<_, i64>(10)? != 0,
                 cached_bytes: row.get(11)?,
+                child_count: row.get(12)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

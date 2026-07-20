@@ -660,6 +660,8 @@ fn record_media_entry(
     file_extension: &str,
     byte_size: i64,
     title: Option<String>,
+    parent_entry_id: Option<i64>,
+    root_entry_id: Option<i64>,
 ) -> Result<database::ArchivedEntry> {
     debug_assert!(run.run_uid.starts_with("run_"));
     debug_assert!(item.item_uid.starts_with("item_"));
@@ -686,8 +688,8 @@ fn record_media_entry(
         &database::NewEntry {
             source_identity_id,
             archive_run_id: run.id,
-            parent_entry_id: None,
-            root_entry_id: None,
+            parent_entry_id,
+            root_entry_id,
             created_by_user_id: user_id,
             owned_by_user_id: user_id,
             source_kind: source_kind.to_string(),
@@ -716,6 +718,59 @@ fn record_media_entry(
             metadata_json: None,
         },
     )?;
+    database::complete_archive_run_item(conn, item.id, entry.id)?;
+    Ok(entry)
+}
+
+/// Creates a playlist/channel container entry with no blob and no primary-media artifact.
+/// Calls `complete_archive_run_item` on the provided item.
+fn record_container_entry(
+    conn: &rusqlite::Connection,
+    store_path: &Path,
+    user_id: i64,
+    run: &database::ArchiveRun,
+    item: &database::ArchiveRunItem,
+    requested_locator: &str,
+    canonical_locator: &str,
+    source: Source,
+    title: Option<String>,
+    playlist_id: &str,
+    uploader: Option<&str>,
+) -> Result<database::ArchivedEntry> {
+    let (source_kind, entity_kind, representation_kind) = source_metadata(source);
+    let source_identity_id = database::upsert_source_identity(
+        conn,
+        source_kind,
+        entity_kind,
+        Some(playlist_id),
+        Some(canonical_locator),
+        canonical_locator,
+    )?;
+    let entry = database::create_archived_entry(
+        conn,
+        &database::NewEntry {
+            source_identity_id,
+            archive_run_id: run.id,
+            parent_entry_id: None,
+            root_entry_id: None,
+            created_by_user_id: user_id,
+            owned_by_user_id: user_id,
+            source_kind: source_kind.to_string(),
+            entity_kind: entity_kind.to_string(),
+            title,
+            visibility: "private".to_string(),
+            representation_kind: representation_kind.to_string(),
+            source_metadata_json: json!({
+                "requested_locator": requested_locator,
+                "canonical_locator": canonical_locator,
+                "playlist_id": playlist_id,
+                "uploader": uploader,
+            })
+            .to_string(),
+            display_metadata_json: None,
+        },
+    )?;
+    create_structured_root(store_path, &entry)?;
     database::complete_archive_run_item(conn, item.id, entry.id)?;
     Ok(entry)
 }
@@ -968,14 +1023,191 @@ pub fn perform_capture(
         ));
     }
 
-    // Sources: YouTube Music Playlist — container expansion not yet implemented.
-    if source == Source::YouTubeMusicPlaylist {
-        return Err(fail_run(
+    // Sources: YouTube playlists, YouTube channels, YouTube Music playlists.
+    // Fetch container metadata, create a root container entry, then download
+    // each video/track as a child entry.
+    // `run` and `item` are already created above; `item` acts as the container item.
+    if matches!(
+        source,
+        Source::YouTubePlaylist | Source::YouTubeChannel | Source::YouTubeMusicPlaylist
+    ) {
+        // `canonical_url` already holds the expanded URL (same value as `path` later).
+        let playlist_info = match downloader::ytdlp::fetch_playlist_info(&canonical_url, &cookies) {
+            Ok(info) => info,
+            Err(e) => {
+                return Err(fail_run(
+                    &conn,
+                    &run,
+                    &item,
+                    &format!("Failed to fetch playlist info: {e:#}"),
+                ));
+            }
+        };
+
+        let container_title = playlist_info
+            .title
+            .clone()
+            .or_else(|| playlist_info.uploader.clone().map(|u| format!("{u} (channel)")));
+
+        let container_entry = match record_container_entry(
             &conn,
+            store_path,
+            user_id,
             &run,
             &item,
-            "YouTube Music playlist archiving is not yet implemented.",
-        ));
+            locator,
+            &canonical_url,
+            source,
+            container_title,
+            &playlist_info.playlist_id,
+            playlist_info.uploader.as_deref(),
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                return Err(fail_run(
+                    &conn,
+                    &run,
+                    &item,
+                    &format!("Failed to create container entry: {e:#}"),
+                ));
+            }
+        };
+
+        let is_audio = source == Source::YouTubeMusicPlaylist;
+        let child_quality: Option<&str> = if is_audio { Some("audio") } else { quality };
+        let child_entity_kind = if is_audio { "music" } else { "video" };
+
+        for (ordinal, playlist_item) in playlist_info.items.iter().enumerate() {
+            let child_timestamp = format!(
+                "{}-{}",
+                Local::now().format("%Y-%m-%dT%H-%M-%S%.3f"),
+                Uuid::new_v4().simple(),
+            );
+
+            let child_item = match database::create_archive_run_item(
+                &conn,
+                run.id,
+                Some(item.id),
+                ordinal as i64,
+                &playlist_item.url,
+                Some(&playlist_item.url),
+                source_kind,
+                child_entity_kind,
+            ) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("warn: playlist item {} create_run_item failed: {e:#}", playlist_item.url);
+                    continue;
+                }
+            };
+
+            // Fetch metadata for the child title (best-effort).
+            let child_meta_json = downloader::ytdlp::fetch_metadata(&playlist_item.url, &cookies);
+            let child_title: Option<String> = match &child_meta_json {
+                Some(json) => {
+                    let meta = downloader::metadata::extract_from_ytdlp_json(json);
+                    Some(generate_entry_title(
+                        if is_audio { Source::YouTubeMusicTrack } else { Source::YouTubeVideo },
+                        &meta,
+                    ))
+                }
+                None => playlist_item.title.clone(),
+            };
+
+            // Download the media.
+            match downloader::ytdlp::download(
+                playlist_item.url.clone(),
+                store_path,
+                &child_timestamp,
+                child_quality,
+                &cookies,
+            ) {
+                Ok((hash, file_extension)) => {
+                    let temp_file = store_path
+                        .join("temp")
+                        .join(&child_timestamp)
+                        .join(format!("{child_timestamp}{file_extension}"));
+                    let byte_size = match fs::metadata(&temp_file) {
+                        Ok(m) => m.len() as i64,
+                        Err(e) => {
+                            eprintln!("warn: stat child temp file: {e:#}");
+                            let _ = database::fail_archive_run_item(
+                                &conn, child_item.id,
+                                &format!("failed to stat downloaded file: {e:#}"),
+                            );
+                            continue;
+                        }
+                    };
+                    if !hash_exists(&hash, &file_extension, store_path).unwrap_or(false) {
+                        if let Err(e) = move_temp_to_raw(&temp_file, &hash, store_path) {
+                            eprintln!("warn: move_temp_to_raw child: {e:#}");
+                            let _ = database::fail_archive_run_item(
+                                &conn, child_item.id,
+                                &format!("failed to move downloaded file: {e:#}"),
+                            );
+                            continue;
+                        }
+                    }
+                    let _ = fs::remove_dir_all(store_path.join("temp").join(&child_timestamp));
+
+                    let child_source =
+                        if is_audio { Source::YouTubeMusicTrack } else { Source::YouTubeVideo };
+                    match record_media_entry(
+                        &conn,
+                        store_path,
+                        user_id,
+                        &run,
+                        &child_item,
+                        &playlist_item.url,
+                        &playlist_item.url,
+                        child_source,
+                        &hash,
+                        &file_extension,
+                        byte_size,
+                        child_title,
+                        Some(container_entry.id),
+                        Some(container_entry.id),
+                    ) {
+                        Ok(child_entry) => {
+                            let _ = database::refresh_entry_cached_bytes(&conn, child_entry.id);
+                        }
+                        Err(e) => {
+                            eprintln!("warn: record child entry: {e:#}");
+                            let _ = database::fail_archive_run_item(
+                                &conn, child_item.id,
+                                &format!("failed to record entry: {e:#}"),
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = fs::remove_dir_all(store_path.join("temp").join(&child_timestamp));
+                    eprintln!("warn: yt-dlp child download failed for {}: {e:#}", playlist_item.url);
+                    let _ = database::fail_archive_run_item(
+                        &conn, child_item.id,
+                        &format!("yt-dlp download failed: {e:#}"),
+                    );
+                }
+            }
+        }
+
+        database::refresh_entry_cached_bytes(&conn, container_entry.id)?;
+        database::finish_archive_run(&conn, run.id)?;
+
+        let run_status: String = conn
+            .query_row(
+                "SELECT status FROM archive_runs WHERE id = ?1",
+                [run.id],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "completed".to_string());
+
+        return Ok(CaptureResult {
+            run_uid: run.run_uid.clone(),
+            status: run_status,
+            ublock_skipped: false,
+            cookie_ext_skipped: false,
+        });
     }
 
     // Source: generic HTTP/S file URL
@@ -1018,6 +1250,8 @@ pub fn perform_capture(
                     &file_extension,
                     byte_size,
                     title_hint,
+                    None,
+                    None,
                 )?;
                 database::refresh_entry_cached_bytes(&conn, entry.id)?;
                 database::finish_archive_run(&conn, run.id)?;
@@ -1144,8 +1378,10 @@ pub fn perform_capture(
                     &html_hash,
                     &file_extension,
                     byte_size,
-                    entry_title,
-                )?;
+                entry_title,
+                None,
+                None,
+            )?;
 
                 // 5. Add favicon artifact if we captured one.
                 if let Some((fav_relpath, fav_blob_id)) = favicon_info {
@@ -1342,14 +1578,7 @@ pub fn perform_capture(
                 }
             }
         }
-        Source::YouTubePlaylist | Source::YouTubeChannel => {
-            return Err(fail_run(
-                &conn,
-                &run,
-                &item,
-                "Playlist and channel container expansion are not yet implemented.",
-            ));
-        }
+        Source::YouTubePlaylist | Source::YouTubeChannel => unreachable!(),
         _ => unreachable!(),
     };
     let temp_file = store_path
@@ -1402,6 +1631,8 @@ pub fn perform_capture(
         &file_extension,
         byte_size,
         entry_title,
+        None,
+        None,
     )?;
     database::refresh_entry_cached_bytes(&conn, media_entry.id)?;
     database::finish_archive_run(&conn, run.id)?;
