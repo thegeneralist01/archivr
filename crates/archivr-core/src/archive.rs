@@ -2005,4 +2005,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn list_child_entries_inherits_parent_visibility() {
+        // Regression: non-admin users who can see a playlist container through a
+        // collection must also see its children. The child is auto-enrolled in the
+        // default collection with private visibility bits — it has no *visible*
+        // collection membership of its own, so it would be filtered out without
+        // the parent-collection OR arm in list_child_entries.
+        let (conn, user_id, run_id) = make_tag_test_db();
+
+        let container = make_entry_in_db(&conn, user_id, run_id, None, None,
+            "Playlist", "https://example.com/pl");
+        let child = make_entry_in_db(&conn, user_id, run_id,
+            Some(container.id), Some(container.id),
+            "Video 1", "https://example.com/pl/v1");
+
+        // Enroll the container (but NOT the child) in a USER-visible collection (bits=2).
+        let coll = database::create_collection(&conn, "My List", "my-list", 2).unwrap();
+        database::add_entry_to_collection(&conn, coll.id, container.id, 2).unwrap();
+
+        // USER caller (bits=2): child must be visible through parent's collection.
+        let children = list_child_entries(&conn, &container.entry_uid, 2).unwrap();
+        assert_eq!(children.len(), 1, "child must be visible via parent collection");
+        assert_eq!(children[0].entry_uid, child.entry_uid);
+
+        // GUEST caller (bits=1): parent collection has bits=2, so child must NOT be visible.
+        let guest_children = list_child_entries(&conn, &container.entry_uid, 1).unwrap();
+        assert!(guest_children.is_empty(), "guest must not see children of a USER-only collection");
+    }
+
 }

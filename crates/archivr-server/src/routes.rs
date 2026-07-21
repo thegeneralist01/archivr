@@ -959,9 +959,10 @@ async fn capture_handler(
                     Some(&notes_str)
                 };
                 // A partial playlist (some items succeeded, some failed) has status="failed"
-                // but completed_count > 0. Treat it as a completed job so onCaptured fires
-                // and the archived entries appear. Only mark failed when nothing succeeded.
-                let job_status = if result.status == "failed" && result.completed_count == 0 {
+                // but completed_child_count > 0. Treat it as a completed job so onCaptured
+                // fires and the archived entries appear. Only mark failed when no child
+                // succeeded (completed_child_count == 0).
+                let job_status = if result.status == "failed" && result.completed_child_count == 0 {
                     "failed"
                 } else {
                     "completed"

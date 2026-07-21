@@ -1445,10 +1445,15 @@ pub fn finish_archive_run(conn: &Connection, run_id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Returns the completed_count for a run after finish_archive_run has been called.
-pub fn get_run_completed_count(conn: &Connection, run_id: i64) -> Result<i64> {
+/// Returns the number of completed **child** archive_run_items for a run.
+///
+/// Excludes the container item (parent_item_id IS NULL) so that a playlist
+/// where every video fails still returns 0 even though the container item
+/// itself was completed before child downloads started.
+pub fn get_run_completed_child_count(conn: &Connection, run_id: i64) -> Result<i64> {
     Ok(conn.query_row(
-        "SELECT completed_count FROM archive_runs WHERE id = ?1",
+        "SELECT COUNT(*) FROM archive_run_items
+         WHERE run_id = ?1 AND status = 'completed' AND parent_item_id IS NOT NULL",
         [run_id],
         |row| row.get(0),
     )?)
@@ -3940,4 +3945,38 @@ mod tests {
             "file must be protected because artifact.relpath references it directly"
         );
     }
+    #[test]
+    fn completed_child_count_excludes_container() {
+        // Regression: get_run_completed_child_count must not count the root container
+        // item. Scenario: complete both the container item and one child item; total
+        // DB completed_count == 2, but completed_child_count must == 1.
+        let c = conn();
+        let user_id = ensure_default_user(&c).unwrap();
+        let run = create_archive_run(&c, user_id, 2).unwrap();
+
+        // Root item (parent_item_id IS NULL) — mirrors what record_container_entry does.
+        let root_item = create_archive_run_item(
+            &c, run.id, None, 0, "https://example.com/pl", None, "youtube", "playlist",
+        ).unwrap();
+        // Child item (parent_item_id IS NOT NULL).
+        let child_item = create_archive_run_item(
+            &c, run.id, Some(root_item.id), 1, "https://example.com/v1", None, "youtube", "video",
+        ).unwrap();
+
+        // Complete both — marks archive_runs.completed_count = 2.
+        c.execute(
+            "UPDATE archive_run_items SET status = 'completed' WHERE id IN (?1, ?2)",
+            rusqlite::params![root_item.id, child_item.id],
+        ).unwrap();
+        refresh_run_counters(&c, run.id).unwrap();
+
+        let total: i64 = c.query_row(
+            "SELECT completed_count FROM archive_runs WHERE id = ?1", [run.id], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(total, 2, "both items completed: DB counter must be 2");
+
+        let child_count = get_run_completed_child_count(&c, run.id).unwrap();
+        assert_eq!(child_count, 1, "only the child item must be counted");
+    }
+
 }
