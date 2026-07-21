@@ -2760,13 +2760,16 @@ body.has-audio-bar { padding-bottom: 56px; }
 #entries-body > .entry-row-outer:nth-child(even) { background: #f2ede5; }
 #entries-body > .entry-row-outer:nth-child(odd)  { background: var(--paper-3); }
 
-/* Selection: class lives on outer wrapper, stroke scoped to inner row. */
-#entries-body > .entry-row-outer.is-selected     { background: #eee2d2; outline: none; box-shadow: none; }
-#entries-body > .entry-row-outer.is-multi-selected { background: #eee2d2; outline: none; box-shadow: none; }
-#entries-body > .entry-row-outer.is-selected .entry-row-main {
+/* Selection: class lives on outer wrapper; background + stroke scoped to inner row
+   so expanded child entries don't inherit the selection highlight. */
+#entries-body > .entry-row-outer.is-selected     { background: unset; outline: none; box-shadow: none; }
+#entries-body > .entry-row-outer.is-multi-selected { background: unset; outline: none; box-shadow: none; }
+#entries-body > .entry-row-outer.is-selected > .entry-row-main {
+  background: #eee2d2;
   box-shadow: inset 0 0 0 2px var(--accent);
 }
-#entries-body > .entry-row-outer.is-multi-selected .entry-row-main {
+#entries-body > .entry-row-outer.is-multi-selected > .entry-row-main {
+  background: #eee2d2;
   box-shadow: inset 0 0 0 2px var(--accent);
 }
 
