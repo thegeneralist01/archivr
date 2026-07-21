@@ -40,7 +40,7 @@ function ChildRow({ entry, index, onRowClick, selectedUids }) {
   );
 }
 
-export default function EntryRow({ entry, archiveId, isSelected, isMultiSelected, onRowClick, selectedUids, deletedUids }) {
+export default function EntryRow({ entry, archiveId, rowIndex, isSelected, isMultiSelected, onRowClick, selectedUids, deletedUids }) {
   const [favFailed, setFavFailed] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState(null);
@@ -96,6 +96,7 @@ export default function EntryRow({ entry, archiveId, isSelected, isMultiSelected
 
   const outerClass = [
     'entry-row-outer',
+    rowIndex % 2 === 0 ? 'entry-row-outer--light' : 'entry-row-outer--dark',
     isSelected && 'is-selected',
     isMultiSelected && 'is-multi-selected',
   ].filter(Boolean).join(' ');

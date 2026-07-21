@@ -299,8 +299,12 @@ select {
   border-bottom: 1px solid var(--line-soft);
 }
 #entries-body > div > div { padding: 7px 10px; flex-shrink: 0; overflow: hidden; }
-#entries-body > div:nth-child(even) { background: #f2ede5; }
-#entries-body > div:nth-child(odd) { background: var(--paper-3); }
+/* Skeleton rows (no index class) fall back to nth-child; real rows use explicit classes. */
+#entries-body > div:not(.entry-row-outer):nth-child(even) { background: #f2ede5; }
+#entries-body > div:not(.entry-row-outer):nth-child(odd)  { background: var(--paper-3); }
+/* Index-based stripes for real entry rows — immune to skeleton sibling count. */
+#entries-body > .entry-row-outer--light { background: var(--paper-3); }
+#entries-body > .entry-row-outer--dark  { background: #f2ede5; }
 #entries-body > div.is-selected {
   background: #eee2d2;
   box-shadow: inset 0 0 0 2px var(--accent);
@@ -2756,9 +2760,6 @@ body.has-audio-bar { padding-bottom: 56px; }
 #entries-body > .entry-row-outer > .entry-row-main > div:last-child { padding-right: 22px; }
 #entries-body > .entry-row-outer > .entry-row-main .col-added { padding-left: 22px; }
 
-/* Striping: one outer wrapper per entry, so nth-child alternation is preserved. */
-#entries-body > .entry-row-outer:nth-child(even) { background: #f2ede5; }
-#entries-body > .entry-row-outer:nth-child(odd)  { background: var(--paper-3); }
 
 /* Selection: class lives on outer wrapper; background + stroke scoped to inner row
    so expanded child entries don't inherit the selection highlight. */
@@ -2796,8 +2797,8 @@ body.has-audio-bar { padding-bottom: 56px; }
 }
 .child-entry-row:hover { opacity: 1; }
 .child-entry-row:last-child { border-bottom: none; }
-.child-entry-row--light { background: var(--paper-3); }
-.child-entry-row--dark  { background: #f2ede5; }
+.child-entry-row--light { background: #fafaf8; }
+.child-entry-row--dark  { background: #f2f0ec; }
 .child-entry-row.is-selected {
   background: #eee2d2;
   box-shadow: inset 0 0 0 2px var(--accent);
