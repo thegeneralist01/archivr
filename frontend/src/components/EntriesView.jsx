@@ -2,7 +2,7 @@ import SkeletonEntryRow from './SkeletonEntryRow';
 
 import EntryRow from './EntryRow';
 
-export default function EntriesView({ entries, selectedUids, onRowClick, archiveId, pendingCaptures = [] }) {
+export default function EntriesView({ entries, selectedUids, onRowClick, archiveId, pendingCaptures = [], deletedUids }) {
   return (
     <section id="archive-view" className="view is-active">
       <div className="entry-table">
@@ -27,6 +27,7 @@ export default function EntriesView({ entries, selectedUids, onRowClick, archive
               isMultiSelected={selectedUids.size >= 2 && selectedUids.has(entry.entry_uid)}
               onRowClick={onRowClick}
               selectedUids={selectedUids}
+              deletedUids={deletedUids}
             />
           ))}
         </div>

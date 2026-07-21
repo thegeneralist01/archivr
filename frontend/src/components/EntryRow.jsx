@@ -2,11 +2,12 @@ import { useState } from 'react';
 import { formatTimestamp, formatBytes, valueText, sourceIconSvg } from '../utils';
 import { fetchEntryChildren } from '../api';
 
-function ChildRow({ entry, onRowClick, selectedUids }) {
+function ChildRow({ entry, index, onRowClick, selectedUids }) {
   const isSelected = (selectedUids?.size === 1) && selectedUids.has(entry.entry_uid);
   const isMultiSelected = (selectedUids?.size >= 2) && selectedUids.has(entry.entry_uid);
 
   const cls = ['child-entry-row',
+    index % 2 === 0 ? 'child-entry-row--light' : 'child-entry-row--dark',
     isSelected && 'is-selected',
     isMultiSelected && 'is-multi-selected',
   ].filter(Boolean).join(' ');
@@ -39,7 +40,7 @@ function ChildRow({ entry, onRowClick, selectedUids }) {
   );
 }
 
-export default function EntryRow({ entry, archiveId, isSelected, isMultiSelected, onRowClick, selectedUids }) {
+export default function EntryRow({ entry, archiveId, isSelected, isMultiSelected, onRowClick, selectedUids, deletedUids }) {
   const [favFailed, setFavFailed] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState(null);
@@ -150,17 +151,22 @@ export default function EntryRow({ entry, archiveId, isSelected, isMultiSelected
         <div className="url-cell col-url">{valueText(entry.original_url)}</div>
       </div>
       {expanded && (
-        <div className="child-entries" aria-label={`${entry.child_count} child entries`}>
+        <>
           {childrenLoading && <div className="child-entries-loading">Loading…</div>}
-          {children && children.map(child => (
-            <ChildRow
-              key={child.entry_uid}
-              entry={child}
-              onRowClick={onRowClick}
-              selectedUids={selectedUids}
-            />
-          ))}
-        </div>
+          <div className="child-entries" aria-label={`${entry.child_count} child entries`}>
+            {children && children
+              .filter(c => !deletedUids?.has(c.entry_uid))
+              .map((child, idx) => (
+                <ChildRow
+                  key={child.entry_uid}
+                  entry={child}
+                  index={idx}
+                  onRowClick={onRowClick}
+                  selectedUids={selectedUids}
+                />
+              ))}
+          </div>
+        </>
       )}
     </div>
   );

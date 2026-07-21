@@ -86,6 +86,7 @@ export default function App() {
   const [archives, setArchives] = useState([])
   const [archiveId, setArchiveId] = useState(null)
   const [entries, setEntries] = useState([])
+  const [deletedUids, setDeletedUids] = useState(() => new Set())
   const [selectedEntryUid, setSelectedEntryUid] = useState(() => parseLocation().entry)
   const [selectedEntry, setSelectedEntry] = useState(null)
   const [selectedUids, setSelectedUids] = useState(() => {
@@ -294,12 +295,20 @@ export default function App() {
       if (next.size === 0) {
         selectEntry(null)
       } else if (next.size === 1) {
-        // Resolve the remaining UID — may be a child not in root entries array.
+        // Resolve the remaining UID — may be a child not in the root entries array
+        // and not yet cached (e.g. picked up via shift-range without a direct click).
         const [remainingUid] = next
         const cached = entryCacheRef.current.get(remainingUid)
             ?? entries.find(x => x.entry_uid === remainingUid)
             ?? null
-        selectEntry(cached)
+        if (cached) {
+          selectEntry(cached)
+        } else {
+          // Cache miss — fetch from server rather than clearing the detail panel.
+          fetchEntryDetail(archiveId, remainingUid)
+            .then(det => { if (det?.summary) selectEntry(det.summary) })
+            .catch(() => {})
+        }
       } else {
         selectEntry(null)
       }
@@ -308,7 +317,7 @@ export default function App() {
       setSelectedUids(new Set([entry.entry_uid]))
       selectEntry(entry)
     }
-  }, [entries, selectedUids, selectEntry])
+  }, [entries, selectedUids, selectEntry, archiveId])
 
   const handleTagFilterSet = useCallback((fullPath) => {
     setTagFilter(fullPath)
@@ -360,18 +369,26 @@ export default function App() {
   }, [archiveId, selectedEntry])
 
   const handleEntryDeleted = useCallback((entryUid) => {
+    const isRoot = entries.some(e => e.entry_uid === entryUid)
+    setDeletedUids(prev => { const n = new Set(prev); n.add(entryUid); return n })
     setEntries(prev => prev.filter(e => e.entry_uid !== entryUid))
     setSelectedEntry(prev => prev?.entry_uid === entryUid ? null : prev)
     setSelectedEntryUid(prev => prev === entryUid ? null : prev)
     setSelectedUids(prev => { const n = new Set(prev); n.delete(entryUid); return n })
-  }, [])
+    // Child delete: parent row's child_count/size are stale — reload after state updates.
+    if (!isRoot) loadEntries(archiveId, searchQuery, tagFilter)
+  }, [entries, archiveId, searchQuery, tagFilter, loadEntries])
 
   const handleBulkDeleted = useCallback((uids) => {
+    const rootUids = new Set(entries.map(e => e.entry_uid))
+    const hasChildDelete = [...uids].some(u => !rootUids.has(u))
+    setDeletedUids(prev => { const n = new Set(prev); uids.forEach(u => n.add(u)); return n })
     setEntries(prev => prev.filter(e => !uids.has(e.entry_uid)))
     setSelectedUids(new Set())
     setSelectedEntry(null)
     setSelectedEntryUid(null)
-  }, [])
+    if (hasChildDelete) loadEntries(archiveId, searchQuery, tagFilter)
+  }, [entries, archiveId, searchQuery, tagFilter, loadEntries])
 
   // Auto-snap: drive selectedEntryUid from selectedUids so URL sync and detail
   // panel stay correct. size >= 2 clears single-entry state (bulk panel takes over).
@@ -581,6 +598,7 @@ export default function App() {
                 onRowClick={handleRowClick}
                 archiveId={archiveId}
                 pendingCaptures={pendingCaptures}
+                deletedUids={deletedUids}
               />
             )}
             {view === 'runs' && <RunsView runs={runs} />}
