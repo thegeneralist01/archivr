@@ -872,13 +872,14 @@ async fn capture_handler(
             )));
         }
     }
-    // NOTE: the server does not enforce that every playlist item has a per_item_quality
-    // entry. Items without an override receive the global `quality` value, which
-    // yt-dlp applies as a format-selector cap (e.g. bestvideo[height<=1080]) and
-    // falls back gracefully to the best available format below that cap. The
-    // "must choose quality for unsupported videos" invariant is enforced by the
+    // per_item_quality semantics (enforced in capture.rs):
+    // - Absent or empty map: all playlist items are downloaded; quality is the
+    //   global `quality` field applied as a yt-dlp cap with graceful fallback.
+    // - Non-empty map: ONLY items whose yt-dlp ID appears as a key are downloaded;
+    //   absent IDs are skipped. This is how the frontend's delete-item button works.
+    // The "must choose quality for unsupported videos" invariant is enforced by the
     // frontend before submission; a direct API caller bypassing the UI accepts
-    // yt-dlp's standard cap-and-fallback behavior.
+    // yt-dlp's standard cap-and-fallback behavior for items it includes.
     let mounted = mounted_archive(&state, &archive_id)?;
     let archive_paths =
         archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;

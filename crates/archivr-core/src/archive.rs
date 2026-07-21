@@ -214,7 +214,7 @@ pub fn list_root_entries(
             e.visibility,
             si.canonical_url,
             COUNT(ea.id) AS artifact_count,
-            COALESCE(SUM(b.byte_size), 0) AS total_artifact_bytes,
+            COALESCE(SUM(b.byte_size), 0) + COALESCE((SELECT SUM(b2.byte_size) FROM archived_entries c2 JOIN entry_artifacts ea2 ON ea2.entry_id = c2.id JOIN blobs b2 ON b2.id = ea2.blob_id WHERE c2.parent_entry_id = e.id), 0) AS total_artifact_bytes,
             NULL AS parent_entry_uid,
             EXISTS(SELECT 1 FROM entry_artifacts fav WHERE fav.entry_id = e.id AND fav.artifact_role = 'favicon') AS has_favicon,
             e.cached_bytes,
@@ -689,7 +689,7 @@ pub fn parse_search_query(raw: &str) -> Result<SearchEntriesQuery, String> {
 
 const ENTRY_SELECT_COLS: &str = "SELECT e.entry_uid, e.archived_at, e.source_kind, e.entity_kind, e.title, \
     e.visibility, si.canonical_url, COUNT(ea.id) AS artifact_count, \
-    COALESCE(SUM(b.byte_size), 0) AS total_artifact_bytes, \
+    COALESCE(SUM(b.byte_size), 0) + COALESCE((SELECT SUM(b2.byte_size) FROM archived_entries c2 JOIN entry_artifacts ea2 ON ea2.entry_id = c2.id JOIN blobs b2 ON b2.id = ea2.blob_id WHERE c2.parent_entry_id = e.id), 0) AS total_artifact_bytes, \
     parent.entry_uid AS parent_entry_uid, \
     EXISTS(SELECT 1 FROM entry_artifacts fav WHERE fav.entry_id = e.id AND fav.artifact_role = 'favicon') AS has_favicon, \
     e.cached_bytes, \

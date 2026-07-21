@@ -90,10 +90,13 @@ pub struct CaptureConfig {
     /// Route WebPage captures through the Freedium mirror to bypass paywalls.
     /// The original locator is still recorded in the DB; only the fetch URL changes.
     pub via_freedium: bool,
-    /// Per-item quality overrides for playlist captures.
+    /// Per-item quality overrides and include-set for playlist captures.
     /// Keys are yt-dlp video IDs (e.g. "dQw4w9WgXcQ"); values are quality strings
     /// accepted by `quality_format` ("best", "audio", "1080p", etc.).
-    /// Empty map = apply the global `quality` to all items.
+    /// - Empty map: all playlist items are downloaded using the global `quality`.
+    /// - Non-empty map: ONLY items whose ID appears as a key are downloaded;
+    ///   items absent from the map are skipped entirely. This is how the UI's
+    ///   per-video delete button excludes specific videos from a capture.
     pub per_item_quality: HashMap<String, String>,
     /// When true, skip playlist items whose URL is already archived as a child
     /// of any container entry with the same canonical playlist URL.
@@ -1139,6 +1142,16 @@ pub fn perform_capture(
             if config.sync && already_archived.contains(&playlist_item.url) {
                 continue;
             }
+            // Per-item exclusion: when per_item_quality is non-empty (frontend
+            // probe ran and the user confirmed the item list), only download
+            // items whose ID appears in the map. IDs absent from a non-empty
+            // map were removed by the user via the delete button before submit.
+            if !config.per_item_quality.is_empty()
+                && !config.per_item_quality.contains_key(&playlist_item.id)
+            {
+                continue;
+            }
+
 
             let child_timestamp = format!(
                 "{}-{}",
