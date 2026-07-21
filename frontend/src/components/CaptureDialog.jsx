@@ -395,6 +395,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     if (toSubmit.some(it => hasConflict(it))) return
     if (toSubmit.some(it => it.probeState === 'probing' ||
         (isPlaylistSource(it.locator) && it.playlistProbeState !== 'done'))) return
+    if (toSubmit.some(it => Array.isArray(it.playlistItems) && it.playlistItems.length === 0)) return
     const batchId = toSubmit.length > 1
       ? (crypto.randomUUID?.() ?? `batch-${Date.now()}`)
       : null
@@ -516,9 +517,20 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   function updateSync(id, val) {
     setItems(prev => prev.map(it => it.id === id ? { ...it, syncEnabled: val } : it))
   }
+  function deletePlaylistItem(itemId, videoId) {
+    setItems(prev => prev.map(it =>
+      it.id !== itemId ? it :
+      { ...it, playlistItems: it.playlistItems.filter(pi => pi.id !== videoId) }
+    ))
+  }
+
 
   const pendingCount = items.filter(it => it.locator.trim()).length
   const anyConflict = items.some(it => hasConflict(it))
+  // True if any playlist row has had all its videos deleted — archive would be a no-op.
+  const anyEmptyPlaylist = items.some(it =>
+    Array.isArray(it.playlistItems) && it.playlistItems.length === 0
+  )
   const anyProbing = items.some(it =>
     it.probeState === 'probing' ||
     // For playlist sources block unless probe completed successfully:
@@ -557,6 +569,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
               onPlaylistItemQualityChange={(vid, q) => updatePlaylistItemQuality(item.id, vid, q)}
               onPlaylistToggle={() => togglePlaylistExpanded(item.id)}
               onSyncChange={val => updateSync(item.id, val)}
+              onPlaylistItemDelete={(vid) => deletePlaylistItem(item.id, vid)}
             />
           ))}
         </div>
@@ -680,7 +693,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
             type="button"
             className="capture-submit"
             onClick={handleArchive}
-            disabled={pendingCount === 0 || anyConflict || anyProbing}
+            disabled={pendingCount === 0 || anyConflict || anyProbing || anyEmptyPlaylist}
           >
             {pendingCount > 1 ? `Archive ${pendingCount}` : 'Archive'}
           </button>
@@ -694,7 +707,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
 }
 
 function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemove, onSubmit,
-  onPlaylistQualityChange, onPlaylistItemQualityChange, onPlaylistToggle, onSyncChange }) {
+  onPlaylistQualityChange, onPlaylistItemQualityChange, onPlaylistToggle, onSyncChange, onPlaylistItemDelete }) {
   const inputRef = useRef(null)
 
   useEffect(() => {
@@ -805,9 +818,9 @@ function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemov
             >
               {item.playlistExpanded ? '▲' : '▼'}
             </button>
-          ) : (
+          ) : item.playlistProbeState === 'probing' ? (
             <span className="capture-playlist-toggle-placeholder" aria-hidden="true" />
-          )
+          ) : null
         ) : null}
         <input
           ref={inputRef}
@@ -852,6 +865,14 @@ function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemov
               {pi.quality === null && (
                 <span className="capture-playlist-conflict-badge">Choose quality</span>
               )}
+              <button
+                type="button"
+                className="capture-playlist-item-remove"
+                aria-label={`Remove ${pi.title || pi.url}`}
+                onClick={() => onPlaylistItemDelete(pi.id)}
+              >
+                &times;
+              </button>
             </div>
           ))}
           {syncToggle}
