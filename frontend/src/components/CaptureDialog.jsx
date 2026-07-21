@@ -818,8 +818,6 @@ function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemov
             >
               {item.playlistExpanded ? '▲' : '▼'}
             </button>
-          ) : item.playlistProbeState === 'probing' ? (
-            <span className="capture-playlist-toggle-placeholder" aria-hidden="true" />
           ) : null
         ) : null}
         <input
