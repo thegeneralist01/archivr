@@ -132,6 +132,8 @@ export default function App() {
   const pendingSearchFocus = useRef(false)
   const firstArchiveLoad = useRef(true)
   const lastAnchorIndexRef = useRef(null)
+  // Monotonic token for j/k keyboard navigation; cancels stale fetchEntryDetail calls.
+  const jkSeqRef = useRef(0)
   // uid → entry object cache; populated on every row click so ctrl/shift
   // selections can resolve child entries that aren't in the root entries array.
   const entryCacheRef = useRef(new Map())
@@ -267,6 +269,8 @@ export default function App() {
     // Cache every clicked entry so shift/ctrl can resolve child entries
     // that are not present in the root `entries` array.
     entryCacheRef.current.set(entry.entry_uid, entry)
+    // Invalidate any in-flight j/k uncached-child fetch.
+    ++jkSeqRef.current
 
     if (e.shiftKey && lastAnchorIndexRef.current !== null) {
       e.preventDefault()
@@ -479,9 +483,11 @@ export default function App() {
       const nextUid = nextNode.dataset.entryUid
 
       lastAnchorIndexRef.current = nextUid
+      const tok = ++jkSeqRef.current
       setSelectedUids(new Set([nextUid]))
 
-      // Resolve entry object: cache → root entries array → server fetch
+      // Resolve entry object: cache → root entries array → server fetch.
+      // Token guards against a slow fetch settling after the user has moved on.
       const cached = entryCacheRef.current.get(nextUid)
           ?? entries.find(x => x.entry_uid === nextUid)
           ?? null
@@ -489,7 +495,7 @@ export default function App() {
         selectEntry(cached)
       } else {
         fetchEntryDetail(archiveId, nextUid)
-          .then(det => { if (det?.summary) selectEntry(det.summary) })
+          .then(det => { if (tok === jkSeqRef.current && det?.summary) selectEntry(det.summary) })
           .catch(() => {})
       }
 
