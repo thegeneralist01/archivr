@@ -2761,8 +2761,8 @@ body.has-audio-bar { padding-bottom: 56px; }
 #entries-body > .entry-row-outer:nth-child(odd)  { background: var(--paper-3); }
 
 /* Selection: class lives on outer wrapper, stroke scoped to inner row. */
-#entries-body > .entry-row-outer.is-selected     { background: #eee2d2; outline: none; }
-#entries-body > .entry-row-outer.is-multi-selected { background: #eee2d2; outline: none; }
+#entries-body > .entry-row-outer.is-selected     { background: #eee2d2; outline: none; box-shadow: none; }
+#entries-body > .entry-row-outer.is-multi-selected { background: #eee2d2; outline: none; box-shadow: none; }
 #entries-body > .entry-row-outer.is-selected .entry-row-main {
   box-shadow: inset 0 0 0 2px var(--accent);
 }
