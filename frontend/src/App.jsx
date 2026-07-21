@@ -131,6 +131,9 @@ export default function App() {
   const pendingSearchFocus = useRef(false)
   const firstArchiveLoad = useRef(true)
   const lastAnchorIndexRef = useRef(null)
+  // uid → entry object cache; populated on every row click so ctrl/shift
+  // selections can resolve child entries that aren't in the root entries array.
+  const entryCacheRef = useRef(new Map())
 
   const humanizeTags = currentUser?.humanize_slugs ?? false;
 
@@ -260,6 +263,10 @@ export default function App() {
   }, [])
 
   const handleRowClick = useCallback((entry, e) => {
+    // Cache every clicked entry so shift/ctrl can resolve child entries
+    // that are not present in the root `entries` array.
+    entryCacheRef.current.set(entry.entry_uid, entry)
+
     if (e.shiftKey && lastAnchorIndexRef.current !== null) {
       e.preventDefault()
       // Use DOM order so child rows (not in the `entries` array) participate
@@ -268,7 +275,6 @@ export default function App() {
       const anchorIdx = allNodes.findIndex(n => n.dataset.entryUid === lastAnchorIndexRef.current)
       const clickIdx  = allNodes.findIndex(n => n.dataset.entryUid === entry.entry_uid)
       if (anchorIdx === -1 || clickIdx === -1) {
-        // anchor no longer visible — fall back to single select
         lastAnchorIndexRef.current = entry.entry_uid
         setSelectedUids(new Set([entry.entry_uid]))
         selectEntry(entry)
@@ -285,10 +291,18 @@ export default function App() {
       if (next.has(entry.entry_uid)) next.delete(entry.entry_uid)
       else next.add(entry.entry_uid)
       setSelectedUids(next)
-      // Auto-snap only restores root entries; explicitly drive selectEntry so
-      // ctrl-clicking a single child row loads its detail and clears on multi.
-      if (next.size === 1 && next.has(entry.entry_uid)) selectEntry(entry)
-      else if (next.size !== 1) selectEntry(null)
+      if (next.size === 0) {
+        selectEntry(null)
+      } else if (next.size === 1) {
+        // Resolve the remaining UID — may be a child not in root entries array.
+        const [remainingUid] = next
+        const cached = entryCacheRef.current.get(remainingUid)
+            ?? entries.find(x => x.entry_uid === remainingUid)
+            ?? null
+        selectEntry(cached)
+      } else {
+        selectEntry(null)
+      }
     } else {
       lastAnchorIndexRef.current = entry.entry_uid
       setSelectedUids(new Set([entry.entry_uid]))
