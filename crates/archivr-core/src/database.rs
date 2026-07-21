@@ -1638,12 +1638,15 @@ pub fn delete_entry(conn: &Connection, entry_uid: &str) -> Result<bool> {
     // shared blobs with any subtree member, excluding every subtree ID simultaneously.
     cascade_cached_bytes_after_subtree_delete(conn, &subtree_ids)?;
 
-    // Null the FK that has no ON DELETE action (covers root and all descendants).
+    // Null the FK that has no ON DELETE action. Must cover:
+    // - The entry itself (child entry: root_entry_id = playlist root, not self)
+    // - All descendants (root entry: children have root_entry_id = entry_id)
     conn.execute(
         "UPDATE archive_run_items SET produced_entry_id = NULL
-         WHERE produced_entry_id IN (
-             SELECT id FROM archived_entries WHERE root_entry_id = ?1
-         )",
+         WHERE produced_entry_id = ?1
+            OR produced_entry_id IN (
+               SELECT id FROM archived_entries WHERE root_entry_id = ?1
+            )",
         [entry_id],
     )?;
 

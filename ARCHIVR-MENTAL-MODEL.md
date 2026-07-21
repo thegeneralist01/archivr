@@ -64,6 +64,17 @@ label = "Personal"
 archive_path = "/path/to/archive/.archivr"
 ```
 
+## Entry Nesting
+
+Entries support a two-level parent/child hierarchy. A **container entry** (playlist or channel) holds zero or more child entries (individual videos). Container entries have no primary media artifact of their own; their `total_artifact_bytes` is the sum of their children's bytes.
+
+Rules:
+- Maximum nesting depth is 2 (root → child). Children cannot have children.
+- The UI shows child entries collapsed under their parent, expandable with a chevron.
+- Container entries are created by playlist/channel captures. Single-video and all other source types produce a standalone root entry with no children.
+
+If a feature touches how entries are parented or how the UI groups them, start in `archivr-core` (`database.rs` for schema, `archive.rs` for listing, `capture.rs` for creation).
+
 ## How To Run It
 
 There are two user-facing binaries:
@@ -155,6 +166,7 @@ sequenceDiagram
 | Capture orchestration, `Source` routing, `CaptureConfig` | `crates/archivr-core/src/capture.rs` |
 | Archive opening, listing entries, entry detail, runs | `crates/archivr-core/src/archive.rs` |
 | Download/save behavior | `crates/archivr-core/src/downloader/` |
+| YouTube playlist/channel download, playlist probe, sync mode | `crates/archivr-core/src/downloader/ytdlp.rs` and `capture.rs` |
 | CLI commands, argument parsing, terminal output | `crates/archivr-cli/src/main.rs` |
 | Server API routes | `crates/archivr-server/src/routes.rs` |
 | Auth model (users, sessions, tokens, roles) | `crates/archivr-server/src/auth.rs` |

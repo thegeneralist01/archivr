@@ -16,6 +16,8 @@ Three crates with a strict ownership split — **core owns truth; CLI and server
 
 Capture flow: locator → `determine_source()` (`crates/archivr-core/src/capture.rs`) routes by platform/shorthand (`yt:`, `x:`, `tweet:` …) → platform downloader (`downloader/ytdlp.rs`, `tweets.rs`, `singlefile.rs`, `http.rs`, `local.rs`) stages into `temp/` → SHA3-256 dedup (`hash.rs`, `downloader/store.rs`) moves blobs to `raw/A/B/HASH.EXT` → rows written to `archivr.sqlite` (runs, entries, artifacts, blobs) → served via `/api/archives/:id/...`. `CaptureConfig` carries per-request toggles (uBlock, reader mode, Freedium mirror, etc.); when `via_freedium` is set, the fetch URL is rewritten through `freedium-mirror.cfd` while the canonical DB URL stays the original locator.
 
+YouTube playlists and channels produce a **parent container entry** with each video captured as a child entry. `downloader/ytdlp.rs` handles the playlist probe (fetching per-video quality metadata before archiving), the multi-video download loop, and sync mode (skipping already-archived videos when re-archiving a playlist or channel).
+
 Per-archive layout (created by `archivr init`): `.archivr/` (name, store_path, `archivr.sqlite`) + sibling `store/` (`raw/`, `raw_tweets/`, `structured/`, `temp/`). Server-level auth lives in a **separate** `archivr-auth.sqlite` (users, sessions, API tokens, role bits GUEST=1/USER=2/ADMIN=4/OWNER=8).
 
 The server mounts multiple archives from a TOML registry (`crates/archivr-server/src/registry.rs`); routes are parameterized by `:archive_id`.
@@ -78,6 +80,7 @@ No CI is configured; no rustfmt.toml/clippy.toml — default `cargo fmt`/`clippy
 - `crates/archivr-server/src/main.rs` — server bootstrap: config load, archive mounting, auth DB init, stalled-job recovery (running → failed on startup).
 - `crates/archivr-server/src/routes.rs` — all HTTP handlers and the router; grep here first for API work.
 - `crates/archivr-core/src/capture.rs` — `perform_capture()`, `Source` enum, shorthand parsing.
+- `crates/archivr-core/src/downloader/ytdlp.rs` — yt-dlp integration; YouTube playlist/channel probe and download, sync mode logic.
 - `crates/archivr-core/src/database.rs` — single source of truth for all SQLite schema and queries (both archive and auth DBs).
 - `frontend/src/App.jsx` / `frontend/src/api.js` — frontend root state and API surface.
 - `docker/config.example.toml` — server config schema: `bind`, `auth_db_path`, repeated `[[archives]]` (`id`, `label`, `archive_path`).
