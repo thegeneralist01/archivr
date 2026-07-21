@@ -504,6 +504,11 @@ pub fn list_child_entries(
                  WHERE ce.entry_id = e.id \
                    AND ce.visibility_bits & CAST(?2 AS INTEGER) != 0\
              )\
+             OR EXISTS (\
+                 SELECT 1 FROM collection_entries ce_p \
+                 WHERE ce_p.entry_id = (SELECT id FROM archived_entries WHERE entry_uid = ?1)\
+                   AND ce_p.visibility_bits & CAST(?2 AS INTEGER) != 0\
+             )\
          ) \
          GROUP BY e.id \
          ORDER BY e.archived_at ASC, e.id ASC",

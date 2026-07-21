@@ -37,8 +37,11 @@ pub enum Source {
 pub struct CaptureResult {
     pub run_uid: String,
     pub status: String,
+    /// Number of successfully completed child items (playlist/container captures only).
+    /// Zero for single-item captures. Used by the server to distinguish a fully-failed
+    /// playlist run from a partial success without needing a new DB status value.
+    pub completed_count: i64,
     /// `true` when uBlock was requested but the extension path was not found.
-    /// The capture succeeded without ad-blocking; the UI should warn the user.
     pub ublock_skipped: bool,
     /// `true` when cookie-consent extension was requested but the path was not found.
     pub cookie_ext_skipped: bool,
@@ -1310,10 +1313,13 @@ pub fn perform_capture(
                 |row| row.get(0),
             )
             .unwrap_or_else(|_| "completed".to_string());
+        let completed_count: i64 = database::get_run_completed_count(&conn, run.id)
+            .unwrap_or(0);
 
         return Ok(CaptureResult {
             run_uid: run.run_uid.clone(),
             status: run_status,
+            completed_count,
             ublock_skipped: false,
             cookie_ext_skipped: false,
         });
@@ -1367,6 +1373,7 @@ pub fn perform_capture(
                 return Ok(CaptureResult {
                     run_uid: run.run_uid.clone(),
                     status: "completed".to_string(),
+                    completed_count: 0,
                     ublock_skipped: false,
                     cookie_ext_skipped: false,
                 });
@@ -1540,6 +1547,7 @@ pub fn perform_capture(
                 return Ok(CaptureResult {
                     run_uid: run.run_uid.clone(),
                     status: "completed".to_string(),
+                    completed_count: 0,
                     ublock_skipped: result.ublock_skipped,
                     cookie_ext_skipped: result.cookie_ext_skipped,
                 });
@@ -1597,6 +1605,7 @@ pub fn perform_capture(
                 return Ok(CaptureResult {
                     run_uid: run.run_uid.clone(),
                     status: "completed".to_string(),
+                    completed_count: 0,
                     ublock_skipped: false,
                     cookie_ext_skipped: false,
                 });
@@ -1750,6 +1759,7 @@ pub fn perform_capture(
     Ok(CaptureResult {
         run_uid: run.run_uid.clone(),
         status: "completed".to_string(),
+        completed_count: 0,
         ublock_skipped: false,
         cookie_ext_skipped: false,
     })

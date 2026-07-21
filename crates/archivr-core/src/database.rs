@@ -1437,16 +1437,21 @@ pub fn finish_archive_run(conn: &Connection, run_id: i64) -> Result<()> {
         [run_id],
         |row| row.get(0),
     )?;
-    let status = if failed_count > 0 {
-        "failed"
-    } else {
-        "completed"
-    };
+    let status = if failed_count > 0 { "failed" } else { "completed" };
     conn.execute(
         "UPDATE archive_runs SET status = ?1, finished_at = ?2 WHERE id = ?3",
         params![status, now_timestamp(), run_id],
     )?;
     Ok(())
+}
+
+/// Returns the completed_count for a run after finish_archive_run has been called.
+pub fn get_run_completed_count(conn: &Connection, run_id: i64) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT completed_count FROM archive_runs WHERE id = ?1",
+        [run_id],
+        |row| row.get(0),
+    )?)
 }
 
 pub fn fail_archive_run(conn: &Connection, run_id: i64, error_summary: &str) -> Result<()> {

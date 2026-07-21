@@ -958,7 +958,7 @@ async fn capture_handler(
                     notes_str = serde_json::Value::Object(notes_map).to_string();
                     Some(&notes_str)
                 };
-                let job_status = if result.status == "completed" { "completed" } else { "failed" };
+                let job_status = if result.status == "failed" { "failed" } else { "completed" };
                 database::update_capture_job_status(
                     &conn,
                     &job_uid_bg,
@@ -1181,7 +1181,7 @@ async fn probe_playlist_handler(
     }
     // Validate it's a playlist/channel source and expand shorthands.
     let canonical_url = capture::locator_to_playlist_url(&locator)
-        .ok_or_else(|| ApiError::bad_request("locator is not a YouTube playlist, channel, or YTM playlist"))?;
+        .ok_or_else(|| ApiError::bad_request("locator is not a YouTube playlist, channel, YTM playlist, or Spotify album/playlist"))?;
     // Verify archive exists.
     let _ = mounted_archive(&state, &archive_id)?;
     // Resolve cookies.
