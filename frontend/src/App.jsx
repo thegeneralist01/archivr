@@ -308,9 +308,9 @@ export default function App() {
         if (cached) {
           selectEntry(cached)
         } else {
-          // Cache miss — fetch from server rather than clearing the detail panel.
+          const tok = ++jkSeqRef.current
           fetchEntryDetail(archiveId, remainingUid)
-            .then(det => { if (det?.summary) selectEntry(det.summary) })
+            .then(det => { if (tok === jkSeqRef.current && det?.summary) selectEntry(det.summary) })
             .catch(() => {})
         }
       } else {
@@ -436,18 +436,23 @@ export default function App() {
     if (current !== url) history.replaceState(null, '', url)
   }, [searchQuery, tagFilter, selectedEntryUid, view])
 
-  // ⌘K / Ctrl+K: focus the search input, switching to archive view first if needed.
+  // ⌘K / Ctrl+K / /: focus the search input, switching to archive view first if needed.
   useEffect(() => {
     const handler = (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
-        e.preventDefault()
-        if (view === 'archive') {
-          searchInputRef.current?.focus()
-          searchInputRef.current?.select()
-        } else {
-          pendingSearchFocus.current = true
-          setView('archive')
-        }
+      const isSlash = e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey
+      const isCmdK  = (e.metaKey || e.ctrlKey) && e.key === 'k'
+      if (!isSlash && !isCmdK) return
+      // Don't intercept / when already typing in an input
+      const tag = document.activeElement?.tagName
+      if (isSlash && (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT')) return
+      if (isSlash && document.activeElement?.isContentEditable) return
+      e.preventDefault()
+      if (view === 'archive') {
+        searchInputRef.current?.focus()
+        searchInputRef.current?.select()
+      } else {
+        pendingSearchFocus.current = true
+        setView('archive')
       }
     }
     document.addEventListener('keydown', handler)
