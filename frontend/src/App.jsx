@@ -262,10 +262,13 @@ export default function App() {
   const handleRowClick = useCallback((entry, e) => {
     if (e.shiftKey && lastAnchorIndexRef.current !== null) {
       e.preventDefault()
-      const anchorIdx = entries.findIndex(x => x.entry_uid === lastAnchorIndexRef.current)
-      const clickIdx  = entries.findIndex(x => x.entry_uid === entry.entry_uid)
+      // Use DOM order so child rows (not in the `entries` array) participate
+      // in range selection. Every rendered row has data-entry-uid.
+      const allNodes = [...document.querySelectorAll('#entries-body [data-entry-uid]')]
+      const anchorIdx = allNodes.findIndex(n => n.dataset.entryUid === lastAnchorIndexRef.current)
+      const clickIdx  = allNodes.findIndex(n => n.dataset.entryUid === entry.entry_uid)
       if (anchorIdx === -1 || clickIdx === -1) {
-        // anchor evicted by search/filter/delete — fall back to single select
+        // anchor no longer visible — fall back to single select
         lastAnchorIndexRef.current = entry.entry_uid
         setSelectedUids(new Set([entry.entry_uid]))
         selectEntry(entry)
@@ -273,24 +276,25 @@ export default function App() {
       }
       const lo = Math.min(anchorIdx, clickIdx)
       const hi = Math.max(anchorIdx, clickIdx)
-      const range = entries.slice(lo, hi + 1)
-      const uids = new Set(range.map(x => x.entry_uid))
+      const uids = new Set(allNodes.slice(lo, hi + 1).map(n => n.dataset.entryUid))
       setSelectedUids(uids)
-      if (uids.size === 1) selectEntry(range[0])
+      if (uids.size === 1) selectEntry(entry)
     } else if (e.ctrlKey || e.metaKey) {
       lastAnchorIndexRef.current = entry.entry_uid
-      setSelectedUids(prev => {
-        const next = new Set(prev)
-        if (next.has(entry.entry_uid)) next.delete(entry.entry_uid)
-        else next.add(entry.entry_uid)
-        return next
-      })
+      const next = new Set(selectedUids)
+      if (next.has(entry.entry_uid)) next.delete(entry.entry_uid)
+      else next.add(entry.entry_uid)
+      setSelectedUids(next)
+      // Auto-snap only restores root entries; explicitly drive selectEntry so
+      // ctrl-clicking a single child row loads its detail and clears on multi.
+      if (next.size === 1 && next.has(entry.entry_uid)) selectEntry(entry)
+      else if (next.size !== 1) selectEntry(null)
     } else {
       lastAnchorIndexRef.current = entry.entry_uid
       setSelectedUids(new Set([entry.entry_uid]))
       selectEntry(entry)
     }
-  }, [entries, selectEntry])
+  }, [entries, selectedUids, selectEntry])
 
   const handleTagFilterSet = useCallback((fullPath) => {
     setTagFilter(fullPath)

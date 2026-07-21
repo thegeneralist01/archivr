@@ -1627,9 +1627,14 @@ pub fn delete_entry(conn: &Connection, entry_uid: &str) -> Result<bool> {
         None => return Ok(false),
     };
 
-    // Collect the full subtree while rows still exist.
+    // Collect the full subtree (entry itself + any descendants) while rows still exist.
+    // Must include the entry itself: for a child entry root_entry_id = ?1 returns nothing
+    // (no grandchildren), so without `id = ?1` the set would be empty and
+    // cascade_cached_bytes_after_subtree_delete would not recalculate shared-blob totals.
     let subtree_ids: Vec<i64> = {
-        let mut stmt = conn.prepare("SELECT id FROM archived_entries WHERE root_entry_id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM archived_entries WHERE id = ?1 OR root_entry_id = ?1",
+        )?;
         stmt.query_map([entry_id], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?
     };
