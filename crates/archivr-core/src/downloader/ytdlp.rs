@@ -298,6 +298,41 @@ pub fn fetch_metadata(path: &str, cookies: &HashMap<String, String>) -> Option<S
     if json.trim().is_empty() { None } else { Some(json) }
 }
 
+/// Resolves an absolute item URL from a flat-playlist entry JSON object.
+///
+/// Priority:
+/// 1. `webpage_url` — yt-dlp makes this absolute when present.
+/// 2. `url` when it is already an absolute HTTP(S) URL.
+/// 3. Platform-specific fallback constructed from `id` + `container_url`:
+///    - YouTube Music → `https://music.youtube.com/watch?v={id}`
+///    - YouTube       → `https://www.youtube.com/watch?v={id}`
+///    - Spotify       → `https://open.spotify.com/track/{id}`
+///    - Other         → `None` (caller should skip the item and warn).
+fn normalize_item_url(
+    entry: &serde_json::Value,
+    id: &str,
+    container_url: &str,
+) -> Option<String> {
+    let is_abs = |s: &str| s.starts_with("http://") || s.starts_with("https://");
+    if let Some(u) = entry.get("webpage_url").and_then(|v| v.as_str()).filter(|s| is_abs(s)) {
+        return Some(u.to_owned());
+    }
+    if let Some(u) = entry.get("url").and_then(|v| v.as_str()).filter(|s| is_abs(s)) {
+        return Some(u.to_owned());
+    }
+    // Bare-ID fallback keyed on the container's platform.
+    if container_url.contains("music.youtube.com") {
+        Some(format!("https://music.youtube.com/watch?v={id}"))
+    } else if container_url.contains("youtube.com") || container_url.contains("youtu.be") {
+        Some(format!("https://www.youtube.com/watch?v={id}"))
+    } else if container_url.contains("open.spotify.com") {
+        Some(format!("https://open.spotify.com/track/{id}"))
+    } else {
+        eprintln!("warn: skipping playlist item {id:?} — no absolute URL from yt-dlp");
+        None
+    }
+}
+
 /// Runs `yt-dlp -J --flat-playlist <url>` and parses the single-JSON result.
 ///
 /// `-J` / `--dump-single-json` returns one JSON object for the whole
@@ -359,42 +394,19 @@ pub fn fetch_playlist_info(url: &str, cookies: &HashMap<String, String>) -> Resu
         .map(|a| a.as_slice())
         .unwrap_or(&[]);
 
-    // Infer the fallback base host from the container URL so YouTube Music
-    // entries stay on music.youtube.com rather than www.youtube.com.
-    let fallback_host = if url.contains("music.youtube.com") {
-        "music.youtube.com"
-    } else {
-        "www.youtube.com"
-    };
-    let is_absolute = |s: &str| s.starts_with("http://") || s.starts_with("https://");
-
     let mut items = Vec::with_capacity(raw_entries.len());
     for entry in raw_entries {
         if entry.is_null() {
-            continue; // unavailable/private video in flat listing
+            continue; // unavailable/private item in flat listing
         }
         let id = match entry.get("id").and_then(|v| v.as_str()) {
             Some(s) => s.to_owned(),
             None => continue,
         };
-        // Normalize the item URL:
-        // 1. Prefer `webpage_url` — yt-dlp always makes this absolute when present.
-        // 2. Accept `url` only when it is already an absolute HTTP(S) URL; in
-        //    flat-playlist mode `url` is often just the bare video ID.
-        // 3. Fallback: construct from `id` using the same host as the container URL.
-        let item_url = entry
-            .get("webpage_url")
-            .and_then(|v| v.as_str())
-            .filter(|s| is_absolute(s))
-            .map(str::to_owned)
-            .or_else(|| {
-                entry
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| is_absolute(s))
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| format!("https://{fallback_host}/watch?v={id}"));
+        let item_url = match normalize_item_url(entry, &id, url) {
+            Some(u) => u,
+            None => continue,
+        };
         let item_title = entry.get("title").and_then(|v| v.as_str()).map(str::to_owned);
         let item_uploader = entry.get("uploader").and_then(|v| v.as_str()).map(str::to_owned);
         items.push(PlaylistItem { id, url: item_url, title: item_title, uploader: item_uploader });
@@ -455,14 +467,6 @@ pub fn probe_playlist_qualities(
     let title = json.get("title").and_then(|v| v.as_str()).map(str::to_owned);
     let uploader = json.get("uploader").and_then(|v| v.as_str()).map(str::to_owned);
 
-    // Same URL normalization as fetch_playlist_info
-    let fallback_host = if url.contains("music.youtube.com") {
-        "music.youtube.com"
-    } else {
-        "www.youtube.com"
-    };
-    let is_absolute = |s: &str| s.starts_with("http://") || s.starts_with("https://");
-
     let raw_entries = json
         .get("entries")
         .and_then(|v| v.as_array())
@@ -476,10 +480,10 @@ pub fn probe_playlist_qualities(
             Some(s) => s.to_owned(),
             None => continue,
         };
-        let item_url = entry
-            .get("webpage_url").and_then(|v| v.as_str()).filter(|s| is_absolute(s)).map(str::to_owned)
-            .or_else(|| entry.get("url").and_then(|v| v.as_str()).filter(|s| is_absolute(s)).map(str::to_owned))
-            .unwrap_or_else(|| format!("https://{fallback_host}/watch?v={id}"));
+        let item_url = match normalize_item_url(entry, &id, url) {
+            Some(u) => u,
+            None => continue,
+        };
         let item_title = entry.get("title").and_then(|v| v.as_str()).map(str::to_owned);
         let heights = available_video_heights_from_value(entry);
         let qualities: Vec<String> = heights.iter().map(|h| format!("{h}p")).collect();

@@ -568,9 +568,11 @@ pub fn locator_to_ytdlp_url(locator: &str) -> Option<String> {
 pub fn locator_to_playlist_url(locator: &str) -> Option<String> {
     let source = determine_source(locator);
     match source {
-        Source::YouTubePlaylist | Source::YouTubeChannel | Source::YouTubeMusicPlaylist => {
-            Some(expand_shorthand_to_url(locator, &source))
-        }
+        Source::YouTubePlaylist
+        | Source::YouTubeChannel
+        | Source::YouTubeMusicPlaylist
+        | Source::SpotifyAlbum
+        | Source::SpotifyPlaylist => Some(expand_shorthand_to_url(locator, &source)),
         _ => None,
     }
 }
@@ -1051,26 +1053,17 @@ pub fn perform_capture(
         ));
     }
 
-    // Sources: Spotify — SpotifyTrack attempts yt-dlp and fails gracefully if the
-    // extractor cannot handle the content. Albums and playlists are not yet supported
-    // as containers (fetch_playlist_info has YouTube-specific URL fallback logic).
-    if matches!(source, Source::SpotifyAlbum | Source::SpotifyPlaylist) {
-        return Err(fail_run(
-            &conn,
-            &run,
-            &item,
-            "Spotify album/playlist capture is not yet implemented. \
-             Archive individual tracks instead.",
-        ));
-    }
-
-    // Sources: YouTube playlists, YouTube channels, YouTube Music playlists.
-    // Fetch container metadata, create a root container entry, then download
-    // each video/track as a child entry.
+    // Sources: YouTube playlists, YouTube channels, YouTube Music playlists,
+    // Spotify albums, Spotify playlists — probe via yt-dlp flat-playlist,
+    // create a root container entry, then download each track as a child entry.
     // `run` and `item` are already created above; `item` acts as the container item.
     if matches!(
         source,
-        Source::YouTubePlaylist | Source::YouTubeChannel | Source::YouTubeMusicPlaylist
+        Source::YouTubePlaylist
+            | Source::YouTubeChannel
+            | Source::YouTubeMusicPlaylist
+            | Source::SpotifyAlbum
+            | Source::SpotifyPlaylist
     ) {
         // `canonical_url` already holds the expanded URL (same value as `path` later).
         let playlist_info = match downloader::ytdlp::fetch_playlist_info(&canonical_url, &cookies) {
@@ -1149,7 +1142,10 @@ pub fn perform_capture(
             (e.id, std::collections::HashSet::new())
         };
 
-        let is_audio = source == Source::YouTubeMusicPlaylist;
+        let is_audio = matches!(
+            source,
+            Source::YouTubeMusicPlaylist | Source::SpotifyAlbum | Source::SpotifyPlaylist
+        );
         let child_quality: Option<&str> = if is_audio { Some("audio") } else { quality };
         let child_entity_kind = if is_audio { "music" } else { "video" };
 
@@ -1199,7 +1195,11 @@ pub fn perform_capture(
                 Some(json) => {
                     let meta = downloader::metadata::extract_from_ytdlp_json(json);
                     Some(generate_entry_title(
-                        if is_audio { Source::YouTubeMusicTrack } else { Source::YouTubeVideo },
+                        match source {
+                            Source::SpotifyAlbum | Source::SpotifyPlaylist => Source::SpotifyTrack,
+                            _ if is_audio => Source::YouTubeMusicTrack,
+                            _ => Source::YouTubeVideo,
+                        },
                         &meta,
                     ))
                 }
@@ -1256,8 +1256,11 @@ pub fn perform_capture(
                     }
                     let _ = fs::remove_dir_all(store_path.join("temp").join(&child_timestamp));
 
-                    let child_source =
-                        if is_audio { Source::YouTubeMusicTrack } else { Source::YouTubeVideo };
+                    let child_source = match source {
+                        Source::SpotifyAlbum | Source::SpotifyPlaylist => Source::SpotifyTrack,
+                        _ if is_audio => Source::YouTubeMusicTrack,
+                        _ => Source::YouTubeVideo,
+                    };
                     match record_media_entry(
                         &conn,
                         store_path,
