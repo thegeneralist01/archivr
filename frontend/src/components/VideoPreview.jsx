@@ -41,10 +41,12 @@ export default function VideoPreview({ src, contentType = 'video/mp4' }) {
     if (!src) { setSignedSrc(null); return; }
     const m = src.match(ARTIFACT_URL_RE);
     if (!m) { setSignedSrc(src); return; } // not a recognised artifact URL
+    let cancelled = false;
     setSignedSrc(null); // reset while fetching
     issueMediaToken(m[1], m[2], parseInt(m[3], 10))
-      .then(({ url }) => setSignedSrc(url))
-      .catch(() => setSignedSrc(src)); // fallback — Cast/AirPlay may fail but browser still works
+      .then(({ url }) => { if (!cancelled) setSignedSrc(url); })
+      .catch(() => { if (!cancelled) setSignedSrc(src); }); // fallback on error
+    return () => { cancelled = true; };
   }, [src]);
 
   // Reload video element when the active source changes.
