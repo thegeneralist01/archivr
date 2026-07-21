@@ -14,7 +14,11 @@ function isVideoSource(locator) {
   for (const scheme of ['yt:', 'youtube:']) {
     if (ll.startsWith(scheme)) {
       const after = ll.slice(scheme.length)
-      return after.startsWith('video/') || after.startsWith('short/') || after.startsWith('shorts/')
+      if (after.startsWith('video/') || after.startsWith('short/') || after.startsWith('shorts/'))
+        return true
+      // bare yt:ID — exactly 11 chars [A-Za-z0-9_-], same predicate as is_youtube_video_id in core
+      if (/^[a-z0-9_-]{11}$/i.test(after)) return true
+      return false
     }
   }
 

@@ -211,6 +211,12 @@ fn generate_entry_title(source: Source, meta: &PlatformMetadata) -> String {
         Source::Other => "Archived Content".to_string(),
     }
 }
+/// Returns true when `s` is a valid bare YouTube video ID:
+/// exactly 11 characters from the set `[A-Za-z0-9_-]`.
+fn is_youtube_video_id(s: &str) -> bool {
+    s.len() == 11 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 
 fn expand_shorthand_to_url(path: &str, source: &Source) -> String {
     // YouTube shorthands: yt:video/ID, yt:playlist/ID, yt:@handle, yt:channel/ID, etc.
@@ -237,6 +243,10 @@ fn expand_shorthand_to_url(path: &str, source: &Source) -> String {
             }
             if let Some(handle) = after.strip_prefix("@") {
                 return format!("https://www.youtube.com/@{handle}");
+            }
+            // bare yt:ID — validated 11-char video ID
+            if is_youtube_video_id(after) {
+                return format!("https://www.youtube.com/watch?v={after}");
             }
         }
     }
@@ -327,6 +337,11 @@ fn determine_source(path: &str) -> Source {
             || after_scheme.starts_with("@")
         {
             return Source::YouTubeChannel;
+        }
+
+        // bare yt:ID — exactly 11 chars [A-Za-z0-9_-], no slash/@ prefixes
+        if is_youtube_video_id(after_scheme) {
+            return Source::YouTubeVideo;
         }
     }
 
@@ -2110,6 +2125,15 @@ mod tests {
                 url: "youtube:@CoreDumpped",
                 expected: Source::YouTubeChannel,
             },
+            // Bare video ID — exactly 11 chars [A-Za-z0-9_-]
+            TestCase { url: "yt:dQw4w9WgXcQ",    expected: Source::YouTubeVideo },
+            TestCase { url: "youtube:dQw4w9WgXcQ", expected: Source::YouTubeVideo },
+            TestCase { url: "yt:a_b-c_d-e_4",    expected: Source::YouTubeVideo },
+            // Non-ID: wrong length (9 chars) → Other
+            TestCase { url: "yt:not-video",        expected: Source::Other },
+            // Reserved prefixes still route correctly when segment looks like an ID
+            TestCase { url: "yt:playlist/dQw4w9WgXcQ", expected: Source::YouTubePlaylist },
+            TestCase { url: "yt:@dQw4w9WgXcQ",         expected: Source::YouTubeChannel },
         ];
 
         for case in &shorthand_cases {
@@ -2120,6 +2144,18 @@ mod tests {
                 case.url
             );
         }
+    }
+
+    #[test]
+    fn test_is_youtube_video_id() {
+        assert!(is_youtube_video_id("dQw4w9WgXcQ"), "canonical ID");
+        assert!(is_youtube_video_id("a_b-c_d-e_4"), "11-char ID with _ and -");
+        assert!(!is_youtube_video_id(""), "empty");
+        assert!(!is_youtube_video_id("short"),       "too short");
+        assert!(!is_youtube_video_id("toolong12345"),  "too long (12 chars)");
+        assert!(!is_youtube_video_id("dQw4w9WgXc!"),   "invalid char (! at pos 11)");
+        assert!(!is_youtube_video_id("not-video"),     "9 chars — too short");
+        assert!(!is_youtube_video_id("dQw4w9WgXC!!"),  "12 chars + bad char");
     }
 
     #[test]
