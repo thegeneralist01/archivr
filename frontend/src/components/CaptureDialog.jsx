@@ -151,7 +151,7 @@ function applyPlaylistQuality(newQ, currentItems) {
 }
 
 function hasConflict(item) {
-  return item.playlistItems !== null && item.playlistItems.some(pi => pi.quality === null)
+  return Array.isArray(item.playlistItems) && item.playlistItems.some(pi => pi.quality === null)
 }
 
 export default function CaptureDialog({ open, archiveId, onClose, onCaptured, onToast, onJobStarted, onJobSettled, activeJobs = [] }) {
@@ -185,7 +185,9 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
         const idle = saved.filter(it => !it.status || it.status === 'idle')
         if (idle.length > 0) {
           idle.forEach(it => { if (it.id >= nextItemId) nextItemId = it.id + 1 })
-          return idle
+          // Merge with makeItem() defaults so items saved before the playlist
+          // fields were added don't have undefined where null/false is expected.
+          return idle.map(it => ({ ...makeItem(it.locator), ...it }))
         }
       }
     } catch {}
