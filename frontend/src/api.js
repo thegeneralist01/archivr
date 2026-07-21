@@ -448,6 +448,19 @@ export async function rearchiveEntry(archiveId, entryUid) {
   return res.json() // { job_uid, status: 'pending' }
 }
 
+// ── Media token ────────────────────────────────────────────────────────────────
+// Issues a short-lived signed URL for one artifact — used so Cast / AirPlay
+// devices (no session cookie) can fetch the media file directly.
+// Returns { url: string, expires_in_secs: number }.
+export async function issueMediaToken(archiveId, entryUid, artifactIndex) {
+  const res = await fetch(
+    `/api/archives/${archiveId}/entries/${entryUid}/artifacts/${artifactIndex}/media-token`,
+    { method: 'POST' }
+  )
+  if (!res.ok) throw new Error(`media-token ${res.status}`)
+  return res.json()
+}
+
 // ── Cookie rules ──────────────────────────────────────────────────────────────
 
 export async function listCookieRules() {

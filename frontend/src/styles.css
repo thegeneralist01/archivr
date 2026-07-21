@@ -2187,6 +2187,50 @@ select {
   display: block;
 }
 
+/* ── Cast / AirPlay TV overlay ───────────────────────────────────────── */
+.video-tv-controls {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  display: flex;
+  gap: 6px;
+  z-index: 10;
+}
+
+.video-tv-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.5);
+  color: rgba(255, 255, 255, 0.82);
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  transition: background 0.15s, color 0.15s;
+}
+
+.video-tv-btn:hover {
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+}
+
+/* google-cast-launcher inherits color for its SVG icon */
+google-cast-launcher.video-tv-btn {
+  color: rgba(255, 255, 255, 0.82);
+}
+
+/* Brief spinner shown while the signed media URL is being fetched */
+.video-tv-loading {
+  width: 100%;
+  min-height: 200px;
+  background: #0d0d0b;
+}
+
 /* ── Iframe preview ───────────────────────────────────────────────── */
 .preview-iframe-wrap {
   flex: 1;

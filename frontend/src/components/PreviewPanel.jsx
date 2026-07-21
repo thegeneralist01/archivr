@@ -6,6 +6,10 @@ import TweetPreview from './TweetPreview';
 const VIDEO_EXTS = new Set(['mp4', 'webm', 'mov', 'mkv', 'avi', 'm4v', 'ogv']);
 const AUDIO_EXTS = new Set(['mp3', 'ogg', 'm4a', 'opus', 'wav', 'flac', 'aac']);
 const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'svg', 'bmp']);
+const CONTENT_TYPES = {
+  mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime',
+  mkv: 'video/x-matroska', avi: 'video/x-msvideo', m4v: 'video/mp4', ogv: 'video/ogg',
+};
 
 export default function PreviewPanel({ archiveId, entry, detail, fullPage, onXArticle }) {
 
@@ -86,7 +90,10 @@ export default function PreviewPanel({ archiveId, entry, detail, fullPage, onXAr
   if (VIDEO_EXTS.has(ext)) {
     return (
       <div className="preview-panel">
-        <VideoPreview src={primaryMediaUrl} />
+        <VideoPreview
+          src={primaryMediaUrl}
+          contentType={CONTENT_TYPES[ext] || 'video/mp4'}
+        />
       </div>
     );
   }
