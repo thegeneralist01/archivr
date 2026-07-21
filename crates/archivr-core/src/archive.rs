@@ -1853,4 +1853,151 @@ mod tests {
         assert!(!urls_a.contains(vid_b), "should not include children of other playlists");
     }
 
+    #[test]
+    fn cached_bytes_excludes_avatar_blobs() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+
+        // entry_a is older (created first, gets the lower id)
+        let entry_a = make_entry_in_db(
+            &conn,
+            user_id,
+            run_id,
+            None,
+            None,
+            "Tweet A",
+            "https://twitter.com/user/status/1",
+        );
+        // entry_b is newer (created second, higher id — tiebreak on id when archived_at is equal)
+        let entry_b = make_entry_in_db(
+            &conn,
+            user_id,
+            run_id,
+            None,
+            None,
+            "Tweet B",
+            "https://twitter.com/user/status/2",
+        );
+
+        // Shared avatar blob: 100 bytes
+        let avatar_blob_id = database::upsert_blob(
+            &conn,
+            &database::BlobRecord {
+                sha256: "avatar_sha256_test".to_string(),
+                byte_size: 100,
+                mime_type: Some("image/jpeg".to_string()),
+                extension: Some("jpg".to_string()),
+                raw_relpath: "raw/av/at/avatar.jpg".to_string(),
+            },
+        )
+        .unwrap();
+
+        // Shared media blob: 900 bytes
+        let media_blob_id = database::upsert_blob(
+            &conn,
+            &database::BlobRecord {
+                sha256: "media_sha256_test".to_string(),
+                byte_size: 900,
+                mime_type: Some("image/png".to_string()),
+                extension: Some("png".to_string()),
+                raw_relpath: "raw/me/di/media.png".to_string(),
+            },
+        )
+        .unwrap();
+
+        // Attach both artifacts to entry_a
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id: entry_a.id,
+                artifact_role: "avatar".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: "raw/av/at/avatar.jpg".to_string(),
+                blob_id: Some(avatar_blob_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id: entry_a.id,
+                artifact_role: "primary_media".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: "raw/me/di/media.png".to_string(),
+                blob_id: Some(media_blob_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+
+        // Attach both artifacts to entry_b (same blobs — simulates shared avatar/media)
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id: entry_b.id,
+                artifact_role: "avatar".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: "raw/av/at/avatar.jpg".to_string(),
+                blob_id: Some(avatar_blob_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id: entry_b.id,
+                artifact_role: "primary_media".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: "raw/me/di/media.png".to_string(),
+                blob_id: Some(media_blob_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+
+        // Recompute cached_bytes for entry_b.
+        // The query excludes avatar-role artifacts and counts only non-avatar blobs
+        // that are already held by an earlier entry.  entry_a (lower id) owns the
+        // same media blob, so cached_bytes for entry_b should be 900, not 1000.
+        database::refresh_entry_cached_bytes(&conn, entry_b.id).unwrap();
+
+        // --- Assert raw DB value ---
+        let cached_bytes_db: i64 = conn
+            .query_row(
+                "SELECT cached_bytes FROM archived_entries WHERE id = ?1",
+                [entry_b.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cached_bytes_db, 900,
+            "cached_bytes should be 900 (media only); avatar blob must be excluded"
+        );
+
+        // --- Assert list_root_entries summary for entry_b ---
+        let entries = list_root_entries(&conn, 12).unwrap(); // 12 = ADMIN bits
+        let summary_b = entries
+            .iter()
+            .find(|e| e.entry_uid == entry_b.entry_uid)
+            .expect("entry_b must appear in list_root_entries");
+
+        assert_eq!(
+            summary_b.cached_bytes, 900,
+            "summary cached_bytes must equal 900 (precomputed, avatar excluded)"
+        );
+        assert_eq!(
+            summary_b.cacheable_bytes, 900,
+            "cacheable_bytes (non-avatar total) must be 900 for entry_b"
+        );
+        assert_eq!(
+            summary_b.total_artifact_bytes, 1000,
+            "total_artifact_bytes must be 1000 (avatar 100 + media 900)"
+        );
+    }
+
 }

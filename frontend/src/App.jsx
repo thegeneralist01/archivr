@@ -450,6 +450,56 @@ export default function App() {
     return () => document.removeEventListener('keydown', handler)
   }, [view])
 
+  // j/k: navigate entries down/up when not focused on an input element.
+  useEffect(() => {
+    const handler = (e) => {
+      // Ignore when a modifier is held (don't steal browser/app shortcuts)
+      if (e.metaKey || e.ctrlKey || e.altKey) return
+      if (e.key !== 'j' && e.key !== 'k') return
+      // Ignore when focus is on any editable target
+      const tag = document.activeElement?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+      if (document.activeElement?.isContentEditable) return
+
+      const allNodes = [...document.querySelectorAll('#entries-body [data-entry-uid]')]
+      if (allNodes.length === 0) return
+
+      const [currentUid] = selectedUids.size === 1 ? selectedUids : [null]
+      const currentIdx = currentUid
+        ? allNodes.findIndex(n => n.dataset.entryUid === currentUid)
+        : -1
+
+      const nextIdx = e.key === 'j'
+        ? Math.min(currentIdx + 1, allNodes.length - 1)
+        : Math.max(currentIdx - 1, 0)
+
+      if (nextIdx === currentIdx && currentIdx !== -1) return
+
+      const nextNode = allNodes[nextIdx < 0 ? 0 : nextIdx]
+      const nextUid = nextNode.dataset.entryUid
+
+      lastAnchorIndexRef.current = nextUid
+      setSelectedUids(new Set([nextUid]))
+
+      // Resolve entry object: cache → root entries array → server fetch
+      const cached = entryCacheRef.current.get(nextUid)
+          ?? entries.find(x => x.entry_uid === nextUid)
+          ?? null
+      if (cached) {
+        selectEntry(cached)
+      } else {
+        fetchEntryDetail(archiveId, nextUid)
+          .then(det => { if (det?.summary) selectEntry(det.summary) })
+          .catch(() => {})
+      }
+
+      nextNode.scrollIntoView({ block: 'nearest' })
+      e.preventDefault()
+    }
+    document.addEventListener('keydown', handler)
+    return () => document.removeEventListener('keydown', handler)
+  }, [selectedUids, entries, selectEntry, archiveId])
+
   // After switching to archive view via ⌘K, focus the search input once rendered.
   useEffect(() => {
     if (view === 'archive' && pendingSearchFocus.current) {
