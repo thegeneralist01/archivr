@@ -502,21 +502,19 @@ async fn serve_artifact(
     Query(params): Query<ArtifactQuery>,
     req: Request,
 ) -> Result<Response, ApiError> {
-    // Auth: either a valid session OR a scoped media token.
-    if let Some(tok) = &params.token {
-        let valid = {
-            let tokens = state.media_tokens.lock();
-            tokens.get(tok.as_str()).map_or(false, |t| {
-                t.archive_id == archive_id
-                    && t.entry_uid == entry_uid
-                    && t.artifact_index == artifact_index
-                    && t.expires_at > std::time::Instant::now()
-            })
-        };
-        if !valid {
-            return Err(ApiError::unauthorized("invalid or expired media token"));
-        }
-    } else {
+    // Auth: valid scoped token OR authenticated session (OR both).
+    // A token present but invalid/expired falls back to session auth so that
+    // a logged-in browser player keeps working after a token expires.
+    let token_valid = params.token.as_deref().map_or(false, |tok| {
+        let tokens = state.media_tokens.lock();
+        tokens.get(tok).map_or(false, |t| {
+            t.archive_id == archive_id
+                && t.entry_uid == entry_uid
+                && t.artifact_index == artifact_index
+                && t.expires_at > std::time::Instant::now()
+        })
+    });
+    if !token_valid {
         auth_user.require_auth()?;
     }
     let mounted = mounted_archive(&state, &archive_id)?;
@@ -5115,7 +5113,7 @@ mod tests {
         assert_eq!(artifact_resp.status(), StatusCode::OK);
     }
 
-    /// A bogus / missing token must return 401.
+    /// A bogus token with NO session must return 401 (no valid auth path).
     #[tokio::test]
     async fn media_token_invalid_token_returns_401() {
         let dir = tempfile::tempdir().unwrap();
@@ -5129,6 +5127,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A bogus token WITH a valid session must return 200 — the session fallback
+    /// keeps a logged-in browser player working after a token expires.
+    #[tokio::test]
+    async fn media_token_bogus_token_with_session_returns_200() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, entry_uid, _, session_cookie) = make_media_token_state(&dir).await;
+        let uri = format!(
+            "/api/archives/test/entries/{}/artifacts/0?token=not-a-real-token",
+            entry_uid
+        );
+        let response = app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// A token issued for artifact 0 must not unlock artifact 1.
