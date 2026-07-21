@@ -143,9 +143,9 @@ export default function EntryRow({ entry, archiveId, rowIndex, isSelected, isMul
         </div>
         <div className="col-size">
           <span className="size-total">{formatBytes(entry.total_artifact_bytes)}</span>
-          {entry.cached_bytes > 0 && entry.total_artifact_bytes > 0 && (
+          {entry.cached_bytes > 0 && entry.cacheable_bytes > 0 && (
             <span className="size-cached-pct" title={`${formatBytes(entry.cached_bytes)} already on disk from an earlier entry`}>
-              {Math.round(entry.cached_bytes / entry.total_artifact_bytes * 100)}% cached
+              {Math.round(entry.cached_bytes / entry.cacheable_bytes * 100)}% cached
             </span>
           )}
         </div>

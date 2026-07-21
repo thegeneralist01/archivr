@@ -390,6 +390,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
                  JOIN blobs b ON b.id = ea.blob_id
                  WHERE ea.entry_id = archived_entries.id
                    AND ea.blob_id IS NOT NULL
+                   AND ea.artifact_role != 'avatar'
                    AND EXISTS (
                        SELECT 1
                        FROM entry_artifacts ea2
@@ -399,6 +400,33 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
                               OR (e2.archived_at = archived_entries.archived_at
                                   AND e2.id < archived_entries.id))
                    )
+             );",
+        )?;
+    } else {
+        // Re-migration: strip avatar blobs from cached_bytes on entries that
+        // already had the column populated before this filter was introduced.
+        // Scoped to entries with avatar artifacts only; fast and idempotent.
+        conn.execute_batch(
+            "UPDATE archived_entries
+             SET cached_bytes = (
+                 SELECT COALESCE(SUM(b.byte_size), 0)
+                 FROM entry_artifacts ea
+                 JOIN blobs b ON b.id = ea.blob_id
+                 WHERE ea.entry_id = archived_entries.id
+                   AND ea.blob_id IS NOT NULL
+                   AND ea.artifact_role != 'avatar'
+                   AND EXISTS (
+                       SELECT 1
+                       FROM entry_artifacts ea2
+                       JOIN archived_entries e2 ON e2.id = ea2.entry_id
+                       WHERE ea2.blob_id = ea.blob_id
+                         AND (e2.archived_at < archived_entries.archived_at
+                              OR (e2.archived_at = archived_entries.archived_at
+                                  AND e2.id < archived_entries.id))
+                   )
+             )
+             WHERE id IN (
+                 SELECT DISTINCT entry_id FROM entry_artifacts WHERE artifact_role = 'avatar'
              );",
         )?;
     }
@@ -1482,6 +1510,7 @@ pub fn refresh_entry_cached_bytes(conn: &Connection, entry_id: i64) -> Result<()
          JOIN archived_entries e ON e.id = ea.entry_id
          WHERE ea.entry_id = ?1
            AND ea.blob_id IS NOT NULL
+           AND ea.artifact_role != 'avatar'
            AND EXISTS (
                SELECT 1
                FROM entry_artifacts ea2
@@ -1518,6 +1547,7 @@ pub fn cascade_cached_bytes_after_delete(conn: &Connection, entry_id: i64) -> Re
              JOIN blobs b ON b.id = ea.blob_id
              WHERE ea.entry_id = archived_entries.id
                AND ea.blob_id IS NOT NULL
+               AND ea.artifact_role != 'avatar'
                AND EXISTS (
                    SELECT 1
                    FROM entry_artifacts ea3
@@ -1570,6 +1600,7 @@ fn cascade_cached_bytes_after_subtree_delete(conn: &Connection, subtree_ids: &[i
              JOIN blobs b ON b.id = ea.blob_id
              WHERE ea.entry_id = archived_entries.id
                AND ea.blob_id IS NOT NULL
+               AND ea.artifact_role != 'avatar'
                AND EXISTS (
                    SELECT 1
                    FROM entry_artifacts ea3
