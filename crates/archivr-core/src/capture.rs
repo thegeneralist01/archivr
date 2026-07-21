@@ -1051,14 +1051,16 @@ pub fn perform_capture(
         ));
     }
 
-    // Sources: Spotify — not downloadable; Spotify audio is DRM-protected.
-    if matches!(source, Source::SpotifyTrack | Source::SpotifyAlbum | Source::SpotifyPlaylist) {
+    // Sources: Spotify — SpotifyTrack attempts yt-dlp and fails gracefully if the
+    // extractor cannot handle the content. Albums and playlists are not yet supported
+    // as containers (fetch_playlist_info has YouTube-specific URL fallback logic).
+    if matches!(source, Source::SpotifyAlbum | Source::SpotifyPlaylist) {
         return Err(fail_run(
             &conn,
             &run,
             &item,
-            "Spotify downloads are not supported: Spotify audio is DRM-protected and cannot \
-             be downloaded by yt-dlp. Archive the equivalent YouTube Music track instead.",
+            "Spotify album/playlist capture is not yet implemented. \
+             Archive individual tracks instead.",
         ));
     }
 
@@ -1615,6 +1617,7 @@ pub fn perform_capture(
     let ytdlp_metadata_json: Option<String> = match source {
         Source::YouTubeVideo
         | Source::YouTubeMusicTrack
+        | Source::SpotifyTrack
         | Source::X
         | Source::Instagram
         | Source::Facebook
@@ -1655,7 +1658,7 @@ pub fn perform_capture(
                 }
             }
         }
-        Source::YouTubeMusicTrack => {
+        Source::YouTubeMusicTrack | Source::SpotifyTrack => {
             // Music tracks are always audio-only regardless of the caller's quality hint.
             match downloader::ytdlp::download(path.clone(), store_path, &timestamp, Some("audio"), &cookies) {
                 Ok(result) => result,
