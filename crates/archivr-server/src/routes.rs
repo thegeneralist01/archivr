@@ -958,7 +958,14 @@ async fn capture_handler(
                     notes_str = serde_json::Value::Object(notes_map).to_string();
                     Some(&notes_str)
                 };
-                let job_status = if result.status == "failed" { "failed" } else { "completed" };
+                // A partial playlist (some items succeeded, some failed) has status="failed"
+                // but completed_count > 0. Treat it as a completed job so onCaptured fires
+                // and the archived entries appear. Only mark failed when nothing succeeded.
+                let job_status = if result.status == "failed" && result.completed_count == 0 {
+                    "failed"
+                } else {
+                    "completed"
+                };
                 database::update_capture_job_status(
                     &conn,
                     &job_uid_bg,
