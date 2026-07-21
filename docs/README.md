@@ -141,7 +141,7 @@ Auth and session handling will be designed when remote or public hosting becomes
 ### Supported Platforms
 
 - Local files: `file:///absolute/path/to/file.ext`
-- YouTube media: standard video/short URLs, plus [shorthand video inputs](#supported-shorthand-inputs)
+- YouTube media: individual videos/shorts, playlists, and channels; standard URLs or [shorthand video inputs](#supported-shorthand-inputs). Playlists and channels archive as a container entry with each video stored as a child entry beneath it.
 - X/Twitter media from Tweets: normal Tweet URLs or the `tweet:media:ID` shorthand
 - X/Twitter Tweet content scrape: [Tweet and Thread shorthands](#supported-shorthand-inputs). (These are saved as JSON files in `raw_tweets/`)
 - Instagram, Facebook, TikTok, Reddit, Snapchat: direct URLs or platform-prefixed shorthand passed through to `yt-dlp`
@@ -174,6 +174,14 @@ The probe endpoint (`GET /api/archives/:id/captures/probe?locator=…`) requires
 { "has_video": false, "has_audio": false, "qualities": [] }
 ```
 `has_video: false, has_audio: false` means yt-dlp found no downloadable tracks (e.g. a tweet with no media). A 502 means yt-dlp itself failed (transient network error, rate-limit, unsupported extractor) — treat as inconclusive, not "no media."
+
+#### YouTube playlists and channels
+
+Capturing a YouTube playlist or channel URL creates a **container entry** for the playlist or channel, with each video archived as a child entry beneath it. Before downloading, the capture UI probes each video to fetch available quality options, letting you set quality per-video or apply a single quality to the whole playlist.
+
+**Incremental sync:** When re-archiving a playlist or channel, enable **sync mode** in the capture dialog to skip videos that are already in the archive. Only new videos are downloaded; the existing container entry is reused.
+
+**Excluding individual videos:** In the expanded per-video list, each video has a remove button (×) to exclude it from the current capture. Removed videos are not downloaded; the rest proceed normally.
 
 ### Hosting on NixOS
 

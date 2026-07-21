@@ -390,6 +390,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
                  JOIN blobs b ON b.id = ea.blob_id
                  WHERE ea.entry_id = archived_entries.id
                    AND ea.blob_id IS NOT NULL
+                   AND ea.artifact_role != 'avatar'
                    AND EXISTS (
                        SELECT 1
                        FROM entry_artifacts ea2
@@ -399,6 +400,33 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
                               OR (e2.archived_at = archived_entries.archived_at
                                   AND e2.id < archived_entries.id))
                    )
+             );",
+        )?;
+    } else {
+        // Re-migration: strip avatar blobs from cached_bytes on entries that
+        // already had the column populated before this filter was introduced.
+        // Scoped to entries with avatar artifacts only; fast and idempotent.
+        conn.execute_batch(
+            "UPDATE archived_entries
+             SET cached_bytes = (
+                 SELECT COALESCE(SUM(b.byte_size), 0)
+                 FROM entry_artifacts ea
+                 JOIN blobs b ON b.id = ea.blob_id
+                 WHERE ea.entry_id = archived_entries.id
+                   AND ea.blob_id IS NOT NULL
+                   AND ea.artifact_role != 'avatar'
+                   AND EXISTS (
+                       SELECT 1
+                       FROM entry_artifacts ea2
+                       JOIN archived_entries e2 ON e2.id = ea2.entry_id
+                       WHERE ea2.blob_id = ea.blob_id
+                         AND (e2.archived_at < archived_entries.archived_at
+                              OR (e2.archived_at = archived_entries.archived_at
+                                  AND e2.id < archived_entries.id))
+                   )
+             )
+             WHERE id IN (
+                 SELECT DISTINCT entry_id FROM entry_artifacts WHERE artifact_role = 'avatar'
              );",
         )?;
     }
@@ -1409,16 +1437,26 @@ pub fn finish_archive_run(conn: &Connection, run_id: i64) -> Result<()> {
         [run_id],
         |row| row.get(0),
     )?;
-    let status = if failed_count > 0 {
-        "failed"
-    } else {
-        "completed"
-    };
+    let status = if failed_count > 0 { "failed" } else { "completed" };
     conn.execute(
         "UPDATE archive_runs SET status = ?1, finished_at = ?2 WHERE id = ?3",
         params![status, now_timestamp(), run_id],
     )?;
     Ok(())
+}
+
+/// Returns the number of completed **child** archive_run_items for a run.
+///
+/// Excludes the container item (parent_item_id IS NULL) so that a playlist
+/// where every video fails still returns 0 even though the container item
+/// itself was completed before child downloads started.
+pub fn get_run_completed_child_count(conn: &Connection, run_id: i64) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM archive_run_items
+         WHERE run_id = ?1 AND status = 'completed' AND parent_item_id IS NOT NULL",
+        [run_id],
+        |row| row.get(0),
+    )?)
 }
 
 pub fn fail_archive_run(conn: &Connection, run_id: i64, error_summary: &str) -> Result<()> {
@@ -1482,6 +1520,7 @@ pub fn refresh_entry_cached_bytes(conn: &Connection, entry_id: i64) -> Result<()
          JOIN archived_entries e ON e.id = ea.entry_id
          WHERE ea.entry_id = ?1
            AND ea.blob_id IS NOT NULL
+           AND ea.artifact_role != 'avatar'
            AND EXISTS (
                SELECT 1
                FROM entry_artifacts ea2
@@ -1518,6 +1557,7 @@ pub fn cascade_cached_bytes_after_delete(conn: &Connection, entry_id: i64) -> Re
              JOIN blobs b ON b.id = ea.blob_id
              WHERE ea.entry_id = archived_entries.id
                AND ea.blob_id IS NOT NULL
+               AND ea.artifact_role != 'avatar'
                AND EXISTS (
                    SELECT 1
                    FROM entry_artifacts ea3
@@ -1570,6 +1610,7 @@ fn cascade_cached_bytes_after_subtree_delete(conn: &Connection, subtree_ids: &[i
              JOIN blobs b ON b.id = ea.blob_id
              WHERE ea.entry_id = archived_entries.id
                AND ea.blob_id IS NOT NULL
+               AND ea.artifact_role != 'avatar'
                AND EXISTS (
                    SELECT 1
                    FROM entry_artifacts ea3
@@ -1627,9 +1668,14 @@ pub fn delete_entry(conn: &Connection, entry_uid: &str) -> Result<bool> {
         None => return Ok(false),
     };
 
-    // Collect the full subtree while rows still exist.
+    // Collect the full subtree (entry itself + any descendants) while rows still exist.
+    // Must include the entry itself: for a child entry root_entry_id = ?1 returns nothing
+    // (no grandchildren), so without `id = ?1` the set would be empty and
+    // cascade_cached_bytes_after_subtree_delete would not recalculate shared-blob totals.
     let subtree_ids: Vec<i64> = {
-        let mut stmt = conn.prepare("SELECT id FROM archived_entries WHERE root_entry_id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM archived_entries WHERE id = ?1 OR root_entry_id = ?1",
+        )?;
         stmt.query_map([entry_id], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?
     };
@@ -1638,12 +1684,15 @@ pub fn delete_entry(conn: &Connection, entry_uid: &str) -> Result<bool> {
     // shared blobs with any subtree member, excluding every subtree ID simultaneously.
     cascade_cached_bytes_after_subtree_delete(conn, &subtree_ids)?;
 
-    // Null the FK that has no ON DELETE action (covers root and all descendants).
+    // Null the FK that has no ON DELETE action. Must cover:
+    // - The entry itself (child entry: root_entry_id = playlist root, not self)
+    // - All descendants (root entry: children have root_entry_id = entry_id)
     conn.execute(
         "UPDATE archive_run_items SET produced_entry_id = NULL
-         WHERE produced_entry_id IN (
-             SELECT id FROM archived_entries WHERE root_entry_id = ?1
-         )",
+         WHERE produced_entry_id = ?1
+            OR produced_entry_id IN (
+               SELECT id FROM archived_entries WHERE root_entry_id = ?1
+            )",
         [entry_id],
     )?;
 
@@ -3896,4 +3945,38 @@ mod tests {
             "file must be protected because artifact.relpath references it directly"
         );
     }
+    #[test]
+    fn completed_child_count_excludes_container() {
+        // Regression: get_run_completed_child_count must not count the root container
+        // item. Scenario: complete both the container item and one child item; total
+        // DB completed_count == 2, but completed_child_count must == 1.
+        let c = conn();
+        let user_id = ensure_default_user(&c).unwrap();
+        let run = create_archive_run(&c, user_id, 2).unwrap();
+
+        // Root item (parent_item_id IS NULL) — mirrors what record_container_entry does.
+        let root_item = create_archive_run_item(
+            &c, run.id, None, 0, "https://example.com/pl", None, "youtube", "playlist",
+        ).unwrap();
+        // Child item (parent_item_id IS NOT NULL).
+        let child_item = create_archive_run_item(
+            &c, run.id, Some(root_item.id), 1, "https://example.com/v1", None, "youtube", "video",
+        ).unwrap();
+
+        // Complete both — marks archive_runs.completed_count = 2.
+        c.execute(
+            "UPDATE archive_run_items SET status = 'completed' WHERE id IN (?1, ?2)",
+            rusqlite::params![root_item.id, child_item.id],
+        ).unwrap();
+        refresh_run_counters(&c, run.id).unwrap();
+
+        let total: i64 = c.query_row(
+            "SELECT completed_count FROM archive_runs WHERE id = ?1", [run.id], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(total, 2, "both items completed: DB counter must be 2");
+
+        let child_count = get_run_completed_child_count(&c, run.id).unwrap();
+        assert_eq!(child_count, 1, "only the child item must be counted");
+    }
+
 }

@@ -299,17 +299,19 @@ select {
   border-bottom: 1px solid var(--line-soft);
 }
 #entries-body > div > div { padding: 7px 10px; flex-shrink: 0; overflow: hidden; }
-#entries-body > div:nth-child(even) { background: #f2ede5; }
-#entries-body > div:nth-child(odd) { background: var(--paper-3); }
+/* Skeleton rows (no index class) fall back to nth-child; real rows use explicit classes. */
+#entries-body > div:not(.entry-row-outer):nth-child(even) { background: #f2ede5; }
+#entries-body > div:not(.entry-row-outer):nth-child(odd)  { background: var(--paper-3); }
+/* Index-based stripes for real entry rows — immune to skeleton sibling count. */
+#entries-body > .entry-row-outer--light { background: var(--paper-3); }
+#entries-body > .entry-row-outer--dark  { background: #f2ede5; }
 #entries-body > div.is-selected {
   background: #eee2d2;
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
+  box-shadow: inset 0 0 0 2px var(--accent);
 }
 #entries-body > div.is-multi-selected {
   background: #eee2d2;
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
+  box-shadow: inset 0 0 0 2px var(--accent);
 }
 
 .col-added { width: 162px; color: var(--muted); }
@@ -339,8 +341,7 @@ select {
 .source-icon > * { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
 .source-icon svg { width: 100%; height: 100%; }
 .url-cell { color: #555b55; white-space: nowrap; text-overflow: ellipsis; word-break: break-all; }
-#entries-body .url-cell:hover,
-#entries-body .is-selected .url-cell { overflow: visible; white-space: normal; }
+#entries-body .url-cell:hover { overflow: visible; white-space: normal; }
 .type-pill { display: inline-block; padding: 2px 6px; background: #d8e3df; color: #275a5f; border: 1px solid #bfd0ca; border-radius: var(--r); }
 
 /* ── Multi-select checkbox column ───────────────────────────────────────── */
@@ -890,6 +891,7 @@ select {
   color: var(--muted);
   font-style: italic;
 }
+.capture-quality-hint--error { color: #c05000; font-style: normal; }
 
 /* Status dot */
 .cap-dot {
@@ -2726,3 +2728,254 @@ body.has-audio-bar { padding-bottom: 56px; }
 @media (pointer: coarse) {
   .skeleton-row .col-added { padding-left: 10px; }
 }
+
+/* ── Child entry expansion ───────────────────────────────────────────────── */
+
+/* Outer wrapper: one block per entry-group so nth-child stays correct.
+   #entries-body > .entry-row-outer beats #entries-body > div on specificity
+   (id + class > id + element) so display:flex is safely overridden. */
+#entries-body > .entry-row-outer {
+  display: block;
+  border-bottom: none;
+}
+
+/* Inner flex row: replicates the #entries-body > div row behaviour. */
+#entries-body > .entry-row-outer > .entry-row-main {
+  display: flex;
+  align-items: center;
+  cursor: default;
+  border-bottom: 1px solid var(--line-soft);
+  /* Reset padding that #entries-body > div > div would otherwise apply. */
+  padding: 0;
+  flex-shrink: unset;
+  overflow: visible;
+}
+
+/* Column cells inside the inner row. */
+#entries-body > .entry-row-outer > .entry-row-main > div {
+  padding: 7px 10px;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+#entries-body > .entry-row-outer > .entry-row-main > div:last-child { padding-right: 22px; }
+#entries-body > .entry-row-outer > .entry-row-main .col-added { padding-left: 22px; }
+
+
+/* Selection: class lives on outer wrapper; background + stroke scoped to inner row
+   so expanded child entries don't inherit the selection highlight. */
+#entries-body > .entry-row-outer.is-selected     { background: unset; outline: none; box-shadow: none; }
+#entries-body > .entry-row-outer.is-multi-selected { background: unset; outline: none; box-shadow: none; }
+#entries-body > .entry-row-outer.is-selected > .entry-row-main {
+  background: #eee2d2;
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+#entries-body > .entry-row-outer.is-multi-selected > .entry-row-main {
+  background: #eee2d2;
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+/* URL overflow on hover only — explicit pointer, not selection. */
+#entries-body > .entry-row-outer .url-cell:hover { overflow: visible; white-space: normal; }
+
+/* child-entries container: reset the padding that #entries-body > div > div applies. */
+#entries-body > .entry-row-outer > .child-entries {
+  display: block;
+  padding: 0;
+  flex-shrink: unset;
+  overflow: visible;
+  border-left: 2px solid var(--line-soft);
+  margin-left: 32px;
+}
+
+/* Each child row reuses the same .col-* flex widths as normal rows. */
+.child-entry-row {
+  display: flex;
+  align-items: center;
+  cursor: default;
+  border-bottom: 1px solid var(--line-soft);
+  opacity: 0.88;
+}
+.child-entry-row:hover { opacity: 1; }
+.child-entry-row:last-child { border-bottom: none; }
+.child-entry-row--light { background: #fafaf8; }
+.child-entry-row--dark  { background: #f2f0ec; }
+.child-entry-row.is-selected {
+  background: #eee2d2;
+  box-shadow: inset 0 0 0 2px var(--accent);
+  opacity: 1;
+}
+.child-entry-row.is-multi-selected {
+  background: #eee2d2;
+  box-shadow: inset 0 0 0 2px var(--accent);
+  opacity: 1;
+}
+.child-entry-row > div {
+  padding: 6px 10px;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+.child-entry-row .col-added { padding-left: 22px; }
+.child-entry-row > div:last-child { padding-right: 22px; }
+
+/* Expand chevron button */
+.entry-expand-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  padding: 0;
+  margin-right: 2px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  opacity: 0.45;
+  color: inherit;
+  transition: opacity 0.15s;
+}
+.entry-expand-btn:focus { outline: none; }
+.entry-expand-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+.entry-expand-btn::before {
+  content: '';
+  display: block;
+  width: 0;
+  height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 6px solid currentColor;
+  transition: transform 0.15s;
+}
+.entry-expand-btn:hover { opacity: 1; }
+.entry-expand-btn.is-expanded::before { transform: rotate(90deg); }
+
+/* Child count badge next to title */
+.child-count-badge {
+  display: inline-block;
+  margin-left: 5px;
+  padding: 0 5px;
+  font-size: 0.72em;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--line-soft) 60%, transparent);
+  border-radius: 10px;
+  opacity: 0.75;
+  vertical-align: middle;
+  line-height: 1.6;
+}
+
+/* Loading placeholder inside child-entries */
+.child-entries-loading {
+  padding: 8px 12px;
+  font-size: 0.85em;
+  opacity: 0.55;
+}
+
+/* ── Playlist quality expansion ──────────────────────────── */
+.capture-playlist-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.75rem;
+  color: var(--muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px 6px;
+}
+.capture-playlist-toggle:hover { color: var(--text); }
+.capture-playlist-toggle--left {
+  flex-shrink: 0;
+  padding: 2px 4px;
+  font-size: 0.7rem;
+}
+
+.capture-conflict-badge {
+  font-size: 0.7rem;
+  color: #c07000;
+  background: #fff3cd;
+  border: 1px solid #e0a000;
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-left: 6px;
+}
+
+.capture-playlist-items {
+  border-top: 1px solid var(--line-soft);
+  max-height: 320px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+
+.capture-playlist-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px 5px 14px;
+  font-size: 0.8rem;
+  border-bottom: 1px solid var(--line-soft);
+  border-left: 3px solid transparent;
+}
+.capture-playlist-item:last-of-type { border-bottom: none; }
+.capture-playlist-item--conflict {
+  border-left-color: #c07000;
+  background: color-mix(in srgb, #c07000 6%, transparent);
+}
+.capture-playlist-item-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  opacity: 0.9;
+}
+.capture-item-quality {
+  font-size: 0.73rem;
+  padding: 2px 4px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--paper-3);
+  color: var(--text);
+  flex-shrink: 0;
+}
+.capture-playlist-conflict-badge {
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: #c07000;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.capture-playlist-item-remove {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  border-radius: 3px;
+  opacity: 0.3;
+  transition: opacity 0.1s, color 0.1s;
+}
+.capture-playlist-item:hover .capture-playlist-item-remove,
+.capture-playlist-item-remove:focus-visible { opacity: 1; }
+.capture-playlist-item-remove:hover { color: #c04000; opacity: 1; }
+@media (pointer: coarse) { .capture-playlist-item-remove { opacity: 1; } }
+.capture-playlist-item-remove { font-size: 0.75rem; line-height: 1; }
+
+.capture-sync-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  font-size: 0.78rem;
+  color: var(--muted);
+  border-top: 1px solid var(--line-soft);
+  cursor: pointer;
+}
+.capture-sync-row input[type=checkbox] { cursor: pointer; }

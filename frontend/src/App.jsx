@@ -86,6 +86,7 @@ export default function App() {
   const [archives, setArchives] = useState([])
   const [archiveId, setArchiveId] = useState(null)
   const [entries, setEntries] = useState([])
+  const [deletedUids, setDeletedUids] = useState(() => new Set())
   const [selectedEntryUid, setSelectedEntryUid] = useState(() => parseLocation().entry)
   const [selectedEntry, setSelectedEntry] = useState(null)
   const [selectedUids, setSelectedUids] = useState(() => {
@@ -131,6 +132,11 @@ export default function App() {
   const pendingSearchFocus = useRef(false)
   const firstArchiveLoad = useRef(true)
   const lastAnchorIndexRef = useRef(null)
+  // Monotonic token for j/k keyboard navigation; cancels stale fetchEntryDetail calls.
+  const jkSeqRef = useRef(0)
+  // uid → entry object cache; populated on every row click so ctrl/shift
+  // selections can resolve child entries that aren't in the root entries array.
+  const entryCacheRef = useRef(new Map())
 
   const humanizeTags = currentUser?.humanize_slugs ?? false;
 
@@ -260,12 +266,20 @@ export default function App() {
   }, [])
 
   const handleRowClick = useCallback((entry, e) => {
+    // Cache every clicked entry so shift/ctrl can resolve child entries
+    // that are not present in the root `entries` array.
+    entryCacheRef.current.set(entry.entry_uid, entry)
+    // Invalidate any in-flight j/k uncached-child fetch.
+    ++jkSeqRef.current
+
     if (e.shiftKey && lastAnchorIndexRef.current !== null) {
       e.preventDefault()
-      const anchorIdx = entries.findIndex(x => x.entry_uid === lastAnchorIndexRef.current)
-      const clickIdx  = entries.findIndex(x => x.entry_uid === entry.entry_uid)
+      // Use DOM order so child rows (not in the `entries` array) participate
+      // in range selection. Every rendered row has data-entry-uid.
+      const allNodes = [...document.querySelectorAll('#entries-body [data-entry-uid]')]
+      const anchorIdx = allNodes.findIndex(n => n.dataset.entryUid === lastAnchorIndexRef.current)
+      const clickIdx  = allNodes.findIndex(n => n.dataset.entryUid === entry.entry_uid)
       if (anchorIdx === -1 || clickIdx === -1) {
-        // anchor evicted by search/filter/delete — fall back to single select
         lastAnchorIndexRef.current = entry.entry_uid
         setSelectedUids(new Set([entry.entry_uid]))
         selectEntry(entry)
@@ -273,24 +287,41 @@ export default function App() {
       }
       const lo = Math.min(anchorIdx, clickIdx)
       const hi = Math.max(anchorIdx, clickIdx)
-      const range = entries.slice(lo, hi + 1)
-      const uids = new Set(range.map(x => x.entry_uid))
+      const uids = new Set(allNodes.slice(lo, hi + 1).map(n => n.dataset.entryUid))
       setSelectedUids(uids)
-      if (uids.size === 1) selectEntry(range[0])
+      if (uids.size === 1) selectEntry(entry)
     } else if (e.ctrlKey || e.metaKey) {
       lastAnchorIndexRef.current = entry.entry_uid
-      setSelectedUids(prev => {
-        const next = new Set(prev)
-        if (next.has(entry.entry_uid)) next.delete(entry.entry_uid)
-        else next.add(entry.entry_uid)
-        return next
-      })
+      const next = new Set(selectedUids)
+      if (next.has(entry.entry_uid)) next.delete(entry.entry_uid)
+      else next.add(entry.entry_uid)
+      setSelectedUids(next)
+      if (next.size === 0) {
+        selectEntry(null)
+      } else if (next.size === 1) {
+        // Resolve the remaining UID — may be a child not in the root entries array
+        // and not yet cached (e.g. picked up via shift-range without a direct click).
+        const [remainingUid] = next
+        const cached = entryCacheRef.current.get(remainingUid)
+            ?? entries.find(x => x.entry_uid === remainingUid)
+            ?? null
+        if (cached) {
+          selectEntry(cached)
+        } else {
+          const tok = ++jkSeqRef.current
+          fetchEntryDetail(archiveId, remainingUid)
+            .then(det => { if (tok === jkSeqRef.current && det?.summary) selectEntry(det.summary) })
+            .catch(() => {})
+        }
+      } else {
+        selectEntry(null)
+      }
     } else {
       lastAnchorIndexRef.current = entry.entry_uid
       setSelectedUids(new Set([entry.entry_uid]))
       selectEntry(entry)
     }
-  }, [entries, selectEntry])
+  }, [entries, selectedUids, selectEntry, archiveId])
 
   const handleTagFilterSet = useCallback((fullPath) => {
     setTagFilter(fullPath)
@@ -342,18 +373,26 @@ export default function App() {
   }, [archiveId, selectedEntry])
 
   const handleEntryDeleted = useCallback((entryUid) => {
+    const isRoot = entries.some(e => e.entry_uid === entryUid)
+    setDeletedUids(prev => { const n = new Set(prev); n.add(entryUid); return n })
     setEntries(prev => prev.filter(e => e.entry_uid !== entryUid))
     setSelectedEntry(prev => prev?.entry_uid === entryUid ? null : prev)
     setSelectedEntryUid(prev => prev === entryUid ? null : prev)
     setSelectedUids(prev => { const n = new Set(prev); n.delete(entryUid); return n })
-  }, [])
+    // Child delete: parent row's child_count/size are stale — reload after state updates.
+    if (!isRoot) loadEntries(archiveId, searchQuery, tagFilter)
+  }, [entries, archiveId, searchQuery, tagFilter, loadEntries])
 
   const handleBulkDeleted = useCallback((uids) => {
+    const rootUids = new Set(entries.map(e => e.entry_uid))
+    const hasChildDelete = [...uids].some(u => !rootUids.has(u))
+    setDeletedUids(prev => { const n = new Set(prev); uids.forEach(u => n.add(u)); return n })
     setEntries(prev => prev.filter(e => !uids.has(e.entry_uid)))
     setSelectedUids(new Set())
     setSelectedEntry(null)
     setSelectedEntryUid(null)
-  }, [])
+    if (hasChildDelete) loadEntries(archiveId, searchQuery, tagFilter)
+  }, [entries, archiveId, searchQuery, tagFilter, loadEntries])
 
   // Auto-snap: drive selectedEntryUid from selectedUids so URL sync and detail
   // panel stay correct. size >= 2 clears single-entry state (bulk panel takes over).
@@ -397,23 +436,80 @@ export default function App() {
     if (current !== url) history.replaceState(null, '', url)
   }, [searchQuery, tagFilter, selectedEntryUid, view])
 
-  // ⌘K / Ctrl+K: focus the search input, switching to archive view first if needed.
+  // ⌘K / Ctrl+K / /: focus the search input, switching to archive view first if needed.
   useEffect(() => {
     const handler = (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
-        e.preventDefault()
-        if (view === 'archive') {
-          searchInputRef.current?.focus()
-          searchInputRef.current?.select()
-        } else {
-          pendingSearchFocus.current = true
-          setView('archive')
-        }
+      const isSlash = e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey
+      const isCmdK  = (e.metaKey || e.ctrlKey) && e.key === 'k'
+      if (!isSlash && !isCmdK) return
+      // Don't intercept / when already typing in an input
+      const tag = document.activeElement?.tagName
+      if (isSlash && (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT')) return
+      if (isSlash && document.activeElement?.isContentEditable) return
+      e.preventDefault()
+      if (view === 'archive') {
+        searchInputRef.current?.focus()
+        searchInputRef.current?.select()
+      } else {
+        pendingSearchFocus.current = true
+        setView('archive')
       }
     }
     document.addEventListener('keydown', handler)
     return () => document.removeEventListener('keydown', handler)
   }, [view])
+
+  // j/k: navigate entries down/up when not focused on an input element.
+  useEffect(() => {
+    const handler = (e) => {
+      // Ignore when a modifier is held (don't steal browser/app shortcuts)
+      if (e.metaKey || e.ctrlKey || e.altKey) return
+      if (e.key !== 'j' && e.key !== 'k') return
+      // Ignore when focus is on any editable target
+      const tag = document.activeElement?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+      if (document.activeElement?.isContentEditable) return
+
+      const allNodes = [...document.querySelectorAll('#entries-body [data-entry-uid]')]
+      if (allNodes.length === 0) return
+
+      const [currentUid] = selectedUids.size === 1 ? selectedUids : [null]
+      const currentIdx = currentUid
+        ? allNodes.findIndex(n => n.dataset.entryUid === currentUid)
+        : -1
+
+      const nextIdx = e.key === 'j'
+        ? Math.min(currentIdx + 1, allNodes.length - 1)
+        : Math.max(currentIdx - 1, 0)
+
+      if (nextIdx === currentIdx && currentIdx !== -1) return
+
+      const nextNode = allNodes[nextIdx < 0 ? 0 : nextIdx]
+      const nextUid = nextNode.dataset.entryUid
+
+      lastAnchorIndexRef.current = nextUid
+      const tok = ++jkSeqRef.current
+      setSelectedUids(new Set([nextUid]))
+
+      // Resolve entry object: cache → root entries array → server fetch.
+      // Token guards against a slow fetch settling after the user has moved on.
+      const cached = entryCacheRef.current.get(nextUid)
+          ?? entries.find(x => x.entry_uid === nextUid)
+          ?? null
+      if (cached) {
+        selectEntry(cached)
+      } else {
+        fetchEntryDetail(archiveId, nextUid)
+          .then(det => { if (tok === jkSeqRef.current && det?.summary) selectEntry(det.summary) })
+          .catch(() => {})
+      }
+
+      nextNode.scrollIntoView({ block: 'nearest' })
+      e.preventDefault()
+    }
+    document.addEventListener('keydown', handler)
+    return () => document.removeEventListener('keydown', handler)
+  }, [selectedUids, entries, selectEntry, archiveId])
 
   // After switching to archive view via ⌘K, focus the search input once rendered.
   useEffect(() => {
@@ -563,6 +659,7 @@ export default function App() {
                 onRowClick={handleRowClick}
                 archiveId={archiveId}
                 pendingCaptures={pendingCaptures}
+                deletedUids={deletedUids}
               />
             )}
             {view === 'runs' && <RunsView runs={runs} />}

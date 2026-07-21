@@ -30,6 +30,10 @@ pub struct EntrySummary {
     pub has_favicon: bool,
     /// Bytes of blobs already on disk from an earlier entry (precomputed at capture time).
     pub cached_bytes: i64,
+    /// Number of direct child entries; 0 for non-container entries.
+    pub child_count: i64,
+    /// Total non-avatar artifact bytes (query-time; used as denominator for cache-hit %).
+    pub cacheable_bytes: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -212,10 +216,12 @@ pub fn list_root_entries(
             e.visibility,
             si.canonical_url,
             COUNT(ea.id) AS artifact_count,
-            COALESCE(SUM(b.byte_size), 0) AS total_artifact_bytes,
+            COALESCE(SUM(b.byte_size), 0) + COALESCE((SELECT SUM(b2.byte_size) FROM archived_entries c2 JOIN entry_artifacts ea2 ON ea2.entry_id = c2.id JOIN blobs b2 ON b2.id = ea2.blob_id WHERE c2.parent_entry_id = e.id), 0) AS total_artifact_bytes,
             NULL AS parent_entry_uid,
             EXISTS(SELECT 1 FROM entry_artifacts fav WHERE fav.entry_id = e.id AND fav.artifact_role = 'favicon') AS has_favicon,
-            e.cached_bytes
+            e.cached_bytes,
+            (SELECT COUNT(*) FROM archived_entries child WHERE child.parent_entry_id = e.id) AS child_count,
+            COALESCE(SUM(CASE WHEN ea.artifact_role != 'avatar' THEN b.byte_size ELSE 0 END), 0) + COALESCE((SELECT SUM(b2.byte_size) FROM archived_entries c2 JOIN entry_artifacts ea2 ON ea2.entry_id = c2.id JOIN blobs b2 ON b2.id = ea2.blob_id WHERE c2.parent_entry_id = e.id), 0) AS cacheable_bytes
          FROM archived_entries e
          JOIN source_identities si ON si.id = e.source_identity_id
          LEFT JOIN entry_artifacts ea ON ea.entry_id = e.id
@@ -248,11 +254,47 @@ pub fn list_root_entries(
                 parent_entry_uid: row.get(9)?,
                 has_favicon: row.get::<_, i64>(10)? != 0,
                 cached_bytes: row.get(11)?,
+                child_count: row.get(12)?,
+                cacheable_bytes: row.get(13)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     Ok(entries)
+}
+
+/// Fetches one `EntrySummary` for any entry (root or child) by uid.
+/// Returns `None` if not found.
+fn get_entry_summary(
+    conn: &rusqlite::Connection,
+    entry_uid: &str,
+) -> Result<Option<EntrySummary>> {
+    let sql = format!(
+        "{} {} WHERE e.entry_uid = ?1 GROUP BY e.id",
+        ENTRY_SELECT_COLS, ENTRY_FROM_JOINS,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let result = stmt
+        .query_row([entry_uid], |row| {
+            Ok(EntrySummary {
+                entry_uid: row.get(0)?,
+                archived_at: row.get(1)?,
+                source_kind: row.get(2)?,
+                entity_kind: row.get(3)?,
+                title: row.get(4)?,
+                visibility: row.get(5)?,
+                original_url: row.get(6)?,
+                artifact_count: row.get(7)?,
+                total_artifact_bytes: row.get(8)?,
+                parent_entry_uid: row.get(9)?,
+                has_favicon: row.get::<_, i64>(10)? != 0,
+                cached_bytes: row.get(11)?,
+                child_count: row.get(12)?,
+                cacheable_bytes: row.get(13)?,
+            })
+        })
+        .optional()?;
+    Ok(result)
 }
 
 pub fn get_entry_detail(
@@ -279,9 +321,7 @@ pub fn get_entry_detail(
         return Ok(None);
     };
 
-    let summary = list_root_entries(conn, u32::MAX)?
-        .into_iter()
-        .find(|entry| entry.entry_uid == entry_uid)
+    let summary = get_entry_summary(conn, entry_uid)?
         .context("entry disappeared while loading detail")?;
 
     let mut stmt = conn.prepare(
@@ -438,10 +478,119 @@ pub fn list_entries_for_collection(
                 parent_entry_uid: row.get(9)?,
                 has_favicon: row.get::<_, i64>(10)? != 0,
                 cached_bytes: row.get(11)?,
+                child_count: row.get(12)?,
+                cacheable_bytes: row.get(13)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(entries)
+}
+
+/// Returns the direct children of the entry identified by `parent_entry_uid`,
+/// ordered ascending by `archived_at, id` (preserves playlist ordinal feel).
+/// Returns an empty vec if the parent has no children or does not exist.
+pub fn list_child_entries(
+    conn: &rusqlite::Connection,
+    parent_entry_uid: &str,
+    caller_bits: u32,
+) -> Result<Vec<EntrySummary>> {
+    let sql = format!(
+        "{} {} \
+         WHERE e.parent_entry_id = (SELECT id FROM archived_entries WHERE entry_uid = ?1) \
+         AND (\
+             CAST(?2 AS INTEGER) & 12 != 0 \
+             OR EXISTS (\
+                 SELECT 1 FROM collection_entries ce \
+                 WHERE ce.entry_id = e.id \
+                   AND ce.visibility_bits & CAST(?2 AS INTEGER) != 0\
+             )\
+             OR EXISTS (\
+                 SELECT 1 FROM collection_entries ce_p \
+                 WHERE ce_p.entry_id = (SELECT id FROM archived_entries WHERE entry_uid = ?1)\
+                   AND ce_p.visibility_bits & CAST(?2 AS INTEGER) != 0\
+             )\
+         ) \
+         GROUP BY e.id \
+         ORDER BY e.archived_at ASC, e.id ASC",
+        ENTRY_SELECT_COLS, ENTRY_FROM_JOINS,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let entries = stmt
+        .query_map(
+            rusqlite::params![parent_entry_uid, caller_bits as i64],
+            |row| {
+                Ok(EntrySummary {
+                    entry_uid: row.get(0)?,
+                    archived_at: row.get(1)?,
+                    source_kind: row.get(2)?,
+                    entity_kind: row.get(3)?,
+                    title: row.get(4)?,
+                    visibility: row.get(5)?,
+                    original_url: row.get(6)?,
+                    artifact_count: row.get(7)?,
+                    total_artifact_bytes: row.get(8)?,
+                    parent_entry_uid: row.get(9)?,
+                    has_favicon: row.get::<_, i64>(10)? != 0,
+                    cached_bytes: row.get(11)?,
+                    child_count: row.get(12)?,
+                    cacheable_bytes: row.get(13)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(entries)
+}
+
+/// Returns the set of canonical URLs for all child entries archived under
+/// **any** container entry whose own canonical URL matches `playlist_canonical_url`.
+///
+/// Used in sync mode so the playlist capture path can skip videos that were
+/// already downloaded in a previous run of the same playlist.
+pub fn get_archived_playlist_child_urls(
+    conn: &rusqlite::Connection,
+    playlist_canonical_url: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT si_child.canonical_url \
+         FROM archived_entries child \
+         JOIN source_identities si_child ON si_child.id = child.source_identity_id \
+         WHERE child.parent_entry_id IN ( \
+             SELECT e.id \
+             FROM archived_entries e \
+             JOIN source_identities si ON si.id = e.source_identity_id \
+             WHERE si.canonical_url = ?1 \
+               AND e.parent_entry_id IS NULL \
+         )",
+    )?;
+    let urls = stmt
+        .query_map([playlist_canonical_url], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+    Ok(urls)
+}
+
+/// Finds the most recent container entry (parent_entry_id IS NULL) whose
+/// canonical URL matches `canonical_url`. Returns its row id, or None if
+/// no such entry exists.
+///
+/// Used in sync mode to reuse an existing playlist/channel container instead
+/// of creating a duplicate root entry on every sync run.
+pub fn find_container_entry_id_by_canonical_url(
+    conn: &rusqlite::Connection,
+    canonical_url: &str,
+) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.id \
+         FROM archived_entries e \
+         JOIN source_identities si ON si.id = e.source_identity_id \
+         WHERE si.canonical_url = ?1 \
+           AND e.parent_entry_id IS NULL \
+         ORDER BY e.archived_at DESC \
+         LIMIT 1",
+    )?;
+    let id = stmt
+        .query_row([canonical_url], |row| row.get::<_, i64>(0))
+        .optional()?;
+    Ok(id)
 }
 
 /// Resolves an artifact to its absolute on-disk path under `store_path`.
@@ -552,10 +701,12 @@ pub fn parse_search_query(raw: &str) -> Result<SearchEntriesQuery, String> {
 
 const ENTRY_SELECT_COLS: &str = "SELECT e.entry_uid, e.archived_at, e.source_kind, e.entity_kind, e.title, \
     e.visibility, si.canonical_url, COUNT(ea.id) AS artifact_count, \
-    COALESCE(SUM(b.byte_size), 0) AS total_artifact_bytes, \
+    COALESCE(SUM(b.byte_size), 0) + COALESCE((SELECT SUM(b2.byte_size) FROM archived_entries c2 JOIN entry_artifacts ea2 ON ea2.entry_id = c2.id JOIN blobs b2 ON b2.id = ea2.blob_id WHERE c2.parent_entry_id = e.id), 0) AS total_artifact_bytes, \
     parent.entry_uid AS parent_entry_uid, \
     EXISTS(SELECT 1 FROM entry_artifacts fav WHERE fav.entry_id = e.id AND fav.artifact_role = 'favicon') AS has_favicon, \
-    e.cached_bytes";
+    e.cached_bytes, \
+    (SELECT COUNT(*) FROM archived_entries child WHERE child.parent_entry_id = e.id) AS child_count, \
+    COALESCE(SUM(CASE WHEN ea.artifact_role != 'avatar' THEN b.byte_size ELSE 0 END), 0) + COALESCE((SELECT SUM(b2.byte_size) FROM archived_entries c2 JOIN entry_artifacts ea2 ON ea2.entry_id = c2.id JOIN blobs b2 ON b2.id = ea2.blob_id WHERE c2.parent_entry_id = e.id), 0) AS cacheable_bytes";
 
 const ENTRY_FROM_JOINS: &str = "FROM archived_entries e \
     JOIN source_identities si ON si.id = e.source_identity_id \
@@ -663,6 +814,8 @@ pub fn search_entries(
                 parent_entry_uid: row.get(9)?,
                 has_favicon: row.get::<_, i64>(10)? != 0,
                 cached_bytes: row.get(11)?,
+                child_count: row.get(12)?,
+                cacheable_bytes: row.get(13)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -870,7 +1023,9 @@ pub fn entries_for_tag(
                 COALESCE(SUM(b.byte_size), 0) AS total_artifact_bytes,
                 parent.entry_uid AS parent_entry_uid,
                 EXISTS(SELECT 1 FROM entry_artifacts fav WHERE fav.entry_id = e.id AND fav.artifact_role = 'favicon') AS has_favicon,
-                e.cached_bytes
+                e.cached_bytes,
+                (SELECT COUNT(*) FROM archived_entries child WHERE child.parent_entry_id = e.id) AS child_count,
+                COALESCE(SUM(CASE WHEN ea.artifact_role != 'avatar' THEN b.byte_size ELSE 0 END), 0) AS cacheable_bytes
          FROM archived_entries e
          JOIN source_identities si ON si.id = e.source_identity_id
          LEFT JOIN entry_artifacts ea ON ea.entry_id = e.id
@@ -896,6 +1051,8 @@ pub fn entries_for_tag(
                 parent_entry_uid: row.get(9)?,
                 has_favicon: row.get::<_, i64>(10)? != 0,
                 cached_bytes: row.get(11)?,
+                child_count: row.get(12)?,
+                cacheable_bytes: row.get(13)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1618,4 +1775,263 @@ mod tests {
         );
         assert_eq!(results[0].entry_uid, parent.entry_uid);
     }
+    // ── sync helper tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn find_container_entry_id_returns_none_when_absent() {
+        let (conn, _, _) = make_tag_test_db();
+        let result = find_container_entry_id_by_canonical_url(
+            &conn,
+            "https://www.youtube.com/playlist?list=PLnobody",
+        )
+        .unwrap();
+        assert!(result.is_none(), "should return None when no entry exists");
+    }
+
+    #[test]
+    fn find_container_entry_id_returns_root_entry() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        let playlist_url = "https://www.youtube.com/playlist?list=PLtest";
+        let container = make_entry_in_db(&conn, user_id, run_id, None, None, "My Playlist", playlist_url);
+        let result = find_container_entry_id_by_canonical_url(&conn, playlist_url)
+            .unwrap()
+            .expect("should find the container");
+        assert_eq!(result, container.id);
+    }
+
+    #[test]
+    fn find_container_entry_id_ignores_child_entries() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        let child_url = "https://www.youtube.com/watch?v=abc123";
+        // Create a parent container and a child whose canonical URL happens to be
+        // what we're querying — should NOT be returned since it has parent_entry_id set.
+        let parent = make_entry_in_db(&conn, user_id, run_id, None, None, "PL", "https://example.com/pl");
+        let _child = make_entry_in_db(&conn, user_id, run_id, Some(parent.id), Some(parent.id), "Vid", child_url);
+        let result = find_container_entry_id_by_canonical_url(&conn, child_url).unwrap();
+        assert!(result.is_none(), "child entry should not be returned as a container");
+    }
+
+    #[test]
+    fn get_archived_playlist_child_urls_empty_when_no_playlist() {
+        let (conn, _, _) = make_tag_test_db();
+        let urls = get_archived_playlist_child_urls(
+            &conn,
+            "https://www.youtube.com/playlist?list=PLnone",
+        )
+        .unwrap();
+        assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn get_archived_playlist_child_urls_returns_children() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        let playlist_url = "https://www.youtube.com/playlist?list=PLchildren";
+        let container = make_entry_in_db(&conn, user_id, run_id, None, None, "Playlist", playlist_url);
+
+        let child1_url = "https://www.youtube.com/watch?v=vid1";
+        let child2_url = "https://www.youtube.com/watch?v=vid2";
+        make_entry_in_db(&conn, user_id, run_id, Some(container.id), Some(container.id), "Vid 1", child1_url);
+        make_entry_in_db(&conn, user_id, run_id, Some(container.id), Some(container.id), "Vid 2", child2_url);
+
+        let urls = get_archived_playlist_child_urls(&conn, playlist_url).unwrap();
+        assert_eq!(urls.len(), 2);
+        assert!(urls.contains(child1_url), "should contain vid1");
+        assert!(urls.contains(child2_url), "should contain vid2");
+    }
+
+    #[test]
+    fn get_archived_playlist_child_urls_excludes_other_playlists() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        let pl_a = "https://www.youtube.com/playlist?list=PLA";
+        let pl_b = "https://www.youtube.com/playlist?list=PLB";
+        let container_a = make_entry_in_db(&conn, user_id, run_id, None, None, "PL A", pl_a);
+        let container_b = make_entry_in_db(&conn, user_id, run_id, None, None, "PL B", pl_b);
+
+        let vid_a = "https://www.youtube.com/watch?v=forA";
+        let vid_b = "https://www.youtube.com/watch?v=forB";
+        make_entry_in_db(&conn, user_id, run_id, Some(container_a.id), Some(container_a.id), "A Vid", vid_a);
+        make_entry_in_db(&conn, user_id, run_id, Some(container_b.id), Some(container_b.id), "B Vid", vid_b);
+
+        let urls_a = get_archived_playlist_child_urls(&conn, pl_a).unwrap();
+        assert_eq!(urls_a.len(), 1);
+        assert!(urls_a.contains(vid_a));
+        assert!(!urls_a.contains(vid_b), "should not include children of other playlists");
+    }
+
+    #[test]
+    fn cached_bytes_excludes_avatar_blobs() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+
+        // entry_a is older (created first, gets the lower id)
+        let entry_a = make_entry_in_db(
+            &conn,
+            user_id,
+            run_id,
+            None,
+            None,
+            "Tweet A",
+            "https://twitter.com/user/status/1",
+        );
+        // entry_b is newer (created second, higher id — tiebreak on id when archived_at is equal)
+        let entry_b = make_entry_in_db(
+            &conn,
+            user_id,
+            run_id,
+            None,
+            None,
+            "Tweet B",
+            "https://twitter.com/user/status/2",
+        );
+
+        // Shared avatar blob: 100 bytes
+        let avatar_blob_id = database::upsert_blob(
+            &conn,
+            &database::BlobRecord {
+                sha256: "avatar_sha256_test".to_string(),
+                byte_size: 100,
+                mime_type: Some("image/jpeg".to_string()),
+                extension: Some("jpg".to_string()),
+                raw_relpath: "raw/av/at/avatar.jpg".to_string(),
+            },
+        )
+        .unwrap();
+
+        // Shared media blob: 900 bytes
+        let media_blob_id = database::upsert_blob(
+            &conn,
+            &database::BlobRecord {
+                sha256: "media_sha256_test".to_string(),
+                byte_size: 900,
+                mime_type: Some("image/png".to_string()),
+                extension: Some("png".to_string()),
+                raw_relpath: "raw/me/di/media.png".to_string(),
+            },
+        )
+        .unwrap();
+
+        // Attach both artifacts to entry_a
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id: entry_a.id,
+                artifact_role: "avatar".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: "raw/av/at/avatar.jpg".to_string(),
+                blob_id: Some(avatar_blob_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id: entry_a.id,
+                artifact_role: "primary_media".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: "raw/me/di/media.png".to_string(),
+                blob_id: Some(media_blob_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+
+        // Attach both artifacts to entry_b (same blobs — simulates shared avatar/media)
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id: entry_b.id,
+                artifact_role: "avatar".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: "raw/av/at/avatar.jpg".to_string(),
+                blob_id: Some(avatar_blob_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id: entry_b.id,
+                artifact_role: "primary_media".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: "raw/me/di/media.png".to_string(),
+                blob_id: Some(media_blob_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+
+        // Recompute cached_bytes for entry_b.
+        // The query excludes avatar-role artifacts and counts only non-avatar blobs
+        // that are already held by an earlier entry.  entry_a (lower id) owns the
+        // same media blob, so cached_bytes for entry_b should be 900, not 1000.
+        database::refresh_entry_cached_bytes(&conn, entry_b.id).unwrap();
+
+        // --- Assert raw DB value ---
+        let cached_bytes_db: i64 = conn
+            .query_row(
+                "SELECT cached_bytes FROM archived_entries WHERE id = ?1",
+                [entry_b.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cached_bytes_db, 900,
+            "cached_bytes should be 900 (media only); avatar blob must be excluded"
+        );
+
+        // --- Assert list_root_entries summary for entry_b ---
+        let entries = list_root_entries(&conn, 12).unwrap(); // 12 = ADMIN bits
+        let summary_b = entries
+            .iter()
+            .find(|e| e.entry_uid == entry_b.entry_uid)
+            .expect("entry_b must appear in list_root_entries");
+
+        assert_eq!(
+            summary_b.cached_bytes, 900,
+            "summary cached_bytes must equal 900 (precomputed, avatar excluded)"
+        );
+        assert_eq!(
+            summary_b.cacheable_bytes, 900,
+            "cacheable_bytes (non-avatar total) must be 900 for entry_b"
+        );
+        assert_eq!(
+            summary_b.total_artifact_bytes, 1000,
+            "total_artifact_bytes must be 1000 (avatar 100 + media 900)"
+        );
+    }
+
+    #[test]
+    fn list_child_entries_inherits_parent_visibility() {
+        // Regression: non-admin users who can see a playlist container through a
+        // collection must also see its children. The child is auto-enrolled in the
+        // default collection with private visibility bits — it has no *visible*
+        // collection membership of its own, so it would be filtered out without
+        // the parent-collection OR arm in list_child_entries.
+        let (conn, user_id, run_id) = make_tag_test_db();
+
+        let container = make_entry_in_db(&conn, user_id, run_id, None, None,
+            "Playlist", "https://example.com/pl");
+        let child = make_entry_in_db(&conn, user_id, run_id,
+            Some(container.id), Some(container.id),
+            "Video 1", "https://example.com/pl/v1");
+
+        // Enroll the container (but NOT the child) in a USER-visible collection (bits=2).
+        let coll = database::create_collection(&conn, "My List", "my-list", 2).unwrap();
+        database::add_entry_to_collection(&conn, coll.id, container.id, 2).unwrap();
+
+        // USER caller (bits=2): child must be visible through parent's collection.
+        let children = list_child_entries(&conn, &container.entry_uid, 2).unwrap();
+        assert_eq!(children.len(), 1, "child must be visible via parent collection");
+        assert_eq!(children[0].entry_uid, child.entry_uid);
+
+        // GUEST caller (bits=1): parent collection has bits=2, so child must NOT be visible.
+        let guest_children = list_child_entries(&conn, &container.entry_uid, 1).unwrap();
+        assert!(guest_children.is_empty(), "guest must not see children of a USER-only collection");
+    }
+
 }

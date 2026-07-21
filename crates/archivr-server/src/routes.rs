@@ -242,6 +242,10 @@ pub fn app_with_state(state: AppState) -> Router {
                 .delete(delete_entry_handler),
         )
         .route(
+            "/api/archives/:archive_id/entries/:entry_uid/children",
+            get(list_entry_children),
+        )
+        .route(
             "/api/archives/:archive_id/entries/:entry_uid/artifacts/:artifact_index",
             get(serve_artifact),
         )
@@ -259,6 +263,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/archives/:archive_id/captures/probe",
             get(probe_handler),
+        )
+        .route(
+            "/api/archives/:archive_id/captures/probe-playlist",
+            post(probe_playlist_handler),
         )
         .route(
             "/api/archives/:archive_id/capture_jobs/:job_uid",
@@ -402,6 +410,18 @@ async fn list_entries(
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let caller_bits = auth_to_caller_bits(&auth);
     Ok(Json(archive::list_root_entries(&conn, caller_bits)?))
+}
+
+async fn list_entry_children(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((archive_id, entry_uid)): Path<(String, String)>,
+) -> Result<Json<Vec<archive::EntrySummary>>, ApiError> {
+    auth.require_auth()?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let caller_bits = auth_to_caller_bits(&auth);
+    Ok(Json(archive::list_child_entries(&conn, &entry_uid, caller_bits)?))
 }
 
 async fn search_entries_handler(
@@ -749,10 +769,22 @@ struct CaptureBody {
     modal_closer_enabled: Option<bool>,
     /// Route through Freedium mirror for WebPage captures. Absent = true (on by default).
     via_freedium: Option<bool>,
+    /// Per-video quality overrides for playlist captures.
+    /// Keys are yt-dlp video IDs; values are quality strings ("best", "1080p", "audio", etc.).
+    #[serde(default)]
+    per_item_quality: std::collections::HashMap<String, String>,
+    /// When true, skip playlist items already archived under an existing container.
+    #[serde(default)]
+    sync: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct ProbeQuery {
+    locator: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ProbePlaylistBody {
     locator: String,
 }
 
@@ -826,6 +858,28 @@ async fn capture_handler(
             ));
         }
     }
+    {
+        let is_valid_quality = |q: &str| {
+            q == "best"
+                || q == "audio"
+                || q.strip_suffix('p')
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .is_some()
+        };
+        if let Some(bad) = body.per_item_quality.values().find(|q| !is_valid_quality(q)) {
+            return Err(ApiError::bad_request(&format!(
+                "invalid per_item_quality value {bad:?}: must be \"best\", \"audio\", or a height string like \"1080p\""
+            )));
+        }
+    }
+    // per_item_quality semantics (enforced in capture.rs):
+    // - Absent or empty map: all playlist items are downloaded; quality is the
+    //   global `quality` field applied as a yt-dlp cap with graceful fallback.
+    // - Non-empty map: ONLY items whose yt-dlp ID appears as a key are downloaded;
+    //   absent IDs are skipped. This is how the frontend's delete-item button works.
+    // The "must choose quality for unsupported videos" invariant is enforced by the
+    // frontend before submission; a direct API caller bypassing the UI accepts
+    // yt-dlp's standard cap-and-fallback behavior for items it includes.
     let mounted = mounted_archive(&state, &archive_id)?;
     let archive_paths =
         archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;
@@ -863,6 +917,8 @@ async fn capture_handler(
         modal_closer_enabled: Some(effective_modal_closer),
         reader_mode: body.reader_mode.unwrap_or(false),
         via_freedium: body.via_freedium.unwrap_or(true),
+        per_item_quality: body.per_item_quality.clone(),
+        sync: body.sync,
     };
 
     // Spawn background capture.
@@ -902,10 +958,19 @@ async fn capture_handler(
                     notes_str = serde_json::Value::Object(notes_map).to_string();
                     Some(&notes_str)
                 };
+                // A partial playlist (some items succeeded, some failed) has status="failed"
+                // but completed_child_count > 0. Treat it as a completed job so onCaptured
+                // fires and the archived entries appear. Only mark failed when no child
+                // succeeded (completed_child_count == 0).
+                let job_status = if result.status == "failed" && result.completed_child_count == 0 {
+                    "failed"
+                } else {
+                    "completed"
+                };
                 database::update_capture_job_status(
                     &conn,
                     &job_uid_bg,
-                    "completed",
+                    job_status,
                     Some(&result.run_uid),
                     None,
                     notes,
@@ -981,6 +1046,8 @@ async fn rearchive_handler(
         modal_closer_enabled: None,
         reader_mode: false,
         via_freedium: false,
+        per_item_quality: std::collections::HashMap::new(),
+        sync: false,
     };
 
     let job_uid_bg = job_uid.clone();
@@ -1107,6 +1174,41 @@ async fn probe_handler(
         "qualities": qualities,
         "has_audio": result.has_audio,
     })))
+}
+
+async fn probe_playlist_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(archive_id): Path<String>,
+    Json(body): Json<ProbePlaylistBody>,
+) -> Result<Json<downloader::ytdlp::PlaylistProbeResult>, ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    let locator = body.locator.trim().to_string();
+    if locator.is_empty() {
+        return Err(ApiError::bad_request("locator must not be empty"));
+    }
+    // Validate it's a playlist/channel source and expand shorthands.
+    let canonical_url = capture::locator_to_playlist_url(&locator)
+        .ok_or_else(|| ApiError::bad_request("locator is not a YouTube playlist, channel, YTM playlist, or Spotify album/playlist"))?;
+    // Verify archive exists.
+    let _ = mounted_archive(&state, &archive_id)?;
+    // Resolve cookies.
+    let cookie_rules = match database::open_auth_db(&state.auth_db_path) {
+        Ok(conn) => database::list_cookie_rules(&conn).unwrap_or_default(),
+        Err(_) => vec![],
+    };
+    let cookies = capture::resolve_cookies_for_url(&cookie_rules, &canonical_url);
+    // Shell out to yt-dlp in a blocking task.
+    let result = tokio::task::spawn_blocking(move || {
+        downloader::ytdlp::probe_playlist_qualities(&canonical_url, &cookies)
+    })
+    .await
+    .map_err(|_| ApiError::internal("probe-playlist task panicked"))?
+    .map_err(|e| ApiError {
+        status: StatusCode::BAD_GATEWAY,
+        message: format!("playlist probe failed: {e:#}"),
+    })?;
+    Ok(Json(result))
 }
 
 async fn auth_setup_status(
