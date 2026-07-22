@@ -37,6 +37,32 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Prune staged upload dirs older than 24 h from each archive's temp/uploads/.
+    // These accumulate when uploads are abandoned without being submitted for capture.
+    let prune_cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(24 * 60 * 60))
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    for archive in &registry.archives {
+        if let Ok(paths) = archivr_core::archive::read_archive_paths(&archive.archive_path) {
+            let uploads_dir = paths.store_path.join("temp").join("uploads");
+            if let Ok(entries) = std::fs::read_dir(&uploads_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let stale = entry
+                            .metadata()
+                            .and_then(|m| m.modified())
+                            .map(|t| t < prune_cutoff)
+                            .unwrap_or(false);
+                        if stale {
+                            let _ = std::fs::remove_dir_all(&path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Spawn session cleanup: runs at startup and every 24h.
     let cleanup_auth_path = auth_db_path.clone();
     tokio::spawn(async move {

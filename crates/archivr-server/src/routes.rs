@@ -32,7 +32,7 @@ use std::{
 use archivr_core::{archive, capture, database, downloader};
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Path, Query, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, Request, State},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -274,6 +274,12 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/archives/:archive_id/blobs/:sha256", get(serve_blob))
         .route("/api/archives/:archive_id/runs", get(list_runs))
         .route("/api/archives/:archive_id/captures", post(capture_handler))
+        .route(
+            "/api/archives/:archive_id/uploads",
+            post(upload_handler)
+                .delete(delete_upload_handler)
+                .layer(DefaultBodyLimit::max(10 * 1024 * 1024 * 1024)),
+        )
         .route(
             "/api/archives/:archive_id/captures/probe",
             get(probe_handler),
@@ -924,6 +930,11 @@ struct UpdateCookieRuleBody {
     ordinal: Option<i64>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct DeleteUploadBody {
+    locator: String,
+}
+
 async fn capture_handler(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -1011,6 +1022,24 @@ async fn capture_handler(
 
     // Spawn background capture.
     let locator = body.locator.trim().to_string();
+    // If the locator is a file:// path staged under temp/uploads/, track it for cleanup.
+    // Canonicalize both sides to prevent path-traversal via `..` components in the locator.
+    // Same pattern as artifact serving (line ~631). The staged file must already exist on disk
+    // (it was written by upload_handler), so canonicalize() will resolve symlinks correctly.
+    let staged_upload_path: Option<std::path::PathBuf> = if locator.starts_with("file://") {
+        let file_path = std::path::PathBuf::from(locator.trim_start_matches("file://"));
+        let staging_dir = archive_paths.store_path.join("temp").join("uploads");
+        match (file_path.canonicalize(), staging_dir.canonicalize()) {
+            (Ok(canonical_file), Ok(canonical_staging))
+                if canonical_file.starts_with(&canonical_staging) =>
+            {
+                Some(canonical_file)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
     let quality = body.quality.clone();
     let archive_path = mounted.archive_path.clone();
     let job_uid_bg = job_uid.clone();
@@ -1064,6 +1093,16 @@ async fn capture_handler(
                     notes,
                 )
                 .ok();
+                // Clean up staged upload file — content is now in the raw store.
+                // `staged` is already the canonicalized path (safe to remove_file directly).
+                // Also attempt to remove the now-empty UUID parent dir; fails silently if
+                // non-empty or already gone.
+                if let Some(staged) = staged_upload_path {
+                    let _ = std::fs::remove_file(&staged);
+                    if let Some(parent) = staged.parent() {
+                        let _ = std::fs::remove_dir(parent);
+                    }
+                }
             }
             Err(e) => {
                 database::update_capture_job_status(
@@ -1083,6 +1122,144 @@ async fn capture_handler(
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "job_uid": job_uid, "status": "pending" })),
     ))
+}
+
+async fn upload_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(archive_id): Path<String>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let archive_paths =
+        archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;
+
+    // Stage under temp/uploads/<uuid>/<safe_name> so Source::Local derives the
+    // entry title from Path::file_name() of the locator rather than the uuid.
+    let staging_base = archive_paths.store_path.join("temp").join("uploads");
+
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::bad_request(&e.to_string()))?
+    {
+        if field.name() != Some("file") {
+            continue;
+        }
+        let filename = field.file_name().unwrap_or("upload").to_string();
+
+        // Sanitize: strip path separators and control chars, truncate to 200 chars.
+        let safe_name: String = filename
+            .chars()
+            .filter(|c| !matches!(*c, '/' | '\\' | '\0'))
+            .collect::<String>()
+            .trim()
+            .to_string();
+        let safe_name = if safe_name.is_empty() {
+            "upload".to_string()
+        } else {
+            safe_name.chars().take(200).collect()
+        };
+
+        let uuid_dir = staging_base.join(uuid::Uuid::new_v4().simple().to_string());
+        tokio::fs::create_dir_all(&uuid_dir)
+            .await
+            .map_err(|e| ApiError::from(anyhow::anyhow!("failed to create upload staging dir: {e}")))?;
+        let staged_path = uuid_dir.join(&safe_name);
+
+        // Stream chunks directly to disk — never buffers the full file in RAM.
+        // The body limit (10 GiB) is enforced by the DefaultBodyLimit layer.
+        // Run inside an async block so any mid-stream error can clean up the
+        // partial file and UUID dir before returning to the caller.
+        let stream_result: Result<(), ApiError> = async {
+            use tokio::io::AsyncWriteExt as _;
+            let file = tokio::fs::File::create(&staged_path)
+                .await
+                .map_err(|e| ApiError::from(anyhow::anyhow!("failed to create staged file: {e}")))?;
+            let mut writer = tokio::io::BufWriter::new(file);
+            while let Some(chunk) = field
+                .chunk()
+                .await
+                .map_err(|e| ApiError::bad_request(&e.to_string()))?
+            {
+                writer
+                    .write_all(&chunk)
+                    .await
+                    .map_err(|e| ApiError::from(anyhow::anyhow!("failed to write chunk: {e}")))?;
+            }
+            writer
+                .flush()
+                .await
+                .map_err(|e| ApiError::from(anyhow::anyhow!("failed to flush upload: {e}")))?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = stream_result {
+            // Best-effort cleanup of partial file and now-empty UUID dir.
+            let _ = tokio::fs::remove_file(&staged_path).await;
+            let _ = tokio::fs::remove_dir(&uuid_dir).await;
+            return Err(e);
+        }
+
+        let size = tokio::fs::metadata(&staged_path)
+            .await
+            .map(|m| m.len() as i64)
+            .unwrap_or(0);
+
+        let locator = format!("file://{}", staged_path.display());
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "locator": locator,
+                "filename": filename,
+                "size": size,
+            })),
+        ));
+    }
+
+    Err(ApiError::bad_request("no file field found in multipart upload"))
+}
+
+/// `DELETE /api/archives/:archive_id/uploads`
+///
+/// Discards a staged upload file that was never submitted for capture —
+/// called by the frontend when the user removes a file row or cancels the
+/// dialog.  The same canonicalize-then-prefix-check used in `capture_handler`
+/// prevents path traversal via crafted `file://` locators.
+async fn delete_upload_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(archive_id): Path<String>,
+    Json(body): Json<DeleteUploadBody>,
+) -> Result<StatusCode, ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let archive_paths =
+        archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;
+
+    if !body.locator.starts_with("file://") {
+        return Err(ApiError::bad_request("locator must be a file:// URI"));
+    }
+    let file_path =
+        std::path::PathBuf::from(body.locator.trim_start_matches("file://"));
+    let staging_dir = archive_paths.store_path.join("temp").join("uploads");
+
+    // Canonicalize both sides before the prefix check (path-traversal guard).
+    let (canonical_file, canonical_staging) =
+        match (file_path.canonicalize(), staging_dir.canonicalize()) {
+            (Ok(f), Ok(s)) => (f, s),
+            _ => return Err(ApiError::not_found("staged upload not found")),
+        };
+    if !canonical_file.starts_with(&canonical_staging) {
+        return Err(ApiError::bad_request("locator is not a staged upload"));
+    }
+
+    tokio::fs::remove_file(&canonical_file).await.ok();
+    if let Some(parent) = canonical_file.parent() {
+        tokio::fs::remove_dir(parent).await.ok(); // no-op if non-empty
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_capture_job_handler(
