@@ -92,19 +92,16 @@ export default function VideoPreview({ src, contentType = 'video/mp4' }) {
     }
   }, []);
 
-  // ── Send video to Cast session when connected / resumed ─────────────────
+  // ── Send video to Cast session ───────────────────────────────────────────
+  // loadMedia is extracted so it can be called both immediately (if a session
+  // already exists when signedSrc becomes available) and on future session events.
   useEffect(() => {
     if (!castReady || !signedSrc) return;
 
     const ctx = cast.framework.CastContext.getInstance();
     const { CastContextEventType, SessionState } = cast.framework;
 
-    const onSessionState = (event) => {
-      if (
-        event.sessionState !== SessionState.SESSION_STARTED &&
-        event.sessionState !== SessionState.SESSION_RESUMED
-      ) return;
-      const session = ctx.getCurrentSession();
+    const loadMedia = (session) => {
       if (!session) return;
       const mediaInfo = new chrome.cast.media.MediaInfo(
         window.location.origin + signedSrc,
@@ -113,6 +110,20 @@ export default function VideoPreview({ src, contentType = 'video/mp4' }) {
       session
         .loadMedia(new chrome.cast.media.LoadRequest(mediaInfo))
         .catch(() => {});
+    };
+
+    // If a session is already active (e.g. resumed before signedSrc was ready,
+    // or user switches videos while already casting), load immediately.
+    loadMedia(ctx.getCurrentSession());
+
+    // Also handle future session starts triggered by the Cast button.
+    const onSessionState = (event) => {
+      if (
+        event.sessionState === SessionState.SESSION_STARTED ||
+        event.sessionState === SessionState.SESSION_RESUMED
+      ) {
+        loadMedia(ctx.getCurrentSession());
+      }
     };
 
     ctx.addEventListener(CastContextEventType.SESSION_STATE_CHANGED, onSessionState);
