@@ -504,6 +504,48 @@ export async function deleteCookieRule(ruleUid) {
   }
 }
 
+// Returns { promise, abort } so callers can cancel an in-flight upload.
+// Aborting rejects the promise with "Upload cancelled" and lets the server's
+// partial-upload cleanup handle any bytes already written to temp/uploads/.
+export function uploadFile(archiveId, file, onProgress) {
+  let xhr
+  const promise = new Promise((resolve, reject) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    xhr = new XMLHttpRequest()
+    xhr.open('POST', `/api/archives/${archiveId}/uploads`)
+    xhr.upload.addEventListener('progress', e => {
+      if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100))
+    })
+    xhr.addEventListener('load', () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try { resolve(JSON.parse(xhr.responseText)) }
+        catch { reject(new Error('Invalid server response')) }
+      } else {
+        let msg = `Upload failed (${xhr.status})`
+        try { msg = JSON.parse(xhr.responseText).message || msg } catch {}
+        reject(new Error(msg))
+      }
+    })
+    xhr.addEventListener('error', () => reject(new Error('Network error during upload')))
+    xhr.addEventListener('abort', () => reject(new Error('Upload cancelled')))
+    xhr.send(formData)
+  })
+  return { promise, abort: () => xhr?.abort() }
+}
+
+// Best-effort discard of a staged upload file (DELETE /archives/:id/uploads).
+// Errors are swallowed — the server also prunes stale dirs on startup.
+export async function deleteUpload(archiveId, locator) {
+  try {
+    await fetch(`/api/archives/${archiveId}/uploads`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ locator }),
+    })
+  } catch {}
+}
+
 // ── 401 interceptor ───────────────────────────────────────────────────────────
 const _origFetch = window.fetch;
 window.fetch = async (...args) => {

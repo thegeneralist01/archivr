@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState, useCallback } from 'react'
-import { submitCapture, pollCaptureJob, probeCapture, probePlaylist, getInstanceSettings } from '../api'
+import { submitCapture, pollCaptureJob, probeCapture, probePlaylist, getInstanceSettings, uploadFile, deleteUpload } from '../api'
 
 let nextItemId = 1
 
@@ -131,6 +131,32 @@ function makeItem(locator = '') {
   }
 }
 
+function makeFileItem(filename) {
+  return {
+    id: nextItemId++,
+    kind: 'file',
+    filename,
+    uploadProgress: 0,
+    uploadStatus: 'uploading',
+    uploadLocator: null,
+    uploadError: null,
+    // Fields present for submission-logic compatibility
+    locator: '',
+    quality: 'best',
+    probeState: 'idle',
+    probeQualities: null,
+    probeHasAudio: false,
+    playlistProbeState: 'idle',
+    playlistInfo: null,
+    playlistItems: null,
+    playlistQuality: null,
+    playlistExpanded: false,
+    syncEnabled: false,
+    error: null,
+    status: 'idle',
+  }
+}
+
 function applyPlaylistQuality(newQ, currentItems) {
   if (newQ === 'best') {
     return currentItems.map(item => ({ ...item, quality: 'best' }))
@@ -174,6 +200,16 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   // stable ref so probe callbacks always see the current archiveId
   const archiveIdRef = useRef(archiveId)
   useEffect(() => { archiveIdRef.current = archiveId }, [archiveId])
+  const fileInputRef = useRef(null)
+  const [dragOver, setDragOver] = useState(false)
+  // Mirror of items state kept in a ref so the native 'close' event handler
+  // can read the latest items without going stale. Updated every render.
+  const itemsRef = useRef([])
+  // Set to true in handleArchive before dialog.close() so the 'close' handler
+  // skips staged-file cleanup (the capture job will clean those up on success).
+  const isSubmittingRef = useRef(false)
+  // item.id → abort() function for in-flight XHR uploads
+  const uploadXhrs = useRef(new Map())
 
   // Stable refs so polling callbacks always use the latest prop values
   const onCapturedRef = useRef(onCaptured)
@@ -204,8 +240,10 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
 
   // Persist items to sessionStorage on every change
   useEffect(() => {
-    sessionStorage.setItem('captureItems', JSON.stringify(items))
+    sessionStorage.setItem('captureItems', JSON.stringify(items.filter(it => it.kind !== 'file')))
   }, [items])
+  // Keep itemsRef in sync so the 'close' handler always sees current items.
+  useEffect(() => { itemsRef.current = items }, [items])
 
   // Advanced options panel state
   const [advancedOpen, setAdvancedOpen] = useState(false)
@@ -257,6 +295,25 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     const handler = () => {
       probeTimers.current.forEach(id => clearTimeout(id))
       probeTimers.current.clear()
+      // On cancel (Escape / Cancel button) clean up any staged upload files.
+      // Guard against the Archive path: handleArchive sets isSubmittingRef true
+      // before dialog.close() so this block is skipped when archiving — the
+      // capture job handles staged-file cleanup on success instead.
+      if (!isSubmittingRef.current) {
+        const aid = archiveIdRef.current
+        itemsRef.current.forEach(it => {
+          if (it.kind !== 'file') return
+          if (it.uploadStatus === 'uploading') {
+            // Abort the XHR — 'Upload cancelled' rejection is swallowed in
+            // handleFiles so no spurious error row appears after close.
+            uploadXhrs.current.get(it.id)?.()
+            uploadXhrs.current.delete(it.id)
+          } else if (it.uploadStatus === 'done' && it.uploadLocator) {
+            deleteUpload(aid, it.uploadLocator).catch(() => {})
+          }
+        })
+      }
+      isSubmittingRef.current = false
       onClose()
     }
     dialog.addEventListener('close', handler)
@@ -398,12 +455,19 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   }
 
   function handleArchive() {
-    const toSubmit = items.filter(it => it.locator.trim())
+    // Guard against the Enter-key shortcut in CaptureRow bypassing the
+    // disabled button — uploads must be complete before archiving starts.
+    if (items.some(it => it.kind === 'file' && it.uploadStatus === 'uploading')) return
+    const toSubmit = items.filter(it =>
+      it.kind === 'file' ? (it.uploadStatus === 'done' && it.uploadLocator) : it.locator.trim()
+    )
     if (toSubmit.length === 0) return
-    if (toSubmit.some(it => hasConflict(it))) return
-    if (toSubmit.some(it => it.probeState === 'probing' ||
-        (isPlaylistSource(it.locator) && it.playlistProbeState !== 'done'))) return
-    if (toSubmit.some(it => Array.isArray(it.playlistItems) && it.playlistItems.length === 0)) return
+    if (toSubmit.some(it => it.kind !== 'file' && hasConflict(it))) return
+    if (toSubmit.some(it => it.kind !== 'file' && (
+        it.probeState === 'probing' ||
+        (isPlaylistSource(it.locator) && it.playlistProbeState !== 'done'))))
+      return
+    if (toSubmit.some(it => it.kind !== 'file' && Array.isArray(it.playlistItems) && it.playlistItems.length === 0)) return
     const batchId = toSubmit.length > 1
       ? (crypto.randomUUID?.() ?? `batch-${Date.now()}`)
       : null
@@ -411,14 +475,22 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
       batchRef.current.set(batchId, { total: toSubmit.length, archived: 0, warnings: 0, failed: 0, failedLocators: [], warningLocators: [] })
     }
     // Capture all submission data before any state changes
-    const submissions = toSubmit.map(it => ({
-      locator: it.locator.trim(),
-      quality: it.playlistItems !== null ? null : (it.quality || 'best'),
-      extraExtensions: it.playlistItems !== null
-        ? { per_item_quality: Object.fromEntries(it.playlistItems.map(pi => [pi.id, pi.quality])), sync: it.syncEnabled }
-        : {},
-    }))
-    // Reset form and close dialog immediately
+    const submissions = toSubmit.map(it => {
+      if (it.kind === 'file') {
+        return { locator: it.uploadLocator, quality: 'best', extraExtensions: {} }
+      }
+      return {
+        locator: it.locator.trim(),
+        quality: it.playlistItems !== null ? null : (it.quality || 'best'),
+        extraExtensions: it.playlistItems !== null
+          ? { per_item_quality: Object.fromEntries(it.playlistItems.map(pi => [pi.id, pi.quality])), sync: it.syncEnabled }
+          : {},
+      }
+    })
+    // Reset form and close dialog immediately.
+    // Set isSubmittingRef before close() — the native 'close' event fires
+    // synchronously and the handler checks this flag to skip staged-file cleanup.
+    isSubmittingRef.current = true
     setItems([makeItem()])
     dialogRef.current?.close()
     // Submit each in background
@@ -434,6 +506,18 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   function removeRow(id) {
     clearTimeout(probeTimers.current.get(id))
     probeTimers.current.delete(id)
+    const item = itemsRef.current.find(it => it.id === id)
+    if (item?.kind === 'file') {
+      if (item.uploadStatus === 'uploading') {
+        // Abort the in-flight XHR; the server's partial-upload cleanup handles
+        // any bytes already written to temp/uploads/.
+        uploadXhrs.current.get(id)?.()
+        uploadXhrs.current.delete(id)
+      } else if (item.uploadStatus === 'done' && item.uploadLocator) {
+        // Discard the fully staged file that was never submitted for capture.
+        deleteUpload(archiveIdRef.current, item.uploadLocator).catch(() => {})
+      }
+    }
     setItems(prev => {
       const next = prev.filter(it => it.id !== id)
       return next.length === 0 ? [makeItem()] : next
@@ -532,22 +616,94 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     ))
   }
 
+  function handleFiles(fileList) {
+    const files = Array.from(fileList)
+    if (files.length === 0) return
+    files.forEach(file => {
+      const newItem = makeFileItem(file.name)
+      setItems(prev => {
+        // Replace a sole empty URL row with the file item; otherwise append
+        if (prev.length === 1 && prev[0].kind !== 'file' && !prev[0].locator.trim()) {
+          return [newItem]
+        }
+        return [...prev, newItem]
+      })
+      const aid = archiveIdRef.current
+      const { promise, abort } = uploadFile(aid, file, progress => {
+        setItems(prev => prev.map(it =>
+          it.id === newItem.id ? { ...it, uploadProgress: progress } : it
+        ))
+      })
+      uploadXhrs.current.set(newItem.id, abort)
+      promise
+        .then(result => {
+          uploadXhrs.current.delete(newItem.id)
+          setItems(prev => prev.map(it =>
+            it.id === newItem.id
+              ? { ...it, uploadStatus: 'done', uploadLocator: result.locator, uploadProgress: 100 }
+              : it
+          ))
+        })
+        .catch(err => {
+          uploadXhrs.current.delete(newItem.id)
+          // 'Upload cancelled' means we aborted deliberately (row removed / dialog
+          // closed); skip the error-state update since the row is already gone.
+          if (err.message === 'Upload cancelled') return
+          setItems(prev => prev.map(it =>
+            it.id === newItem.id
+              ? { ...it, uploadStatus: 'error', uploadError: err.message }
+              : it
+          ))
+        })
+    })
+  }
+  function handleDragOver(e) {
+    e.preventDefault()
+    e.stopPropagation()
+    if (e.dataTransfer.types.includes('Files')) setDragOver(true)
+  }
+  function handleDragLeave(e) {
+    // Only clear when leaving the dialog itself, not a child element
+    if (!e.currentTarget.contains(e.relatedTarget)) setDragOver(false)
+  }
+  function handleDrop(e) {
+    e.preventDefault()
+    e.stopPropagation()
+    setDragOver(false)
+    handleFiles(e.dataTransfer.files)
+  }
+  function handleFileInput(e) {
+    handleFiles(e.target.files)
+    e.target.value = ''
+  }
 
-  const pendingCount = items.filter(it => it.locator.trim()).length
-  const anyConflict = items.some(it => hasConflict(it))
+
+  const anyUploading = items.some(it => it.kind === 'file' && it.uploadStatus === 'uploading')
+  const pendingCount = items.filter(it =>
+    it.kind === 'file' ? (it.uploadStatus === 'done' && it.uploadLocator) : it.locator.trim()
+  ).length
+  const anyConflict = items.some(it => it.kind !== 'file' && hasConflict(it))
   // True if any playlist row has had all its videos deleted — archive would be a no-op.
   const anyEmptyPlaylist = items.some(it =>
-    Array.isArray(it.playlistItems) && it.playlistItems.length === 0
+    it.kind !== 'file' && Array.isArray(it.playlistItems) && it.playlistItems.length === 0
   )
   const anyProbing = items.some(it =>
-    it.probeState === 'probing' ||
-    // For playlist sources block unless probe completed successfully:
-    // idle = debounce not yet fired; probing = in flight; error = no quality data.
-    (isPlaylistSource(it.locator) && it.playlistProbeState !== 'done')
+    it.kind !== 'file' && (
+      it.probeState === 'probing' ||
+      // For playlist sources block unless probe completed successfully:
+      // idle = debounce not yet fired; probing = in flight; error = no quality data.
+      (isPlaylistSource(it.locator) && it.playlistProbeState !== 'done')
+    )
   )
 
   return (
-    <dialog ref={dialogRef} className="capture-dialog">
+    <dialog
+      ref={dialogRef}
+      className={`capture-dialog${dragOver ? ' capture-dialog--dragover' : ''}`}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
       <div className="capture-dialog-inner">
         <div className="capture-dialog-header">
           <h2 className="capture-dialog-title">Capture</h2>
@@ -565,29 +721,59 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
 
         <div className="capture-rows">
           {items.map((item, idx) => (
-            <CaptureRow
-              key={item.id}
-              item={item}
-              autoFocus={idx === items.length - 1}
-              onLocatorChange={val => updateLocator(item.id, val)}
-              onQualityChange={val => updateQuality(item.id, val)}
-              onRemove={() => removeRow(item.id)}
-              onSubmit={handleArchive}
-              onPlaylistQualityChange={q => updatePlaylistQuality(item.id, q)}
-              onPlaylistItemQualityChange={(vid, q) => updatePlaylistItemQuality(item.id, vid, q)}
-              onPlaylistToggle={() => togglePlaylistExpanded(item.id)}
-              onSyncChange={val => updateSync(item.id, val)}
-              onPlaylistItemDelete={(vid) => deletePlaylistItem(item.id, vid)}
-            />
+            item.kind === 'file' ? (
+              <CaptureFileRow
+                key={item.id}
+                item={item}
+                onRemove={() => removeRow(item.id)}
+              />
+            ) : (
+              <CaptureRow
+                key={item.id}
+                item={item}
+                autoFocus={idx === items.length - 1}
+                onLocatorChange={val => updateLocator(item.id, val)}
+                onQualityChange={val => updateQuality(item.id, val)}
+                onRemove={() => removeRow(item.id)}
+                onSubmit={handleArchive}
+                onPlaylistQualityChange={q => updatePlaylistQuality(item.id, q)}
+                onPlaylistItemQualityChange={(vid, q) => updatePlaylistItemQuality(item.id, vid, q)}
+                onPlaylistToggle={() => togglePlaylistExpanded(item.id)}
+                onSyncChange={val => updateSync(item.id, val)}
+                onPlaylistItemDelete={(vid) => deletePlaylistItem(item.id, vid)}
+              />
+            )
           ))}
         </div>
 
-        <button type="button" className="capture-add-row" onClick={addRow}>
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-            <line x1="8" y1="2" x2="8" y2="14"/><line x1="2" y1="8" x2="14" y2="8"/>
-          </svg>
-          Add another
-        </button>
+        {/* Hidden file input */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          hidden
+          onChange={handleFileInput}
+          aria-hidden="true"
+          tabIndex={-1}
+        />
+
+        <div className="capture-add-row-group">
+          <button type="button" className="capture-add-row" onClick={addRow}>
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <line x1="8" y1="2" x2="8" y2="14"/><line x1="2" y1="8" x2="14" y2="8"/>
+            </svg>
+            Add URL
+          </button>
+          <button type="button" className="capture-add-row capture-add-file" onClick={() => fileInputRef.current?.click()}>
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="1" width="10" height="14" rx="1.5"/>
+              <line x1="5.5" y1="5.5" x2="10.5" y2="5.5"/>
+              <line x1="5.5" y1="8" x2="10.5" y2="8"/>
+              <line x1="5.5" y1="10.5" x2="8.5" y2="10.5"/>
+            </svg>
+            Upload file
+          </button>
+        </div>
 
         {/* ── Advanced options ────────────────────────────── */}
         <div className="capture-advanced">
@@ -701,7 +887,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
             type="button"
             className="capture-submit"
             onClick={handleArchive}
-            disabled={pendingCount === 0 || anyConflict || anyProbing || anyEmptyPlaylist}
+            disabled={pendingCount === 0 || anyConflict || anyProbing || anyEmptyPlaylist || anyUploading}
           >
             {pendingCount > 1 ? `Archive ${pendingCount}` : 'Archive'}
           </button>
@@ -884,6 +1070,64 @@ function CaptureRow({ item, autoFocus, onLocatorChange, onQualityChange, onRemov
           {syncToggle}
         </div>
       ) : syncToggle}
+    </div>
+  )
+}
+function CaptureFileRow({ item, onRemove }) {
+  const uploading = item.uploadStatus === 'uploading'
+  const done = item.uploadStatus === 'done'
+  const errored = item.uploadStatus === 'error'
+
+  return (
+    <div className="capture-row">
+      <div className="capture-row-main">
+        <span className="capture-file-icon" aria-hidden="true">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" style={{ width: 14, height: 14 }}>
+            <rect x="3" y="1" width="10" height="14" rx="1.5"/>
+            <line x1="5.5" y1="5.5" x2="10.5" y2="5.5"/>
+            <line x1="5.5" y1="8" x2="10.5" y2="8"/>
+            <line x1="5.5" y1="10.5" x2="8.5" y2="10.5"/>
+          </svg>
+        </span>
+        <span className={`capture-file-name${errored ? ' capture-file-name--error' : ''}`}>
+          {item.filename}
+        </span>
+        {uploading && (
+          <span className="capture-file-progress-wrap" aria-label={`Uploading ${item.uploadProgress}%`}>
+            <span className="capture-file-progress-bar">
+              <span
+                className="capture-file-progress-fill"
+                style={{ width: `${item.uploadProgress}%` }}
+              />
+            </span>
+            <span className="capture-file-progress-pct">{item.uploadProgress}%</span>
+          </span>
+        )}
+        {done && (
+          <span className="capture-file-badge capture-file-badge--done" aria-label="Upload complete">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ width: 11, height: 11 }}>
+              <polyline points="3 8.5 6.5 12 13 5"/>
+            </svg>
+          </span>
+        )}
+        {errored && (
+          <span className="capture-file-badge capture-file-badge--error">!</span>
+        )}
+        <button
+          type="button"
+          className="capture-row-action capture-row-remove"
+          onClick={onRemove}
+          aria-label="Remove"
+          disabled={uploading}
+        >
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+            <line x1="3" y1="3" x2="13" y2="13"/><line x1="13" y1="3" x2="3" y2="13"/>
+          </svg>
+        </button>
+      </div>
+      {errored && (
+        <p className="capture-row-error">{item.uploadError || 'Upload failed'}</p>
+      )}
     </div>
   )
 }
