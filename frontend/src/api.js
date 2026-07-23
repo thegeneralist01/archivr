@@ -163,7 +163,9 @@ export async function submitCapture(archiveId, locator, quality = null, extensio
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || `HTTP ${res.status}`);
+    const err = new Error(body.error || `HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
   }
   return res.json(); // { job_uid, status: "pending" }
 }

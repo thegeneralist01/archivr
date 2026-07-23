@@ -53,10 +53,10 @@ const LOGIN_MAX_ATTEMPTS: usize = 5;
 // Short-lived token granting unauthenticated access to one specific artifact.
 // Used so Cast / AirPlay devices (which carry no session cookie) can fetch media.
 pub(crate) struct MediaToken {
-    archive_id:     String,
-    entry_uid:      String,
+    archive_id: String,
+    entry_uid: String,
     artifact_index: usize,
-    expires_at:     std::time::Instant,
+    expires_at: std::time::Instant,
 }
 
 #[derive(Clone)]
@@ -442,7 +442,11 @@ async fn list_entry_children(
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let caller_bits = auth_to_caller_bits(&auth);
-    Ok(Json(archive::list_child_entries(&conn, &entry_uid, caller_bits)?))
+    Ok(Json(archive::list_child_entries(
+        &conn,
+        &entry_uid,
+        caller_bits,
+    )?))
 }
 
 async fn search_entries_handler(
@@ -499,7 +503,6 @@ struct MediaTokenResponse {
     url: String,
     expires_in_secs: u64,
 }
-
 
 async fn serve_artifact(
     State(state): State<AppState>,
@@ -965,7 +968,11 @@ async fn capture_handler(
                     .and_then(|n| n.parse::<u32>().ok())
                     .is_some()
         };
-        if let Some(bad) = body.per_item_quality.values().find(|q| !is_valid_quality(q)) {
+        if let Some(bad) = body
+            .per_item_quality
+            .values()
+            .find(|q| !is_valid_quality(q))
+        {
             return Err(ApiError::bad_request(&format!(
                 "invalid per_item_quality value {bad:?}: must be \"best\", \"audio\", or a height string like \"1080p\""
             )));
@@ -1172,20 +1179,27 @@ async fn upload_handler(
         };
 
         let uuid_dir = staging_base.join(uuid::Uuid::new_v4().simple().to_string());
-        tokio::fs::create_dir_all(&uuid_dir)
-            .await
-            .map_err(|e| ApiError::from(anyhow::anyhow!("failed to create upload staging dir: {e}")))?;
+        tokio::fs::create_dir_all(&uuid_dir).await.map_err(|e| {
+            ApiError::from(anyhow::anyhow!("failed to create upload staging dir: {e}"))
+        })?;
+
+        // Sentinel: exists while the XHR is streaming. The prune task skips any
+        // uuid_dir that contains this file, so a slow upload is never deleted
+        // mid-transfer regardless of wall-clock age.
+        let sentinel = uuid_dir.join(".uploading");
+        tokio::fs::File::create(&sentinel).await.map_err(|e| {
+            ApiError::from(anyhow::anyhow!("failed to create upload sentinel: {e}"))
+        })?;
+
         let staged_path = uuid_dir.join(&safe_name);
 
         // Stream chunks directly to disk — never buffers the full file in RAM.
         // The body limit (10 GiB) is enforced by the DefaultBodyLimit layer.
-        // Run inside an async block so any mid-stream error can clean up the
-        // partial file and UUID dir before returning to the caller.
         let stream_result: Result<(), ApiError> = async {
             use tokio::io::AsyncWriteExt as _;
-            let file = tokio::fs::File::create(&staged_path)
-                .await
-                .map_err(|e| ApiError::from(anyhow::anyhow!("failed to create staged file: {e}")))?;
+            let file = tokio::fs::File::create(&staged_path).await.map_err(|e| {
+                ApiError::from(anyhow::anyhow!("failed to create staged file: {e}"))
+            })?;
             let mut writer = tokio::io::BufWriter::new(file);
             while let Some(chunk) = field
                 .chunk()
@@ -1205,11 +1219,14 @@ async fn upload_handler(
         }
         .await;
         if let Err(e) = stream_result {
-            // Best-effort cleanup of partial file and now-empty UUID dir.
-            let _ = tokio::fs::remove_file(&staged_path).await;
-            let _ = tokio::fs::remove_dir(&uuid_dir).await;
+            // remove_dir_all cleans up the partial file and the sentinel together.
+            let _ = tokio::fs::remove_dir_all(&uuid_dir).await;
             return Err(e);
         }
+
+        // Stream complete — drop the sentinel so the prune task can reclaim the
+        // dir if it is later abandoned without being submitted for capture.
+        let _ = tokio::fs::remove_file(&sentinel).await;
 
         let size = tokio::fs::metadata(&staged_path)
             .await
@@ -1227,7 +1244,9 @@ async fn upload_handler(
         ));
     }
 
-    Err(ApiError::bad_request("no file field found in multipart upload"))
+    Err(ApiError::bad_request(
+        "no file field found in multipart upload",
+    ))
 }
 
 /// `DELETE /api/archives/:archive_id/uploads`
@@ -1250,8 +1269,7 @@ async fn delete_upload_handler(
     if !body.locator.starts_with("file://") {
         return Err(ApiError::bad_request("locator must be a file:// URI"));
     }
-    let file_path =
-        std::path::PathBuf::from(body.locator.trim_start_matches("file://"));
+    let file_path = std::path::PathBuf::from(body.locator.trim_start_matches("file://"));
     let staging_dir = archive_paths.store_path.join("temp").join("uploads");
 
     // Canonicalize both sides before the prefix check (path-traversal guard).
@@ -1462,8 +1480,11 @@ async fn probe_playlist_handler(
         return Err(ApiError::bad_request("locator must not be empty"));
     }
     // Validate it's a playlist/channel source and expand shorthands.
-    let canonical_url = capture::locator_to_playlist_url(&locator)
-        .ok_or_else(|| ApiError::bad_request("locator is not a YouTube playlist, channel, YTM playlist, or Spotify album/playlist"))?;
+    let canonical_url = capture::locator_to_playlist_url(&locator).ok_or_else(|| {
+        ApiError::bad_request(
+            "locator is not a YouTube playlist, channel, YTM playlist, or Spotify album/playlist",
+        )
+    })?;
     // Verify archive exists.
     let _ = mounted_archive(&state, &archive_id)?;
     // Resolve cookies.
@@ -5184,9 +5205,14 @@ mod tests {
         let conn = database::open_or_initialize(&paths.archive_path).unwrap();
         let user_id = database::ensure_default_user(&conn).unwrap();
         let sid = database::upsert_source_identity(
-            &conn, "yt", "video", Some("media-token-test"),
-            Some("https://yt.example/v"), "https://yt.example/v",
-        ).unwrap();
+            &conn,
+            "yt",
+            "video",
+            Some("media-token-test"),
+            Some("https://yt.example/v"),
+            "https://yt.example/v",
+        )
+        .unwrap();
         let run = database::create_archive_run(&conn, user_id, 1).unwrap();
         let entry = database::create_archived_entry(
             &conn,
@@ -5205,17 +5231,20 @@ mod tests {
                 source_metadata_json: "{}".to_string(),
                 display_metadata_json: None,
             },
-        ).unwrap();
+        )
+        .unwrap();
         let blob_id = database::upsert_blob(
             &conn,
             &database::BlobRecord {
-                sha256: "bbbb2222cccc3333dddd4444aaaa1111bbbb2222cccc3333dddd4444aaaa1111".to_string(),
+                sha256: "bbbb2222cccc3333dddd4444aaaa1111bbbb2222cccc3333dddd4444aaaa1111"
+                    .to_string(),
                 byte_size: 9,
                 mime_type: Some("video/mp4".to_string()),
                 extension: Some("mp4".to_string()),
                 raw_relpath: artifact_relpath.to_string(),
             },
-        ).unwrap();
+        )
+        .unwrap();
         database::add_entry_artifact(
             &conn,
             &database::NewArtifact {
@@ -5227,7 +5256,8 @@ mod tests {
                 logical_path: None,
                 metadata_json: None,
             },
-        ).unwrap();
+        )
+        .unwrap();
         drop(conn);
         let auth_path = dir.path().join("auth.sqlite");
         {
@@ -5293,7 +5323,12 @@ mod tests {
         assert!(body["expires_in_secs"].as_u64().unwrap() > 0);
         // Fetch artifact with signed URL — no session cookie.
         let artifact_resp = app_with_state(state)
-            .oneshot(Request::builder().uri(signed_url).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(signed_url)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(artifact_resp.status(), StatusCode::OK);
@@ -5361,15 +5396,24 @@ mod tests {
             .unwrap();
         assert_eq!(token_resp.status(), StatusCode::OK);
         let body = body_json(token_resp).await;
-        let token = body["url"].as_str().unwrap()
-            .split("token=").nth(1).unwrap();
+        let token = body["url"]
+            .as_str()
+            .unwrap()
+            .split("token=")
+            .nth(1)
+            .unwrap();
         // Try to use it for artifact 1.
         let wrong_uri = format!(
             "/api/archives/test/entries/{}/artifacts/1?token={}",
             entry_uid, token
         );
         let response = app_with_state(state)
-            .oneshot(Request::builder().uri(&wrong_uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(&wrong_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);

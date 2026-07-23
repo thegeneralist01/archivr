@@ -451,6 +451,14 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
       const msg = e.message || 'Submission failed.'
       onToastRef.current(msg, locator)
       settleBatch(batchId, 'failed', locator)
+      // Only delete the staged file when the server definitively rejected the
+      // request (e.status set by submitCapture on non-2xx HTTP responses).
+      // A network error (no e.status) means the response may have been lost
+      // after the server accepted the job — deleting here would race the
+      // in-flight capture and remove its input file.
+      if (locator.startsWith('file://') && e.status) {
+        deleteUpload(aid, locator).catch(() => {})
+      }
     }
   }
 
