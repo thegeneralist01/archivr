@@ -243,7 +243,6 @@ export default function CollectionsView({ archiveId }) {
                 className="coll-vis-select"
                 value={collDetail?.default_visibility_bits ?? selected.default_visibility_bits}
                 onChange={e => handleVisChange(Number(e.target.value))}
-                disabled={isDefault}
               >
                 {VIS_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
               </select>

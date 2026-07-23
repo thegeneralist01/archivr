@@ -1866,9 +1866,24 @@ pub fn create_archived_entry(conn: &Connection, entry: &NewEntry) -> Result<Arch
         )?;
     }
 
-    // Auto-enroll in the default collection with appropriate visibility_bits.
+    // Auto-enroll in the default collection.
+    // Root entries: use the collection's configured default_visibility_bits so the
+    // archive owner's visibility setting is respected — capture always passes
+    // "private" (visibility_to_bits → 0) as a safe fallback regardless of intent.
+    // Child entries (parent_entry_id IS NOT NULL): keep visibility_to_bits(entry.visibility)
+    // so they inherit the private/unlisted bits set by the parent capture path;
+    // list_child_entries_inherits_parent_visibility documents this contract.
     let default_coll_id = ensure_default_collection(conn)?;
-    let vbits = visibility_to_bits(&entry.visibility);
+    let vbits: u32 = if entry.parent_entry_id.is_none() {
+        conn.query_row(
+            "SELECT default_visibility_bits FROM collections WHERE id = ?1",
+            [default_coll_id],
+            |row| row.get::<_, i64>(0).map(|v| v as u32),
+        )
+        .unwrap_or(0)
+    } else {
+        visibility_to_bits(&entry.visibility)
+    };
     add_entry_to_collection(conn, default_coll_id, id, vbits)?;
 
     Ok(ArchivedEntry {
@@ -2311,6 +2326,7 @@ pub fn visibility_to_bits(visibility: &str) -> u32 {
     }
 }
 
+
 /// Returns the id of the '_default_' collection, creating it if absent.
 pub fn ensure_default_collection(conn: &Connection) -> Result<i64> {
     let now = now_timestamp();
@@ -2466,7 +2482,8 @@ pub fn get_entry_collection_memberships(
 
 /// Renames a collection and/or updates its default_visibility_bits.
 /// Returns true if updated, false if not found.
-/// Refuses to rename the '_default_' collection.
+/// Refuses to rename the '_default_' collection but allows changing its
+/// default_visibility_bits so users can control the visibility of new captures.
 pub fn update_collection(
     conn: &Connection,
     collection_uid: &str,
@@ -2475,8 +2492,8 @@ pub fn update_collection(
 ) -> Result<bool> {
     let coll = get_collection_by_uid(conn, collection_uid)?;
     let Some(coll) = coll else { return Ok(false) };
-    if coll.slug == "_default_" {
-        anyhow::bail!("cannot modify the default collection");
+    if coll.slug == "_default_" && new_name.is_some() {
+        anyhow::bail!("cannot rename the default collection");
     }
     let name = new_name.unwrap_or(&coll.name);
     let vbits = new_visibility_bits.unwrap_or(coll.default_visibility_bits);
@@ -2636,6 +2653,7 @@ pub fn delete_entry_artifacts(conn: &Connection, entry_id: i64) -> Result<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive;
     use std::{
         env, fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -2928,6 +2946,121 @@ mod tests {
 
         set_public_settings(&conn, true, true, false).unwrap();
         assert_eq!(public_index_entry_count(&conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn default_collection_allows_visibility_change_but_not_rename() {
+        let conn = conn();
+        let coll_uid = {
+            let id = ensure_default_collection(&conn).unwrap();
+            conn.query_row(
+                "SELECT collection_uid FROM collections WHERE id = ?1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+        };
+
+        // Changing default_visibility_bits on _default_ must succeed.
+        let updated = update_collection(&conn, &coll_uid, None, Some(3)).unwrap();
+        assert!(updated, "visibility change on _default_ should succeed");
+        let bits: u32 = conn
+            .query_row(
+                "SELECT default_visibility_bits FROM collections WHERE collection_uid = ?1",
+                [&coll_uid],
+                |row| row.get::<_, i64>(0).map(|v| v as u32),
+            )
+            .unwrap();
+        assert_eq!(bits, 3, "default_visibility_bits should be updated to 3");
+
+        // Renaming _default_ must still be rejected.
+        let err = update_collection(&conn, &coll_uid, Some("My Archive"), None);
+        assert!(err.is_err(), "renaming _default_ must be rejected");
+        assert!(
+            err.unwrap_err().to_string().contains("cannot rename"),
+            "error must mention rename"
+        );
+    }
+
+    #[test]
+    fn default_collection_visibility_governs_enrollment_not_entry_visibility() {
+        // Regression: capture hardcodes entry.visibility = "private", but
+        // collection_entries.visibility_bits must come from the collection's
+        // default_visibility_bits so that non-admin users can see new entries.
+        let conn = conn();
+
+        // Confirm the default collection starts with default_visibility_bits = 2
+        // (USER-only / "unlisted").
+        let default_id = ensure_default_collection(&conn).unwrap();
+        let default_bits: u32 = conn
+            .query_row(
+                "SELECT default_visibility_bits FROM collections WHERE id = ?1",
+                [default_id],
+                |row| row.get::<_, i64>(0).map(|v| v as u32),
+            )
+            .unwrap();
+        assert_eq!(default_bits, 2, "default collection should start USER-visible");
+
+        // Create an entry with visibility = "private" (what capture always passes).
+        let entry = create_entry_fixture(&conn, "private", None, None);
+
+        // The archived_entries row must keep the caller's value ("private").
+        let stored_vis: String = conn
+            .query_row(
+                "SELECT visibility FROM archived_entries WHERE id = ?1",
+                [entry.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_vis, "private");
+
+        // But the collection_entries enrollment must use default_visibility_bits (2),
+        // not visibility_to_bits("private") (0) — otherwise the entry is invisible.
+        let enrolled_bits: u32 = conn
+            .query_row(
+                "SELECT visibility_bits FROM collection_entries WHERE entry_id = ?1",
+                [entry.id],
+                |row| row.get::<_, i64>(0).map(|v| v as u32),
+            )
+            .unwrap();
+        assert_eq!(
+            enrolled_bits, 2,
+            "collection_entries.visibility_bits must come from the collection default, not entry.visibility"
+        );
+
+        // A USER caller (role_bits = 2) must now see the entry.
+        let visible = archive::list_root_entries(&conn, 2).unwrap();
+        assert_eq!(visible.len(), 1, "USER should see the entry after fix");
+
+        // An explicit public entry must still enroll at bits = 3 when the
+        // collection default is changed to public.
+        conn.execute(
+            "UPDATE collections SET default_visibility_bits = 3 WHERE id = ?1",
+            [default_id],
+        )
+        .unwrap();
+        let public_entry = create_entry_fixture(&conn, "public", None, None);
+        let public_bits: u32 = conn
+            .query_row(
+                "SELECT visibility_bits FROM collection_entries WHERE entry_id = ?1",
+                [public_entry.id],
+                |row| row.get::<_, i64>(0).map(|v| v as u32),
+            )
+            .unwrap();
+        assert_eq!(public_bits, 3, "collection default=public should produce bits=3");
+
+        // Child entries must NOT use the collection default — they keep
+        // visibility_to_bits(entry.visibility) so parent-child visibility
+        // inheritance is not broken (list_child_entries_inherits_parent_visibility).
+        let child = create_entry_fixture(&conn, "private", Some(entry.id), Some(entry.id));
+        let child_bits: u32 = conn
+            .query_row(
+                "SELECT visibility_bits FROM collection_entries WHERE entry_id = ?1",
+                [child.id],
+                |row| row.get::<_, i64>(0).map(|v| v as u32),
+            )
+            .unwrap();
+        assert_eq!(child_bits, 0, "child entries must use visibility_to_bits, not collection default");
     }
 
     #[test]

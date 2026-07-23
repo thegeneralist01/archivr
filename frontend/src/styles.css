@@ -969,6 +969,94 @@ select {
 .capture-add-row svg { width: 13px; height: 13px; flex-shrink: 0; }
 .capture-add-row:hover { border-color: var(--accent-2); color: var(--ink); background: var(--paper-2); }
 
+/* Upload file button group (Add URL + Upload file side by side) */
+.capture-add-row-group {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+  margin-bottom: 18px;
+}
+.capture-add-row-group .capture-add-row {
+  margin-top: 0;
+  margin-bottom: 0;
+  flex: 1;
+}
+
+/* Drag-over state on the whole dialog */
+.capture-dialog--dragover .capture-dialog-inner {
+  outline: 2px dashed var(--accent);
+  outline-offset: -6px;
+  border-radius: var(--r3);
+}
+
+/* File row */
+.capture-file-icon {
+  flex-shrink: 0;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+}
+.capture-file-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 13.5px;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.capture-file-name--error { color: var(--accent); }
+
+/* Upload progress bar */
+.capture-file-progress-wrap {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.capture-file-progress-bar {
+  width: 80px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--paper-2);
+  overflow: hidden;
+  border: 1px solid var(--line);
+}
+.capture-file-progress-fill {
+  display: block;
+  height: 100%;
+  background: var(--ink);
+  border-radius: 2px;
+  transition: width 0.1s ease;
+}
+.capture-file-progress-pct {
+  font-size: 11px;
+  color: var(--muted);
+  min-width: 28px;
+  text-align: right;
+}
+
+/* Done / error badge */
+.capture-file-badge {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+.capture-file-badge--done {
+  background: #d8eddf;
+  color: #235c35;
+}
+.capture-file-badge--error {
+  background: #f5ddd8;
+  color: #8d3f30;
+}
+
 /* ── Toast stack ─────────────────────────────────────────────────────────── */
 .toast-stack {
   position: fixed;
@@ -2185,6 +2273,50 @@ select {
   max-height: 100%;
   width: 100%;
   display: block;
+}
+
+/* ── Cast / AirPlay TV overlay ───────────────────────────────────────── */
+.video-tv-controls {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  display: flex;
+  gap: 6px;
+  z-index: 10;
+}
+
+.video-tv-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.5);
+  color: rgba(255, 255, 255, 0.82);
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  transition: background 0.15s, color 0.15s;
+}
+
+.video-tv-btn:hover {
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+}
+
+/* google-cast-launcher inherits color for its SVG icon */
+google-cast-launcher.video-tv-btn {
+  color: rgba(255, 255, 255, 0.82);
+}
+
+/* Brief spinner shown while the signed media URL is being fetched */
+.video-tv-loading {
+  width: 100%;
+  min-height: 200px;
+  background: #0d0d0b;
 }
 
 /* ── Iframe preview ───────────────────────────────────────────────── */

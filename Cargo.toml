@@ -12,7 +12,7 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
-axum = "0.7.9"
+axum = { version = "0.7.9", features = ["multipart"] }
 chrono = "0.4.42"
 clap = { version = "4.5.48", features = ["derive"] }
 hex = "0.4.3"
@@ -22,7 +22,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.132"
 sha3 = "0.10.8"
 tempfile = "3.13.0"
-tokio = { version = "1.41.1", features = ["macros", "rt-multi-thread", "net"] }
+tokio = { version = "1.41.1", features = ["macros", "rt-multi-thread", "net", "fs", "io-util"] }
 toml = "0.8.19"
 tower = "0.5.1"
 tower-http = { version = "0.6.2", features = ["fs", "trace"] }
