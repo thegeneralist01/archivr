@@ -63,15 +63,43 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Spawn session cleanup: runs at startup and every 24h.
-    let cleanup_auth_path = auth_db_path.clone();
+    // Spawn maintenance task: session cleanup + staged-upload pruning, every 24 h.
+    // Running pruning here (not only at startup) ensures abandoned uploads don't
+    // accumulate indefinitely on a long-running server.
+    let cleanup_auth_path  = auth_db_path.clone();
+    let cleanup_registry   = registry.clone();
     tokio::spawn(async move {
         loop {
+            // Session cleanup.
             if let Ok(conn) = archivr_core::database::open_auth_db(&cleanup_auth_path) {
                 match archivr_core::database::delete_expired_sessions(&conn) {
                     Ok(n) if n > 0 => eprintln!("info: cleaned up {n} expired sessions"),
                     Err(e) => eprintln!("warn: session cleanup failed: {e:#}"),
                     _ => {}
+                }
+            }
+            // Prune staged upload dirs older than 24 h.
+            let prune_cutoff = std::time::SystemTime::now()
+                .checked_sub(std::time::Duration::from_secs(24 * 60 * 60))
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            for archive in &cleanup_registry.archives {
+                if let Ok(paths) = archivr_core::archive::read_archive_paths(&archive.archive_path) {
+                    let uploads_dir = paths.store_path.join("temp").join("uploads");
+                    if let Ok(entries) = std::fs::read_dir(&uploads_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                let stale = entry
+                                    .metadata()
+                                    .and_then(|m| m.modified())
+                                    .map(|t| t < prune_cutoff)
+                                    .unwrap_or(false);
+                                if stale {
+                                    let _ = std::fs::remove_dir_all(&path);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(24 * 60 * 60)).await;

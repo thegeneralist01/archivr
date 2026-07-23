@@ -1114,6 +1114,15 @@ async fn capture_handler(
                     None,
                 )
                 .ok();
+                // Failed captures never move the file into the raw store,
+                // so clean up the staged upload here rather than waiting
+                // for the next startup or periodic prune.
+                if let Some(staged) = staged_upload_path {
+                    let _ = std::fs::remove_file(&staged);
+                    if let Some(parent) = staged.parent() {
+                        let _ = std::fs::remove_dir(parent);
+                    }
+                }
             }
         }
     });
