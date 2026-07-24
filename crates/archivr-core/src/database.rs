@@ -2511,6 +2511,37 @@ pub fn get_entry_collection_memberships(
     .map_err(Into::into)
 }
 
+/// Returns true if this entry (or its direct parent, for child entries) is in at least one
+/// collection with `requires_auth = false` AND `collection_entries.visibility_bits & ROLE_GUEST (1) != 0`.
+///
+/// Child entries are not directly assigned to collections; they inherit visibility from their
+/// parent's collection membership, matching the logic in `list_child_entries`.
+pub fn is_entry_publicly_accessible(conn: &Connection, entry_uid: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM archived_entries e \
+         WHERE e.entry_uid = ?1 \
+           AND (\
+             EXISTS (\
+               SELECT 1 FROM collection_entries ce \
+               JOIN collections c ON c.id = ce.collection_id \
+               WHERE ce.entry_id = e.id \
+                 AND c.requires_auth = 0 \
+                 AND (ce.visibility_bits & 1) != 0\
+             ) \
+             OR (e.parent_entry_id IS NOT NULL AND EXISTS (\
+               SELECT 1 FROM collection_entries ce_p \
+               JOIN collections c ON c.id = ce_p.collection_id \
+               WHERE ce_p.entry_id = e.parent_entry_id \
+                 AND c.requires_auth = 0 \
+                 AND (ce_p.visibility_bits & 1) != 0\
+             ))\
+           )",
+        [entry_uid],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 /// Renames a collection and/or updates its default_visibility_bits.
 /// Returns true if updated, false if not found.
 /// Refuses to rename the '_default_' collection but allows changing its
