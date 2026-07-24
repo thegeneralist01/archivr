@@ -2323,14 +2323,19 @@ impl IntoResponse for ApiError {
 
 async fn list_collections_handler(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(archive_id): Path<String>,
 ) -> Result<Json<Vec<archive::CollectionSummary>>, ApiError> {
-    // Collection summaries (name/slug/uid/requires_auth/default_visibility_bits) are public
-    // metadata; no auth required so guests can populate the collection switcher.
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
-    Ok(Json(archive::list_collections(&conn)?))
+    let all = archive::list_collections(&conn)?;
+    // Guests only see public collections; authenticated users see all.
+    let visible = if matches!(auth, AuthUser::Guest) {
+        all.into_iter().filter(|c| !c.requires_auth).collect()
+    } else {
+        all
+    };
+    Ok(Json(visible))
 }
 
 async fn create_collection_handler(
@@ -6014,18 +6019,22 @@ mod tests {
                 source_metadata_json: "{}".to_string(), display_metadata_json: None,
             }).unwrap()
         };
-        let _ = child;
         // Put parent in a public collection with guest visibility.
         let coll = api_make_collection(
             registry.clone(), auth_path.clone(), &session, "PubParent", "pub-parent", 3, false,
         ).await;
         api_add_to_coll(registry.clone(), auth_path.clone(), &session, &coll, &parent.entry_uid, 3).await;
-        // Guest requests children of the public parent.
+        // Guest requests children of the public parent — must see the child, not just 200.
         let resp = app(registry, auth_path)
             .oneshot(Request::builder()
                 .uri(format!("/api/archives/test/entries/{}/children", parent.entry_uid))
                 .body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let uids: Vec<&str> = body.as_array().unwrap()
+            .iter().map(|e| e["entry_uid"].as_str().unwrap()).collect();
+        assert!(uids.contains(&child.entry_uid.as_str()),
+            "guest must see child uid in children response; got {:?}", uids);
     }
 
     #[tokio::test]
@@ -6078,5 +6087,37 @@ mod tests {
                 .uri(format!("/api/archives/test/entries/{}", child.entry_uid))
                 .body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn guest_list_collections_returns_only_public() {
+        // GET /api/archives/:id/collections for a guest must omit auth-required collections
+        // so their names are never leaked to unsigned users.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+        // Create one public and one auth-required collection.
+        let _ = api_make_collection(
+            registry.clone(), auth_path.clone(), &session,
+            "PublicColl", "public-coll", 3, false,
+        ).await;
+        let auth_coll_name = "SecretColl";
+        let _ = api_make_collection(
+            registry.clone(), auth_path.clone(), &session,
+            auth_coll_name, "secret-coll", 2, true,
+        ).await;
+        // Guest fetches the collection list.
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri("/api/archives/test/collections")
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let names: Vec<&str> = body.as_array().unwrap()
+            .iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert!(!names.contains(&auth_coll_name),
+            "auth-required collection name must not be returned to guests; got {:?}", names);
+        assert!(names.contains(&"PublicColl"),
+            "public collection must be returned to guests; got {:?}", names);
     }
 }
