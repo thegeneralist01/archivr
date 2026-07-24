@@ -454,15 +454,19 @@ async fn list_entry_children(
     auth: AuthUser,
     Path((archive_id, entry_uid)): Path<(String, String)>,
 ) -> Result<Json<Vec<archive::EntrySummary>>, ApiError> {
-    auth.require_auth()?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    if matches!(auth, AuthUser::Guest) {
+        // list_child_entries checks visibility_bits but not collections.requires_auth;
+        // gate on the parent being publicly accessible before opening the endpoint.
+        if !database::is_entry_publicly_accessible(&conn, &entry_uid)? {
+            return Err(ApiError::unauthorized("login required"));
+        }
+    } else {
+        auth.require_auth()?;
+    }
     let caller_bits = auth_to_caller_bits(&auth);
-    Ok(Json(archive::list_child_entries(
-        &conn,
-        &entry_uid,
-        caller_bits,
-    )?))
+    Ok(Json(archive::list_child_entries(&conn, &entry_uid, caller_bits)?))
 }
 
 async fn search_entries_handler(
@@ -498,9 +502,13 @@ async fn entry_detail(
     auth_user: AuthUser,
     Path((archive_id, entry_uid)): Path<(String, String)>,
 ) -> Result<Json<archive::EntryDetail>, ApiError> {
-    auth_user.require_auth()?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    if matches!(auth_user, AuthUser::Guest) {
+        if !database::is_entry_publicly_accessible(&conn, &entry_uid)? {
+            return Err(ApiError::unauthorized("login required"));
+        }
+    }
     let detail = archive::get_entry_detail(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
     Ok(Json(detail))
@@ -536,8 +544,8 @@ async fn serve_artifact(
     Query(params): Query<ArtifactQuery>,
     req: Request,
 ) -> Result<Response, ApiError> {
-    // Auth: valid scoped token OR authenticated session (OR both).
-    // A token present but invalid/expired falls back to session auth so that
+    // Auth: valid scoped token OR authenticated session OR publicly accessible entry.
+    // A token present but invalid/expired falls back to session/public check so that
     // a logged-in browser player keeps working after a token expires.
     let token_valid = params.token.as_deref().map_or(false, |tok| {
         let tokens = state.media_tokens.lock();
@@ -549,7 +557,15 @@ async fn serve_artifact(
         })
     });
     if !token_valid {
-        auth_user.require_auth()?;
+        if matches!(auth_user, AuthUser::Guest) {
+            let mounted_check = mounted_archive(&state, &archive_id)?;
+            let conn_check = database::open_or_initialize(&mounted_check.archive_path)?;
+            if !database::is_entry_publicly_accessible(&conn_check, &entry_uid)? {
+                return Err(ApiError::unauthorized("login required"));
+            }
+        } else {
+            auth_user.require_auth()?;
+        }
     }
     let mounted = mounted_archive(&state, &archive_id)?;
     let paths = archive::read_archive_paths(&mounted.archive_path)?;
