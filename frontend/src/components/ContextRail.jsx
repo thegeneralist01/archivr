@@ -11,7 +11,7 @@ const ExternalIcon = () => (
   </svg>
 )
 
-export default function ContextRail({ archiveId, selectedEntry, selectedUids, selectedEntries, detail, onTagFilterSet, tagNodes, onTagsRefresh, onEntryTitleChange, onEntryDeleted, onBulkDeleted, humanizeTags, onDetailRefresh, onOpenPreview, onPlay }) {
+export default function ContextRail({ archiveId, selectedEntry, selectedUids, selectedEntries, detail, onTagFilterSet, tagNodes, onTagsRefresh, onEntryTitleChange, onEntryDeleted, onBulkDeleted, humanizeTags, onDetailRefresh, onOpenPreview, onPlay, isPublicSession }) {
   const [tags, setTags] = useState([])
   const [assignInput, setAssignInput] = useState('')
   const [entryCollections, setEntryCollections] = useState([])
@@ -50,6 +50,12 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
       setEntryCollections([])
       return
     }
+    // Skip auth-required tag/collection fetches for public guests.
+    if (isPublicSession) {
+      setTags([])
+      setEntryCollections([])
+      return
+    }
     setEditingTitle(false)
     setTitleDraft('')
     titleCancelRef.current = false
@@ -62,7 +68,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
       setTags(tgs)
       setEntryCollections(ecs)
     }).catch(() => {})
-  }, [selectedEntry, archiveId])
+  }, [selectedEntry, archiveId, isPublicSession])
 
   useEffect(() => {
     return () => {
@@ -363,7 +369,19 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
       ) : !selectedEntry ? (
         <p className="tags-empty">Select an entry.</p>
       ) : !detail ? (
-        <p className="tags-empty">Loading\u2026</p>
+        isPublicSession && selectedEntry ? (
+          <div className="rail-public-summary">
+            <h2 className="rail-title">{selectedEntry.title || selectedEntry.entry_uid}</h2>
+            {selectedEntry.original_url && (
+              <a className="url-tile" href={selectedEntry.original_url} target="_blank" rel="noopener noreferrer">
+                <span className="u-text">{selectedEntry.original_url}</span>
+              </a>
+            )}
+            <p className="tags-empty" style={{ marginTop: 16 }}>Sign in to view archived content.</p>
+          </div>
+        ) : (
+          <p className="tags-empty">Loading\u2026</p>
+        )
       ) : (
         <>
           {editingTitle ? (

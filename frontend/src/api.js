@@ -10,14 +10,18 @@ export async function fetchArchives() {
   return getJson("/api/archives");
 }
 
-export async function fetchEntries(archiveId) {
-  return getJson(`/api/archives/${archiveId}/entries`);
+export async function fetchEntries(archiveId, collectionUid = null) {
+  const url = collectionUid
+    ? `/api/archives/${archiveId}/entries?collection=${encodeURIComponent(collectionUid)}`
+    : `/api/archives/${archiveId}/entries`
+  return getJson(url)
 }
 
-export async function searchEntries(archiveId, q, tag) {
+export async function searchEntries(archiveId, q, tag, collectionUid = null) {
   const params = new URLSearchParams();
   if (q) params.set("q", q);
   if (tag) params.set("tag", tag);
+  if (collectionUid) params.set("collection", collectionUid);
   return getJson(`/api/archives/${archiveId}/entries/search?${params}`);
 }
 

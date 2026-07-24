@@ -40,7 +40,7 @@ function ChildRow({ entry, index, onRowClick, selectedUids }) {
   );
 }
 
-export default function EntryRow({ entry, archiveId, rowIndex, isSelected, isMultiSelected, onRowClick, selectedUids, deletedUids }) {
+export default function EntryRow({ entry, archiveId, rowIndex, isSelected, isMultiSelected, onRowClick, selectedUids, deletedUids, isPublicSession }) {
   const [favFailed, setFavFailed] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState(null);
@@ -67,7 +67,7 @@ export default function EntryRow({ entry, archiveId, rowIndex, isSelected, isMul
   );
 
   const checked = isSelected || isMultiSelected;
-  const hasChildren = entry.child_count > 0;
+  const hasChildren = entry.child_count > 0 && !isPublicSession;
 
   function handleCheckboxClick(e) {
     e.stopPropagation();
