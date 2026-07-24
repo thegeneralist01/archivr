@@ -1729,6 +1729,44 @@ select {
 }
 .coll-add-btn:hover { opacity: 0.85; }
 .coll-add-btn:disabled { opacity: 0.45; cursor: default; }
+
+/* ── Public link row in collection detail ───────────────────────────────── */
+.coll-public-link-row { flex-direction: column; align-items: flex-start; gap: 6px; }
+.coll-public-link-wrap { display: flex; width: 100%; gap: 6px; }
+.coll-public-link-input {
+  flex: 1; min-width: 0;
+  border: 1px solid var(--line); border-radius: var(--r);
+  background: var(--paper-3); color: var(--link);
+  padding: 5px 8px; font-size: 12px; font-family: monospace;
+  cursor: text;
+}
+.coll-copy-btn {
+  border: 1px solid var(--line); border-radius: var(--r);
+  background: var(--paper-2); color: var(--ink);
+  padding: 4px 10px; font-size: 12px; cursor: pointer; white-space: nowrap;
+  transition: background .12s;
+}
+.coll-copy-btn:hover { background: var(--line); }
+
+/* ── Public collection page ─────────────────────────────────────────────── */
+.pub-coll-page { min-height: 100vh; background: var(--paper); color: var(--ink); }
+.pub-coll-topbar {
+  height: 58px; display: flex; align-items: center; gap: 20px;
+  padding: 0 22px; background: var(--top);
+  border-bottom: 3px solid var(--accent);
+}
+.pub-coll-brand { font-family: var(--display); font-weight: 600; font-size: 30px; color: #f4ead8; }
+.pub-coll-divider { color: rgba(244,234,216,.35); font-size: 20px; }
+.pub-coll-name { font-size: 14px; font-weight: 600; color: #d8cfc0; letter-spacing: 0.01em; }
+.pub-coll-body { max-width: 820px; margin: 0 auto; padding: 32px 24px; }
+.pub-coll-meta { font-size: 12px; color: var(--muted); margin-bottom: 24px; }
+.pub-coll-empty { color: var(--muted); font-size: 14px; }
+.pub-coll-entry-title {
+  font-size: 14px; font-weight: 500; color: var(--link);
+  text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pub-coll-entry-title:hover { text-decoration: underline; }
+.pub-coll-entry-title--plain { font-size: 14px; font-weight: 500; color: var(--ink); }
 /* old override — superseded by coll-create-details section below */
 
 /* ── Auth loading state ─────────────────────────────────────────────────── */

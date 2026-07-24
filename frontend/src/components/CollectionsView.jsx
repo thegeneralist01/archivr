@@ -39,6 +39,9 @@ export default function CollectionsView({ archiveId }) {
   const [renaming, setRenaming] = useState(false)
   const [renameVal, setRenameVal] = useState('')
   const renameRef = useRef(null)
+  const publicLinkRef = useRef(null)
+  // Public link copy state
+  const [copyState, setCopyState] = useState('idle') // 'idle' | 'copied'
 
   const selected = collections.find(c => c.collection_uid === selectedUid) ?? null
   const isDefault = selected?.slug === '_default_'
@@ -135,6 +138,24 @@ export default function CollectionsView({ archiveId }) {
       setCollDetail(d => d ? { ...d, requires_auth: val } : d)
     } catch (e) {
       setError(e.message)
+    }
+  }
+
+  function handleCopyPublicLink() {
+    const input = publicLinkRef.current
+    if (!input) return
+    // Clipboard API only available in secure contexts (HTTPS); fall back to
+    // execCommand so self-hosted HTTP deployments still get one-click copy.
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(input.value).then(() => {
+        setCopyState('copied')
+        setTimeout(() => setCopyState('idle'), 2000)
+      }).catch(() => {})
+    } else {
+      input.select()
+      try { document.execCommand('copy') } catch { /* silently ignore */ }
+      setCopyState('copied')
+      setTimeout(() => setCopyState('idle'), 2000)
     }
   }
 
@@ -276,6 +297,26 @@ export default function CollectionsView({ archiveId }) {
                 {' Require authentication to view'}
               </label>
             </div>
+
+            {/* Public link — shown when auth is not required */}
+            {!(collDetail?.requires_auth ?? selected.requires_auth) && (
+              <div className="coll-detail-vis coll-public-link-row">
+                <span className="coll-vis-label">Public link</span>
+                <div className="coll-public-link-wrap">
+                  <input
+                    ref={publicLinkRef}
+                    className="coll-public-link-input"
+                    type="text"
+                    readOnly
+                    value={`${window.location.origin}/c/${archiveId}/${selected.collection_uid}`}
+                    onFocus={e => e.target.select()}
+                  />
+                  <button className="coll-copy-btn" onClick={handleCopyPublicLink}>
+                    {copyState === 'copied' ? '✓ Copied' : 'Copy'}
+                  </button>
+                </div>
+              </div>
+            )}
 
             {/* Entries */}
             <div className="coll-entries-section">

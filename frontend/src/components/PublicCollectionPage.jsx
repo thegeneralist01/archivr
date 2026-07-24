@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react'
 import { getCollection } from '../api.js'
 import { formatTimestamp } from '../utils.js'
 
+// Standalone public collection page — rendered at /c/:archiveId/:collUid.
+// Bypasses the login gate; the server only returns guest-visible entries.
 export default function PublicCollectionPage({ archiveId, collUid }) {
   const [collection, setCollection] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -14,50 +16,63 @@ export default function PublicCollectionPage({ archiveId, collUid }) {
   }, [archiveId, collUid])
 
   if (loading) return <div className="auth-loading">Loading…</div>
+
   if (error) return (
-    <div style={{ padding: '40px 24px', fontFamily: 'system-ui, sans-serif', color: '#888' }}>
-      <p>{error}</p>
+    <div className="pub-coll-page">
+      <div className="pub-coll-topbar">
+        <span className="pub-coll-brand">Archivr</span>
+      </div>
+      <div className="pub-coll-body">
+        <p className="pub-coll-empty">{error}</p>
+      </div>
     </div>
   )
 
   const entries = collection.entries ?? []
 
   return (
-    <div style={{ maxWidth: 760, margin: '0 auto', padding: '40px 24px', fontFamily: 'system-ui, sans-serif' }}>
-      <h1 style={{ fontSize: 28, fontWeight: 700, marginBottom: 4 }}>{collection.name}</h1>
-      <p style={{ color: '#888', fontSize: 13, marginBottom: 32 }}>
-        {entries.length} entr{entries.length === 1 ? 'y' : 'ies'}
-      </p>
-      {entries.length === 0 ? (
-        <p style={{ color: '#888' }}>No entries in this collection.</p>
-      ) : (
-        <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
-          {entries.map(entry => (
-            <li key={entry.entry_uid} style={{
-              borderBottom: '1px solid #e5e5e5',
-              padding: '14px 0',
-            }}>
-              {entry.original_url ? (
-                <a
-                  href={entry.original_url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  style={{ fontWeight: 600, color: '#111', textDecoration: 'none', fontSize: 15 }}
-                >
-                  {entry.title || entry.entry_uid}
-                </a>
-              ) : (
-                <span style={{ fontWeight: 600, color: '#111', fontSize: 15 }}>
-                  {entry.title || entry.entry_uid}
-                </span>
-              )}
-              <div style={{ fontSize: 12, color: '#888', marginTop: 4 }}>
-                {entry.source_kind} · {formatTimestamp(entry.archived_at)}
-              </div>
-            </li>
-          ))}
-        </ul>
-      )}
+    <div className="pub-coll-page">
+      <div className="pub-coll-topbar">
+        <span className="pub-coll-brand">Archivr</span>
+        <span className="pub-coll-divider">·</span>
+        <span className="pub-coll-name">{collection.name}</span>
+      </div>
+
+      <div className="pub-coll-body">
+        <p className="pub-coll-meta">
+          {entries.length} entr{entries.length === 1 ? 'y' : 'ies'}
+        </p>
+
+        {entries.length === 0 ? (
+          <p className="pub-coll-empty">No public entries in this collection.</p>
+        ) : (
+          <ul className="coll-entries-list">
+            {entries.map(entry => (
+              <li key={entry.entry_uid} className="coll-entry-row">
+                <div className="coll-entry-info">
+                  {entry.original_url ? (
+                    <a
+                      className="pub-coll-entry-title"
+                      href={entry.original_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      {entry.title || entry.entry_uid}
+                    </a>
+                  ) : (
+                    <span className="pub-coll-entry-title--plain">
+                      {entry.title || entry.entry_uid}
+                    </span>
+                  )}
+                  <span className="coll-entry-kind muted">
+                    {entry.source_kind} · {formatTimestamp(entry.archived_at)}
+                  </span>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
     </div>
   )
 }
