@@ -2431,6 +2431,24 @@ pub fn get_collection_by_uid(conn: &Connection, uid: &str) -> Result<Option<Coll
     .map_err(Into::into)
 }
 
+/// Returns a collection by its slug, or None if not found.
+pub fn get_collection_by_slug(conn: &Connection, slug: &str) -> Result<Option<CollectionRecord>> {
+    conn.query_row(
+        "SELECT id, collection_uid, name, slug, default_visibility_bits, created_at, requires_auth \
+         FROM collections WHERE slug = ?1",
+        [slug],
+        |row| Ok(CollectionRecord {
+            id: row.get(0)?,
+            collection_uid: row.get(1)?,
+            name: row.get(2)?,
+            slug: row.get(3)?,
+            default_visibility_bits: row.get::<_, i64>(4)? as u32,
+            created_at: row.get(5)?,
+            requires_auth: row.get::<_, i64>(6)? != 0,
+        }),
+    ).optional().map_err(Into::into)
+}
+
 /// Adds an entry to a collection with given visibility_bits. Idempotent (INSERT OR IGNORE).
 pub fn add_entry_to_collection(
     conn: &Connection,

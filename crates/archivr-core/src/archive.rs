@@ -646,6 +646,7 @@ pub struct SearchEntriesQuery {
     /// Role bits of the caller for visibility filtering. Admins (bits 4/8) bypass all filters.
     /// Pass `u32::MAX` internally to bypass all visibility. Pass 0 for unauthenticated guests only.
     pub caller_bits: u32,
+    pub collection_id: Option<i64>,
 }
 
 impl Default for SearchEntriesQuery {
@@ -660,6 +661,7 @@ impl Default for SearchEntriesQuery {
             before: None,
             tag: None,
             caller_bits: u32::MAX,
+            collection_id: None,
         }
     }
 }
@@ -791,14 +793,29 @@ pub fn search_entries(
         params.push(b.clone());
     }
 
-    // Visibility filter
-    let n = params.len() + 1;
-    sql.push_str(&format!(
-        " AND (CAST(?{n} AS INTEGER) & 12 != 0 \
-         OR EXISTS (SELECT 1 FROM collection_entries ce \
-         WHERE ce.entry_id = e.id AND ce.visibility_bits & CAST(?{n} AS INTEGER) != 0))"
-    ));
-    params.push(query.caller_bits.to_string());
+    // Collection scope + visibility filter.
+    if let Some(coll_id) = query.collection_id {
+        let cn = params.len() + 1;
+        let vn = params.len() + 2;
+        sql.push_str(&format!(
+            " AND EXISTS (\
+                SELECT 1 FROM collection_entries cef \
+                WHERE cef.entry_id = e.id AND cef.collection_id = ?{cn} \
+                AND (CAST(?{vn} AS INTEGER) & 12 != 0 \
+                     OR cef.visibility_bits & CAST(?{vn} AS INTEGER) != 0)\
+            )"
+        ));
+        params.push(coll_id.to_string());
+        params.push(query.caller_bits.to_string());
+    } else {
+        let n = params.len() + 1;
+        sql.push_str(&format!(
+            " AND (CAST(?{n} AS INTEGER) & 12 != 0 \
+             OR EXISTS (SELECT 1 FROM collection_entries ce \
+             WHERE ce.entry_id = e.id AND ce.visibility_bits & CAST(?{n} AS INTEGER) != 0))"
+        ));
+        params.push(query.caller_bits.to_string());
+    }
 
     sql.push_str(" GROUP BY e.id ORDER BY e.archived_at DESC, e.id DESC");
 
