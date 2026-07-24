@@ -358,11 +358,11 @@ export async function listCollections(archiveId) {
   return getJson(`/api/archives/${archiveId}/collections`);
 }
 
-export async function createCollection(archiveId, name, slug, defaultVisibilityBits = 2) {
+export async function createCollection(archiveId, name, slug, defaultVisibilityBits = 2, requiresAuth = true) {
   const res = await fetch(`/api/archives/${archiveId}/collections`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name, slug, default_visibility_bits: defaultVisibilityBits }),
+    body: JSON.stringify({ name, slug, default_visibility_bits: defaultVisibilityBits, requires_auth: requiresAuth }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));

@@ -15,6 +15,7 @@ import ContextRail from './components/ContextRail'
 import PreviewModal from './components/PreviewModal'
 import AudioBar from './components/AudioBar'
 import PreviewPage from './components/PreviewPage'
+import PublicCollectionPage from './components/PublicCollectionPage.jsx'
 import { displayPath } from './utils'
 import ToastStack from './components/ToastStack'
 
@@ -24,6 +25,12 @@ export const AuthContext = createContext(null);
 const PREVIEW_ROUTE = (() => {
   const m = window.location.pathname.match(/^\/preview\/([^/]+)\/([^/]+)/)
   return m ? { archiveId: m[1], entryUid: m[2] } : null
+})()
+
+// Detect /c/:archiveId/:collUid at load time (static — no navigation)
+const PUBLIC_COLL_ROUTE = (() => {
+  const m = window.location.pathname.match(/^\/c\/([^/]+)\/([^/]+)/)
+  return m ? { archiveId: m[1], collUid: m[2] } : null
 })()
 
 const VIEWS = ['archive','tags','collections','runs','admin','settings']
@@ -603,6 +610,8 @@ export default function App() {
     document.body.classList.toggle('has-audio-bar', !!currentAudio)
     return () => document.body.classList.remove('has-audio-bar')
   }, [currentAudio])
+
+  if (PUBLIC_COLL_ROUTE) return <PublicCollectionPage archiveId={PUBLIC_COLL_ROUTE.archiveId} collUid={PUBLIC_COLL_ROUTE.collUid} />;
 
   if (authState === 'loading') return <div className="auth-loading">Loading\u2026</div>;
   if (authState === 'setup')   return <SetupPage onComplete={() => setAuthState('login')} />;
