@@ -5783,4 +5783,300 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
+
+    // ── Public preview contract tests ──────────────────────────────────────────
+    // entry_detail and serve_artifact are open to guests iff the entry lives in a
+    // public collection (requires_auth=false) with visibility_bits & ROLE_GUEST (1).
+    // list_entry_children is open to guests iff the parent passes the same check.
+    // Children inherit public accessibility from their parent.
+
+    /// Build a collection via API; return its uid.
+    async fn api_make_collection(
+        registry: ServerRegistry, auth_path: std::path::PathBuf,
+        session: &str, name: &str, slug: &str, vis: u32, requires_auth: bool,
+    ) -> String {
+        let r = app(registry, auth_path)
+            .oneshot(Request::builder().method("POST")
+                .uri("/api/archives/test/collections")
+                .header("content-type", "application/json").header("cookie", session)
+                .body(json_body(&serde_json::json!({
+                    "name": name, "slug": slug,
+                    "default_visibility_bits": vis, "requires_auth": requires_auth
+                }))).unwrap()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+        body_json(r).await["collection_uid"].as_str().unwrap().to_string()
+    }
+
+    /// Add an entry to a collection via API.
+    async fn api_add_to_coll(
+        registry: ServerRegistry, auth_path: std::path::PathBuf,
+        session: &str, coll_uid: &str, entry_uid: &str, vis: u32,
+    ) {
+        let r = app(registry, auth_path)
+            .oneshot(Request::builder().method("POST")
+                .uri(format!("/api/archives/test/collections/{coll_uid}/entries"))
+                .header("content-type", "application/json").header("cookie", session)
+                .body(json_body(&serde_json::json!({
+                    "entry_uid": entry_uid, "visibility_bits": vis
+                }))).unwrap()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// Create an entry with one artifact file; returns (entry, artifact uri component).
+    fn make_entry_with_artifact(
+        archive_path: &std::path::Path,
+        store_path: &std::path::Path,
+    ) -> archivr_core::database::ArchivedEntry {
+        let conn = database::open_or_initialize(archive_path).unwrap();
+        let user_id = database::ensure_default_user(&conn).unwrap();
+        let run = database::create_archive_run(&conn, user_id, 1).unwrap();
+        let si = database::upsert_source_identity(
+            &conn, "web", "page", None,
+            Some("https://example.com/artitest"), "https://example.com/artitest",
+        ).unwrap();
+        let entry = database::create_archived_entry(&conn, &database::NewEntry {
+            source_identity_id: si, archive_run_id: run.id,
+            parent_entry_id: None, root_entry_id: None,
+            created_by_user_id: user_id, owned_by_user_id: user_id,
+            source_kind: "web".to_string(), entity_kind: "page".to_string(),
+            title: Some("Artifact Test".to_string()), visibility: "private".to_string(),
+            representation_kind: "html".to_string(),
+            source_metadata_json: "{}".to_string(), display_metadata_json: None,
+        }).unwrap();
+        let relpath = "raw/pp/qq/test.html";
+        let file_dir = store_path.join("raw").join("pp").join("qq");
+        std::fs::create_dir_all(&file_dir).unwrap();
+        std::fs::write(file_dir.join("test.html"), b"<html>pub</html>").unwrap();
+        let blob_id = database::upsert_blob(&conn, &database::BlobRecord {
+            sha256: "cccc3333dddd4444eeee5555ffff6666cccc3333dddd4444eeee5555ffff6666".to_string(),
+            byte_size: 16, mime_type: Some("text/html".to_string()),
+            extension: Some("html".to_string()), raw_relpath: relpath.to_string(),
+        }).unwrap();
+        database::add_entry_artifact(&conn, &database::NewArtifact {
+            entry_id: entry.id, artifact_role: "primary_media".to_string(),
+            storage_area: "raw".to_string(), relpath: relpath.to_string(),
+            blob_id: Some(blob_id), logical_path: None, metadata_json: None,
+        }).unwrap();
+        entry
+    }
+
+    #[tokio::test]
+    async fn guest_entry_detail_public_entry_succeeds() {
+        // Entry in a requires_auth=false collection with vis=3 (ROLE_GUEST) → 200 without cookie.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+        let entry = make_test_entry(&archive_path);
+        let coll = api_make_collection(
+            registry.clone(), auth_path.clone(), &session,
+            "PubD", "pub-d", 3, false,
+        ).await;
+        api_add_to_coll(registry.clone(), auth_path.clone(), &session, &coll, &entry.entry_uid, 3).await;
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}", entry.entry_uid))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn guest_entry_detail_users_only_entry_blocked() {
+        // Entry in requires_auth=false collection but visibility_bits=2 (no ROLE_GUEST) → 401.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+        let entry = make_test_entry(&archive_path);
+        let coll = api_make_collection(
+            registry.clone(), auth_path.clone(), &session,
+            "SemiPub", "semi-pub", 3, false,
+        ).await;
+        // Add with visibility_bits=2: users-only, ROLE_GUEST bit not set.
+        api_add_to_coll(registry.clone(), auth_path.clone(), &session, &coll, &entry.entry_uid, 2).await;
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}", entry.entry_uid))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn guest_entry_detail_auth_required_collection_blocked() {
+        // Entry in requires_auth=true collection even with guest visibility bits → 401.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+        let entry = make_test_entry(&archive_path);
+        let coll = api_make_collection(
+            registry.clone(), auth_path.clone(), &session,
+            "AuthColl", "auth-coll", 3, true,
+        ).await;
+        api_add_to_coll(registry.clone(), auth_path.clone(), &session, &coll, &entry.entry_uid, 3).await;
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}", entry.entry_uid))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn guest_serve_artifact_public_entry_succeeds() {
+        // Artifact of an entry in a public collection is accessible without cookie.
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("store");
+        let paths = archivr_core::archive::initialize_archive(
+            dir.path(), &store_path, "test", false,
+        ).unwrap();
+        let auth_path = dir.path().join("auth.sqlite");
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
+        let registry = ServerRegistry {
+            archives: vec![MountedArchive {
+                id: "test".to_string(), label: "Test".to_string(),
+                archive_path: paths.archive_path.clone(),
+            }],
+            bind: None, auth_db_path: None,
+        };
+        let session = make_test_session(&auth_path);
+        let entry = make_entry_with_artifact(&paths.archive_path, &store_path);
+        let coll = api_make_collection(
+            registry.clone(), auth_path.clone(), &session,
+            "PubArt", "pub-art", 3, false,
+        ).await;
+        api_add_to_coll(registry.clone(), auth_path.clone(), &session, &coll, &entry.entry_uid, 3).await;
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}/artifacts/0", entry.entry_uid))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn guest_serve_artifact_users_only_entry_blocked() {
+        // Artifact of a users-only entry is blocked for guests even in a public collection.
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("store");
+        let paths = archivr_core::archive::initialize_archive(
+            dir.path(), &store_path, "test", false,
+        ).unwrap();
+        let auth_path = dir.path().join("auth.sqlite");
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
+        let registry = ServerRegistry {
+            archives: vec![MountedArchive {
+                id: "test".to_string(), label: "Test".to_string(),
+                archive_path: paths.archive_path.clone(),
+            }],
+            bind: None, auth_db_path: None,
+        };
+        let session = make_test_session(&auth_path);
+        let entry = make_entry_with_artifact(&paths.archive_path, &store_path);
+        let coll = api_make_collection(
+            registry.clone(), auth_path.clone(), &session,
+            "PubArt2", "pub-art2", 3, false,
+        ).await;
+        // visibility_bits=2: users-only, guest cannot see.
+        api_add_to_coll(registry.clone(), auth_path.clone(), &session, &coll, &entry.entry_uid, 2).await;
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}/artifacts/0", entry.entry_uid))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn guest_list_children_public_parent_succeeds() {
+        // Children of a public parent are accessible to guests.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+        // Create parent entry.
+        let parent = make_test_entry(&archive_path);
+        // Create child entry referencing parent.
+        let child = {
+            let conn = database::open_or_initialize(&archive_path).unwrap();
+            let user_id = database::ensure_default_user(&conn).unwrap();
+            let run = database::create_archive_run(&conn, user_id, 1).unwrap();
+            let si = database::upsert_source_identity(
+                &conn, "web", "page", None,
+                Some("https://example.com/child"), "https://example.com/child",
+            ).unwrap();
+            database::create_archived_entry(&conn, &database::NewEntry {
+                source_identity_id: si, archive_run_id: run.id,
+                parent_entry_id: Some(parent.id), root_entry_id: Some(parent.id),
+                created_by_user_id: user_id, owned_by_user_id: user_id,
+                source_kind: "web".to_string(), entity_kind: "page".to_string(),
+                title: Some("Child Entry".to_string()), visibility: "private".to_string(),
+                representation_kind: "html".to_string(),
+                source_metadata_json: "{}".to_string(), display_metadata_json: None,
+            }).unwrap()
+        };
+        let _ = child;
+        // Put parent in a public collection with guest visibility.
+        let coll = api_make_collection(
+            registry.clone(), auth_path.clone(), &session, "PubParent", "pub-parent", 3, false,
+        ).await;
+        api_add_to_coll(registry.clone(), auth_path.clone(), &session, &coll, &parent.entry_uid, 3).await;
+        // Guest requests children of the public parent.
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}/children", parent.entry_uid))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn guest_list_children_private_parent_blocked() {
+        // Children of a non-public parent are blocked for guests.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        // Parent only in _default_ (requires_auth=true by default); not in any public collection.
+        let parent = make_test_entry(&archive_path);
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}/children", parent.entry_uid))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn guest_child_entry_detail_via_public_parent_succeeds() {
+        // A child entry inherits public accessibility from its parent's collection membership.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+        let parent = make_test_entry(&archive_path);
+        let child = {
+            let conn = database::open_or_initialize(&archive_path).unwrap();
+            let user_id = database::ensure_default_user(&conn).unwrap();
+            let run = database::create_archive_run(&conn, user_id, 1).unwrap();
+            let si = database::upsert_source_identity(
+                &conn, "web", "page", None,
+                Some("https://example.com/child2"), "https://example.com/child2",
+            ).unwrap();
+            database::create_archived_entry(&conn, &database::NewEntry {
+                source_identity_id: si, archive_run_id: run.id,
+                parent_entry_id: Some(parent.id), root_entry_id: Some(parent.id),
+                created_by_user_id: user_id, owned_by_user_id: user_id,
+                source_kind: "web".to_string(), entity_kind: "page".to_string(),
+                title: Some("Child Detail Test".to_string()), visibility: "private".to_string(),
+                representation_kind: "html".to_string(),
+                source_metadata_json: "{}".to_string(), display_metadata_json: None,
+            }).unwrap()
+        };
+        // Parent in a public collection with guest visibility.
+        let coll = api_make_collection(
+            registry.clone(), auth_path.clone(), &session, "PubParent2", "pub-parent2", 3, false,
+        ).await;
+        api_add_to_coll(registry.clone(), auth_path.clone(), &session, &coll, &parent.entry_uid, 3).await;
+        // Child detail accessible to guest via parent's public membership.
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}", child.entry_uid))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 }
