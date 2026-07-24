@@ -13,8 +13,12 @@ export default function Topbar({ archives, archiveId, onArchiveChange, view, onV
     window.location.reload();
   }
 
-  // Non-default collections for the switcher; exclude _default_ since it's "All entries"
-  const namedCollections = collections.filter(c => c.slug !== '_default_')
+  // For guests: hide auth-required collections; "All entries" only if _default_ is public.
+  const defaultColl = collections.find(c => c.slug === '_default_')
+  const showAllEntriesOption = !isPublicSession || (!!defaultColl && !defaultColl.requires_auth)
+  const namedCollections = collections
+    .filter(c => c.slug !== '_default_')
+    .filter(c => !isPublicSession || !c.requires_auth)
 
   return (
     <header className="topbar">
@@ -35,7 +39,7 @@ export default function Topbar({ archives, archiveId, onArchiveChange, view, onV
               value={selectedCollectionUid ?? ''}
               onChange={e => onCollectionChange(e.target.value || null)}
             >
-              <option value="">All entries</option>
+              {showAllEntriesOption && <option value="">All entries</option>}
               {namedCollections.map(c => (
                 <option key={c.collection_uid} value={c.collection_uid}>{c.name}</option>
               ))}

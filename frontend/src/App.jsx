@@ -176,18 +176,17 @@ export default function App() {
 
   const humanizeTags = currentUser?.humanize_slugs ?? false;
 
-  // Fetch entry detail whenever selected entry changes
+  // Fetch entry detail whenever selected entry changes.
+  // The backend gates by public accessibility, so guests get detail for public entries too.
   useEffect(() => {
     const seq = ++detailSeqRef.current
     setEntryDetail(null)
-    // Skip detail fetch in public-session mode: fetchEntryDetail requires auth.
-    // ContextRail will show summary data from the entry list instead.
-    if (!selectedEntry || !archiveId || !currentUser) return
+    if (!selectedEntry || !archiveId) return
     fetchEntryDetail(archiveId, selectedEntry.entry_uid).then(det => {
       if (seq !== detailSeqRef.current) return
       setEntryDetail(det)
     }).catch(() => {})
-  }, [selectedEntry, archiveId, currentUser])
+  }, [selectedEntry, archiveId])
 
   // Persist captureDialogOpen to sessionStorage
   useEffect(() => {

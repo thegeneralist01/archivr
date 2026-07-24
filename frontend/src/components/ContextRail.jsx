@@ -294,6 +294,12 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
       <div className="rail-eyebrow">Context</div>
 
       {isBulk ? (
+        isPublicSession ? (
+          <p className="bulk-count">
+            <span className="bulk-count-num">{selectedUids.size}</span>
+            {' entries selected'}
+          </p>
+        ) : (
         <div className="bulk-panel">
           <p className="bulk-count">
             <span className="bulk-count-num">{selectedUids.size}</span>
@@ -366,25 +372,18 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
             </button>
           </div>
         </div>
+        )
       ) : !selectedEntry ? (
         <p className="tags-empty">Select an entry.</p>
       ) : !detail ? (
-        isPublicSession && selectedEntry ? (
-          <div className="rail-public-summary">
-            <h2 className="rail-title">{selectedEntry.title || selectedEntry.entry_uid}</h2>
-            {selectedEntry.original_url && (
-              <a className="url-tile" href={selectedEntry.original_url} target="_blank" rel="noopener noreferrer">
-                <span className="u-text">{selectedEntry.original_url}</span>
-              </a>
-            )}
-            <p className="tags-empty" style={{ marginTop: 16 }}>Sign in to view archived content.</p>
-          </div>
-        ) : (
-          <p className="tags-empty">Loading\u2026</p>
-        )
+        <p className="tags-empty">Loading\u2026</p>
       ) : (
         <>
-          {editingTitle ? (
+          {isPublicSession ? (
+            <h2 className="rail-title">
+              {valueText(detail.summary.title) || valueText(detail.summary.entry_uid)}
+            </h2>
+          ) : editingTitle ? (
             <input
               className="rail-title-input"
               autoFocus
@@ -504,8 +503,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
           })()}
         </>
       )}
-
-      {selectedEntry && !isBulk && (
+      {selectedEntry && !isBulk && !isPublicSession && (
         <>
           <div className="rail-section">
             <div className="rail-section-heading">Tags</div>
