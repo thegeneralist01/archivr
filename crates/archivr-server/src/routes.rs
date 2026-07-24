@@ -71,6 +71,7 @@ pub struct AppState {
 pub struct EntrySearchParams {
     pub q: Option<String>,
     pub tag: Option<String>,
+    pub collection: Option<String>,
 }
 
 /// Tower middleware: returns 503 on all non-exempt routes if setup hasn't been completed.
@@ -421,16 +422,31 @@ async fn list_archives(State(state): State<AppState>) -> Json<Vec<MountedArchive
     Json(state.registry.archives.clone())
 }
 
+#[derive(Debug, serde::Deserialize, Default)]
+struct EntriesFilter {
+    collection: Option<String>,
+}
+
 async fn list_entries(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(archive_id): Path<String>,
+    Query(filter): Query<EntriesFilter>,
 ) -> Result<Json<Vec<archive::EntrySummary>>, ApiError> {
-    auth.require_auth()?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    // "main" is a URL-friendly alias for the default collection; no param also resolves to it.
+    let coll = match filter.collection.as_deref() {
+        None | Some("main") => database::get_collection_by_slug(&conn, "_default_")?
+            .ok_or(ApiError::not_found("default collection missing"))?,
+        Some(uid) => database::get_collection_by_uid(&conn, uid)?
+            .ok_or(ApiError::not_found("collection not found"))?,
+    };
+    if coll.requires_auth {
+        auth.require_auth()?;
+    }
     let caller_bits = auth_to_caller_bits(&auth);
-    Ok(Json(archive::list_root_entries(&conn, caller_bits)?))
+    Ok(Json(archive::list_entries_for_collection(&conn, coll.id, caller_bits)?))
 }
 
 async fn list_entry_children(
@@ -438,15 +454,19 @@ async fn list_entry_children(
     auth: AuthUser,
     Path((archive_id, entry_uid)): Path<(String, String)>,
 ) -> Result<Json<Vec<archive::EntrySummary>>, ApiError> {
-    auth.require_auth()?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    if matches!(auth, AuthUser::Guest) {
+        // list_child_entries checks visibility_bits but not collections.requires_auth;
+        // gate on the parent being publicly accessible before opening the endpoint.
+        if !database::is_entry_publicly_accessible(&conn, &entry_uid)? {
+            return Err(ApiError::unauthorized("login required"));
+        }
+    } else {
+        auth.require_auth()?;
+    }
     let caller_bits = auth_to_caller_bits(&auth);
-    Ok(Json(archive::list_child_entries(
-        &conn,
-        &entry_uid,
-        caller_bits,
-    )?))
+    Ok(Json(archive::list_child_entries(&conn, &entry_uid, caller_bits)?))
 }
 
 async fn search_entries_handler(
@@ -455,9 +475,17 @@ async fn search_entries_handler(
     Path(archive_id): Path<String>,
     Query(params): Query<EntrySearchParams>,
 ) -> Result<Json<Vec<archive::EntrySummary>>, ApiError> {
-    auth.require_auth()?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let coll = match params.collection.as_deref() {
+        None | Some("main") => database::get_collection_by_slug(&conn, "_default_")?
+            .ok_or(ApiError::not_found("default collection missing"))?,
+        Some(uid) => database::get_collection_by_uid(&conn, uid)?
+            .ok_or(ApiError::not_found("collection not found"))?,
+    };
+    if coll.requires_auth {
+        auth.require_auth()?;
+    }
     let raw = params.q.as_deref().unwrap_or("");
     let mut search_query = archive::parse_search_query(raw)
         .map_err(|prefix| ApiError::bad_request(&format!("unknown search prefix: {prefix}")))?;
@@ -465,6 +493,7 @@ async fn search_entries_handler(
         search_query.tag = Some(tag);
     }
     search_query.caller_bits = auth_to_caller_bits(&auth);
+    search_query.collection_id = Some(coll.id);
     Ok(Json(archive::search_entries(&conn, &search_query)?))
 }
 
@@ -473,9 +502,13 @@ async fn entry_detail(
     auth_user: AuthUser,
     Path((archive_id, entry_uid)): Path<(String, String)>,
 ) -> Result<Json<archive::EntryDetail>, ApiError> {
-    auth_user.require_auth()?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    if matches!(auth_user, AuthUser::Guest) {
+        if !database::is_entry_publicly_accessible(&conn, &entry_uid)? {
+            return Err(ApiError::unauthorized("login required"));
+        }
+    }
     let detail = archive::get_entry_detail(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
     Ok(Json(detail))
@@ -511,8 +544,8 @@ async fn serve_artifact(
     Query(params): Query<ArtifactQuery>,
     req: Request,
 ) -> Result<Response, ApiError> {
-    // Auth: valid scoped token OR authenticated session (OR both).
-    // A token present but invalid/expired falls back to session auth so that
+    // Auth: valid scoped token OR authenticated session OR publicly accessible entry.
+    // A token present but invalid/expired falls back to session/public check so that
     // a logged-in browser player keeps working after a token expires.
     let token_valid = params.token.as_deref().map_or(false, |tok| {
         let tokens = state.media_tokens.lock();
@@ -524,7 +557,15 @@ async fn serve_artifact(
         })
     });
     if !token_valid {
-        auth_user.require_auth()?;
+        if matches!(auth_user, AuthUser::Guest) {
+            let mounted_check = mounted_archive(&state, &archive_id)?;
+            let conn_check = database::open_or_initialize(&mounted_check.archive_path)?;
+            if !database::is_entry_publicly_accessible(&conn_check, &entry_uid)? {
+                return Err(ApiError::unauthorized("login required"));
+            }
+        } else {
+            auth_user.require_auth()?;
+        }
     }
     let mounted = mounted_archive(&state, &archive_id)?;
     let paths = archive::read_archive_paths(&mounted.archive_path)?;
@@ -659,10 +700,16 @@ struct CreateCollectionBody {
     slug: String,
     #[serde(default = "default_user_visibility")]
     default_visibility_bits: u32,
+    #[serde(default = "default_requires_auth")]
+    requires_auth: bool,
 }
 
 fn default_user_visibility() -> u32 {
     2
+}
+
+fn default_requires_auth() -> bool {
+    true
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -681,6 +728,7 @@ struct UpdateVisibilityBody {
 struct PatchCollectionBody {
     name: Option<String>,
     default_visibility_bits: Option<u32>,
+    requires_auth: Option<bool>,
 }
 
 async fn list_tags(
@@ -2275,13 +2323,19 @@ impl IntoResponse for ApiError {
 
 async fn list_collections_handler(
     State(state): State<AppState>,
-    auth_user: AuthUser,
+    auth: AuthUser,
     Path(archive_id): Path<String>,
 ) -> Result<Json<Vec<archive::CollectionSummary>>, ApiError> {
-    auth_user.require_auth()?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
-    Ok(Json(archive::list_collections(&conn)?))
+    let all = archive::list_collections(&conn)?;
+    // Guests only see public collections; authenticated users see all.
+    let visible = if matches!(auth, AuthUser::Guest) {
+        all.into_iter().filter(|c| !c.requires_auth).collect()
+    } else {
+        all
+    };
+    Ok(Json(visible))
 }
 
 async fn create_collection_handler(
@@ -2302,7 +2356,7 @@ async fn create_collection_handler(
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let record =
-        database::create_collection(&conn, &body.name, &body.slug, body.default_visibility_bits)
+        database::create_collection(&conn, &body.name, &body.slug, body.default_visibility_bits, body.requires_auth)
             .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     Ok((
         StatusCode::CREATED,
@@ -2311,6 +2365,7 @@ async fn create_collection_handler(
             name: record.name,
             slug: record.slug,
             default_visibility_bits: record.default_visibility_bits,
+            requires_auth: record.requires_auth,
             created_at: record.created_at,
         }),
     ))
@@ -2321,11 +2376,13 @@ async fn get_collection_handler(
     auth: AuthUser,
     Path((archive_id, coll_uid)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    auth.require_auth()?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let record = database::get_collection_by_uid(&conn, &coll_uid)?
         .ok_or(ApiError::not_found("collection not found"))?;
+    if record.requires_auth {
+        auth.require_auth()?;
+    }
     let caller_bits = auth_to_caller_bits(&auth);
     let entries = archive::list_entries_for_collection(&conn, record.id, caller_bits)?;
     // Collect per-entry visibility bits from collection_entries
@@ -2358,6 +2415,7 @@ async fn get_collection_handler(
                 "title": e.title,
                 "source_kind": e.source_kind,
                 "archived_at": e.archived_at,
+                "original_url": e.original_url,
                 "collection_visibility_bits": vis,
             })
         })
@@ -2367,6 +2425,7 @@ async fn get_collection_handler(
         "name": record.name,
         "slug": record.slug,
         "default_visibility_bits": record.default_visibility_bits,
+        "requires_auth": record.requires_auth,
         "created_at": record.created_at,
         "entries": entries_json,
     })))
@@ -2482,7 +2541,7 @@ async fn patch_collection_handler(
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let name_ref: Option<&str> = body.name.as_deref();
     let updated =
-        database::update_collection(&conn, &coll_uid, name_ref, body.default_visibility_bits)?;
+        database::update_collection(&conn, &coll_uid, name_ref, body.default_visibility_bits, body.requires_auth)?;
     if updated {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -4589,7 +4648,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_collections_requires_auth() {
+    async fn list_collections_is_public() {
+        // list_collections no longer requires auth — collection summaries are public metadata
+        // needed for the collection switcher in guest mode.
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
         let response = app(registry, auth_path)
@@ -4601,7 +4662,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -4660,18 +4721,87 @@ mod tests {
 
     #[tokio::test]
     async fn get_collection_requires_auth() {
+        // Create a collection (requires_auth defaults to true), then confirm
+        // that an unauthenticated GET returns 401, not 404.
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let create_resp = app(registry.clone(), auth_path.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/collections")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({
+                        "name": "Auth Required",
+                        "slug": "auth-required",
+                        "default_visibility_bits": 2,
+                        "requires_auth": true
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::CREATED);
+        let coll = body_json(create_resp).await;
+        let coll_uid = coll["collection_uid"].as_str().unwrap().to_string();
+        // Now GET without auth — must be 401 because requires_auth == true.
+        let uri = format!("/api/archives/test/collections/{coll_uid}");
         let response = app(registry, auth_path)
             .oneshot(
                 Request::builder()
-                    .uri("/api/archives/test/collections/coll_notexist")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn get_public_collection_no_auth_returns_ok() {
+        // A collection with requires_auth=false must be reachable by guests.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let create_resp = app(registry.clone(), auth_path.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/collections")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({
+                        "name": "Public Collection",
+                        "slug": "public-coll",
+                        "default_visibility_bits": 3,
+                        "requires_auth": false
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::CREATED);
+        let coll = body_json(create_resp).await;
+        let coll_uid = coll["collection_uid"].as_str().unwrap().to_string();
+        assert_eq!(coll["requires_auth"], false, "requires_auth should be false");
+        // GET without any auth cookie — must be 200.
+        let uri = format!("/api/archives/test/collections/{coll_uid}");
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["requires_auth"], false);
+        assert_eq!(body["name"], "Public Collection");
     }
 
     #[tokio::test]
@@ -4769,6 +4899,246 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ── Collection-scoped entries + search security tests ──────────────────
+
+    #[tokio::test]
+    async fn list_entries_public_named_collection_allows_guest() {
+        // A named collection with requires_auth=false must be accessible without a cookie.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        // Create a public collection.
+        let create = app(registry.clone(), auth_path.clone())
+            .oneshot(Request::builder().method("POST")
+                .uri("/api/archives/test/collections")
+                .header("content-type", "application/json")
+                .header("cookie", &session_cookie)
+                .body(json_body(&serde_json::json!({
+                    "name": "Public Coll", "slug": "public-coll",
+                    "default_visibility_bits": 3, "requires_auth": false
+                }))).unwrap()).await.unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let coll = body_json(create).await;
+        let uid = coll["collection_uid"].as_str().unwrap().to_string();
+        // Guest access to entries scoped to that collection → 200.
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries?collection={uid}"))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn list_entries_auth_required_named_collection_blocks_guest() {
+        // A named collection with requires_auth=true must block guests.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let create = app(registry.clone(), auth_path.clone())
+            .oneshot(Request::builder().method("POST")
+                .uri("/api/archives/test/collections")
+                .header("content-type", "application/json")
+                .header("cookie", &session_cookie)
+                .body(json_body(&serde_json::json!({
+                    "name": "Private Coll", "slug": "private-coll",
+                    "default_visibility_bits": 2, "requires_auth": true
+                }))).unwrap()).await.unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let coll = body_json(create).await;
+        let uid = coll["collection_uid"].as_str().unwrap().to_string();
+        // Guest access → 401.
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries?collection={uid}"))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn list_entries_public_default_collection_allows_guest() {
+        // When the _default_ collection is set to requires_auth=false, guests can list entries.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        // PATCH the default collection to make it public.
+        let default_uid = {
+            let conn = database::open_or_initialize(&archive_path).unwrap();
+            database::get_collection_by_slug(&conn, "_default_").unwrap().unwrap().collection_uid
+        };
+        let patch = app(registry.clone(), auth_path.clone())
+            .oneshot(Request::builder().method("PATCH")
+                .uri(format!("/api/archives/test/collections/{default_uid}"))
+                .header("content-type", "application/json")
+                .header("cookie", &session_cookie)
+                .body(json_body(&serde_json::json!({ "requires_auth": false }))).unwrap())
+            .await.unwrap();
+        assert_eq!(patch.status(), StatusCode::NO_CONTENT);
+        // Guest access to /entries (no collection param → resolves to _default_) → 200.
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri("/api/archives/test/entries")
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn search_entries_public_collection_allows_guest() {
+        // Guest can search within a public collection.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let create = app(registry.clone(), auth_path.clone())
+            .oneshot(Request::builder().method("POST")
+                .uri("/api/archives/test/collections")
+                .header("content-type", "application/json")
+                .header("cookie", &session_cookie)
+                .body(json_body(&serde_json::json!({
+                    "name": "Public Search", "slug": "public-search",
+                    "default_visibility_bits": 3, "requires_auth": false
+                }))).unwrap()).await.unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let coll = body_json(create).await;
+        let uid = coll["collection_uid"].as_str().unwrap().to_string();
+        // Guest search scoped to that collection → 200.
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/search?collection={uid}&q=test"))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn search_entries_auth_required_collection_blocks_guest() {
+        // Guest cannot search within an auth-required collection.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let create = app(registry.clone(), auth_path.clone())
+            .oneshot(Request::builder().method("POST")
+                .uri("/api/archives/test/collections")
+                .header("content-type", "application/json")
+                .header("cookie", &session_cookie)
+                .body(json_body(&serde_json::json!({
+                    "name": "Private Search", "slug": "private-search",
+                    "default_visibility_bits": 2, "requires_auth": true
+                }))).unwrap()).await.unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let coll = body_json(create).await;
+        let uid = coll["collection_uid"].as_str().unwrap().to_string();
+        // Guest search → 401.
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/search?collection={uid}&q=test"))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn collection_scoped_visibility_does_not_leak_across_collections() {
+        // Entry is users-only (visibility_bits=2) in CollA and public (visibility_bits=3)
+        // in CollB. Guest list + search of CollA must return 0 results; CollB must return 1.
+        // This catches the bug where cross-collection visibility check would return the entry
+        // because it is public *somewhere*, regardless of the requested collection.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+
+        // Two public collections: CollA (default vis=2) and CollB (default vis=3).
+        let coll_a_uid = {
+            let r = app(registry.clone(), auth_path.clone())
+                .oneshot(Request::builder().method("POST")
+                    .uri("/api/archives/test/collections")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({
+                        "name": "CollA", "slug": "coll-a",
+                        "default_visibility_bits": 2, "requires_auth": false
+                    }))).unwrap()).await.unwrap();
+            assert_eq!(r.status(), StatusCode::CREATED);
+            body_json(r).await["collection_uid"].as_str().unwrap().to_string()
+        };
+        let coll_b_uid = {
+            let r = app(registry.clone(), auth_path.clone())
+                .oneshot(Request::builder().method("POST")
+                    .uri("/api/archives/test/collections")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({
+                        "name": "CollB", "slug": "coll-b",
+                        "default_visibility_bits": 3, "requires_auth": false
+                    }))).unwrap()).await.unwrap();
+            assert_eq!(r.status(), StatusCode::CREATED);
+            body_json(r).await["collection_uid"].as_str().unwrap().to_string()
+        };
+
+        // Create a fixture entry (title "Test Entry" is searchable).
+        let entry = make_test_entry(&archive_path);
+
+        // Add entry to CollA with visibility_bits=2 (users-only in CollA).
+        let add_a = app(registry.clone(), auth_path.clone())
+            .oneshot(Request::builder().method("POST")
+                .uri(format!("/api/archives/test/collections/{coll_a_uid}/entries"))
+                .header("content-type", "application/json")
+                .header("cookie", &session_cookie)
+                .body(json_body(&serde_json::json!({
+                    "entry_uid": entry.entry_uid, "visibility_bits": 2
+                }))).unwrap()).await.unwrap();
+        assert_eq!(add_a.status(), StatusCode::NO_CONTENT);
+
+        // Add same entry to CollB with visibility_bits=3 (public in CollB).
+        let add_b = app(registry.clone(), auth_path.clone())
+            .oneshot(Request::builder().method("POST")
+                .uri(format!("/api/archives/test/collections/{coll_b_uid}/entries"))
+                .header("content-type", "application/json")
+                .header("cookie", &session_cookie)
+                .body(json_body(&serde_json::json!({
+                    "entry_uid": entry.entry_uid, "visibility_bits": 3
+                }))).unwrap()).await.unwrap();
+        assert_eq!(add_b.status(), StatusCode::NO_CONTENT);
+
+        // ── list_entries scoping ──────────────────────────────────────────
+        // Guest list CollA → 0 results (users-only there).
+        let list_a = app(registry.clone(), auth_path.clone())
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries?collection={coll_a_uid}"))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(list_a.status(), StatusCode::OK);
+        let body_a = body_json(list_a).await;
+        assert_eq!(body_a.as_array().unwrap().len(), 0,
+            "guest must not see users-only entry in CollA via list");
+
+        // Guest list CollB → 1 result (public there).
+        let list_b = app(registry.clone(), auth_path.clone())
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries?collection={coll_b_uid}"))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(list_b.status(), StatusCode::OK);
+        let body_b = body_json(list_b).await;
+        assert_eq!(body_b.as_array().unwrap().len(), 1,
+            "guest should see public entry in CollB via list");
+
+        // ── search_entries scoping ────────────────────────────────────────
+        // Guest search CollA → 0 results (entry is users-only there, not leaked by CollB).
+        let search_a = app(registry.clone(), auth_path.clone())
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/search?collection={coll_a_uid}&q=Test"))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(search_a.status(), StatusCode::OK);
+        let srch_a = body_json(search_a).await;
+        assert_eq!(srch_a.as_array().unwrap().len(), 0,
+            "guest search in CollA must not return entry visible only in CollB");
+
+        // Guest search CollB → 1 result (public there).
+        let search_b = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/search?collection={coll_b_uid}&q=Test"))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(search_b.status(), StatusCode::OK);
+        let srch_b = body_json(search_b).await;
+        assert_eq!(srch_b.as_array().unwrap().len(), 1,
+            "guest search in CollB must return the public entry");
     }
 
     #[tokio::test]
@@ -5417,5 +5787,337 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Public preview contract tests ──────────────────────────────────────────
+    // entry_detail and serve_artifact are open to guests iff the entry lives in a
+    // public collection (requires_auth=false) with visibility_bits & ROLE_GUEST (1).
+    // list_entry_children is open to guests iff the parent passes the same check.
+    // Children inherit public accessibility from their parent.
+
+    /// Build a collection via API; return its uid.
+    async fn api_make_collection(
+        registry: ServerRegistry, auth_path: std::path::PathBuf,
+        session: &str, name: &str, slug: &str, vis: u32, requires_auth: bool,
+    ) -> String {
+        let r = app(registry, auth_path)
+            .oneshot(Request::builder().method("POST")
+                .uri("/api/archives/test/collections")
+                .header("content-type", "application/json").header("cookie", session)
+                .body(json_body(&serde_json::json!({
+                    "name": name, "slug": slug,
+                    "default_visibility_bits": vis, "requires_auth": requires_auth
+                }))).unwrap()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+        body_json(r).await["collection_uid"].as_str().unwrap().to_string()
+    }
+
+    /// Add an entry to a collection via API.
+    async fn api_add_to_coll(
+        registry: ServerRegistry, auth_path: std::path::PathBuf,
+        session: &str, coll_uid: &str, entry_uid: &str, vis: u32,
+    ) {
+        let r = app(registry, auth_path)
+            .oneshot(Request::builder().method("POST")
+                .uri(format!("/api/archives/test/collections/{coll_uid}/entries"))
+                .header("content-type", "application/json").header("cookie", session)
+                .body(json_body(&serde_json::json!({
+                    "entry_uid": entry_uid, "visibility_bits": vis
+                }))).unwrap()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// Create an entry with one artifact file; returns (entry, artifact uri component).
+    fn make_entry_with_artifact(
+        archive_path: &std::path::Path,
+        store_path: &std::path::Path,
+    ) -> archivr_core::database::ArchivedEntry {
+        let conn = database::open_or_initialize(archive_path).unwrap();
+        let user_id = database::ensure_default_user(&conn).unwrap();
+        let run = database::create_archive_run(&conn, user_id, 1).unwrap();
+        let si = database::upsert_source_identity(
+            &conn, "web", "page", None,
+            Some("https://example.com/artitest"), "https://example.com/artitest",
+        ).unwrap();
+        let entry = database::create_archived_entry(&conn, &database::NewEntry {
+            source_identity_id: si, archive_run_id: run.id,
+            parent_entry_id: None, root_entry_id: None,
+            created_by_user_id: user_id, owned_by_user_id: user_id,
+            source_kind: "web".to_string(), entity_kind: "page".to_string(),
+            title: Some("Artifact Test".to_string()), visibility: "private".to_string(),
+            representation_kind: "html".to_string(),
+            source_metadata_json: "{}".to_string(), display_metadata_json: None,
+        }).unwrap();
+        let relpath = "raw/pp/qq/test.html";
+        let file_dir = store_path.join("raw").join("pp").join("qq");
+        std::fs::create_dir_all(&file_dir).unwrap();
+        std::fs::write(file_dir.join("test.html"), b"<html>pub</html>").unwrap();
+        let blob_id = database::upsert_blob(&conn, &database::BlobRecord {
+            sha256: "cccc3333dddd4444eeee5555ffff6666cccc3333dddd4444eeee5555ffff6666".to_string(),
+            byte_size: 16, mime_type: Some("text/html".to_string()),
+            extension: Some("html".to_string()), raw_relpath: relpath.to_string(),
+        }).unwrap();
+        database::add_entry_artifact(&conn, &database::NewArtifact {
+            entry_id: entry.id, artifact_role: "primary_media".to_string(),
+            storage_area: "raw".to_string(), relpath: relpath.to_string(),
+            blob_id: Some(blob_id), logical_path: None, metadata_json: None,
+        }).unwrap();
+        entry
+    }
+
+    #[tokio::test]
+    async fn guest_entry_detail_public_entry_succeeds() {
+        // Entry in a requires_auth=false collection with vis=3 (ROLE_GUEST) → 200 without cookie.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+        let entry = make_test_entry(&archive_path);
+        let coll = api_make_collection(
+            registry.clone(), auth_path.clone(), &session,
+            "PubD", "pub-d", 3, false,
+        ).await;
+        api_add_to_coll(registry.clone(), auth_path.clone(), &session, &coll, &entry.entry_uid, 3).await;
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}", entry.entry_uid))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn guest_entry_detail_users_only_entry_blocked() {
+        // Entry in requires_auth=false collection but visibility_bits=2 (no ROLE_GUEST) → 401.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+        let entry = make_test_entry(&archive_path);
+        let coll = api_make_collection(
+            registry.clone(), auth_path.clone(), &session,
+            "SemiPub", "semi-pub", 3, false,
+        ).await;
+        // Add with visibility_bits=2: users-only, ROLE_GUEST bit not set.
+        api_add_to_coll(registry.clone(), auth_path.clone(), &session, &coll, &entry.entry_uid, 2).await;
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}", entry.entry_uid))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn guest_entry_detail_auth_required_collection_blocked() {
+        // Entry in requires_auth=true collection even with guest visibility bits → 401.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+        let entry = make_test_entry(&archive_path);
+        let coll = api_make_collection(
+            registry.clone(), auth_path.clone(), &session,
+            "AuthColl", "auth-coll", 3, true,
+        ).await;
+        api_add_to_coll(registry.clone(), auth_path.clone(), &session, &coll, &entry.entry_uid, 3).await;
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}", entry.entry_uid))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn guest_serve_artifact_public_entry_succeeds() {
+        // Artifact of an entry in a public collection is accessible without cookie.
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("store");
+        let paths = archivr_core::archive::initialize_archive(
+            dir.path(), &store_path, "test", false,
+        ).unwrap();
+        let auth_path = dir.path().join("auth.sqlite");
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
+        let registry = ServerRegistry {
+            archives: vec![MountedArchive {
+                id: "test".to_string(), label: "Test".to_string(),
+                archive_path: paths.archive_path.clone(),
+            }],
+            bind: None, auth_db_path: None,
+        };
+        let session = make_test_session(&auth_path);
+        let entry = make_entry_with_artifact(&paths.archive_path, &store_path);
+        let coll = api_make_collection(
+            registry.clone(), auth_path.clone(), &session,
+            "PubArt", "pub-art", 3, false,
+        ).await;
+        api_add_to_coll(registry.clone(), auth_path.clone(), &session, &coll, &entry.entry_uid, 3).await;
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}/artifacts/0", entry.entry_uid))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn guest_serve_artifact_users_only_entry_blocked() {
+        // Artifact of a users-only entry is blocked for guests even in a public collection.
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("store");
+        let paths = archivr_core::archive::initialize_archive(
+            dir.path(), &store_path, "test", false,
+        ).unwrap();
+        let auth_path = dir.path().join("auth.sqlite");
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            archivr_core::database::create_owner(&conn, "testowner", "dummy").unwrap();
+        }
+        let registry = ServerRegistry {
+            archives: vec![MountedArchive {
+                id: "test".to_string(), label: "Test".to_string(),
+                archive_path: paths.archive_path.clone(),
+            }],
+            bind: None, auth_db_path: None,
+        };
+        let session = make_test_session(&auth_path);
+        let entry = make_entry_with_artifact(&paths.archive_path, &store_path);
+        let coll = api_make_collection(
+            registry.clone(), auth_path.clone(), &session,
+            "PubArt2", "pub-art2", 3, false,
+        ).await;
+        // visibility_bits=2: users-only, guest cannot see.
+        api_add_to_coll(registry.clone(), auth_path.clone(), &session, &coll, &entry.entry_uid, 2).await;
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}/artifacts/0", entry.entry_uid))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn guest_list_children_public_parent_succeeds() {
+        // Children of a public parent are accessible to guests.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+        // Create parent entry.
+        let parent = make_test_entry(&archive_path);
+        // Create child entry referencing parent.
+        let child = {
+            let conn = database::open_or_initialize(&archive_path).unwrap();
+            let user_id = database::ensure_default_user(&conn).unwrap();
+            let run = database::create_archive_run(&conn, user_id, 1).unwrap();
+            let si = database::upsert_source_identity(
+                &conn, "web", "page", None,
+                Some("https://example.com/child"), "https://example.com/child",
+            ).unwrap();
+            database::create_archived_entry(&conn, &database::NewEntry {
+                source_identity_id: si, archive_run_id: run.id,
+                parent_entry_id: Some(parent.id), root_entry_id: Some(parent.id),
+                created_by_user_id: user_id, owned_by_user_id: user_id,
+                source_kind: "web".to_string(), entity_kind: "page".to_string(),
+                title: Some("Child Entry".to_string()), visibility: "private".to_string(),
+                representation_kind: "html".to_string(),
+                source_metadata_json: "{}".to_string(), display_metadata_json: None,
+            }).unwrap()
+        };
+        // Put parent in a public collection with guest visibility.
+        let coll = api_make_collection(
+            registry.clone(), auth_path.clone(), &session, "PubParent", "pub-parent", 3, false,
+        ).await;
+        api_add_to_coll(registry.clone(), auth_path.clone(), &session, &coll, &parent.entry_uid, 3).await;
+        // Guest requests children of the public parent — must see the child, not just 200.
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}/children", parent.entry_uid))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let uids: Vec<&str> = body.as_array().unwrap()
+            .iter().map(|e| e["entry_uid"].as_str().unwrap()).collect();
+        assert!(uids.contains(&child.entry_uid.as_str()),
+            "guest must see child uid in children response; got {:?}", uids);
+    }
+
+    #[tokio::test]
+    async fn guest_list_children_private_parent_blocked() {
+        // Children of a non-public parent are blocked for guests.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        // Parent only in _default_ (requires_auth=true by default); not in any public collection.
+        let parent = make_test_entry(&archive_path);
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}/children", parent.entry_uid))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn guest_child_entry_detail_via_public_parent_succeeds() {
+        // A child entry inherits public accessibility from its parent's collection membership.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+        let parent = make_test_entry(&archive_path);
+        let child = {
+            let conn = database::open_or_initialize(&archive_path).unwrap();
+            let user_id = database::ensure_default_user(&conn).unwrap();
+            let run = database::create_archive_run(&conn, user_id, 1).unwrap();
+            let si = database::upsert_source_identity(
+                &conn, "web", "page", None,
+                Some("https://example.com/child2"), "https://example.com/child2",
+            ).unwrap();
+            database::create_archived_entry(&conn, &database::NewEntry {
+                source_identity_id: si, archive_run_id: run.id,
+                parent_entry_id: Some(parent.id), root_entry_id: Some(parent.id),
+                created_by_user_id: user_id, owned_by_user_id: user_id,
+                source_kind: "web".to_string(), entity_kind: "page".to_string(),
+                title: Some("Child Detail Test".to_string()), visibility: "private".to_string(),
+                representation_kind: "html".to_string(),
+                source_metadata_json: "{}".to_string(), display_metadata_json: None,
+            }).unwrap()
+        };
+        // Parent in a public collection with guest visibility.
+        let coll = api_make_collection(
+            registry.clone(), auth_path.clone(), &session, "PubParent2", "pub-parent2", 3, false,
+        ).await;
+        api_add_to_coll(registry.clone(), auth_path.clone(), &session, &coll, &parent.entry_uid, 3).await;
+        // Child detail accessible to guest via parent's public membership.
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}", child.entry_uid))
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn guest_list_collections_returns_only_public() {
+        // GET /api/archives/:id/collections for a guest must omit auth-required collections
+        // so their names are never leaked to unsigned users.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+        // Create one public and one auth-required collection.
+        let _ = api_make_collection(
+            registry.clone(), auth_path.clone(), &session,
+            "PublicColl", "public-coll", 3, false,
+        ).await;
+        let auth_coll_name = "SecretColl";
+        let _ = api_make_collection(
+            registry.clone(), auth_path.clone(), &session,
+            auth_coll_name, "secret-coll", 2, true,
+        ).await;
+        // Guest fetches the collection list.
+        let resp = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri("/api/archives/test/collections")
+                .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let names: Vec<&str> = body.as_array().unwrap()
+            .iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert!(!names.contains(&auth_coll_name),
+            "auth-required collection name must not be returned to guests; got {:?}", names);
+        assert!(names.contains(&"PublicColl"),
+            "public collection must be returned to guests; got {:?}", names);
     }
 }

@@ -26,6 +26,7 @@ export default function CollectionsView({ archiveId }) {
   const [newSlug, setNewSlug] = useState('')
   const [newVis, setNewVis] = useState(2)
   const [creating, setCreating] = useState(false)
+  const [newRequiresAuth, setNewRequiresAuth] = useState(true)
   const [createError, setCreateError] = useState(null)
 
   // Add-entry form
@@ -75,6 +76,9 @@ export default function CollectionsView({ archiveId }) {
 
   // Auto-focus rename input
   useEffect(() => { if (renaming && renameRef.current) renameRef.current.focus() }, [renaming])
+  useEffect(() => {
+    if (collDetail != null) setAddVis(collDetail.default_visibility_bits)
+  }, [collDetail])
 
   async function handleCreate(e) {
     e.preventDefault()
@@ -84,10 +88,11 @@ export default function CollectionsView({ archiveId }) {
     setCreating(true)
     setCreateError(null)
     try {
-      const coll = await createCollection(archiveId, name, slug, newVis)
+      const coll = await createCollection(archiveId, name, slug, newVis, newRequiresAuth)
       setNewName('')
       setNewSlug('')
       setNewVis(2)
+      setNewRequiresAuth(true)
       await refreshList()
       setSelectedUid(coll.collection_uid)
     } catch (err) {
@@ -121,6 +126,18 @@ export default function CollectionsView({ archiveId }) {
       setError(e.message)
     }
   }
+
+  async function handleAuthChange(val) {
+    if (!selected) return
+    try {
+      await updateCollection(archiveId, selected.collection_uid, { requires_auth: val })
+      await refreshList()
+      setCollDetail(d => d ? { ...d, requires_auth: val } : d)
+    } catch (e) {
+      setError(e.message)
+    }
+  }
+
 
   async function handleDelete() {
     if (!selected) return
@@ -238,7 +255,7 @@ export default function CollectionsView({ archiveId }) {
 
             {/* Visibility */}
             <div className="coll-detail-vis">
-              <span className="coll-vis-label">Default visibility</span>
+              <span className="coll-vis-label">Entries' default visibility</span>
               <select
                 className="coll-vis-select"
                 value={collDetail?.default_visibility_bits ?? selected.default_visibility_bits}
@@ -246,6 +263,19 @@ export default function CollectionsView({ archiveId }) {
               >
                 {VIS_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
               </select>
+            </div>
+
+            {/* Auth requirement */}
+            <div className="coll-detail-vis">
+              <span className="coll-vis-label">Collection access</span>
+              <label className="coll-auth-label">
+                <input
+                  type="checkbox"
+                  checked={!!(collDetail?.requires_auth ?? selected.requires_auth)}
+                  onChange={e => handleAuthChange(e.target.checked)}
+                />
+                {' Require authentication to view'}
+              </label>
             </div>
 
             {/* Entries */}
@@ -351,11 +381,21 @@ export default function CollectionsView({ archiveId }) {
             />
           </div>
           <div className="form-field">
-            <label className="form-label" htmlFor="coll-vis">Default visibility</label>
+            <label className="form-label" htmlFor="coll-vis">Entries' default visibility</label>
             <select className="capture-input" id="coll-vis" style={{ height: 42 }}
               value={newVis} onChange={e => setNewVis(Number(e.target.value))}>
               {VIS_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
             </select>
+          </div>
+          <div className="form-field">
+            <label className="form-label">
+              <input
+                type="checkbox"
+                checked={newRequiresAuth}
+                onChange={e => setNewRequiresAuth(e.target.checked)}
+              />
+              {' Require authentication to view'}
+            </label>
           </div>
           {createError && <div className="collections-error">{createError}</div>}
           <button className="btn-primary" type="submit" disabled={creating}>

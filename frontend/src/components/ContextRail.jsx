@@ -11,7 +11,7 @@ const ExternalIcon = () => (
   </svg>
 )
 
-export default function ContextRail({ archiveId, selectedEntry, selectedUids, selectedEntries, detail, onTagFilterSet, tagNodes, onTagsRefresh, onEntryTitleChange, onEntryDeleted, onBulkDeleted, humanizeTags, onDetailRefresh, onOpenPreview, onPlay }) {
+export default function ContextRail({ archiveId, selectedEntry, selectedUids, selectedEntries, detail, onTagFilterSet, tagNodes, onTagsRefresh, onEntryTitleChange, onEntryDeleted, onBulkDeleted, humanizeTags, onDetailRefresh, onOpenPreview, onPlay, isPublicSession }) {
   const [tags, setTags] = useState([])
   const [assignInput, setAssignInput] = useState('')
   const [entryCollections, setEntryCollections] = useState([])
@@ -36,6 +36,9 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
   const [bulkCollState, setBulkCollState] = useState('idle') // 'idle'|'running'|'done'|'error'
   const [bulkCollError, setBulkCollError] = useState('')
   const [bulkDeleteState, setBulkDeleteState] = useState('idle') // 'idle'|'running'
+  const [singleCollUid, setSingleCollUid] = useState('')
+  const [singleCollState, setSingleCollState] = useState('idle')
+  const [singleCollError, setSingleCollError] = useState('')
 
   useEffect(() => {
     const seq = ++selectSeqRef.current
@@ -43,6 +46,12 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
     setRearchiveState('idle')
     setRearchiveError('')
     if (!selectedEntry || !archiveId) {
+      setTags([])
+      setEntryCollections([])
+      return
+    }
+    // Skip auth-required tag/collection fetches for public guests.
+    if (isPublicSession) {
       setTags([])
       setEntryCollections([])
       return
@@ -59,7 +68,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
       setTags(tgs)
       setEntryCollections(ecs)
     }).catch(() => {})
-  }, [selectedEntry, archiveId])
+  }, [selectedEntry, archiveId, isPublicSession])
 
   useEffect(() => {
     return () => {
@@ -67,11 +76,11 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
     }
   }, [])
 
-  // Fetch available collections when entering bulk mode
+  // Fetch available collections whenever archiveId is available
   useEffect(() => {
-    if (!isBulk || !archiveId) { setCollections([]); return }
+    if (!archiveId) { setCollections([]); return }
     listCollections(archiveId).then(setCollections).catch(() => setCollections([]))
-  }, [isBulk, archiveId])
+  }, [archiveId])
 
   // Reset transient bulk state when selection changes
   useEffect(() => {
@@ -82,6 +91,9 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
     setBulkCollState('idle')
     setBulkCollError('')
     setBulkDeleteState('idle')
+    setSingleCollUid('')
+    setSingleCollState('idle')
+    setSingleCollError('')
   }, [selectedUids])
 
   async function handleBulkDelete() {
@@ -125,9 +137,10 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
     setBulkCollState('running')
     setBulkCollError('')
     const failed = []
+    const coll = collections.find(c => c.collection_uid === bulkCollUid)
     for (const uid of selectedUids) {
       try {
-        await addEntryToCollection(archiveId, bulkCollUid, uid)
+        await addEntryToCollection(archiveId, bulkCollUid, uid, coll?.default_visibility_bits ?? 2)
       } catch (err) {
         failed.push(uid)
       }
@@ -138,6 +151,25 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
     } else {
       setBulkCollState('done')
       setTimeout(() => setBulkCollState('idle'), 1800)
+    }
+  }
+
+  async function handleSingleAddToCollection() {
+    if (!singleCollUid || !selectedEntry) return
+    setSingleCollState('running')
+    setSingleCollError('')
+    const coll = collections.find(c => c.collection_uid === singleCollUid)
+    try {
+      await addEntryToCollection(archiveId, singleCollUid, selectedEntry.entry_uid, coll?.default_visibility_bits ?? 2)
+      setSingleCollState('done')
+      setSingleCollUid('')
+      // Refresh collection membership list
+      const updated = await listEntryCollections(archiveId, selectedEntry.entry_uid)
+      setEntryCollections(updated)
+      setTimeout(() => setSingleCollState('idle'), 1800)
+    } catch (err) {
+      setSingleCollError(err.message)
+      setSingleCollState('error')
     }
   }
 
@@ -262,6 +294,12 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
       <div className="rail-eyebrow">Context</div>
 
       {isBulk ? (
+        isPublicSession ? (
+          <p className="bulk-count">
+            <span className="bulk-count-num">{selectedUids.size}</span>
+            {' entries selected'}
+          </p>
+        ) : (
         <div className="bulk-panel">
           <p className="bulk-count">
             <span className="bulk-count-num">{selectedUids.size}</span>
@@ -304,7 +342,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
                   onChange={e => setBulkCollUid(e.target.value)}
                 >
                   <option value="">Pick a collection…</option>
-                  {collections.map(c => (
+                  {collections.filter(c => c.slug !== '_default_').map(c => (
                     <option key={c.collection_uid} value={c.collection_uid}>{c.name}</option>
                   ))}
                 </select>
@@ -334,13 +372,18 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
             </button>
           </div>
         </div>
+        )
       ) : !selectedEntry ? (
         <p className="tags-empty">Select an entry.</p>
       ) : !detail ? (
         <p className="tags-empty">Loading\u2026</p>
       ) : (
         <>
-          {editingTitle ? (
+          {isPublicSession ? (
+            <h2 className="rail-title">
+              {valueText(detail.summary.title) || valueText(detail.summary.entry_uid)}
+            </h2>
+          ) : editingTitle ? (
             <input
               className="rail-title-input"
               autoFocus
@@ -460,8 +503,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
           })()}
         </>
       )}
-
-      {selectedEntry && !isBulk && (
+      {selectedEntry && !isBulk && !isPublicSession && (
         <>
           <div className="rail-section">
             <div className="rail-section-heading">Tags</div>
@@ -499,17 +541,41 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
             </div>
           </div>
 
-          {entryCollections.length > 0 && (
+          {(entryCollections.length > 0 || collections.filter(c => c.slug !== '_default_').length > 0) && (
             <div className="rail-section">
               <div className="rail-section-heading">Collections</div>
               {entryCollections.map(c => (
                 <div key={c.collection_uid} className="coll-row">
-                  <span className="coll-name">{c.collection_uid}</span>
+                  <span className="coll-name">{c.name}</span>
                   <span className="vis-badge">
                     {VIS_LABEL[c.visibility_bits] ?? `bits:${c.visibility_bits}`}
                   </span>
                 </div>
               ))}
+              {collections.filter(c => c.slug !== '_default_').length > 0 && (
+                <div className="bulk-coll-row" style={{ marginTop: 8 }}>
+                  <select
+                    className="bulk-coll-select"
+                    value={singleCollUid}
+                    onChange={e => setSingleCollUid(e.target.value)}
+                  >
+                    <option value="">Add to collection…</option>
+                    {collections.filter(c => c.slug !== '_default_').map(c => (
+                      <option key={c.collection_uid} value={c.collection_uid}>{c.name}</option>
+                    ))}
+                  </select>
+                  <button
+                    className="tag-add-btn"
+                    onClick={handleSingleAddToCollection}
+                    disabled={!singleCollUid || singleCollState === 'running'}
+                  >
+                    {singleCollState === 'running' ? '…' : singleCollState === 'done' ? '✓' : singleCollState === 'error' ? '!' : 'Add'}
+                  </button>
+                </div>
+              )}
+              {singleCollError && (
+                <p className="form-msg form-msg--err" style={{ margin: '4px 0 0' }}>{singleCollError}</p>
+              )}
             </div>
           )}
 

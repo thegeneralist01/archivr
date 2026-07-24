@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo, createContext } from 'react'
-import { fetchArchives, fetchEntries, searchEntries, fetchRuns, fetchTags, checkSetup, fetchMe, fetchEntryDetail } from './api'
+import { fetchArchives, fetchEntries, searchEntries, fetchRuns, fetchTags, checkSetup, fetchMe, fetchEntryDetail, listCollections } from './api'
 import LoginPage from './components/LoginPage.jsx'
 import SetupPage from './components/SetupPage.jsx'
 
@@ -20,14 +20,14 @@ import ToastStack from './components/ToastStack'
 
 export const AuthContext = createContext(null);
 
+const VIEWS = ['archive','tags','collections','runs','admin','settings']
+const SETTINGS_TABS = ['profile','tokens','instance','cookies','extensions','storage']
+
 // Detect /preview/:archiveId/:entryUid at load time (static — no navigation)
 const PREVIEW_ROUTE = (() => {
   const m = window.location.pathname.match(/^\/preview\/([^/]+)\/([^/]+)/)
   return m ? { archiveId: m[1], entryUid: m[2] } : null
 })()
-
-const VIEWS = ['archive','tags','collections','runs','admin','settings']
-const SETTINGS_TABS = ['profile','tokens','instance','cookies','extensions','storage']
 
 function parseLocation() {
   const parts = window.location.pathname.split('/').filter(Boolean)
@@ -37,7 +37,14 @@ function parseLocation() {
   const q = params.get('q') ?? ''
   const tag = view === 'archive' ? (params.get('tag') ?? null) : null
   const entry = view === 'archive' ? (params.get('entry') ?? null) : null
-  return { view, settingsTab, q, tag, entry }
+  // 'main' is the user-facing alias for the default collection; normalize to null
+  // so the collection dropdown shows "All entries" and no ?collection param is needed.
+  const rawColl = view === 'archive' ? (params.get('collection') ?? null) : null
+  const collection = rawColl === 'main' ? null : rawColl
+  // ?archive=<id> pins a specific archive for public-collection sharing in multi-archive
+  // setups; without it the bootstrap tries archives[0] which may be the wrong one.
+  const archive = params.get('archive') ?? null
+  return { view, settingsTab, q, tag, entry, collection, archive }
 }
 
 function locationPath(view, settingsTab) {
@@ -55,22 +62,48 @@ export default function App() {
       const needsSetup = await checkSetup();
       if (needsSetup) { setAuthState('setup'); return; }
       const user = await fetchMe();
-      if (!user) { setAuthState('login'); return; }
+      if (!user) {
+        // Before showing login: check whether the active collection is publicly accessible.
+        // fetchArchives is unauthenticated. ?archive=<id> pins the archive for multi-archive
+        // setups; without it we try archives[0] (works for the common single-archive case).
+        const { collection, archive: archiveParam } = parseLocation();
+        try {
+          const archiveList = await fetchArchives();
+          const aid = archiveParam
+            ? (archiveList.find(a => a.id === archiveParam)?.id ?? archiveList[0]?.id)
+            : archiveList[0]?.id;
+          if (aid) {
+            await fetchEntries(aid, collection); // 401 if collection requires auth
+            setArchives(archiveList);
+            setArchiveId(aid);
+            setSelectedCollectionUid(collection);
+            setAuthState('authenticated');
+            return;
+          }
+        } catch { /* not public or error — fall through to login */ }
+        setAuthState('login');
+        return;
+      }
       setCurrentUser(user);
       setAuthState('authenticated');
     })();
   }, []);
 
+  // Suppress auth:expired redirect when browsing as a public guest (no currentUser).
+  // Without this, incidental 401s on auth-required tabs would kick guests to login.
   useEffect(() => {
-    const handler = () => { setCurrentUser(null); setAuthState('login'); };
+    const handler = () => {
+      if (!currentUser) return;
+      setCurrentUser(null); setAuthState('login');
+    };
     window.addEventListener('auth:expired', handler);
     return () => window.removeEventListener('auth:expired', handler);
-  }, []);
+  }, [currentUser]);
 
   // Sync URL → state on back/forward
   useEffect(() => {
     const handler = () => {
-      const { view, settingsTab, q, tag, entry } = parseLocation()
+      const { view, settingsTab, q, tag, entry, collection } = parseLocation()
       setView(view)
       setSettingsTab(settingsTab)
       setSearchQuery(q)
@@ -78,6 +111,7 @@ export default function App() {
       setSelectedEntryUid(entry)
       setSelectedEntry(null)
       setSelectedUids(entry ? new Set([entry]) : new Set())
+      setSelectedCollectionUid(collection)
     }
     window.addEventListener('popstate', handler)
     return () => window.removeEventListener('popstate', handler)
@@ -85,6 +119,8 @@ export default function App() {
 
   const [archives, setArchives] = useState([])
   const [archiveId, setArchiveId] = useState(null)
+  const [selectedCollectionUid, setSelectedCollectionUid] = useState(() => parseLocation().collection)
+  const [collections, setCollections] = useState([])
   const [entries, setEntries] = useState([])
   const [deletedUids, setDeletedUids] = useState(() => new Set())
   const [selectedEntryUid, setSelectedEntryUid] = useState(() => parseLocation().entry)
@@ -140,7 +176,8 @@ export default function App() {
 
   const humanizeTags = currentUser?.humanize_slugs ?? false;
 
-  // Fetch entry detail whenever selected entry changes
+  // Fetch entry detail whenever selected entry changes.
+  // The backend gates by public accessibility, so guests get detail for public entries too.
   useEffect(() => {
     const seq = ++detailSeqRef.current
     setEntryDetail(null)
@@ -156,15 +193,15 @@ export default function App() {
     sessionStorage.setItem('captureDialogOpen', captureDialogOpen)
   }, [captureDialogOpen])
 
-  const loadEntries = useCallback(async (aid, q, tag) => {
+  const loadEntries = useCallback(async (aid, q, tag, collUid) => {
     if (!aid) return
     setSearchBusy(true)
     try {
       let results
       if (q || tag) {
-        results = await searchEntries(aid, q, tag)
+        results = await searchEntries(aid, q, tag, collUid)
       } else {
-        results = await fetchEntries(aid)
+        results = await fetchEntries(aid, collUid)
       }
       setEntries(results)
       // Prune multi-selection to only entries still visible after load.
@@ -184,51 +221,57 @@ export default function App() {
     }
   }, [])
 
-  // Load archives once authenticated (re-runs when authState changes so
-  // it triggers correctly after first login or a session refresh).
+  // Load archives once authenticated. Public-session auth also pre-sets archiveId in the auth
+  // useEffect; this effect handles the normal authenticated path and page refreshes.
   useEffect(() => {
     if (authState !== 'authenticated') return
+    if (archiveId) return // already set (public-session path set it synchronously)
     fetchArchives().then(list => {
       setArchives(list)
       if (list.length > 0) {
-        const first = list[0].id
-        setArchiveId(first)
+        const { archive: archiveParam } = parseLocation()
+        const preferred = archiveParam ? list.find(a => a.id === archiveParam) : null
+        setArchiveId(preferred?.id ?? list[0].id)
       }
     })
-  }, [authState])
+  }, [authState, archiveId])
 
   // Archive change: parallel load entries + runs + tags
+  // Archive change: load entries + runs/tags (runs/tags skipped for public guests).
   useEffect(() => {
     if (!archiveId) return
+    const isGuest = !currentUser
     if (firstArchiveLoad.current) {
-      // First load: URL-initialized filters are already in state; the debounced
-      // search and tagFilter effects will call loadEntries with the right values.
       firstArchiveLoad.current = false
-      Promise.all([
-        fetchRuns(archiveId).then(setRuns),
-        fetchTags(archiveId).then(setTagNodes),
-      ])
+      const tasks = []
+      if (!isGuest) {
+        tasks.push(fetchRuns(archiveId).then(setRuns))
+        tasks.push(fetchTags(archiveId).then(setTagNodes))
+      }
+      if (tasks.length) Promise.all(tasks)
       return
     }
     setTagFilter(null)
     setSelectedEntry(null)
     setSelectedEntryUid(null)
     setSelectedUids(new Set())
-    Promise.all([
-      loadEntries(archiveId, '', null),
-      fetchRuns(archiveId).then(setRuns),
-      fetchTags(archiveId).then(setTagNodes),
-    ])
-  }, [archiveId]) // intentionally not including loadEntries to avoid re-running on its recreation
+    setSelectedCollectionUid(null)
+    const tasks = [loadEntries(archiveId, '', null, null)]
+    if (!isGuest) {
+      tasks.push(fetchRuns(archiveId).then(setRuns))
+      tasks.push(fetchTags(archiveId).then(setTagNodes))
+    }
+    Promise.all(tasks)
+  }, [archiveId, currentUser]) // currentUser distinguishes guest vs authenticated
 
-  // Debounced search
+  // Debounced search — scoped to active collection
   useEffect(() => {
     if (archiveId === null) return
     const timer = setTimeout(() => {
-      loadEntries(archiveId, searchQuery, tagFilter)
+      loadEntries(archiveId, searchQuery, tagFilter, selectedCollectionUid)
     }, 300)
     return () => clearTimeout(timer)
-  }, [searchQuery, archiveId]) // tagFilter handled separately below
+  }, [searchQuery, archiveId, selectedCollectionUid])
 
   // Tag filter applied: switch to archive view and reload.
   // Only reset view when tagFilter is non-null; archive change alone (tagFilter=null)
@@ -236,12 +279,46 @@ export default function App() {
   useEffect(() => {
     if (archiveId === null) return
     if (tagFilter !== null) setView('archive')
-    loadEntries(archiveId, searchQuery, tagFilter)
-  }, [tagFilter, archiveId]) // intentional: searchQuery excluded to avoid double-fire
+    loadEntries(archiveId, searchQuery, tagFilter, selectedCollectionUid)
+  }, [tagFilter, archiveId, selectedCollectionUid])
 
   const handleArchiveChange = useCallback((id) => {
     setArchiveId(id)
+    setSelectedCollectionUid(null)
+    // Update URL so refresh/share reopens the correct archive.
+    const params = new URLSearchParams(window.location.search)
+    params.set('archive', id)
+    params.delete('collection')
+    const qs = params.toString()
+    history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : ''))
   }, [])
+
+  // Load collection list for the switcher — listCollections is now public so guests get it too.
+  useEffect(() => {
+    if (!archiveId) { setCollections([]); return }
+    listCollections(archiveId).then(setCollections).catch(() => setCollections([]))
+  }, [archiveId])
+
+  const handleCollectionChange = useCallback((uid) => {
+    // Resolve which collection record applies: named uid or the _default_ collection.
+    // If the guest would land on an auth-required collection, redirect to login.
+    if (!currentUser) {
+      const coll = uid
+        ? collections.find(c => c.collection_uid === uid)
+        : collections.find(c => c.slug === '_default_')
+      if (coll?.requires_auth) { setAuthState('login'); return }
+    }
+    setSelectedCollectionUid(uid)
+    setSelectedEntry(null)
+    setSelectedEntryUid(null)
+    setSelectedUids(new Set())
+    loadEntries(archiveId, searchQuery, tagFilter, uid)
+    const params = new URLSearchParams(window.location.search)
+    if (uid) { params.set('collection', uid); params.set('archive', archiveId) }
+    else { params.delete('collection'); if (archiveId) params.set('archive', archiveId) }
+    const qs = params.toString()
+    history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : ''))
+  }, [archiveId, searchQuery, tagFilter, currentUser, collections, loadEntries])
 
   const handleViewChange = useCallback((name) => {
     setView(name)
@@ -380,8 +457,8 @@ export default function App() {
     setSelectedEntryUid(prev => prev === entryUid ? null : prev)
     setSelectedUids(prev => { const n = new Set(prev); n.delete(entryUid); return n })
     // Child delete: parent row's child_count/size are stale — reload after state updates.
-    if (!isRoot) loadEntries(archiveId, searchQuery, tagFilter)
-  }, [entries, archiveId, searchQuery, tagFilter, loadEntries])
+    if (!isRoot) loadEntries(archiveId, searchQuery, tagFilter, selectedCollectionUid)
+  }, [entries, archiveId, searchQuery, tagFilter, selectedCollectionUid, loadEntries])
 
   const handleBulkDeleted = useCallback((uids) => {
     const rootUids = new Set(entries.map(e => e.entry_uid))
@@ -391,8 +468,8 @@ export default function App() {
     setSelectedUids(new Set())
     setSelectedEntry(null)
     setSelectedEntryUid(null)
-    if (hasChildDelete) loadEntries(archiveId, searchQuery, tagFilter)
-  }, [entries, archiveId, searchQuery, tagFilter, loadEntries])
+    if (hasChildDelete) loadEntries(archiveId, searchQuery, tagFilter, selectedCollectionUid)
+  }, [entries, archiveId, searchQuery, tagFilter, selectedCollectionUid, loadEntries])
 
   // Auto-snap: drive selectedEntryUid from selectedUids so URL sync and detail
   // panel stay correct. size >= 2 clears single-entry state (bulk panel takes over).
@@ -424,17 +501,27 @@ export default function App() {
   }, [entries, selectedEntryUid, selectedEntry])
 
   // Sync search params → URL via replaceState (no new history entry).
+  // ?archive=<id> is preserved whenever it was already in the URL (sticky) so that
+  // multi-archive public links (?archive=other) survive navigation to the default collection.
   useEffect(() => {
     if (PREVIEW_ROUTE) return
+    const existingArchive = new URLSearchParams(window.location.search).get('archive')
     const params = new URLSearchParams()
     if (searchQuery) params.set('q', searchQuery)
     if (view === 'archive' && tagFilter) params.set('tag', tagFilter)
     if (view === 'archive' && selectedEntryUid) params.set('entry', selectedEntryUid)
+    if (view === 'archive' && selectedCollectionUid) {
+      params.set('collection', selectedCollectionUid)
+      if (archiveId) params.set('archive', archiveId)
+    } else if (existingArchive && archiveId) {
+      // Preserve ?archive when already in the URL (e.g. default collection public link)
+      params.set('archive', archiveId)
+    }
     const qs = params.toString()
     const url = window.location.pathname + (qs ? '?' + qs : '')
     const current = window.location.pathname + window.location.search
     if (current !== url) history.replaceState(null, '', url)
-  }, [searchQuery, tagFilter, selectedEntryUid, view])
+  }, [searchQuery, tagFilter, selectedEntryUid, selectedCollectionUid, archiveId, view])
 
   // ⌘K / Ctrl+K / /: focus the search input, switching to archive view first if needed.
   useEffect(() => {
@@ -533,10 +620,10 @@ export default function App() {
   const handleCaptured = useCallback(() => {
     if (!archiveId) return
     return Promise.allSettled([
-      loadEntries(archiveId, searchQuery, tagFilter),
+      loadEntries(archiveId, searchQuery, tagFilter, selectedCollectionUid),
       fetchRuns(archiveId).then(setRuns),
     ])
-  }, [archiveId, searchQuery, tagFilter, loadEntries])
+  }, [archiveId, searchQuery, tagFilter, selectedCollectionUid, loadEntries])
 
   const handleToast = useCallback((text, locator, type = 'error', headline = null) => {
     // Only suppress per-item ublock/cookie warnings (those carry a locator).
@@ -604,10 +691,10 @@ export default function App() {
     return () => document.body.classList.remove('has-audio-bar')
   }, [currentAudio])
 
+  if (PREVIEW_ROUTE)           return <PreviewPage archiveId={PREVIEW_ROUTE.archiveId} entryUid={PREVIEW_ROUTE.entryUid} />;
   if (authState === 'loading') return <div className="auth-loading">Loading\u2026</div>;
   if (authState === 'setup')   return <SetupPage onComplete={() => setAuthState('login')} />;
   if (authState === 'login')   return <LoginPage onLogin={user => { setCurrentUser(user); setAuthState('authenticated'); }} />;
-  if (PREVIEW_ROUTE)           return <PreviewPage archiveId={PREVIEW_ROUTE.archiveId} entryUid={PREVIEW_ROUTE.entryUid} />;
 
   return (
     <AuthContext.Provider value={{ currentUser, setCurrentUser }}>
@@ -619,6 +706,11 @@ export default function App() {
           view={view}
           onViewChange={handleViewChange}
           onCaptureClick={handleCaptureClick}
+          collections={collections}
+          selectedCollectionUid={selectedCollectionUid}
+          onCollectionChange={handleCollectionChange}
+          isPublicSession={!currentUser}
+          onSignInClick={() => setAuthState('login')}
         />
         <main className="app-shell">
           <div className="workspace">
@@ -660,6 +752,7 @@ export default function App() {
                 archiveId={archiveId}
                 pendingCaptures={pendingCaptures}
                 deletedUids={deletedUids}
+                isPublicSession={!currentUser}
               />
             )}
             {view === 'runs' && <RunsView runs={runs} />}
@@ -700,6 +793,7 @@ export default function App() {
             onDetailRefresh={handleDetailRefresh}
             onOpenPreview={handleOpenPreview}
             onPlay={handlePlay}
+            isPublicSession={!currentUser}
           />
         </main>
         {previewEntryUid && selectedEntry && selectedEntry.entry_uid === previewEntryUid && (

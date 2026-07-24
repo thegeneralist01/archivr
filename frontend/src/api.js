@@ -10,14 +10,18 @@ export async function fetchArchives() {
   return getJson("/api/archives");
 }
 
-export async function fetchEntries(archiveId) {
-  return getJson(`/api/archives/${archiveId}/entries`);
+export async function fetchEntries(archiveId, collectionUid = null) {
+  const url = collectionUid
+    ? `/api/archives/${archiveId}/entries?collection=${encodeURIComponent(collectionUid)}`
+    : `/api/archives/${archiveId}/entries`
+  return getJson(url)
 }
 
-export async function searchEntries(archiveId, q, tag) {
+export async function searchEntries(archiveId, q, tag, collectionUid = null) {
   const params = new URLSearchParams();
   if (q) params.set("q", q);
   if (tag) params.set("tag", tag);
+  if (collectionUid) params.set("collection", collectionUid);
   return getJson(`/api/archives/${archiveId}/entries/search?${params}`);
 }
 
@@ -358,11 +362,11 @@ export async function listCollections(archiveId) {
   return getJson(`/api/archives/${archiveId}/collections`);
 }
 
-export async function createCollection(archiveId, name, slug, defaultVisibilityBits = 2) {
+export async function createCollection(archiveId, name, slug, defaultVisibilityBits = 2, requiresAuth = true) {
   const res = await fetch(`/api/archives/${archiveId}/collections`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name, slug, default_visibility_bits: defaultVisibilityBits }),
+    body: JSON.stringify({ name, slug, default_visibility_bits: defaultVisibilityBits, requires_auth: requiresAuth }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));

@@ -100,6 +100,7 @@ pub struct CollectionSummary {
     pub name: String,
     pub slug: String,
     pub default_visibility_bits: u32,
+    pub requires_auth: bool,
     pub created_at: String,
 }
 
@@ -405,6 +406,7 @@ pub fn list_collections(conn: &rusqlite::Connection) -> Result<Vec<CollectionSum
             name: r.name,
             slug: r.slug,
             default_visibility_bits: r.default_visibility_bits,
+            requires_auth: r.requires_auth,
             created_at: r.created_at,
         })
         .collect())
@@ -414,6 +416,7 @@ pub fn list_collections(conn: &rusqlite::Connection) -> Result<Vec<CollectionSum
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EntryCollectionMembership {
     pub collection_uid: String,
+    pub name: String,
     pub visibility_bits: u32,
 }
 
@@ -437,8 +440,9 @@ pub fn get_entry_collections(
     Ok(Some(
         memberships
             .into_iter()
-            .map(|(_, uid, bits)| EntryCollectionMembership {
+            .map(|(_, uid, name, bits)| EntryCollectionMembership {
                 collection_uid: uid,
+                name,
                 visibility_bits: bits,
             })
             .collect(),
@@ -642,6 +646,7 @@ pub struct SearchEntriesQuery {
     /// Role bits of the caller for visibility filtering. Admins (bits 4/8) bypass all filters.
     /// Pass `u32::MAX` internally to bypass all visibility. Pass 0 for unauthenticated guests only.
     pub caller_bits: u32,
+    pub collection_id: Option<i64>,
 }
 
 impl Default for SearchEntriesQuery {
@@ -656,6 +661,7 @@ impl Default for SearchEntriesQuery {
             before: None,
             tag: None,
             caller_bits: u32::MAX,
+            collection_id: None,
         }
     }
 }
@@ -787,14 +793,29 @@ pub fn search_entries(
         params.push(b.clone());
     }
 
-    // Visibility filter
-    let n = params.len() + 1;
-    sql.push_str(&format!(
-        " AND (CAST(?{n} AS INTEGER) & 12 != 0 \
-         OR EXISTS (SELECT 1 FROM collection_entries ce \
-         WHERE ce.entry_id = e.id AND ce.visibility_bits & CAST(?{n} AS INTEGER) != 0))"
-    ));
-    params.push(query.caller_bits.to_string());
+    // Collection scope + visibility filter.
+    if let Some(coll_id) = query.collection_id {
+        let cn = params.len() + 1;
+        let vn = params.len() + 2;
+        sql.push_str(&format!(
+            " AND EXISTS (\
+                SELECT 1 FROM collection_entries cef \
+                WHERE cef.entry_id = e.id AND cef.collection_id = ?{cn} \
+                AND (CAST(?{vn} AS INTEGER) & 12 != 0 \
+                     OR cef.visibility_bits & CAST(?{vn} AS INTEGER) != 0)\
+            )"
+        ));
+        params.push(coll_id.to_string());
+        params.push(query.caller_bits.to_string());
+    } else {
+        let n = params.len() + 1;
+        sql.push_str(&format!(
+            " AND (CAST(?{n} AS INTEGER) & 12 != 0 \
+             OR EXISTS (SELECT 1 FROM collection_entries ce \
+             WHERE ce.entry_id = e.id AND ce.visibility_bits & CAST(?{n} AS INTEGER) != 0))"
+        ));
+        params.push(query.caller_bits.to_string());
+    }
 
     sql.push_str(" GROUP BY e.id ORDER BY e.archived_at DESC, e.id DESC");
 
@@ -2021,7 +2042,7 @@ mod tests {
             "Video 1", "https://example.com/pl/v1");
 
         // Enroll the container (but NOT the child) in a USER-visible collection (bits=2).
-        let coll = database::create_collection(&conn, "My List", "my-list", 2).unwrap();
+        let coll = database::create_collection(&conn, "My List", "my-list", 2, true).unwrap();
         database::add_entry_to_collection(&conn, coll.id, container.id, 2).unwrap();
 
         // USER caller (bits=2): child must be visible through parent's collection.

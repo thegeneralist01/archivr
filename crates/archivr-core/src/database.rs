@@ -163,6 +163,7 @@ pub struct CollectionRecord {
     pub name: String,
     pub slug: String,
     pub default_visibility_bits: u32,
+    pub requires_auth: bool,
     pub created_at: String,
 }
 
@@ -339,6 +340,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             name                    TEXT NOT NULL,
             slug                    TEXT NOT NULL UNIQUE,
             default_visibility_bits INTEGER NOT NULL DEFAULT 2,
+            requires_auth           INTEGER NOT NULL DEFAULT 1,
             created_at              TEXT NOT NULL
         );
 
@@ -434,6 +436,12 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     // Migration: add notes_json column to existing capture_jobs tables.
     // Silently ignored when the column already exists (idempotent).
     let _ = conn.execute("ALTER TABLE capture_jobs ADD COLUMN notes_json TEXT", []);
+    // Migration: add requires_auth column to existing collections tables.
+    // Silently ignored when the column already exists (idempotent).
+    let _ = conn.execute(
+        "ALTER TABLE collections ADD COLUMN requires_auth INTEGER NOT NULL DEFAULT 1",
+        [],
+    );
 
     Ok(())
 }
@@ -2349,6 +2357,7 @@ pub fn create_collection(
     name: &str,
     slug: &str,
     default_visibility_bits: u32,
+    requires_auth: bool,
 ) -> Result<CollectionRecord> {
     if slug.is_empty() || slug.starts_with('_') {
         anyhow::bail!("collection slug must be non-empty and not start with underscore");
@@ -2356,13 +2365,14 @@ pub fn create_collection(
     let collection_uid = public_id("coll");
     let now = now_timestamp();
     conn.execute(
-        "INSERT INTO collections (collection_uid, name, slug, default_visibility_bits, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO collections (collection_uid, name, slug, default_visibility_bits, requires_auth, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             collection_uid,
             name,
             slug,
             default_visibility_bits as i64,
+            requires_auth as i64,
             now
         ],
     )?;
@@ -2373,6 +2383,7 @@ pub fn create_collection(
         name: name.to_string(),
         slug: slug.to_string(),
         default_visibility_bits,
+        requires_auth,
         created_at: now,
     })
 }
@@ -2380,7 +2391,7 @@ pub fn create_collection(
 /// Lists all collections ordered by creation date.
 pub fn list_collections(conn: &Connection) -> Result<Vec<CollectionRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT id, collection_uid, name, slug, default_visibility_bits, created_at \
+        "SELECT id, collection_uid, name, slug, default_visibility_bits, created_at, requires_auth \
          FROM collections ORDER BY created_at ASC",
     )?;
     stmt.query_map([], |row| {
@@ -2391,6 +2402,7 @@ pub fn list_collections(conn: &Connection) -> Result<Vec<CollectionRecord>> {
             slug: row.get(3)?,
             default_visibility_bits: row.get::<_, i64>(4)? as u32,
             created_at: row.get(5)?,
+            requires_auth: row.get::<_, i64>(6)? != 0,
         })
     })?
     .collect::<Result<_, _>>()
@@ -2400,7 +2412,7 @@ pub fn list_collections(conn: &Connection) -> Result<Vec<CollectionRecord>> {
 /// Returns a collection by its uid, or None if not found.
 pub fn get_collection_by_uid(conn: &Connection, uid: &str) -> Result<Option<CollectionRecord>> {
     conn.query_row(
-        "SELECT id, collection_uid, name, slug, default_visibility_bits, created_at \
+        "SELECT id, collection_uid, name, slug, default_visibility_bits, created_at, requires_auth \
          FROM collections WHERE collection_uid = ?1",
         [uid],
         |row| {
@@ -2411,11 +2423,30 @@ pub fn get_collection_by_uid(conn: &Connection, uid: &str) -> Result<Option<Coll
                 slug: row.get(3)?,
                 default_visibility_bits: row.get::<_, i64>(4)? as u32,
                 created_at: row.get(5)?,
+                requires_auth: row.get::<_, i64>(6)? != 0,
             })
         },
     )
     .optional()
     .map_err(Into::into)
+}
+
+/// Returns a collection by its slug, or None if not found.
+pub fn get_collection_by_slug(conn: &Connection, slug: &str) -> Result<Option<CollectionRecord>> {
+    conn.query_row(
+        "SELECT id, collection_uid, name, slug, default_visibility_bits, created_at, requires_auth \
+         FROM collections WHERE slug = ?1",
+        [slug],
+        |row| Ok(CollectionRecord {
+            id: row.get(0)?,
+            collection_uid: row.get(1)?,
+            name: row.get(2)?,
+            slug: row.get(3)?,
+            default_visibility_bits: row.get::<_, i64>(4)? as u32,
+            created_at: row.get(5)?,
+            requires_auth: row.get::<_, i64>(6)? != 0,
+        }),
+    ).optional().map_err(Into::into)
 }
 
 /// Adds an entry to a collection with given visibility_bits. Idempotent (INSERT OR IGNORE).
@@ -2462,22 +2493,53 @@ pub fn remove_entry_from_collection(
     Ok(n > 0)
 }
 
-/// Returns (collection_id, collection_uid, visibility_bits) for all collections containing an entry.
+/// Returns (collection_id, collection_uid, name, visibility_bits) for all collections containing an entry.
 pub fn get_entry_collection_memberships(
     conn: &Connection,
     entry_id: i64,
-) -> Result<Vec<(i64, String, u32)>> {
+) -> Result<Vec<(i64, String, String, u32)>> {
     let mut stmt = conn.prepare(
-        "SELECT ce.collection_id, c.collection_uid, ce.visibility_bits \
+        "SELECT ce.collection_id, c.collection_uid, c.name, ce.visibility_bits \
          FROM collection_entries ce \
          JOIN collections c ON c.id = ce.collection_id \
          WHERE ce.entry_id = ?1",
     )?;
     stmt.query_map([entry_id], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? as u32))
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, i64>(3)? as u32))
     })?
     .collect::<Result<_, _>>()
     .map_err(Into::into)
+}
+
+/// Returns true if this entry (or its direct parent, for child entries) is in at least one
+/// collection with `requires_auth = false` AND `collection_entries.visibility_bits & ROLE_GUEST (1) != 0`.
+///
+/// Child entries are not directly assigned to collections; they inherit visibility from their
+/// parent's collection membership, matching the logic in `list_child_entries`.
+pub fn is_entry_publicly_accessible(conn: &Connection, entry_uid: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM archived_entries e \
+         WHERE e.entry_uid = ?1 \
+           AND (\
+             EXISTS (\
+               SELECT 1 FROM collection_entries ce \
+               JOIN collections c ON c.id = ce.collection_id \
+               WHERE ce.entry_id = e.id \
+                 AND c.requires_auth = 0 \
+                 AND (ce.visibility_bits & 1) != 0\
+             ) \
+             OR (e.parent_entry_id IS NOT NULL AND EXISTS (\
+               SELECT 1 FROM collection_entries ce_p \
+               JOIN collections c ON c.id = ce_p.collection_id \
+               WHERE ce_p.entry_id = e.parent_entry_id \
+                 AND c.requires_auth = 0 \
+                 AND (ce_p.visibility_bits & 1) != 0\
+             ))\
+           )",
+        [entry_uid],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 /// Renames a collection and/or updates its default_visibility_bits.
@@ -2489,6 +2551,7 @@ pub fn update_collection(
     collection_uid: &str,
     new_name: Option<&str>,
     new_visibility_bits: Option<u32>,
+    requires_auth: Option<bool>,
 ) -> Result<bool> {
     let coll = get_collection_by_uid(conn, collection_uid)?;
     let Some(coll) = coll else { return Ok(false) };
@@ -2497,9 +2560,10 @@ pub fn update_collection(
     }
     let name = new_name.unwrap_or(&coll.name);
     let vbits = new_visibility_bits.unwrap_or(coll.default_visibility_bits);
+    let auth = requires_auth.unwrap_or(coll.requires_auth);
     conn.execute(
-        "UPDATE collections SET name = ?1, default_visibility_bits = ?2 WHERE id = ?3",
-        params![name, vbits as i64, coll.id],
+        "UPDATE collections SET name = ?1, default_visibility_bits = ?2, requires_auth = ?3 WHERE id = ?4",
+        params![name, vbits as i64, auth as i64, coll.id],
     )?;
     Ok(true)
 }
@@ -2962,7 +3026,7 @@ mod tests {
         };
 
         // Changing default_visibility_bits on _default_ must succeed.
-        let updated = update_collection(&conn, &coll_uid, None, Some(3)).unwrap();
+        let updated = update_collection(&conn, &coll_uid, None, Some(3), None).unwrap();
         assert!(updated, "visibility change on _default_ should succeed");
         let bits: u32 = conn
             .query_row(
@@ -2974,7 +3038,7 @@ mod tests {
         assert_eq!(bits, 3, "default_visibility_bits should be updated to 3");
 
         // Renaming _default_ must still be rejected.
-        let err = update_collection(&conn, &coll_uid, Some("My Archive"), None);
+        let err = update_collection(&conn, &coll_uid, Some("My Archive"), None, None);
         assert!(err.is_err(), "renaming _default_ must be rejected");
         assert!(
             err.unwrap_err().to_string().contains("cannot rename"),
