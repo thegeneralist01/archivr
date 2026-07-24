@@ -659,10 +659,16 @@ struct CreateCollectionBody {
     slug: String,
     #[serde(default = "default_user_visibility")]
     default_visibility_bits: u32,
+    #[serde(default = "default_requires_auth")]
+    requires_auth: bool,
 }
 
 fn default_user_visibility() -> u32 {
     2
+}
+
+fn default_requires_auth() -> bool {
+    true
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -681,6 +687,7 @@ struct UpdateVisibilityBody {
 struct PatchCollectionBody {
     name: Option<String>,
     default_visibility_bits: Option<u32>,
+    requires_auth: Option<bool>,
 }
 
 async fn list_tags(
@@ -2302,7 +2309,7 @@ async fn create_collection_handler(
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let record =
-        database::create_collection(&conn, &body.name, &body.slug, body.default_visibility_bits)
+        database::create_collection(&conn, &body.name, &body.slug, body.default_visibility_bits, body.requires_auth)
             .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     Ok((
         StatusCode::CREATED,
@@ -2311,6 +2318,7 @@ async fn create_collection_handler(
             name: record.name,
             slug: record.slug,
             default_visibility_bits: record.default_visibility_bits,
+            requires_auth: record.requires_auth,
             created_at: record.created_at,
         }),
     ))
@@ -2321,11 +2329,13 @@ async fn get_collection_handler(
     auth: AuthUser,
     Path((archive_id, coll_uid)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    auth.require_auth()?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let record = database::get_collection_by_uid(&conn, &coll_uid)?
         .ok_or(ApiError::not_found("collection not found"))?;
+    if record.requires_auth {
+        auth.require_auth()?;
+    }
     let caller_bits = auth_to_caller_bits(&auth);
     let entries = archive::list_entries_for_collection(&conn, record.id, caller_bits)?;
     // Collect per-entry visibility bits from collection_entries
@@ -2358,6 +2368,7 @@ async fn get_collection_handler(
                 "title": e.title,
                 "source_kind": e.source_kind,
                 "archived_at": e.archived_at,
+                "original_url": e.original_url,
                 "collection_visibility_bits": vis,
             })
         })
@@ -2367,6 +2378,7 @@ async fn get_collection_handler(
         "name": record.name,
         "slug": record.slug,
         "default_visibility_bits": record.default_visibility_bits,
+        "requires_auth": record.requires_auth,
         "created_at": record.created_at,
         "entries": entries_json,
     })))
@@ -2482,7 +2494,7 @@ async fn patch_collection_handler(
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let name_ref: Option<&str> = body.name.as_deref();
     let updated =
-        database::update_collection(&conn, &coll_uid, name_ref, body.default_visibility_bits)?;
+        database::update_collection(&conn, &coll_uid, name_ref, body.default_visibility_bits, body.requires_auth)?;
     if updated {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -4660,18 +4672,87 @@ mod tests {
 
     #[tokio::test]
     async fn get_collection_requires_auth() {
+        // Create a collection (requires_auth defaults to true), then confirm
+        // that an unauthenticated GET returns 401, not 404.
         let dir = tempfile::tempdir().unwrap();
         let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let create_resp = app(registry.clone(), auth_path.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/collections")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({
+                        "name": "Auth Required",
+                        "slug": "auth-required",
+                        "default_visibility_bits": 2,
+                        "requires_auth": true
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::CREATED);
+        let coll = body_json(create_resp).await;
+        let coll_uid = coll["collection_uid"].as_str().unwrap().to_string();
+        // Now GET without auth — must be 401 because requires_auth == true.
+        let uri = format!("/api/archives/test/collections/{coll_uid}");
         let response = app(registry, auth_path)
             .oneshot(
                 Request::builder()
-                    .uri("/api/archives/test/collections/coll_notexist")
+                    .uri(&uri)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn get_public_collection_no_auth_returns_ok() {
+        // A collection with requires_auth=false must be reachable by guests.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let create_resp = app(registry.clone(), auth_path.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/collections")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({
+                        "name": "Public Collection",
+                        "slug": "public-coll",
+                        "default_visibility_bits": 3,
+                        "requires_auth": false
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::CREATED);
+        let coll = body_json(create_resp).await;
+        let coll_uid = coll["collection_uid"].as_str().unwrap().to_string();
+        assert_eq!(coll["requires_auth"], false, "requires_auth should be false");
+        // GET without any auth cookie — must be 200.
+        let uri = format!("/api/archives/test/collections/{coll_uid}");
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["requires_auth"], false);
+        assert_eq!(body["name"], "Public Collection");
     }
 
     #[tokio::test]
