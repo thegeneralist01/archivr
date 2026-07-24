@@ -100,6 +100,7 @@ pub struct CollectionSummary {
     pub name: String,
     pub slug: String,
     pub default_visibility_bits: u32,
+    pub requires_auth: bool,
     pub created_at: String,
 }
 
@@ -405,6 +406,7 @@ pub fn list_collections(conn: &rusqlite::Connection) -> Result<Vec<CollectionSum
             name: r.name,
             slug: r.slug,
             default_visibility_bits: r.default_visibility_bits,
+            requires_auth: r.requires_auth,
             created_at: r.created_at,
         })
         .collect())
@@ -414,6 +416,7 @@ pub fn list_collections(conn: &rusqlite::Connection) -> Result<Vec<CollectionSum
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EntryCollectionMembership {
     pub collection_uid: String,
+    pub name: String,
     pub visibility_bits: u32,
 }
 
@@ -437,8 +440,9 @@ pub fn get_entry_collections(
     Ok(Some(
         memberships
             .into_iter()
-            .map(|(_, uid, bits)| EntryCollectionMembership {
+            .map(|(_, uid, name, bits)| EntryCollectionMembership {
                 collection_uid: uid,
+                name,
                 visibility_bits: bits,
             })
             .collect(),
@@ -2021,7 +2025,7 @@ mod tests {
             "Video 1", "https://example.com/pl/v1");
 
         // Enroll the container (but NOT the child) in a USER-visible collection (bits=2).
-        let coll = database::create_collection(&conn, "My List", "my-list", 2).unwrap();
+        let coll = database::create_collection(&conn, "My List", "my-list", 2, true).unwrap();
         database::add_entry_to_collection(&conn, coll.id, container.id, 2).unwrap();
 
         // USER caller (bits=2): child must be visible through parent's collection.
