@@ -11,7 +11,7 @@ This document explains the current project shape after the workspace refactor.
 
 ## The Big Model
 
-Archivr is now a Rust workspace with three crates:
+archivr is now a Rust workspace with three crates:
 
 ```mermaid
 flowchart LR

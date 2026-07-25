@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120">
+  <defs>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@600&amp;display=swap');
+      .mark-letter {
+        font-family: "Cormorant Garamond", Georgia, serif;
+        font-weight: 600;
+        font-size: 74px;
+        fill: #f4ead8;
+        dominant-baseline: middle;
+        text-anchor: middle;
+      }
+    </style>
+  </defs>
+
+  <!-- Accent background -->
+  <rect x="4" y="4" width="112" height="112" rx="16" ry="16" fill="#8d3f30"/>
+  <!-- Letter a -->
+  <text class="mark-letter" x="60" y="63">a</text>
+</svg>

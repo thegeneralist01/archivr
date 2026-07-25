@@ -1,0 +1,954 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Archivr — Brand Guidelines</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;1,400&family=Spectral:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --shell:       #141d18;
+    --shell-2:     #263330;
+    --ink:         #20251f;
+    --paper:       #f5f0e7;
+    --paper-2:     #e9e1d2;
+    --paper-3:     #fffaf0;
+    --field:       #fffdf7;
+    --line:        #d2c6b5;
+    --line-soft:   #e5dccd;
+    --accent:      #8d3f30;
+    --accent-2:    #b78342;
+    --link:        #245f72;
+    --muted:       #6b6f66;
+    --muted-2:     #8a8d83;
+    --brand-text:  #f4ead8;
+
+    --display: 'Cormorant Garamond', Georgia, serif;
+    --serif:   'Spectral', Georgia, serif;
+    --sans:    'Helvetica Neue', Helvetica, Arial, sans-serif;
+  }
+
+  html { background: var(--shell); color: var(--brand-text); font-family: var(--sans); font-size: 14px; -webkit-font-smoothing: antialiased; }
+
+  body { max-width: 900px; margin: 0 auto; padding: 0 40px 120px; }
+
+  /* ── Cover ────────────────────────────────────────────────── */
+  .cover {
+    padding: 100px 0 80px;
+    border-bottom: 1px solid rgba(244,234,216,0.78);
+    display: flex;
+    flex-direction: column;
+    gap: 32px;
+  }
+  .cover-meta {
+    font-family: var(--sans);
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: rgba(244,234,216,0.65);
+  }
+  .cover-logo {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+  }
+  .cover-mark {
+    width: 56px; height: 56px;
+    background: var(--accent);
+    border-radius: 9px;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .cover-mark span {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: 42px;
+    color: var(--brand-text);
+    line-height: 1;
+    transform: translateX(0.02em) translateY(0.03em);
+    display: block;
+  }
+  .cover-wordmark {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: 48px;
+    letter-spacing: 0.01em;
+    color: var(--brand-text);
+    line-height: 1;
+  }
+  .cover-tagline {
+    font-family: var(--display);
+    font-weight: 500;
+    font-style: italic;
+    font-size: 20px;
+    color: rgba(244,234,216,0.78);
+    line-height: 1.5;
+    max-width: 480px;
+  }
+
+  /* ── Section chrome ──────────────────────────────────────── */
+  .section {
+    padding: 72px 0 0;
+  }
+  .section-num {
+    font-family: var(--sans);
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--accent-2);
+    margin-bottom: 8px;
+  }
+  .section-title {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: 32px;
+    color: var(--brand-text);
+    letter-spacing: 0.01em;
+    margin-bottom: 8px;
+  }
+  .section-desc {
+    font-size: 13px;
+    line-height: 1.7;
+    color: rgba(244,234,216,0.78);
+    max-width: 560px;
+    margin-bottom: 40px;
+  }
+  .rule {
+    border: none;
+    border-top: 1px solid rgba(244,234,216,0.16);
+    margin-top: 72px;
+  }
+
+  /* ── Logo display ────────────────────────────────────────── */
+  .logo-stage {
+    background: var(--shell-2);
+    border: 1px solid rgba(244,234,216,0.16);
+    border-radius: 10px;
+    padding: 56px 48px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .logo-stage.light {
+    background: var(--paper);
+  }
+  .lockup {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+  .mark {
+    background: var(--accent);
+    border-radius: calc(var(--sz) * 0.16);
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+    --sz: 88px;
+    width: var(--sz); height: var(--sz);
+  }
+  .mark .A {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: 66px;
+    color: var(--brand-text);
+    line-height: 1;
+    transform: translateX(0.02em) translateY(0.03em);
+    display: block;
+  }
+  .wordmark {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: 52px;
+    letter-spacing: 0.01em;
+    color: var(--brand-text);
+    line-height: 1;
+  }
+  .wordmark.on-light { color: var(--ink); }
+
+  .logo-stage-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+  .logo-stage-label {
+    font-size: 10px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: rgba(244,234,216,0.60);
+    text-align: center;
+    margin-top: 10px;
+  }
+
+  /* ── Mark-only grid ──────────────────────────────────────── */
+  .mark-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  .mark-col { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+  .mark-sz-label {
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    color: rgba(244,234,216,0.65);
+    text-align: center;
+  }
+
+  /* ── Clear space ─────────────────────────────────────────── */
+  .clearspace-diagram {
+    display: inline-flex;
+    position: relative;
+    padding: 44px;
+    border: 1px dashed rgba(244,234,216,0.78);
+    border-radius: 4px;
+  }
+  .clearspace-arrows {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+  }
+  .cs-label {
+    position: absolute;
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: rgba(244,234,216,0.68);
+    white-space: nowrap;
+  }
+  .cs-label.top    { top: 14px;  left: 50%; transform: translateX(-50%); }
+  .cs-label.bottom { bottom: 14px; left: 50%; transform: translateX(-50%); }
+  .cs-label.left   { left: 8px;  top: 50%; transform: translateY(-50%) rotate(-90deg); transform-origin: center; }
+  .cs-label.right  { right: 6px; top: 50%; transform: translateY(-50%) rotate(90deg); }
+
+  /* ── Don'ts ──────────────────────────────────────────────── */
+  .donts-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+  }
+  .dont-card {
+    background: var(--shell-2);
+    border: 1px solid rgba(244,234,216,0.16);
+    border-radius: 8px;
+    padding: 28px 20px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .dont-visual {
+    height: 72px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+  .dont-x {
+    position: absolute;
+    top: -8px; right: -4px;
+    width: 18px; height: 18px;
+    background: #c0392b;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; font-weight: 700; color: #fff;
+    line-height: 1;
+  }
+  .dont-label {
+    font-size: 11px;
+    color: rgba(244,234,216,0.72);
+    line-height: 1.5;
+    text-align: center;
+  }
+  /* Don't visuals */
+  .dont-stretch {
+    font-family: var(--display); font-weight: 600; font-size: 28px;
+    color: var(--brand-text); letter-spacing: 0.01em;
+    transform: scaleX(1.5);
+    display: inline-block;
+  }
+  .dont-color .mark { --sz: 44px; filter: hue-rotate(180deg); }
+  .dont-color .mark .A { font-size: 33px; }
+  .dont-shadow .mark { --sz: 44px; filter: drop-shadow(0 4px 12px #8d3f30); }
+  .dont-shadow .mark .A { font-size: 33px; }
+  .dont-rotate .lockup { transform: rotate(-15deg); }
+  .dont-rotate .mark { --sz: 44px; }
+  .dont-rotate .mark .A { font-size: 33px; }
+  .dont-rotate .wordmark { font-size: 28px; }
+  .dont-font {
+    font-family: var(--sans); font-weight: 700; font-size: 28px;
+    color: var(--brand-text); letter-spacing: 0.01em;
+  }
+  .dont-bg .mark { --sz: 44px; }
+  .dont-bg .mark .A { font-size: 33px; }
+  .dont-bg-inner {
+    background: repeating-linear-gradient(45deg, #2a3d30, #2a3d30 5px, #1c271f 5px, #1c271f 10px);
+    padding: 10px 14px; border-radius: 6px;
+  }
+
+  /* ── Color palette ───────────────────────────────────────── */
+  .palette-group { margin-bottom: 36px; }
+  .palette-group-label {
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: rgba(244,234,216,0.60);
+    margin-bottom: 14px;
+  }
+  .swatches {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .swatch { width: 108px; }
+  .swatch-block {
+    height: 64px;
+    border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.07);
+    margin-bottom: 8px;
+  }
+  .swatch-name {
+    font-size: 11px;
+    color: rgba(244,234,216,0.88);
+    margin-bottom: 2px;
+  }
+  .swatch-hex {
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+    font-size: 10.5px;
+    color: rgba(244,234,216,0.65);
+    margin-bottom: 2px;
+  }
+  .swatch-role {
+    font-size: 10px;
+    color: rgba(244,234,216,0.58);
+    line-height: 1.4;
+  }
+
+  /* ── Typography ──────────────────────────────────────────── */
+  .type-block {
+    border-top: 1px solid rgba(244,234,216,0.16);
+    padding: 36px 0;
+    display: grid;
+    grid-template-columns: 200px 1fr;
+    gap: 40px;
+    align-items: start;
+  }
+  .type-meta {}
+  .type-family {
+    font-size: 11px;
+    color: rgba(244,234,216,0.68);
+    margin-bottom: 4px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .type-name {
+    font-size: 14px;
+    color: var(--brand-text);
+    margin-bottom: 2px;
+  }
+  .type-role {
+    font-size: 11px;
+    color: rgba(244,234,216,0.65);
+    line-height: 1.5;
+    margin-top: 8px;
+  }
+  .type-sample-display {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: 52px;
+    color: var(--brand-text);
+    line-height: 1.05;
+    letter-spacing: 0.01em;
+  }
+  .type-sample-display-italic {
+    font-family: var(--display);
+    font-weight: 400;
+    font-style: italic;
+    font-size: 32px;
+    color: rgba(244,234,216,0.80);
+    line-height: 1.3;
+    margin-top: 6px;
+  }
+  .type-sample-sans {
+    font-family: var(--sans);
+    font-size: 14px;
+    color: var(--brand-text);
+    line-height: 1.7;
+  }
+  .type-sample-sans strong { font-weight: 700; }
+  .type-sample-serif {
+    font-family: var(--serif);
+    font-size: 18px;
+    color: rgba(244,234,216,0.8);
+    line-height: 1.65;
+  }
+
+  /* ── Type scale ──────────────────────────────────────────── */
+  .scale-row {
+    display: flex;
+    align-items: baseline;
+    gap: 20px;
+    padding: 14px 0;
+    border-bottom: 1px solid rgba(244,234,216,0.14);
+  }
+  .scale-label {
+    width: 80px;
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: rgba(244,234,216,0.60);
+    flex-shrink: 0;
+  }
+  .scale-sample {
+    font-family: var(--display);
+    font-weight: 600;
+    color: var(--brand-text);
+    line-height: 1;
+    letter-spacing: 0.01em;
+  }
+
+  /* ── In context ──────────────────────────────────────────── */
+  .context-app {
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid rgba(244,234,216,0.16);
+    box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+  }
+  .ctx-topbar {
+    background: var(--shell);
+    border-bottom: 2px solid var(--accent);
+    padding: 14px 20px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+  .ctx-icon {
+    width: 28px; height: 28px;
+    background: var(--accent);
+    border-radius: 5px;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .ctx-icon span {
+    font-family: var(--display); font-weight: 600; font-size: 21px;
+    color: var(--brand-text); line-height: 1;
+    transform: translateX(0.02em) translateY(0.03em); display: block;
+  }
+  .ctx-wordmark {
+    font-family: var(--display); font-weight: 600; font-size: 22px;
+    letter-spacing: 0.01em; color: var(--brand-text); line-height: 1;
+  }
+  .ctx-spacer { flex: 1; }
+  .ctx-ghost { width: 80px; height: 24px; background: rgba(244,234,216,0.16); border-radius: 4px; }
+  .ctx-btn {
+    background: linear-gradient(to bottom, color-mix(in srgb, #8d3f30 88%, #fff), #8d3f30);
+    color: #f4ead8; border: none; border-radius: 4px;
+    padding: 7px 20px; font-family: var(--sans); font-size: 12px;
+    font-weight: 550; letter-spacing: 0.08em; text-transform: uppercase; cursor: default;
+  }
+  .ctx-content {
+    background: var(--paper);
+    padding: 24px 20px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .ctx-row {
+    height: 12px; background: var(--paper-2); border-radius: 3px;
+  }
+
+  /* ── File list ───────────────────────────────────────────── */
+  .file-list {
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .file-row {
+    display: flex; align-items: center; gap: 14px;
+    padding: 12px 16px;
+    background: var(--shell-2);
+    border: 1px solid rgba(244,234,216,0.16);
+    border-radius: 6px;
+  }
+  .file-icon {
+    width: 32px; height: 32px; flex-shrink: 0;
+    background: rgba(141,63,48,0.15);
+    border-radius: 5px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .file-icon svg { width: 16px; height: 16px; fill: var(--accent); }
+  .file-name { font-size: 12.5px; color: var(--brand-text); flex: 1; font-family: ui-monospace, 'SF Mono', Menlo, monospace; }
+  .file-desc { font-size: 11px; color: rgba(244,234,216,0.65); }
+
+  /* ── Footer ──────────────────────────────────────────────── */
+  .footer {
+    margin-top: 100px;
+    padding-top: 32px;
+    border-top: 1px solid rgba(244,234,216,0.16);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .footer-brand {
+    font-family: var(--display); font-weight: 600; font-size: 16px;
+    color: rgba(244,234,216,0.65); letter-spacing: 0.01em;
+  }
+  .footer-meta {
+    font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
+    color: rgba(244,234,216,0.78);
+  }
+</style>
+</head>
+<body>
+
+<!-- ══ COVER ═══════════════════════════════════════════════════════════════ -->
+<div class="cover">
+  <div class="cover-meta">Archivr &nbsp;·&nbsp; Brand Guidelines &nbsp;·&nbsp; v1.0 &nbsp;·&nbsp; 2025</div>
+  <div class="cover-logo">
+    <div class="cover-mark"><span>A</span></div>
+    <div class="cover-wordmark"\>Archivr</div>
+  </div>
+  <div class="cover-tagline">Preserve what matters. Forever.</div>
+</div>
+
+
+<!-- ══ 01 THE LOGO ═════════════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-num">01</div>
+  <div class="section-title">The Logo</div>
+  <div class="section-desc">The Archivr logo consists of two elements: the mark — a capital A in Cormorant Garamond set inside a rounded square in Terracotta — and the wordmark. Use both together as the primary logo. Never separate them in contexts where the brand is being introduced for the first time.</div>
+
+  <!-- Primary: on dark -->
+  <div style="margin-bottom:12px">
+    <div class="logo-stage">
+      <div class="lockup">
+        <div class="mark"><span class="A">A</span></div>
+        <div class="wordmark"\>Archivr</div>
+      </div>
+    </div>
+    <div class="logo-stage-label">Primary — on dark</div>
+  </div>
+
+  <!-- Secondary: on light -->
+  <div>
+    <div class="logo-stage light">
+      <div class="lockup">
+        <div class="mark"><span class="A">A</span></div>
+        <div class="wordmark on-light"\>Archivr</div>
+      </div>
+    </div>
+    <div class="logo-stage-label">Secondary — on light</div>
+  </div>
+</div>
+
+<hr class="rule">
+
+<!-- ══ 02 MARK ═════════════════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-num">02</div>
+  <div class="section-title">The Mark</div>
+  <div class="section-desc">Use the standalone mark when the wordmark would be redundant (favicon, app icon, avatar) or when the space is too small for the full lockup. The mark is recognizable on its own once the brand is established.</div>
+
+  <div class="mark-row">
+    <div class="mark-col">
+      <div class="mark" style="--sz:128px"><span class="A" style="font-size:96px">A</span></div>
+      <div class="mark-sz-label">128 px</div>
+    </div>
+    <div class="mark-col">
+      <div class="mark" style="--sz:64px"><span class="A" style="font-size:48px">A</span></div>
+      <div class="mark-sz-label">64 px</div>
+    </div>
+    <div class="mark-col">
+      <div class="mark" style="--sz:32px; border-radius:5px"><span class="A" style="font-size:24px">A</span></div>
+      <div class="mark-sz-label">32 px</div>
+    </div>
+    <div class="mark-col">
+      <div class="mark" style="--sz:16px; border-radius:3px"><span class="A" style="font-size:12px">A</span></div>
+      <div class="mark-sz-label">16 px</div>
+    </div>
+  </div>
+</div>
+
+<hr class="rule">
+
+<!-- ══ 03 CLEAR SPACE ══════════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-num">03</div>
+  <div class="section-title">Clear Space</div>
+  <div class="section-desc">Always maintain a minimum clear space equal to half the mark's height (½H) on all sides of the lockup. Never crowd the logo with other elements.</div>
+
+  <div style="display:flex; gap:48px; align-items:flex-start; flex-wrap:wrap">
+    <div>
+      <div class="clearspace-diagram">
+        <div class="cs-label top">½H</div>
+        <div class="cs-label bottom">½H</div>
+        <div class="cs-label left">½H</div>
+        <div class="cs-label right">½H</div>
+        <div class="lockup">
+          <div class="mark" style="--sz:64px"><span class="A" style="font-size:48px">A</span></div>
+          <div class="wordmark" style="font-size:36px"\>Archivr</div>
+        </div>
+      </div>
+    </div>
+
+    <div style="padding-top:8px">
+      <div style="margin-bottom:20px">
+        <div style="font-size:11px;color:rgba(244,234,216,0.68);margin-bottom:6px;letter-spacing:.08em;text-transform:uppercase">Full lockup</div>
+        <div style="font-size:13px;color:rgba(244,234,216,0.88)">Minimum width: <strong style="color:var(--brand-text)">120 px</strong></div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:rgba(244,234,216,0.68);margin-bottom:6px;letter-spacing:.08em;text-transform:uppercase">Mark alone</div>
+        <div style="font-size:13px;color:rgba(244,234,216,0.88)">Minimum size: <strong style="color:var(--brand-text)">16 × 16 px</strong></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<hr class="rule">
+
+<!-- ══ 04 DON'TS ════════════════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-num">04</div>
+  <div class="section-title">Don'ts</div>
+  <div class="section-desc">These are the most common mistakes. All of them dilute or distort the brand.</div>
+
+  <div class="donts-grid">
+
+    <div class="dont-card">
+      <div class="dont-visual">
+        <div style="position:relative">
+          <span class="dont-stretch"\>Archivr</span>
+          <div class="dont-x">✕</div>
+        </div>
+      </div>
+      <div class="dont-label">Don't stretch or distort the proportions</div>
+    </div>
+
+    <div class="dont-card">
+      <div class="dont-visual">
+        <div style="position:relative" class="dont-color">
+          <div class="lockup" style="gap:10px">
+            <div class="mark"><span class="A">A</span></div>
+            <div class="wordmark" style="font-size:28px"\>Archivr</div>
+          </div>
+          <div class="dont-x">✕</div>
+        </div>
+      </div>
+      <div class="dont-label">Don't change or recolor the logo</div>
+    </div>
+
+    <div class="dont-card">
+      <div class="dont-visual">
+        <div style="position:relative" class="dont-shadow">
+          <div class="lockup" style="gap:10px">
+            <div class="mark"><span class="A">A</span></div>
+            <div class="wordmark" style="font-size:28px"\>Archivr</div>
+          </div>
+          <div class="dont-x">✕</div>
+        </div>
+      </div>
+      <div class="dont-label">Don't add shadows, glows, or effects</div>
+    </div>
+
+    <div class="dont-card">
+      <div class="dont-visual">
+        <div style="position:relative" class="dont-rotate">
+          <div class="lockup">
+            <div class="mark"><span class="A">A</span></div>
+            <div class="wordmark"\>Archivr</div>
+          </div>
+          <div class="dont-x" style="top:-18px; right:-12px">✕</div>
+        </div>
+      </div>
+      <div class="dont-label">Don't rotate or tilt the logo</div>
+    </div>
+
+    <div class="dont-card">
+      <div class="dont-visual">
+        <div style="position:relative">
+          <div style="display:flex;align-items:center;gap:10px">
+            <div class="mark" style="--sz:44px"><span class="A" style="font-size:33px">A</span></div>
+            <span class="dont-font"\>Archivr</span>
+          </div>
+          <div class="dont-x">✕</div>
+        </div>
+      </div>
+      <div class="dont-label">Don't substitute a different typeface for the wordmark</div>
+    </div>
+
+    <div class="dont-card">
+      <div class="dont-visual">
+        <div style="position:relative" class="dont-bg">
+          <div class="dont-bg-inner">
+            <div class="lockup" style="gap:10px">
+              <div class="mark"><span class="A">A</span></div>
+              <div class="wordmark" style="font-size:28px"\>Archivr</div>
+            </div>
+          </div>
+          <div class="dont-x">✕</div>
+        </div>
+      </div>
+      <div class="dont-label">Don't place on busy or patterned backgrounds</div>
+    </div>
+
+  </div>
+</div>
+
+<hr class="rule">
+
+<!-- ══ 05 COLOR ════════════════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-num">05</div>
+  <div class="section-title">Color</div>
+  <div class="section-desc">The palette is organized by role. Shell and Paper form the light/dark surface pair. Terracotta is the single brand accent — use it with restraint. Amber is a secondary accent for highlights and metadata. Never introduce colors outside this palette in brand contexts.</div>
+
+  <div class="palette-group">
+    <div class="palette-group-label">Shell &amp; Dark Surfaces</div>
+    <div class="swatches">
+      <div class="swatch">
+        <div class="swatch-block" style="background:#141d18"></div>
+        <div class="swatch-name">Shell</div>
+        <div class="swatch-hex">#141d18</div>
+        <div class="swatch-role">App topbar, dark surfaces</div>
+      </div>
+      <div class="swatch">
+        <div class="swatch-block" style="background:#1c271f"></div>
+        <div class="swatch-name">Shell 2</div>
+        <div class="swatch-hex">#1c271f</div>
+        <div class="swatch-role">Elevated dark panels</div>
+      </div>
+      <div class="swatch">
+        <div class="swatch-block" style="background:#20251f"></div>
+        <div class="swatch-name">Ink</div>
+        <div class="swatch-hex">#20251f</div>
+        <div class="swatch-role">Primary text on light</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="palette-group">
+    <div class="palette-group-label">Paper &amp; Light Surfaces</div>
+    <div class="swatches">
+      <div class="swatch">
+        <div class="swatch-block" style="background:#f5f0e7; border-color:rgba(0,0,0,.07)"></div>
+        <div class="swatch-name">Paper</div>
+        <div class="swatch-hex">#f5f0e7</div>
+        <div class="swatch-role">Primary content bg</div>
+      </div>
+      <div class="swatch">
+        <div class="swatch-block" style="background:#e9e1d2; border-color:rgba(0,0,0,.07)"></div>
+        <div class="swatch-name">Paper 2</div>
+        <div class="swatch-hex">#e9e1d2</div>
+        <div class="swatch-role">Rows, alternating bg</div>
+      </div>
+      <div class="swatch">
+        <div class="swatch-block" style="background:#fffaf0; border-color:rgba(0,0,0,.07)"></div>
+        <div class="swatch-name">Paper 3</div>
+        <div class="swatch-hex">#fffaf0</div>
+        <div class="swatch-role">Elevated panels on light</div>
+      </div>
+      <div class="swatch">
+        <div class="swatch-block" style="background:#f4ead8; border-color:rgba(0,0,0,.07)"></div>
+        <div class="swatch-name">Brand Text</div>
+        <div class="swatch-hex">#f4ead8</div>
+        <div class="swatch-role">Text on dark &amp; accent</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="palette-group">
+    <div class="palette-group-label">Accents</div>
+    <div class="swatches">
+      <div class="swatch">
+        <div class="swatch-block" style="background:#8d3f30"></div>
+        <div class="swatch-name">Terracotta</div>
+        <div class="swatch-hex">#8d3f30</div>
+        <div class="swatch-role">Primary brand accent, logo mark, CTAs, focus rings</div>
+      </div>
+      <div class="swatch">
+        <div class="swatch-block" style="background:#b78342"></div>
+        <div class="swatch-name">Amber</div>
+        <div class="swatch-hex">#b78342</div>
+        <div class="swatch-role">Secondary accent, metadata highlights</div>
+      </div>
+      <div class="swatch">
+        <div class="swatch-block" style="background:#245f72"></div>
+        <div class="swatch-name">Ocean</div>
+        <div class="swatch-hex">#245f72</div>
+        <div class="swatch-role">Links, informational states</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="palette-group">
+    <div class="palette-group-label">Neutrals &amp; Borders</div>
+    <div class="swatches">
+      <div class="swatch">
+        <div class="swatch-block" style="background:#6b6f66"></div>
+        <div class="swatch-name">Muted</div>
+        <div class="swatch-hex">#6b6f66</div>
+        <div class="swatch-role">Secondary text, captions</div>
+      </div>
+      <div class="swatch">
+        <div class="swatch-block" style="background:#8a8d83"></div>
+        <div class="swatch-name">Muted 2</div>
+        <div class="swatch-hex">#8a8d83</div>
+        <div class="swatch-role">Tertiary text, placeholders</div>
+      </div>
+      <div class="swatch">
+        <div class="swatch-block" style="background:#d2c6b5; border-color:rgba(0,0,0,.07)"></div>
+        <div class="swatch-name">Line</div>
+        <div class="swatch-hex">#d2c6b5</div>
+        <div class="swatch-role">Borders, dividers on light</div>
+      </div>
+      <div class="swatch">
+        <div class="swatch-block" style="background:#e5dccd; border-color:rgba(0,0,0,.07)"></div>
+        <div class="swatch-name">Line Soft</div>
+        <div class="swatch-hex">#e5dccd</div>
+        <div class="swatch-role">Subtle dividers, rules</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<hr class="rule">
+
+<!-- ══ 06 TYPOGRAPHY ════════════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-num">06</div>
+  <div class="section-title">Typography</div>
+  <div class="section-desc">Three typefaces cover every context. Cormorant Garamond is the brand voice — it appears in the logo, headings, and display text. Helvetica Neue handles all interface chrome. Spectral carries long-form reading content.</div>
+
+  <div class="type-block">
+    <div class="type-meta">
+      <div class="type-family">Display</div>
+      <div class="type-name">Cormorant Garamond</div>
+      <div class="type-role">Logo wordmark · Headings · Display text · Taglines<br><br>Weights: 500, 600<br>Google Fonts: free</div>
+    </div>
+    <div>
+      <div class="type-sample-display">Aa Bb Cc<br>Preserve what<br>matters.</div>
+      <div class="type-sample-display-italic">The archive of a lifetime,<br>held with care.</div>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-meta">
+      <div class="type-family">Interface</div>
+      <div class="type-name">Helvetica Neue</div>
+      <div class="type-role">UI labels · Buttons · Nav · Captions · Body copy<br><br>Weights: 400, 550, 700<br>System font (macOS/iOS)</div>
+    </div>
+    <div>
+      <div class="type-sample-sans">
+        <strong>The quick brown fox jumps</strong> over the lazy dog.<br>
+        Capture · Archive · Preserve · Retrieve<br>
+        0123456789 &amp; #%@!
+      </div>
+      <div style="margin-top:14px;display:flex;gap:24px;flex-wrap:wrap">
+        <span style="font-family:var(--sans);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:rgba(244,234,216,.5)">Small caps label</span>
+        <span style="font-family:var(--sans);font-size:12px;font-weight:550;color:rgba(244,234,216,0.88)">Button Text</span>
+        <span style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:11.5px;color:rgba(244,234,216,.4)">mono/url/code</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="type-block">
+    <div class="type-meta">
+      <div class="type-family">Reading</div>
+      <div class="type-name">Spectral</div>
+      <div class="type-role">Article body · Long-form content · Reading mode<br><br>Weights: 400, 500<br>Google Fonts: free</div>
+    </div>
+    <div>
+      <div class="type-sample-serif">An archive is not a graveyard. It is the opposite — a place where things are kept because they still matter, because the person who saved them believed they would matter again.</div>
+    </div>
+  </div>
+
+  <!-- Type scale -->
+  <div style="margin-top:48px">
+    <div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:rgba(244,234,216,.25);margin-bottom:20px">Display scale (Cormorant Garamond 600)</div>
+    <div class="scale-row">
+      <div class="scale-label">72 px</div>
+      <div class="scale-sample" style="font-size:72px"\>Archivr</div>
+    </div>
+    <div class="scale-row">
+      <div class="scale-label">48 px</div>
+      <div class="scale-sample" style="font-size:48px"\>Archivr</div>
+    </div>
+    <div class="scale-row">
+      <div class="scale-label">36 px</div>
+      <div class="scale-sample" style="font-size:36px">Preserve what matters.</div>
+    </div>
+    <div class="scale-row">
+      <div class="scale-label">24 px</div>
+      <div class="scale-sample" style="font-size:24px">Capture, archive, retrieve. Forever.</div>
+    </div>
+  </div>
+</div>
+
+<hr class="rule">
+
+<!-- ══ 07 IN CONTEXT ════════════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-num">07</div>
+  <div class="section-title">In Context</div>
+  <div class="section-desc">The logo as it appears in the application shell. The mark sits at 28 × 28 px in the topbar, framed by a 2 px Terracotta rule at the bottom of the navigation bar.</div>
+
+  <div class="context-app">
+    <div class="ctx-topbar">
+      <div class="ctx-icon"><span>A</span></div>
+      <span class="ctx-wordmark"\>Archivr</span>
+      <div class="ctx-spacer"></div>
+      <div class="ctx-ghost"></div>
+      <div class="ctx-btn">Capture</div>
+    </div>
+    <div class="ctx-content">
+      <div class="ctx-row" style="width:62%"></div>
+      <div class="ctx-row" style="width:88%"></div>
+      <div class="ctx-row" style="width:41%"></div>
+      <div class="ctx-row" style="width:75%"></div>
+    </div>
+  </div>
+</div>
+
+<hr class="rule">
+
+<!-- ══ 08 ASSETS ═══════════════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-num">08</div>
+  <div class="section-title">Asset Files</div>
+  <div class="section-desc">All files live in <code style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:12px;color:rgba(244,234,216,.5)">branding/assets/</code>. SVG files embed Cormorant Garamond via Google Fonts — they require a network connection to render the typeface correctly, or the font installed locally.</div>
+
+  <div class="file-list">
+    <div class="file-row">
+      <div class="file-icon">
+        <svg viewBox="0 0 16 16"><path d="M2 2h12v12H2z" fill-opacity=".2"/><path d="M4 4h8M4 7h8M4 10h5" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linecap="round"/></svg>
+      </div>
+      <div class="file-name">logo-on-dark.svg</div>
+      <div class="file-desc">Full lockup · cream wordmark · use on dark backgrounds</div>
+    </div>
+    <div class="file-row">
+      <div class="file-icon">
+        <svg viewBox="0 0 16 16"><path d="M2 2h12v12H2z" fill-opacity=".2"/><path d="M4 4h8M4 7h8M4 10h5" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linecap="round"/></svg>
+      </div>
+      <div class="file-name">logo-on-light.svg</div>
+      <div class="file-desc">Full lockup · dark wordmark · use on light / paper backgrounds</div>
+    </div>
+    <div class="file-row">
+      <div class="file-icon">
+        <svg viewBox="0 0 16 16"><path d="M2 2h12v12H2z" fill-opacity=".2"/><path d="M4 4h8M4 7h8M4 10h5" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linecap="round"/></svg>
+      </div>
+      <div class="file-name">logo-mark.svg</div>
+      <div class="file-desc">Standalone mark · 48 × 48 · for established contexts, avatars</div>
+    </div>
+    <div class="file-row">
+      <div class="file-icon">
+        <svg viewBox="0 0 16 16"><path d="M2 2h12v12H2z" fill-opacity=".2"/><path d="M4 4h8M4 7h8M4 10h5" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linecap="round"/></svg>
+      </div>
+      <div class="file-name">favicon.svg</div>
+      <div class="file-desc">Favicon · reference from &lt;link rel="icon"&gt; or convert to .ico</div>
+    </div>
+  </div>
+</div>
+
+<div class="footer">
+  <div class="footer-brand"\>Archivr</div>
+  <div class="footer-meta">Brand Guidelines v1.0 &nbsp;·&nbsp; Internal Use</div>
+</div>
+
+</body>
+</html>

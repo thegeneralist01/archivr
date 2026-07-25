@@ -1,4 +1,4 @@
-# archivr
+# Archivr
 
 An open-source self-hosted archiving tool. Work in progress.
 
@@ -65,9 +65,9 @@ This project aims to provide a reliable solution for archiving important data fr
 - Direct platform URLs
 - Platform shorthand inputs such as `tweet:...`, `yt:...`, or `instagram:...`
 
-## Running Archivr
+## Running archivr
 
-Archivr currently ships as two binaries:
+archivr currently ships as two binaries:
 
 - `archivr`
   - The CLI for creating and writing to one archive.

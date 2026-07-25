@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 196 48" width="196" height="48" role="img" aria-label="Archivr">
+  <defs>
+    <style>@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@600&amp;display=swap');</style>
+  </defs>
+  <!-- Mark -->
+  <rect x="4" y="4" width="40" height="40" rx="6.4" fill="#8d3f30"/>
+  <text x="24" y="24" text-anchor="middle" dominant-baseline="central"
+        dx="0.02em" dy="0.03em"
+        font-family="'Cormorant Garamond', Georgia, serif"
+        font-weight="600" font-size="30" fill="#f4ead8">A</text>
+  <!-- Wordmark -->
+  <text x="58" y="24" text-anchor="start" dominant-baseline="central"
+        font-family="'Cormorant Garamond', Georgia, serif"
+        font-weight="600" font-size="28" letter-spacing="0.28" fill="#f4ead8">archivr</text>
+</svg>
