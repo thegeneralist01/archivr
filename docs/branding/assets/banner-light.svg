@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 140" width="860" height="140" role="img" aria-label="Archivr — Preserve what matters. Forever.">
+  <!-- Background -->
+  <rect width="860" height="140" fill="#f5f0e7"/>
+  <!-- Top accent rule -->
+  <rect width="860" height="2" fill="#8d3f30"/>
+
+  <!-- Mark -->
+  <rect x="319" y="29" width="52" height="52" rx="8" fill="#8d3f30"/>
+  <text x="345" y="56" text-anchor="middle" dominant-baseline="central"
+        font-family="Georgia, 'Times New Roman', serif"
+        font-weight="bold" font-size="34" fill="#f4ead8">A</text>
+
+  <!-- Wordmark -->
+  <text x="383" y="55" text-anchor="start" dominant-baseline="central"
+        font-family="Georgia, 'Times New Roman', serif"
+        font-weight="normal" font-size="32" fill="#20251f">archivr</text>
+
+  <!-- Tagline -->
+  <text x="430" y="107" text-anchor="middle" dominant-baseline="central"
+        font-family="Georgia, 'Times New Roman', serif"
+        font-style="italic" font-size="13.5" fill="#6b6f66" letter-spacing="0.2">Preserve what matters. Forever.</text>
+</svg>

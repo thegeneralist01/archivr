@@ -1,192 +1,215 @@
-# Archivr
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="branding/assets/banner-dark.svg">
+    <img alt="Archivr — Preserve what matters. Forever." src="branding/assets/banner-light.svg" width="860">
+  </picture>
+</p>
 
-An open-source self-hosted archiving tool. Work in progress.
+<p align="center">
+  <a href="../LICENSE.md"><img src="https://img.shields.io/badge/license-MIT-8d3f30?style=flat-square" alt="MIT License"></a>
+  <img src="https://img.shields.io/badge/rust-2024_edition-b78342?style=flat-square&logo=rust&logoColor=white" alt="Rust 2024">
+  <img src="https://img.shields.io/badge/self--hosted-yes-245f72?style=flat-square" alt="Self-hosted">
+</p>
 
-- [x] Archiving
-  - [x] Archiving media files from social media platforms
-    - [x] YouTube Videos
-    - [x] YouTube Playlists
-    - [x] YouTube Channels
-    - [x] Twitter Videos
-    - [x] Instagram
-    - [x] Facebook
-    - [x] TikTok
-    - [x] Reddit
-    - [x] Snapchat
-    - [ ] YouTube Posts (postponed)
-  - [x] Archiving local files
-  - [x] Archiving Twitter Tweets, Threads, and Articles
-  - [ ] Archiving files from cloud storage services (Google Drive, Dropbox, OneDrive) and from URLs
-    - [x] URLs
-    - [ ] Google Drive
-    - [ ] Dropbox
-    - [ ] OneDrive
-    - (Some of these could be postponed for later.)
-  - [x] Archive web pages (HTML, CSS, JS, images)
-  - [ ] Archiving emails (???)
-    - [ ] Gmail
-    - [ ] Outlook
-    - [ ] Yahoo Mail
-- [x] Management
-  - [x] Deduplication
-  - [x] Tagging system
-  - [x] Search functionality
-  - [ ] Categorization
-  - [x] Metadata extraction and storage
-- [x] User Interface
-  - [x] Web-based UI
-    - [x] Authentication and login
-    - [x] Archive setup
-    - [x] Browse and view entries
-    - [x] Tag management and filtering
-    - [x] Search entries
-    - [x] View archive runs
-    - [x] Capture dialog
-    - [x] User settings and API tokens
-    - [x] Admin panel
-- [ ] Backup and Sync
-  - [ ] Cloud backup (AWS S3, Google Cloud Storage)
-  - [ ] Local backup
+---
 
-## Motivation
+Archivr is a self-hosted tool for capturing and preserving digital content — YouTube videos and playlists, tweets and threads, Instagram, TikTok, web pages, and local files — into self-contained, locally-owned archives. Content is stored in SQLite with SHA3-256 blob deduplication, hierarchical tags, a browser-based UI, and role-based auth.
 
-There are two driving factors behind this project:
+## Table of Contents
 
-- In the age of information, all data is ephemeral. Social media platforms frequently delete content, and cloud storage services can become inaccessible and unreliable. Being able to archive important data is _very important_ for preserving personal memories and digital history.
-- I will be creating a small encyclopedia for my future family and kids. Therefore, I want to make sure that all the information I gather is preserved and accessible for future reference.
+- [Features](#features)
+- [Quick Start](#quick-start)
+  - [With Nix](#with-nix)
+  - [With Docker](#with-docker-1)
+- [Architecture](#architecture)
+- [Supported Inputs](#supported-inputs)
+  - [YouTube playlists and channels](#youtube-playlists-and-channels)
+  - [Video quality and audio-only](#video-quality-and-audio-only)
+- [Configuration](#configuration)
+  - [TOML config file](#toml-config-file)
+  - [Environment variables](#environment-variables)
+- [Deployment](#deployment)
+  - [Security](#security)
+  - [NixOS](#hosting-on-nixos)
+  - [Docker](#hosting-with-docker)
+- [Development](#development)
+- [License](#license)
 
-This project aims to provide a reliable solution for archiving important data from various sources, ensuring that users can preserve their digital assets for the long term.
+## Features
 
-## Archive Inputs
+- **Social media** — YouTube (videos, shorts, playlists, channels with sync mode), X/Twitter (tweet and thread JSON + media downloads), Instagram, TikTok, Facebook, Reddit, Snapchat via yt-dlp
+- **Web pages** — full self-contained HTML snapshots via SingleFile + Chromium; optional Freedium mirror for paywalled articles; reader mode
+- **Local files** — import any file from disk by `file://` path
+- **Deduplication** — SHA3-256 content-addressed blob store shared across all captures; identical files are stored once
+- **Tags and search** — hierarchical tag tree, full-text search, filterable entry list
+- **Multiple archives** — the server mounts any number of separate archives from a single TOML config
+- **Role-based auth** — Guest / User / Admin / Owner roles; session cookies and API tokens; Argon2 passwords
+- **Quality selection** — choose video quality or audio-only per capture; a live metadata probe populates the selector before download
 
-`archivr archive <path>` currently accepts three kinds of inputs:
+## Quick Start
 
-- Local files via `file://...`
-- Direct platform URLs
-- Platform shorthand inputs such as `tweet:...`, `yt:...`, or `instagram:...`
-
-## Running archivr
-
-archivr currently ships as two binaries:
-
-- `archivr`
-  - The CLI for creating and writing to one archive.
-  - Use this for `init` and `archive`.
-- `archivr-server`
-  - The web server for reading one or more existing archives through the browser UI.
-  - Use this after archives already exist.
-
-With Nix, run the CLI with:
+### With Nix
 
 ```sh
-nix run .#archivr -- init ./my-archive --name "My Archive"
-nix run .#archivr -- archive file:///absolute/path/to/file.pdf
+# Create an archive
+nix run github:thegeneralist/archivr#archivr -- init ./my-archive --name "My Archive"
+
+# Archive something
+nix run github:thegeneralist/archivr#archivr -- archive https://www.youtube.com/watch?v=dQw4w9WgXcQ
+
+# Start the web UI (reads ./archivr-server.toml)
+nix run github:thegeneralist/archivr#archivr-server
 ```
 
-Run the web server with:
-
-```sh
-nix run .#archivr-server -- ./archivr-server.toml
-```
-
-The server expects a TOML registry file. If no path is passed, it reads `./archivr-server.toml`.
-
-Example:
+Create `archivr-server.toml` next to where you run the command:
 
 ```toml
+auth_db_path = "/absolute/path/to/archivr-auth.sqlite"
+
 [[archives]]
 id = "personal"
 label = "Personal"
 archive_path = "/absolute/path/to/my-archive/.archivr"
 ```
 
-Then open:
+Then open `http://127.0.0.1:8080`. On the first visit you will be prompted to create the owner account.
 
-```text
-http://127.0.0.1:8080
-```
-
-When installed through Nix, `archivr-server` is wrapped so it can find the static web UI assets automatically. The wrapper sets `ARCHIVR_STATIC_DIR` to the installed static asset directory. Running from source with `cargo run -p archivr-server` falls back to `crates/archivr-server/static`.
-
-### Security and Deployment
-
-`archivr-server` is a **local-only tool by default**. It binds to `127.0.0.1:8080` and has no authentication or access control. Do not expose it to a public network or a shared LAN without understanding the risks.
-
-**Changing the bind address**
-
-You can set the bind address in your TOML config:
-
-```toml
-# Optional. Default: 127.0.0.1:8080
-# Only change this if you know what you are doing — the server has no authentication.
-bind = "127.0.0.1:9090"
-```
-
-Or override it with the `ARCHIVR_BIND` environment variable:
+### With Docker
 
 ```sh
-ARCHIVR_BIND=127.0.0.1:9090 nix run .#archivr-server -- ./archivr-server.toml
+mkdir config
+cp docker/config.example.toml config/archivr-server.toml
+# Edit config/archivr-server.toml
+
+# Initialize the archive on the persistent volume (run once)
+docker compose run --rm archivr archivr init \
+  /data/archives/main /data/archives/main/.archivr/store \
+  --name "Main Archive"
+
+docker compose up -d
 ```
 
-If the server is started with a non-loopback address (e.g. `0.0.0.0`), it prints a warning to stderr:
+Open `http://localhost:8080`. See [Hosting with Docker](#hosting-with-docker) for volume layout and Twitter/X credential setup.
 
-```text
-warn: archivr-server is bound to 0.0.0.0:8080 — this server has no authentication. Only expose it on a trusted network.
+## Architecture
+
+Two binaries:
+
+| Binary | Purpose |
+|---|---|
+| `archivr` | CLI — create archives (`init`) and add content (`archive`) |
+| `archivr-server` | Web server — browse and search one or more archives via browser UI |
+
+Archive layout created by `archivr init`:
+
+```
+my-archive/
+├── .archivr/          # metadata: name, store_path, archivr.sqlite
+└── store/
+    ├── raw/           # deduplicated blobs: raw/A/B/<sha3-256>.ext
+    ├── raw_tweets/    # tweet and thread JSON
+    ├── structured/    # structured metadata outputs
+    └── temp/          # staging area during capture
 ```
 
-**When will auth be added?**
+A separate auth database (`archivr-auth.sqlite`, path set in TOML) holds users, sessions, API tokens, and role bits. It is independent of individual archives.
 
-Auth and session handling will be designed when remote or public hosting becomes a real requirement. Until then, keep the server on loopback. See `crates/archivr-server/src/routes.rs` for the route classification that will guide where middleware is applied.
+## Supported Inputs
 
-### Supported Platforms
+`archivr archive <locator>` accepts URLs and platform shorthands:
 
-- Local files: `file:///absolute/path/to/file.ext`
-- YouTube media: individual videos/shorts, playlists, and channels; standard URLs or [shorthand video inputs](#supported-shorthand-inputs). Playlists and channels archive as a container entry with each video stored as a child entry beneath it.
-- X/Twitter media from Tweets: normal Tweet URLs or the `tweet:media:ID` shorthand
-- X/Twitter Tweet content scrape: [Tweet and Thread shorthands](#supported-shorthand-inputs). (These are saved as JSON files in `raw_tweets/`)
-- Instagram, Facebook, TikTok, Reddit, Snapchat: direct URLs or platform-prefixed shorthand passed through to `yt-dlp`
+| Platform | Input examples |
+|---|---|
+| Local file | `file:///absolute/path/to/file.pdf` |
+| YouTube video / short | `https://youtube.com/watch?v=ID` · `yt:video/ID` · `yt:short/ID` |
+| YouTube playlist | `https://youtube.com/playlist?list=ID` |
+| YouTube channel | `https://youtube.com/@handle` |
+| X/Twitter tweet (JSON) | `tweet:ID` · `x:tweet:ID` · `twitter:tweet:ID` |
+| X/Twitter thread (JSON) | `x:thread:ID` · `twitter:thread:ID` |
+| X/Twitter media download | `tweet:media:ID` |
+| Instagram | Direct URL · `instagram:ID` |
+| TikTok | Direct URL · `tiktok:ID` |
+| Facebook | Direct URL · `facebook:ID` |
+| Reddit | Direct URL · `reddit:ID` |
+| Snapchat | Direct URL · `snapchat:ID` |
+| Arbitrary URL / web page | Any `https://` URL |
 
-#### Video quality and audio-only downloads
+### YouTube playlists and channels
 
-When capturing via the web UI, entering a URL for a yt-dlp-backed source (YouTube, Instagram, TikTok, Facebook, Reddit, Snapchat, X media) triggers a metadata probe via `GET /api/archives/:id/captures/probe`. The quality selector then shows only the heights actually available in that video plus **Best quality** (default). An **Audio only** option is appended whenever the probe confirms an audio track exists. UI behaviour by probe outcome:
+Capturing a playlist or channel creates a **container entry** with each video archived as a child beneath it. Before downloading, the UI probes each video for available quality options — set quality per-video or apply one to the whole batch. Individual videos can be excluded with the remove button.
+
+**Sync mode:** when re-archiving a playlist or channel, enable sync mode in the capture dialog to skip videos that are already in the archive. Only new videos are downloaded; the existing container is reused.
+
+### Video quality and audio-only
+
+When capturing a yt-dlp-backed source through the web UI, a metadata probe runs first and populates the quality selector with heights actually available in that video:
 
 | `qualities` | `has_audio` | UI shows |
 |---|---|---|
 | `["1080p", "720p", …]` | `true` | Best / heights / Audio only |
 | `["1080p", …]` | `false` | Best / heights |
-| `[]` | `true` | Audio only (pre-selected, no Best option) |
+| `[]` | `true` | Audio only (pre-selected) |
 | `[]` | `false` | "No media detected" |
-| probe fails (502) | — | picker hidden, capture still submittable |
+| probe fails (502) | — | picker hidden; capture still submittable |
 
-The `POST /api/archives/:id/captures` endpoint accepts an optional `quality` field: `"best"`, `"audio"`, or any `"NNNp"` height string:
+The `POST /api/archives/:id/captures` endpoint accepts an optional `quality` field:
 
 ```json
 { "locator": "https://www.youtube.com/watch?v=...", "quality": "720p" }
 { "locator": "https://www.youtube.com/watch?v=...", "quality": "audio" }
 ```
 
-`"audio"` selects the most efficient native audio track without transcoding: Opus/WebM is preferred (smallest at equivalent quality), then AAC/M4A, then whatever yt-dlp considers best. The saved file's extension matches the native format (`.webm` for Opus, `.m4a` for AAC, etc.) — no ffmpeg re-encode, no size inflation. Any `"NNNp"` height is accepted; the server builds the yt-dlp format selector with an unconditional `/best` fallback so the download succeeds even if the exact height is unavailable. Omitting `quality` or passing `"best"` downloads at the highest available quality. Anything else is rejected with HTTP 400.
+`"audio"` selects the most efficient native audio track without re-encoding (Opus/WebM preferred, then AAC/M4A). Omitting `quality` or passing `"best"` downloads at the highest available quality.
 
-The probe endpoint (`GET /api/archives/:id/captures/probe?locator=…`) requires auth and returns 200 with:
-```json
-{ "has_video": true,  "has_audio": true,  "qualities": ["1080p", "720p", "480p"] }
-{ "has_video": false, "has_audio": true,  "qualities": [] }
-{ "has_video": false, "has_audio": false, "qualities": [] }
+## Configuration
+
+### TOML config file
+
+```toml
+# Optional. Default: 127.0.0.1:8080
+bind = "127.0.0.1:8080"
+
+# Required. Persists across upgrades; must be on a writable path.
+auth_db_path = "/var/lib/archivr/archivr-auth.sqlite"
+
+[[archives]]
+id = "personal"
+label = "Personal"
+archive_path = "/srv/archivr/personal/.archivr"
+
+[[archives]]
+id = "work"
+label = "Work"
+archive_path = "/srv/archivr/work/.archivr"
 ```
-`has_video: false, has_audio: false` means yt-dlp found no downloadable tracks (e.g. a tweet with no media). A 502 means yt-dlp itself failed (transient network error, rate-limit, unsupported extractor) — treat as inconclusive, not "no media."
 
-#### YouTube playlists and channels
+See `docker/config.example.toml` for a complete annotated example.
 
-Capturing a YouTube playlist or channel URL creates a **container entry** for the playlist or channel, with each video archived as a child entry beneath it. Before downloading, the capture UI probes each video to fetch available quality options, letting you set quality per-video or apply a single quality to the whole playlist.
+### Environment variables
 
-**Incremental sync:** When re-archiving a playlist or channel, enable **sync mode** in the capture dialog to skip videos that are already in the archive. Only new videos are downloaded; the existing container entry is reused.
+| Variable | Default | Description |
+|---|---|---|
+| `ARCHIVR_BIND` | `127.0.0.1:8080` | Bind address; overrides `bind` in TOML |
+| `ARCHIVR_STATIC_DIR` | `crates/archivr-server/static` | Pre-built frontend asset directory |
+| `ARCHIVR_YT_DLP` | `yt-dlp` | yt-dlp binary used for video and social downloads |
+| `ARCHIVR_SINGLE_FILE` | `single-file` | single-file-cli binary for web page archiving |
+| `ARCHIVR_CHROME` | `chromium` | Chromium executable passed to single-file |
+| `ARCHIVR_CHROME_ARGS` | — | Extra space-separated Chromium flags (Docker sets `--no-sandbox`) |
+| `ARCHIVR_TWITTER_CREDENTIALS_FILE` | — | Cookies file for tweet/thread scraping — required for `tweet:ID` and `x:thread:ID` inputs |
+| `ARCHIVR_TWEET_SCRAPER` | `vendor/twitter/scrape_user_tweet_contents.py` | Tweet scraper script path |
+| `ARCHIVR_TWEET_PYTHON` | `python3` | Python executable for the tweet scraper |
 
-**Excluding individual videos:** In the expanded per-video list, each video has a remove button (×) to exclude it from the current capture. Removed videos are not downloaded; the rest proceed normally.
+The Nix wrapper and Docker image set `ARCHIVR_STATIC_DIR`, `ARCHIVR_SINGLE_FILE`, and `ARCHIVR_CHROME` automatically.
+
+## Deployment
+
+### Security
+
+`archivr-server` binds to `127.0.0.1:8080` by default. Do not expose it to a public network without understanding the risks. When started on a non-loopback address the server logs a warning to stderr.
 
 ### Hosting on NixOS
 
-The flake exposes a `nixosModules.default` output. Add it to your system flake and
-enable the service:
+The flake exposes `nixosModules.default`:
 
 ```nix
 # flake.nix (your system flake)
@@ -200,7 +223,7 @@ enable the service:
         {
           services.archivr-server = {
             enable = true;
-            # listenAddress defaults to "127.0.0.1" (loopback only)
+            # listenAddress defaults to "127.0.0.1"
             # port defaults to 8080
             archives = [
               { id = "personal"; label = "Personal"; path = "/srv/archivr/personal/.archivr"; }
@@ -214,161 +237,73 @@ enable the service:
 }
 ```
 
-The module:
-- Creates an `archivr` system user and group.
-- Generates the TOML config from your options and stores the auth database under
-  `/var/lib/archivr-server/` (persists across upgrades).
-- Runs under a hardened systemd unit (`ProtectSystem = strict`, `NoNewPrivileges`,
-  `PrivateTmp`, etc.). Archive directories are whitelisted for read-write access.
-- Restarts automatically on failure.
+The module creates an `archivr` system user and group, generates the TOML config from your options, stores the auth database at `/var/lib/archivr-server/` (persists across upgrades), and runs under a hardened systemd unit (`ProtectSystem = strict`, `NoNewPrivileges`, `PrivateTmp`). Archive directories are whitelisted for read-write access.
 
-**`openFirewall`** — set to `true` to open the TCP port derived from `bind`.
-Only needed when binding to a non-loopback address:
+Set `openFirewall = true` with a non-loopback `listenAddress` only when LAN or remote access is required.
 
-```nix
-services.archivr-server = {
-  listenAddress = "0.0.0.0";
-  port = 8080;            # explicit, though 8080 is the default
-  openFirewall = true;
-};
-```
-
-**Archive directories** must be readable and writable by the `archivr` user.
-Initialise them with `archivr init` first, then `chown -R archivr:archivr /srv/archivr`.
-
+Archive directories must be owned by the `archivr` user. Initialise them with `archivr init` first, then `chown -R archivr:archivr /srv/archivr`.
 
 ### Hosting with Docker
 
-A `Dockerfile` and `docker-compose.yml` are provided for self-hosting without Nix.
+```sh
+# 1. Configure
+mkdir config
+cp docker/config.example.toml config/archivr-server.toml
+# Edit archivr-server.toml — set id, label, archive_path, and auth_db_path
 
-**Quickstart**
+# 2. Initialize each archive (run once per archive)
+docker compose run --rm archivr archivr init \
+  /data/archives/main /data/archives/main/.archivr/store \
+  --name "Main Archive"
 
-1. Copy the example config and edit it:
-
-   ```sh
-   mkdir config
-   cp docker/config.example.toml config/archivr-server.toml
-   # edit config/archivr-server.toml — set archive id, label, and archive_path
-   ```
-
-2. Initialize each archive on the persistent data volume before the first start.
-   The image includes the `archivr` CLI for this purpose:
-
-   ```sh
-   docker compose run --rm archivr archivr init /data/archives/main /data/archives/main/.archivr/store --name "Main Archive"
-   ```
-
-   This creates `/data/archives/main/.archivr/` with the metadata the server requires.
-   A bare `mkdir` is not enough — the server reads `name` and `store_path` files that
-   only `archivr init` writes.
-
-3. Start the server:
-
-   ```sh
-   docker compose up -d
-   ```
-
-   Then open `http://localhost:8080`.
-
-**Volumes**
+# 3. Start
+docker compose up -d
+```
 
 | Mount | Purpose |
-|-------|---------|
+|---|---|
 | `./config` (read-only) | Directory containing `archivr-server.toml` |
 | `archivr-data` named volume | Auth database (`/data/archivr-auth.sqlite`) and archive directories |
 
-> **Important:** `auth_db_path` must be set explicitly in `archivr-server.toml` to a
-> path on the writable data volume (e.g. `/data/archivr-auth.sqlite`). If left unset,
-> the server defaults to writing the auth database next to the config file — which is
-> on the read-only `/config` mount and will fail. The example config sets this correctly.
+> **Important:** `auth_db_path` must point to a path on the writable data volume (e.g. `/data/archivr-auth.sqlite`). The example config sets this correctly. A bare `mkdir` is not enough to initialise an archive — `archivr init` writes metadata files the server requires.
 
-**Twitter/X archiving**
-
-Supply a cookies file inside the config volume and set `ARCHIVR_TWITTER_CREDENTIALS_FILE` in `docker-compose.yml`:
+**Twitter/X archiving:** supply a cookies file inside the config volume and reference it in `docker-compose.yml`:
 
 ```yaml
 environment:
   ARCHIVR_TWITTER_CREDENTIALS_FILE: /config/twitter-cookies.txt
 ```
 
-**Building the image locally**
+**Building locally:**
 
 ```sh
 docker build -t archivr-server .
 ```
 
-The image compiles the Rust binary in a separate build stage so only the runtime
-dependencies (Chromium, Node.js, Python) land in the final layer.
+The image compiles the Rust binary in a separate build stage; only runtime dependencies (Chromium, Node.js, Python) land in the final layer.
 
-### Supported Shorthand Inputs
+## Development
 
-- YouTube video/short media:
-  - `yt:video/ID`
-  - `youtube:video/ID`
-  - `yt:short/ID`
-  - `yt:shorts/ID`
-  - `youtube:shorts/ID`
-- X/Twitter tweet JSON content:
-  - `tweet:ID`
-  - `x:tweet:ID`
-  - `x:x:ID`
-  - `twitter:x:ID`
-  - `twitter:tweet:ID`
-- X/Twitter media/video download:
-  - `tweet:media:ID`
-- X/Twitter thread JSON content:
-  - `x:thread:ID`
-  - `twitter:thread:ID`
-- Other platform shorthands:
-  - `instagram:ID`
-  - `facebook:ID`
-  - `tiktok:ID`
-  - `reddit:ID`
-  - `snapchat:ID`
+Runtime dependencies beyond Rust and Node: `yt-dlp`, Chromium, `single-file` (Node), Python 3 with `twitter-api-client`, `ffmpeg`. `nix develop` provides the dev subset.
 
-### Environment Variables
+```sh
+# Rust (workspace root)
+cargo build
+cargo test
+cargo test -p archivr-core
+cargo run -p archivr-server -- ./archivr-server.toml
 
-- `ARCHIVR_BIND`
-  - Optional.
-  - Overrides the bind address from the TOML config. Useful in Docker where you need
-    `0.0.0.0:8080` without editing the config file. Default: `127.0.0.1:8080`.
-- `ARCHIVR_STATIC_DIR`
-  - Optional.
-  - Path to the directory of pre-built frontend assets served by the web UI.
-    Set automatically by the Nix wrapper and the Docker image. When running from
-    source with `cargo run`, falls back to `crates/archivr-server/static`.
-- `ARCHIVR_YT_DLP`
-  - Optional.
-  - Overrides the `yt-dlp` binary used for YouTube, X media posts, Instagram, Facebook, TikTok, Reddit, and Snapchat downloads.
-- `ARCHIVR_SINGLE_FILE`
-  - Optional.
-  - Overrides the `single-file` binary used for web page archiving. Set automatically by the Nix wrapper and the Docker image.
-- `ARCHIVR_CHROME`
-  - Optional.
-  - Overrides the Chromium/Chrome executable passed to `single-file` via `--browser-executable-path`. Set automatically by the Nix wrapper and the Docker image. Default: `chromium`.
-- `ARCHIVR_CHROME_ARGS`
-  - Optional.
-  - Space-separated extra flags appended to Chromium's `--browser-args`. The Docker
-    image sets this to `--no-sandbox` because Chromium refuses to run as root without
-    it. Leave unset when running natively (Nix, Linux desktop).
-    A `--window-size=1920,1080` is always passed to provide a realistic desktop
-    viewport (so responsive @media rules and styles are evaluated and preserved
-    correctly). Supply your own `--window-size=...` here to override.
-- `ARCHIVR_TWITTER_CREDENTIALS_FILE`
-  - Required for tweet/thread scraping inputs such as `tweet:ID` and `x:thread:ID`.
-  - Must point to a cookies file for the vendored scraper.
-- `ARCHIVR_TWEET_SCRAPER`
-  - Optional.
-  - Overrides the tweet scraper script path. Default: `vendor/twitter/scrape_user_tweet_contents.py`.
-- `ARCHIVR_TWEET_PYTHON`
-  - Optional.
-  - Overrides the Python executable used to run the tweet scraper. Default: `python3`.
+# Frontend (from frontend/)
+bun install
+bun run dev        # Vite dev server
+bun run build      # → crates/archivr-server/static/
+bun run storybook  # Component QA on :6006
 
-### Current Limitations
-
-- Arbitrary `http://` or `https://` URLs that return HTML are archived as self-contained single-file HTML snapshots via `single-file-cli` (requires Chromium). Plain file URLs (PDFs, images, zips, etc.) are downloaded directly. Requires `single-file` and a Chromium binary on PATH, or the `ARCHIVR_SINGLE_FILE` / `ARCHIVR_CHROME` env vars set.
-- Local files currently need to be passed as `file://...` paths.
+# Nix
+nix develop        # dev shell
+nix build .#archivr-server
+```
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE.md) file for details.
+MIT — see [LICENSE](../LICENSE.md).
