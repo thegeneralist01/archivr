@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="branding/assets/banner-dark.png">
-    <img alt="Archivr — Preserve what matters. Forever." src="branding/assets/banner-light.svg" width="860">
+    <img alt="Archivr — Preserve what matters. Forever." src="branding/assets/banner-light.png" width="860">
   </picture>
 </p>
 
