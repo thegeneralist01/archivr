@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Archivr is a self-hosted archival tool that captures and preserves digital content — YouTube/Twitter/Instagram/TikTok/Reddit posts, arbitrary URLs, full web pages (via SingleFile + Chromium, optionally through a Freedium mirror for paywalled articles), and local files — into self-contained, SQLite-backed archive directories with blob deduplication, hierarchical tags, collections, and role-based auth. Rust workspace + React frontend.
+archivr is a self-hosted archival tool that captures and preserves digital content — YouTube/Twitter/Instagram/TikTok/Reddit posts, arbitrary URLs, full web pages (via SingleFile + Chromium, optionally through a Freedium mirror for paywalled articles), and local files — into self-contained, SQLite-backed archive directories with blob deduplication, hierarchical tags, collections, and role-based auth. Rust workspace + React frontend.
 
 Read `ARCHIVR-MENTAL-MODEL.md` before making structural changes.
 

@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 120" width="480" height="120">
+  <defs>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@600&amp;display=swap');
+      .mark-letter {
+        font-family: "Cormorant Garamond", Georgia, serif;
+        font-weight: 600;
+        font-size: 62px;
+        fill: #f4ead8;
+        dominant-baseline: middle;
+        text-anchor: middle;
+      }
+      .wordmark {
+        font-family: "Cormorant Garamond", Georgia, serif;
+        font-weight: 600;
+        font-size: 46px;
+        letter-spacing: 0.01em;
+        fill: #f4ead8;
+        dominant-baseline: middle;
+      }
+    </style>
+  </defs>
+
+  <!-- Icon mark: accent background -->
+  <rect x="8" y="8" width="104" height="104" rx="14" ry="14" fill="#8d3f30"/>
+  <!-- The 'a' -->
+  <text class="mark-letter" x="60" y="62">a</text>
+
+  <!-- Wordmark -->
+  <text class="wordmark" x="138" y="62">archivr</text>
+</svg>
