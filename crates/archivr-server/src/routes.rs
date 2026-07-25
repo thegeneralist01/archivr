@@ -387,8 +387,7 @@ pub fn app_with_state(state: AppState) -> Router {
             get(blob_cleanup_scan_handler).delete(blob_cleanup_delete_handler),
         )
         .route("/api/util/resolve-tco", post(resolve_tco_handler))
-        .nest_service("/assets", ServeDir::new(static_dir.join("assets")))
-        .fallback_service(ServeFile::new(static_dir.join("index.html")))
+        .fallback_service(ServeDir::new(&static_dir).not_found_service(ServeFile::new(static_dir.join("index.html"))))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             setup_guard,
