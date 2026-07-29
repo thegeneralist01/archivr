@@ -1,13 +1,17 @@
+use crate::{
+    archive::{self, ArchivePaths},
+    database, downloader,
+    twitter::parse_tweet_id,
+};
 use anyhow::{Context, Result};
 use chrono::Local;
-use uuid::Uuid;
 use serde_json::json;
 use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
-use crate::{archive::{self, ArchivePaths}, database, downloader, twitter::parse_tweet_id};
+use uuid::Uuid;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Source {
@@ -125,15 +129,12 @@ pub fn resolve_cookies_for_url(
             None => true,
             Some(pattern) => match rule.pattern_kind.as_str() {
                 "wildcard" => wildcard_matches(pattern, url),
-                "regex" => regex::Regex::new(pattern)
-                    .is_ok_and(|re| re.is_match(url)),
+                "regex" => regex::Regex::new(pattern).is_ok_and(|re| re.is_match(url)),
                 _ => false,
             },
         };
         if applies {
-            if let Ok(map) =
-                serde_json::from_str::<HashMap<String, String>>(&rule.cookies_json)
-            {
+            if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&rule.cookies_json) {
                 result.extend(map);
             }
         }
@@ -163,7 +164,10 @@ fn wildcard_matches(pattern: &str, url: &str) -> bool {
         match ch {
             '*' => pat.push_str(".*"),
             '?' => pat.push('.'),
-            c if "$.+[]{}()|^\\".contains(c) => { pat.push('\\'); pat.push(c); }
+            c if "$.+[]{}()|^\\".contains(c) => {
+                pat.push('\\');
+                pat.push(c);
+            }
             c => pat.push(c),
         }
     }
@@ -171,10 +175,48 @@ fn wildcard_matches(pattern: &str, url: &str) -> bool {
     regex::Regex::new(&pat).is_ok_and(|re| re.is_match(&target))
 }
 
+/// The set of base domains that Freedium supports as of its "7 new sources" announcement.
+/// A URL matches if its hostname is exactly `domain` or any subdomain (`*.domain`).
+///
+/// Source: https://freedium-mirror.cfd/ — "7 new sources supported! Medium, NYT, WaPo,
+/// Bloomberg, Reuters, Economist, and Financial Times."
+const FREEDIUM_SUPPORTED_HOSTS: &[&str] = &[
+    "medium.com",
+    "nytimes.com",
+    "washingtonpost.com",
+    "bloomberg.com",
+    "reuters.com",
+    "economist.com",
+    "ft.com",
+];
+
+/// Returns true when `url`'s hostname is one of the domains Freedium explicitly supports,
+/// either as the bare domain or a subdomain (e.g. `towardsdatascience.medium.com`).
+/// Unparseable URLs return false so we never accidentally proxy an unknown host.
+fn is_freedium_supported_url(url: &str) -> bool {
+    use reqwest::Url as ReqwestUrl;
+    let host = match ReqwestUrl::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+    {
+        Some(h) => h,
+        None => return false,
+    };
+    FREEDIUM_SUPPORTED_HOSTS
+        .iter()
+        .any(|&domain| host == domain || host.ends_with(&format!(".{domain}")))
+}
+
 fn generate_entry_title(source: Source, meta: &PlatformMetadata) -> String {
     match source {
-        Source::YouTubeVideo => meta.title.clone().unwrap_or_else(|| "YouTube Video".to_string()),
-        Source::YouTubePlaylist => meta.title.clone().unwrap_or_else(|| "YouTube Playlist".to_string()),
+        Source::YouTubeVideo => meta
+            .title
+            .clone()
+            .unwrap_or_else(|| "YouTube Video".to_string()),
+        Source::YouTubePlaylist => meta
+            .title
+            .clone()
+            .unwrap_or_else(|| "YouTube Playlist".to_string()),
         Source::YouTubeChannel => format!(
             "Archival of {}",
             meta.author.as_deref().unwrap_or("Unknown Channel")
@@ -186,18 +228,28 @@ fn generate_entry_title(source: Source, meta: &PlatformMetadata) -> String {
                 None => title.to_string(),
             }
         }
-        Source::YouTubeMusicPlaylist => {
-            meta.title.clone().unwrap_or_else(|| "YouTube Music Playlist".to_string())
-        }
-        Source::SpotifyTrack | Source::SpotifyAlbum | Source::SpotifyPlaylist => {
-            meta.title.clone().unwrap_or_else(|| "Spotify Content".to_string())
-        }
+        Source::YouTubeMusicPlaylist => meta
+            .title
+            .clone()
+            .unwrap_or_else(|| "YouTube Music Playlist".to_string()),
+        Source::SpotifyTrack | Source::SpotifyAlbum | Source::SpotifyPlaylist => meta
+            .title
+            .clone()
+            .unwrap_or_else(|| "Spotify Content".to_string()),
         Source::X => format!("X Media by {}", meta.author.as_deref().unwrap_or("unknown")),
         Source::Tweet => {
-            let excerpt = meta.caption_excerpt().unwrap_or_else(|| "Tweet".to_string());
-            format!("{} \u{2014} @{}", excerpt, meta.author.as_deref().unwrap_or("unknown"))
+            let excerpt = meta
+                .caption_excerpt()
+                .unwrap_or_else(|| "Tweet".to_string());
+            format!(
+                "{} \u{2014} @{}",
+                excerpt,
+                meta.author.as_deref().unwrap_or("unknown")
+            )
         }
-        Source::TweetThread => format!("Thread by @{}", meta.author.as_deref().unwrap_or("unknown")),
+        Source::TweetThread => {
+            format!("Thread by @{}", meta.author.as_deref().unwrap_or("unknown"))
+        }
         Source::Instagram => format!("Post by @{}", meta.author.as_deref().unwrap_or("unknown")),
         Source::Facebook => format!("Post by {}", meta.author.as_deref().unwrap_or("unknown")),
         Source::TikTok => format!("TikTok by @{}", meta.author.as_deref().unwrap_or("unknown")),
@@ -208,23 +260,39 @@ fn generate_entry_title(source: Source, meta: &PlatformMetadata) -> String {
             meta.post_author.as_deref().unwrap_or("unknown")
         ),
         Source::Snapchat => format!("Snap by {}", meta.author.as_deref().unwrap_or("unknown")),
-        Source::Local => meta.title.clone().unwrap_or_else(|| "Local File".to_string()),
-        Source::Url => meta.title.clone().unwrap_or_else(|| "Downloaded File".to_string()),
-        Source::WebPage => meta.title.clone().unwrap_or_else(|| "Archived Web Page".to_string()),
+        Source::Local => meta
+            .title
+            .clone()
+            .unwrap_or_else(|| "Local File".to_string()),
+        Source::Url => meta
+            .title
+            .clone()
+            .unwrap_or_else(|| "Downloaded File".to_string()),
+        Source::WebPage => meta
+            .title
+            .clone()
+            .unwrap_or_else(|| "Archived Web Page".to_string()),
         Source::Other => "Archived Content".to_string(),
     }
 }
 /// Returns true when `s` is a valid bare YouTube video ID:
 /// exactly 11 characters from the set `[A-Za-z0-9_-]`.
 fn is_youtube_video_id(s: &str) -> bool {
-    s.len() == 11 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    s.len() == 11
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
-
 
 fn expand_shorthand_to_url(path: &str, source: &Source) -> String {
     // YouTube shorthands: yt:video/ID, yt:playlist/ID, yt:@handle, yt:channel/ID, etc.
-    if matches!(source, Source::YouTubeVideo | Source::YouTubePlaylist | Source::YouTubeChannel) {
-        if let Some(after) = path.strip_prefix("yt:").or_else(|| path.strip_prefix("youtube:")) {
+    if matches!(
+        source,
+        Source::YouTubeVideo | Source::YouTubePlaylist | Source::YouTubeChannel
+    ) {
+        if let Some(after) = path
+            .strip_prefix("yt:")
+            .or_else(|| path.strip_prefix("youtube:"))
+        {
             if let Some(id) = after
                 .strip_prefix("video/")
                 .or_else(|| after.strip_prefix("short/"))
@@ -255,7 +323,10 @@ fn expand_shorthand_to_url(path: &str, source: &Source) -> String {
     }
 
     // YouTube Music shorthands: ytm:ID (track) or ytm:playlist/ID
-    if matches!(source, Source::YouTubeMusicTrack | Source::YouTubeMusicPlaylist) {
+    if matches!(
+        source,
+        Source::YouTubeMusicTrack | Source::YouTubeMusicPlaylist
+    ) {
         if let Some(after) = path.strip_prefix("ytm:") {
             if let Some(id) = after.strip_prefix("playlist/") {
                 return format!("https://music.youtube.com/playlist?list={id}");
@@ -266,7 +337,10 @@ fn expand_shorthand_to_url(path: &str, source: &Source) -> String {
     }
 
     // Spotify shorthands: spotify:track:ID, spotify:album:ID, spotify:playlist:ID
-    if matches!(source, Source::SpotifyTrack | Source::SpotifyAlbum | Source::SpotifyPlaylist) {
+    if matches!(
+        source,
+        Source::SpotifyTrack | Source::SpotifyAlbum | Source::SpotifyPlaylist
+    ) {
         if let Some(after) = path.strip_prefix("spotify:") {
             if let Some(id) = after.strip_prefix("track:") {
                 return format!("https://open.spotify.com/track/{id}");
@@ -869,8 +943,12 @@ fn register_tweet_artifacts(
             },
         )?;
         let json_path = store_path.join(relpath);
-        let json_str = fs::read_to_string(&json_path)
-            .with_context(|| format!("failed to read tweet JSON for artifact registration: {}", json_path.display()))?;
+        let json_str = fs::read_to_string(&json_path).with_context(|| {
+            format!(
+                "failed to read tweet JSON for artifact registration: {}",
+                json_path.display()
+            )
+        })?;
         for (role, raw_relpath) in tweet_raw_artifacts(&json_str)? {
             let raw_path = PathBuf::from(&raw_relpath);
             let blob = blob_record_for_raw_relpath(store_path, &raw_path)?;
@@ -1081,10 +1159,12 @@ pub fn perform_capture(
             }
         };
 
-        let container_title = playlist_info
-            .title
-            .clone()
-            .or_else(|| playlist_info.uploader.clone().map(|u| format!("{u} (channel)")));
+        let container_title = playlist_info.title.clone().or_else(|| {
+            playlist_info
+                .uploader
+                .clone()
+                .map(|u| format!("{u} (channel)"))
+        });
 
         // Sync mode: reuse an existing container so we don't create a duplicate
         // root entry on every sync run. Non-sync always creates a fresh container.
@@ -1092,55 +1172,89 @@ pub fn perform_capture(
             match archive::find_container_entry_id_by_canonical_url(&conn, &canonical_url) {
                 Err(e) => {
                     return Err(fail_run(
-                        &conn, &run, &item,
+                        &conn,
+                        &run,
+                        &item,
                         &format!("Failed to query existing container: {e:#}"),
                     ));
                 }
                 Ok(Some(existing_id)) => {
                     // Container already exists — mark the run item done pointing at it;
                     // don't call record_container_entry (that would create a duplicate).
-                    if let Err(e) = database::complete_archive_run_item(&conn, item.id, existing_id) {
+                    if let Err(e) = database::complete_archive_run_item(&conn, item.id, existing_id)
+                    {
                         return Err(fail_run(
-                            &conn, &run, &item,
+                            &conn,
+                            &run,
+                            &item,
                             &format!("Failed to complete run item for existing container: {e:#}"),
                         ));
                     }
-                    let archived = match archive::get_archived_playlist_child_urls(&conn, &canonical_url) {
-                        Ok(set) => set,
-                        Err(e) => return Err(fail_run(
-                            &conn, &run, &item,
-                            &format!("Failed to query archived playlist children: {e:#}"),
-                        )),
-                    };
+                    let archived =
+                        match archive::get_archived_playlist_child_urls(&conn, &canonical_url) {
+                            Ok(set) => set,
+                            Err(e) => {
+                                return Err(fail_run(
+                                    &conn,
+                                    &run,
+                                    &item,
+                                    &format!("Failed to query archived playlist children: {e:#}"),
+                                ));
+                            }
+                        };
                     (existing_id, archived)
                 }
                 Ok(None) => {
                     // First sync run for this playlist — create the container normally.
                     let e = match record_container_entry(
-                        &conn, store_path, user_id, &run, &item, locator, &canonical_url,
-                        source, container_title, &playlist_info.playlist_id,
+                        &conn,
+                        store_path,
+                        user_id,
+                        &run,
+                        &item,
+                        locator,
+                        &canonical_url,
+                        source,
+                        container_title,
+                        &playlist_info.playlist_id,
                         playlist_info.uploader.as_deref(),
                     ) {
                         Ok(e) => e,
-                        Err(e) => return Err(fail_run(
-                            &conn, &run, &item,
-                            &format!("Failed to create container entry: {e:#}"),
-                        )),
+                        Err(e) => {
+                            return Err(fail_run(
+                                &conn,
+                                &run,
+                                &item,
+                                &format!("Failed to create container entry: {e:#}"),
+                            ));
+                        }
                     };
                     (e.id, std::collections::HashSet::new())
                 }
             }
         } else {
             let e = match record_container_entry(
-                &conn, store_path, user_id, &run, &item, locator, &canonical_url,
-                source, container_title, &playlist_info.playlist_id,
+                &conn,
+                store_path,
+                user_id,
+                &run,
+                &item,
+                locator,
+                &canonical_url,
+                source,
+                container_title,
+                &playlist_info.playlist_id,
                 playlist_info.uploader.as_deref(),
             ) {
                 Ok(e) => e,
-                Err(e) => return Err(fail_run(
-                    &conn, &run, &item,
-                    &format!("Failed to create container entry: {e:#}"),
-                )),
+                Err(e) => {
+                    return Err(fail_run(
+                        &conn,
+                        &run,
+                        &item,
+                        &format!("Failed to create container entry: {e:#}"),
+                    ));
+                }
             };
             (e.id, std::collections::HashSet::new())
         };
@@ -1168,7 +1282,6 @@ pub fn perform_capture(
                 continue;
             }
 
-
             let child_timestamp = format!(
                 "{}-{}",
                 Local::now().format("%Y-%m-%dT%H-%M-%S%.3f"),
@@ -1187,7 +1300,10 @@ pub fn perform_capture(
             ) {
                 Ok(i) => i,
                 Err(e) => {
-                    eprintln!("warn: playlist item {} create_run_item failed: {e:#}", playlist_item.url);
+                    eprintln!(
+                        "warn: playlist item {} create_run_item failed: {e:#}",
+                        playlist_item.url
+                    );
                     continue;
                 }
             };
@@ -1241,7 +1357,8 @@ pub fn perform_capture(
                         Err(e) => {
                             eprintln!("warn: stat child temp file: {e:#}");
                             let _ = database::fail_archive_run_item(
-                                &conn, child_item.id,
+                                &conn,
+                                child_item.id,
                                 &format!("failed to stat downloaded file: {e:#}"),
                             );
                             continue;
@@ -1251,7 +1368,8 @@ pub fn perform_capture(
                         if let Err(e) = move_temp_to_raw(&temp_file, &hash, store_path) {
                             eprintln!("warn: move_temp_to_raw child: {e:#}");
                             let _ = database::fail_archive_run_item(
-                                &conn, child_item.id,
+                                &conn,
+                                child_item.id,
                                 &format!("failed to move downloaded file: {e:#}"),
                             );
                             continue;
@@ -1286,7 +1404,8 @@ pub fn perform_capture(
                         Err(e) => {
                             eprintln!("warn: record child entry: {e:#}");
                             let _ = database::fail_archive_run_item(
-                                &conn, child_item.id,
+                                &conn,
+                                child_item.id,
                                 &format!("failed to record entry: {e:#}"),
                             );
                         }
@@ -1294,9 +1413,13 @@ pub fn perform_capture(
                 }
                 Err(e) => {
                     let _ = fs::remove_dir_all(store_path.join("temp").join(&child_timestamp));
-                    eprintln!("warn: yt-dlp child download failed for {}: {e:#}", playlist_item.url);
+                    eprintln!(
+                        "warn: yt-dlp child download failed for {}: {e:#}",
+                        playlist_item.url
+                    );
                     let _ = database::fail_archive_run_item(
-                        &conn, child_item.id,
+                        &conn,
+                        child_item.id,
                         &format!("yt-dlp download failed: {e:#}"),
                     );
                 }
@@ -1313,8 +1436,8 @@ pub fn perform_capture(
                 |row| row.get(0),
             )
             .unwrap_or_else(|_| "completed".to_string());
-        let completed_child_count: i64 = database::get_run_completed_child_count(&conn, run.id)
-            .unwrap_or(0);
+        let completed_child_count: i64 =
+            database::get_run_completed_child_count(&conn, run.id).unwrap_or(0);
 
         return Ok(CaptureResult {
             run_uid: run.run_uid.clone(),
@@ -1391,20 +1514,36 @@ pub fn perform_capture(
 
     // Source: web page — archive as a self-contained HTML snapshot via single-file-cli
     if source == Source::WebPage {
-        // When via_freedium is enabled and the URL is not already a freedium mirror,
-        // fetch through the mirror to bypass paywalls. Store the original locator in DB.
+        // When via_freedium is enabled, the URL is on a Freedium-supported host, and it is
+        // not already a freedium mirror URL, fetch through the mirror to bypass paywalls.
+        // Store the original locator in the DB; only the fetch URL changes.
         // Use an empty cookie jar for the mirror URL: cookies resolved for the original
         // domain (e.g. NYT, Medium) must not be sent to freedium-mirror.cfd.
-        let (fetch_url, fetch_cookies): (String, HashMap<String, String>) =
-            if config.via_freedium && !locator.starts_with("https://freedium-mirror.cfd/") {
-                (format!("https://freedium-mirror.cfd/{}", locator), HashMap::new())
-            } else {
-                (locator.to_string(), cookies.clone())
-            };
+        let (fetch_url, fetch_cookies): (String, HashMap<String, String>) = if config.via_freedium
+            && is_freedium_supported_url(locator)
+            && !locator.starts_with("https://freedium-mirror.cfd/")
+        {
+            (
+                format!("https://freedium-mirror.cfd/{}", locator),
+                HashMap::new(),
+            )
+        } else {
+            (locator.to_string(), cookies.clone())
+        };
         // Key cleanup/title-stripping off the actual fetch host so that
         // user-supplied freedium-mirror.cfd URLs are also handled correctly.
         let is_freedium_fetch = fetch_url.starts_with("https://freedium-mirror.cfd/");
-        match downloader::singlefile::save(&fetch_url, store_path, &timestamp, &fetch_cookies, config.ublock_enabled, config.cookie_ext_enabled, config.reader_mode, config.modal_closer_enabled, is_freedium_fetch) {
+        match downloader::singlefile::save(
+            &fetch_url,
+            store_path,
+            &timestamp,
+            &fetch_cookies,
+            config.ublock_enabled,
+            config.cookie_ext_enabled,
+            config.reader_mode,
+            config.modal_closer_enabled,
+            is_freedium_fetch,
+        ) {
             Ok(result) => {
                 let file_extension = ".html".to_string();
                 let temp_html = store_path
@@ -1415,27 +1554,28 @@ pub fn perform_capture(
                 // Font extraction: rewrite the HTML in-place before hashing.
                 // Only runs when archive_id is known (server context). CLI passes
                 // None and keeps fonts embedded — no behaviour change for CLI.
-                let (html_hash, byte_size, extracted_fonts, html_title) =
-                    if let Some(aid) = archive_id {
-                        let content = fs::read_to_string(&temp_html)
-                            .with_context(|| format!("failed to read {}", temp_html.display()))?;
-                        let (rewritten, fonts) =
-                            downloader::font_extractor::extract_and_rewrite(&content, store_path, aid)
-                                .unwrap_or_else(|_| (content.clone(), vec![])); // non-fatal
-                        // Extract title after font-stripping so the title tag is not buried
-                        // behind multi-MB embedded font data that would exceed the 256 KiB window.
-                        let title = downloader::singlefile::extract_html_title_str(&rewritten);
-                        fs::write(&temp_html, rewritten.as_bytes())
-                            .with_context(|| "failed to write rewritten HTML")?;
-                        let size = rewritten.len() as i64;
-                        let new_hash = crate::hash::hash_bytes(rewritten.as_bytes());
-                        (new_hash, size, fonts, title)
-                    } else {
-                        let size = fs::metadata(&temp_html)
-                            .with_context(|| format!("failed to stat {}", temp_html.display()))?
-                            .len() as i64;
-                        (result.html_hash.clone(), size, vec![], result.title.clone())
-                    };
+                let (html_hash, byte_size, extracted_fonts, html_title) = if let Some(aid) =
+                    archive_id
+                {
+                    let content = fs::read_to_string(&temp_html)
+                        .with_context(|| format!("failed to read {}", temp_html.display()))?;
+                    let (rewritten, fonts) =
+                        downloader::font_extractor::extract_and_rewrite(&content, store_path, aid)
+                            .unwrap_or_else(|_| (content.clone(), vec![])); // non-fatal
+                    // Extract title after font-stripping so the title tag is not buried
+                    // behind multi-MB embedded font data that would exceed the 256 KiB window.
+                    let title = downloader::singlefile::extract_html_title_str(&rewritten);
+                    fs::write(&temp_html, rewritten.as_bytes())
+                        .with_context(|| "failed to write rewritten HTML")?;
+                    let size = rewritten.len() as i64;
+                    let new_hash = crate::hash::hash_bytes(rewritten.as_bytes());
+                    (new_hash, size, fonts, title)
+                } else {
+                    let size = fs::metadata(&temp_html)
+                        .with_context(|| format!("failed to stat {}", temp_html.display()))?
+                        .len() as i64;
+                    (result.html_hash.clone(), size, vec![], result.title.clone())
+                };
 
                 // 1. Move HTML to raw store (if this hash hasn't been seen before).
                 if !hash_exists(&html_hash, &file_extension, store_path)? {
@@ -1446,21 +1586,24 @@ pub fn perform_capture(
                 //    Errors here are silenced — favicon is supplementary.
                 let favicon_info: Option<(String, i64)> = (|| -> Option<(String, i64)> {
                     let fav_hash = result.favicon_hash.as_deref()?;
-                    let fav_ext  = result.favicon_ext.as_deref()?;
+                    let fav_ext = result.favicon_ext.as_deref()?;
                     let fav_temp = store_path
-                        .join("temp").join(&timestamp)
+                        .join("temp")
+                        .join(&timestamp)
                         .join(format!("{timestamp}.favicon{fav_ext}"));
-                    if !fav_temp.exists() { return None; }
+                    if !fav_temp.exists() {
+                        return None;
+                    }
                     let fav_size = fs::metadata(&fav_temp).ok()?.len() as i64;
-                    let fav_raw  = raw_relative_path_from_hash(fav_hash, fav_ext).ok()?;
+                    let fav_raw = raw_relative_path_from_hash(fav_hash, fav_ext).ok()?;
                     if !hash_exists(fav_hash, fav_ext, store_path).ok()? {
                         move_temp_to_raw(&fav_temp, fav_hash, store_path).ok()?;
                     }
                     let fav_blob = database::BlobRecord {
-                        sha256:      fav_hash.to_string(),
-                        byte_size:   fav_size,
-                        mime_type:   None,
-                        extension:   extension_without_dot(fav_ext),
+                        sha256: fav_hash.to_string(),
+                        byte_size: fav_size,
+                        mime_type: None,
+                        extension: extension_without_dot(fav_ext),
                         raw_relpath: path_to_store_string(&fav_raw),
                     };
                     let fav_blob_id = database::upsert_blob(&conn, &fav_blob).ok()?;
@@ -1475,9 +1618,9 @@ pub fn perform_capture(
                 let entry_title = if is_freedium_fetch {
                     html_title.as_deref().map(|t| {
                         t.trim_end_matches(" - Freedium")
-                         .trim_end_matches(" \u{2014} Freedium")
-                         .trim()
-                         .to_string()
+                            .trim_end_matches(" \u{2014} Freedium")
+                            .trim()
+                            .to_string()
                     })
                 } else {
                     html_title
@@ -1494,22 +1637,22 @@ pub fn perform_capture(
                     &html_hash,
                     &file_extension,
                     byte_size,
-                entry_title,
-                None,
-                None,
-            )?;
+                    entry_title,
+                    None,
+                    None,
+                )?;
 
                 // 5. Add favicon artifact if we captured one.
                 if let Some((fav_relpath, fav_blob_id)) = favicon_info {
                     let _ = database::add_entry_artifact(
                         &conn,
                         &database::NewArtifact {
-                            entry_id:      entry.id,
+                            entry_id: entry.id,
                             artifact_role: "favicon".to_string(),
-                            storage_area:  "raw".to_string(),
-                            relpath:       fav_relpath,
-                            blob_id:       Some(fav_blob_id),
-                            logical_path:  None,
+                            storage_area: "raw".to_string(),
+                            relpath: fav_relpath,
+                            blob_id: Some(fav_blob_id),
+                            logical_path: None,
                             metadata_json: None,
                         },
                     );
@@ -1518,22 +1661,22 @@ pub fn perform_capture(
                 // 6. Register each extracted font as a deduplicated blob + artifact.
                 for font in extracted_fonts {
                     let font_blob = database::BlobRecord {
-                        sha256:      font.sha256.clone(),
-                        byte_size:   font.byte_size,
-                        mime_type:   mime_for_font_ext(&font.ext),
-                        extension:   font.ext.strip_prefix('.').map(|s| s.to_string()),
+                        sha256: font.sha256.clone(),
+                        byte_size: font.byte_size,
+                        mime_type: mime_for_font_ext(&font.ext),
+                        extension: font.ext.strip_prefix('.').map(|s| s.to_string()),
                         raw_relpath: font.raw_relpath.clone(),
                     };
                     if let Ok(blob_id) = database::upsert_blob(&conn, &font_blob) {
                         let _ = database::add_entry_artifact(
                             &conn,
                             &database::NewArtifact {
-                                entry_id:      entry.id,
+                                entry_id: entry.id,
                                 artifact_role: "font".to_string(),
-                                storage_area:  "raw".to_string(),
-                                relpath:       font.raw_relpath,
-                                blob_id:       Some(blob_id),
-                                logical_path:  None,
+                                storage_area: "raw".to_string(),
+                                relpath: font.raw_relpath,
+                                blob_id: Some(blob_id),
+                                logical_path: None,
                                 metadata_json: None,
                             },
                         );
@@ -1658,7 +1801,13 @@ pub fn perform_capture(
         | Source::TikTok
         | Source::Reddit
         | Source::Snapchat => {
-            match downloader::ytdlp::download(path.clone(), store_path, &timestamp, quality, &cookies) {
+            match downloader::ytdlp::download(
+                path.clone(),
+                store_path,
+                &timestamp,
+                quality,
+                &cookies,
+            ) {
                 Ok(result) => result,
                 Err(e) => {
                     return Err(fail_run(
@@ -1672,7 +1821,13 @@ pub fn perform_capture(
         }
         Source::YouTubeMusicTrack | Source::SpotifyTrack => {
             // Music tracks are always audio-only regardless of the caller's quality hint.
-            match downloader::ytdlp::download(path.clone(), store_path, &timestamp, Some("audio"), &cookies) {
+            match downloader::ytdlp::download(
+                path.clone(),
+                store_path,
+                &timestamp,
+                Some("audio"),
+                &cookies,
+            ) {
                 Ok(result) => result,
                 Err(e) => {
                     return Err(fail_run(
@@ -1684,19 +1839,17 @@ pub fn perform_capture(
                 }
             }
         }
-        Source::Local => {
-            match downloader::local::save(path.clone(), store_path, &timestamp) {
-                Ok(h) => (h, local_file_extension(&path)),
-                Err(e) => {
-                    return Err(fail_run(
-                        &conn,
-                        &run,
-                        &item,
-                        &format!("Failed to archive local file: {e}"),
-                    ));
-                }
+        Source::Local => match downloader::local::save(path.clone(), store_path, &timestamp) {
+            Ok(h) => (h, local_file_extension(&path)),
+            Err(e) => {
+                return Err(fail_run(
+                    &conn,
+                    &run,
+                    &item,
+                    &format!("Failed to archive local file: {e}"),
+                ));
             }
-        }
+        },
         Source::YouTubePlaylist | Source::YouTubeChannel => unreachable!(),
         _ => unreachable!(),
     };
@@ -1811,10 +1964,7 @@ pub fn perform_rearchive(
     // Parse source_metadata_json for tweet_id and requested_locator.
     let meta: serde_json::Value = serde_json::from_str(&entry.source_metadata_json)
         .unwrap_or(serde_json::Value::Object(Default::default()));
-    let requested_locator = meta["requested_locator"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
+    let requested_locator = meta["requested_locator"].as_str().unwrap_or("").to_string();
     let tweet_id = meta["tweet_id"].as_str().unwrap_or("").to_string();
     if requested_locator.is_empty() || tweet_id.is_empty() {
         return Ok(RearchiveResult {
@@ -1858,7 +2008,10 @@ pub fn perform_rearchive(
 
     database::refresh_entry_cached_bytes(&conn, entry.id)?;
 
-    eprintln!("info: rearchived entry {entry_uid}: {} tweet JSONs", tweet_json_relpaths.len());
+    eprintln!(
+        "info: rearchived entry {entry_uid}: {} tweet JSONs",
+        tweet_json_relpaths.len()
+    );
 
     Ok(RearchiveResult {
         status: "completed".to_string(),
@@ -1869,9 +2022,9 @@ pub fn perform_rearchive(
 fn mime_for_font_ext(ext: &str) -> Option<String> {
     match ext {
         ".woff2" => Some("font/woff2".to_string()),
-        ".woff"  => Some("font/woff".to_string()),
-        ".ttf"   => Some("font/ttf".to_string()),
-        ".otf"   => Some("font/otf".to_string()),
+        ".woff" => Some("font/woff".to_string()),
+        ".ttf" => Some("font/ttf".to_string()),
+        ".otf" => Some("font/otf".to_string()),
         _ => None,
     }
 }
@@ -2012,7 +2165,10 @@ mod tests {
         );
         // Full YouTube URLs pass through unchanged
         assert_eq!(
-            expand_shorthand_to_url("https://www.youtube.com/watch?v=UHxw-L2WyyY", &Source::YouTubeVideo),
+            expand_shorthand_to_url(
+                "https://www.youtube.com/watch?v=UHxw-L2WyyY",
+                &Source::YouTubeVideo
+            ),
             "https://www.youtube.com/watch?v=UHxw-L2WyyY"
         );
     }
@@ -2142,14 +2298,32 @@ mod tests {
                 expected: Source::YouTubeChannel,
             },
             // Bare video ID — exactly 11 chars [A-Za-z0-9_-]
-            TestCase { url: "yt:dQw4w9WgXcQ",    expected: Source::YouTubeVideo },
-            TestCase { url: "youtube:dQw4w9WgXcQ", expected: Source::YouTubeVideo },
-            TestCase { url: "yt:a_b-c_d-e_4",    expected: Source::YouTubeVideo },
+            TestCase {
+                url: "yt:dQw4w9WgXcQ",
+                expected: Source::YouTubeVideo,
+            },
+            TestCase {
+                url: "youtube:dQw4w9WgXcQ",
+                expected: Source::YouTubeVideo,
+            },
+            TestCase {
+                url: "yt:a_b-c_d-e_4",
+                expected: Source::YouTubeVideo,
+            },
             // Non-ID: wrong length (9 chars) → Other
-            TestCase { url: "yt:not-video",        expected: Source::Other },
+            TestCase {
+                url: "yt:not-video",
+                expected: Source::Other,
+            },
             // Reserved prefixes still route correctly when segment looks like an ID
-            TestCase { url: "yt:playlist/dQw4w9WgXcQ", expected: Source::YouTubePlaylist },
-            TestCase { url: "yt:@dQw4w9WgXcQ",         expected: Source::YouTubeChannel },
+            TestCase {
+                url: "yt:playlist/dQw4w9WgXcQ",
+                expected: Source::YouTubePlaylist,
+            },
+            TestCase {
+                url: "yt:@dQw4w9WgXcQ",
+                expected: Source::YouTubeChannel,
+            },
         ];
 
         for case in &shorthand_cases {
@@ -2165,13 +2339,19 @@ mod tests {
     #[test]
     fn test_is_youtube_video_id() {
         assert!(is_youtube_video_id("dQw4w9WgXcQ"), "canonical ID");
-        assert!(is_youtube_video_id("a_b-c_d-e_4"), "11-char ID with _ and -");
+        assert!(
+            is_youtube_video_id("a_b-c_d-e_4"),
+            "11-char ID with _ and -"
+        );
         assert!(!is_youtube_video_id(""), "empty");
-        assert!(!is_youtube_video_id("short"),       "too short");
-        assert!(!is_youtube_video_id("toolong12345"),  "too long (12 chars)");
-        assert!(!is_youtube_video_id("dQw4w9WgXc!"),   "invalid char (! at pos 11)");
-        assert!(!is_youtube_video_id("not-video"),     "9 chars — too short");
-        assert!(!is_youtube_video_id("dQw4w9WgXC!!"),  "12 chars + bad char");
+        assert!(!is_youtube_video_id("short"), "too short");
+        assert!(!is_youtube_video_id("toolong12345"), "too long (12 chars)");
+        assert!(
+            !is_youtube_video_id("dQw4w9WgXc!"),
+            "invalid char (! at pos 11)"
+        );
+        assert!(!is_youtube_video_id("not-video"), "9 chars — too short");
+        assert!(!is_youtube_video_id("dQw4w9WgXC!!"), "12 chars + bad char");
     }
 
     #[test]
@@ -2289,11 +2469,17 @@ mod tests {
 
         // --- expand_shorthand_to_url ---
         assert_eq!(
-            expand_shorthand_to_url("spotify:track:4iV5W9uYEdYUVa79Axb7Rh", &Source::SpotifyTrack),
+            expand_shorthand_to_url(
+                "spotify:track:4iV5W9uYEdYUVa79Axb7Rh",
+                &Source::SpotifyTrack
+            ),
             "https://open.spotify.com/track/4iV5W9uYEdYUVa79Axb7Rh"
         );
         assert_eq!(
-            expand_shorthand_to_url("spotify:album:1DFixLWuPkv3KT3TnV35m3", &Source::SpotifyAlbum),
+            expand_shorthand_to_url(
+                "spotify:album:1DFixLWuPkv3KT3TnV35m3",
+                &Source::SpotifyAlbum
+            ),
             "https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3"
         );
         assert_eq!(
@@ -2305,9 +2491,18 @@ mod tests {
         );
 
         // --- source_metadata ---
-        assert_eq!(source_metadata(Source::SpotifyTrack), ("spotify", "music", "audio"));
-        assert_eq!(source_metadata(Source::SpotifyAlbum), ("spotify", "album", "container"));
-        assert_eq!(source_metadata(Source::SpotifyPlaylist), ("spotify", "playlist", "container"));
+        assert_eq!(
+            source_metadata(Source::SpotifyTrack),
+            ("spotify", "music", "audio")
+        );
+        assert_eq!(
+            source_metadata(Source::SpotifyAlbum),
+            ("spotify", "album", "container")
+        );
+        assert_eq!(
+            source_metadata(Source::SpotifyPlaylist),
+            ("spotify", "playlist", "container")
+        );
     }
 
     #[test]
@@ -2566,25 +2761,37 @@ mod tests {
         #[test]
         fn youtube_video_uses_title() {
             let m = meta(None, Some("How to Rust"), None, None, None);
-            assert_eq!(generate_entry_title(Source::YouTubeVideo, &m), "How to Rust");
+            assert_eq!(
+                generate_entry_title(Source::YouTubeVideo, &m),
+                "How to Rust"
+            );
         }
 
         #[test]
         fn youtube_video_fallback() {
             let m = meta(None, None, None, None, None);
-            assert_eq!(generate_entry_title(Source::YouTubeVideo, &m), "YouTube Video");
+            assert_eq!(
+                generate_entry_title(Source::YouTubeVideo, &m),
+                "YouTube Video"
+            );
         }
 
         #[test]
         fn youtube_playlist_uses_title() {
             let m = meta(None, Some("Rust Tutorial Series"), None, None, None);
-            assert_eq!(generate_entry_title(Source::YouTubePlaylist, &m), "Rust Tutorial Series");
+            assert_eq!(
+                generate_entry_title(Source::YouTubePlaylist, &m),
+                "Rust Tutorial Series"
+            );
         }
 
         #[test]
         fn youtube_channel_uses_author() {
             let m = meta(Some("Rust By Example"), None, None, None, None);
-            assert_eq!(generate_entry_title(Source::YouTubeChannel, &m), "Archival of Rust By Example");
+            assert_eq!(
+                generate_entry_title(Source::YouTubeChannel, &m),
+                "Archival of Rust By Example"
+            );
         }
 
         #[test]
@@ -2596,7 +2803,10 @@ mod tests {
         #[test]
         fn tweet_uses_excerpt_and_author() {
             let m = meta(Some("alice"), None, Some("Hello world"), None, None);
-            assert_eq!(generate_entry_title(Source::Tweet, &m), "Hello world \u{2014} @alice");
+            assert_eq!(
+                generate_entry_title(Source::Tweet, &m),
+                "Hello world \u{2014} @alice"
+            );
         }
 
         #[test]
@@ -2612,30 +2822,48 @@ mod tests {
         #[test]
         fn tweet_thread_uses_author() {
             let m = meta(Some("bob"), None, None, None, None);
-            assert_eq!(generate_entry_title(Source::TweetThread, &m), "Thread by @bob");
+            assert_eq!(
+                generate_entry_title(Source::TweetThread, &m),
+                "Thread by @bob"
+            );
         }
 
         #[test]
         fn instagram_uses_author() {
             let m = meta(Some("photographer"), None, None, None, None);
-            assert_eq!(generate_entry_title(Source::Instagram, &m), "Post by @photographer");
+            assert_eq!(
+                generate_entry_title(Source::Instagram, &m),
+                "Post by @photographer"
+            );
         }
 
         #[test]
         fn facebook_uses_author_no_at() {
             let m = meta(Some("John Doe"), None, None, None, None);
-            assert_eq!(generate_entry_title(Source::Facebook, &m), "Post by John Doe");
+            assert_eq!(
+                generate_entry_title(Source::Facebook, &m),
+                "Post by John Doe"
+            );
         }
 
         #[test]
         fn tiktok_uses_author() {
             let m = meta(Some("dancemaster"), None, None, None, None);
-            assert_eq!(generate_entry_title(Source::TikTok, &m), "TikTok by @dancemaster");
+            assert_eq!(
+                generate_entry_title(Source::TikTok, &m),
+                "TikTok by @dancemaster"
+            );
         }
 
         #[test]
         fn reddit_full_fields() {
-            let m = meta(None, Some("My first Rust project"), None, Some("rust"), Some("newbie"));
+            let m = meta(
+                None,
+                Some("My first Rust project"),
+                None,
+                Some("rust"),
+                Some("newbie"),
+            );
             assert_eq!(
                 generate_entry_title(Source::Reddit, &m),
                 "My first Rust project \u{2014} r/rust (u/newbie)"
@@ -2645,7 +2873,10 @@ mod tests {
         #[test]
         fn snapchat_uses_author() {
             let m = meta(Some("snapuser"), None, None, None, None);
-            assert_eq!(generate_entry_title(Source::Snapchat, &m), "Snap by snapuser");
+            assert_eq!(
+                generate_entry_title(Source::Snapchat, &m),
+                "Snap by snapuser"
+            );
         }
 
         #[test]
@@ -2668,7 +2899,10 @@ mod tests {
             }"#;
             let meta = tweet_metadata_from_json(json);
             assert_eq!(meta.author, Some("rustacean".to_string()));
-            assert_eq!(meta.caption, Some("Hello Rust world, this is a test tweet".to_string()));
+            assert_eq!(
+                meta.caption,
+                Some("Hello Rust world, this is a test tweet".to_string())
+            );
         }
     }
 
@@ -2735,4 +2969,94 @@ mod tests {
         assert_eq!(locator_to_playlist_url("https://example.com/page"), None);
     }
 
+    mod freedium_supported_url_tests {
+        use super::is_freedium_supported_url;
+
+        #[test]
+        fn medium_bare_domain() {
+            assert!(is_freedium_supported_url("https://medium.com/some/article"));
+        }
+
+        #[test]
+        fn medium_subdomain() {
+            // Custom Medium publication domains use *.medium.com
+            assert!(is_freedium_supported_url(
+                "https://towardsdatascience.medium.com/article-slug-abc123"
+            ));
+        }
+
+        #[test]
+        fn nytimes() {
+            assert!(is_freedium_supported_url(
+                "https://www.nytimes.com/2024/01/01/tech/ai.html"
+            ));
+        }
+
+        #[test]
+        fn washingtonpost() {
+            assert!(is_freedium_supported_url(
+                "https://www.washingtonpost.com/technology/article"
+            ));
+        }
+
+        #[test]
+        fn bloomberg() {
+            assert!(is_freedium_supported_url(
+                "https://bloomberg.com/news/articles/2024-01-01/story"
+            ));
+        }
+
+        #[test]
+        fn reuters() {
+            assert!(is_freedium_supported_url(
+                "https://www.reuters.com/technology/story-2024"
+            ));
+        }
+
+        #[test]
+        fn economist() {
+            assert!(is_freedium_supported_url(
+                "https://www.economist.com/science-and-technology/2024/01/01/article"
+            ));
+        }
+
+        #[test]
+        fn financial_times() {
+            assert!(is_freedium_supported_url(
+                "https://www.ft.com/content/some-uuid"
+            ));
+        }
+
+        #[test]
+        fn non_paywall_site_rejected() {
+            // The original bug: borretti.me was incorrectly routed through Freedium
+            assert!(!is_freedium_supported_url(
+                "https://borretti.me/article/notes-on-managing-adhd"
+            ));
+        }
+
+        #[test]
+        fn generic_url_rejected() {
+            assert!(!is_freedium_supported_url("https://example.com/page"));
+        }
+
+        #[test]
+        fn freedium_mirror_itself_rejected() {
+            // Existing check already blocks mirror re-wrapping, but belt-and-suspenders
+            assert!(!is_freedium_supported_url(
+                "https://freedium-mirror.cfd/https://medium.com/article"
+            ));
+        }
+
+        #[test]
+        fn unparseable_url_rejected() {
+            assert!(!is_freedium_supported_url("not a url at all"));
+        }
+
+        #[test]
+        fn lookalike_subdomain_rejected() {
+            // "notmedium.com" should not match due to the dot-prefix check
+            assert!(!is_freedium_supported_url("https://notmedium.com/article"));
+        }
+    }
 }
