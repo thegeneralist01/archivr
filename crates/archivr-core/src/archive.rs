@@ -460,6 +460,7 @@ pub fn list_entries_for_collection(
         "{} {} \
          JOIN collection_entries ce ON ce.entry_id = e.id \
          WHERE ce.collection_id = ?1 \
+         AND e.parent_entry_id IS NULL \
          AND (CAST(?2 AS INTEGER) & 12 != 0 \
               OR (ce.visibility_bits & CAST(?2 AS INTEGER)) != 0) \
          GROUP BY e.id \
