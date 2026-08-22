@@ -16,7 +16,7 @@ export default function EntriesView({ entries, selectedUids, onRowClick, archive
         </div>
         <div id="entries-body">
           {pendingCaptures.filter(c => c.archiveId === archiveId).reverse().map(cap => (
-            <SkeletonEntryRow key={cap.id} />
+            <SkeletonEntryRow key={cap.id} locator={cap.locator} />
           ))}
           {entries.map((entry, idx) => (
             <EntryRow

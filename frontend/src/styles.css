@@ -302,10 +302,10 @@ select {
   border-bottom: 1px solid var(--line-soft);
 }
 #entries-body > div > div { padding: 7px 10px; flex-shrink: 0; overflow: hidden; }
-/* Skeleton rows (no index class) fall back to nth-child; real rows use explicit classes. */
+/* Pending capture rows (no index class) fall back to nth-child; real rows use explicit classes. */
 #entries-body > div:not(.entry-row-outer):nth-child(even) { background: #f2ede5; }
 #entries-body > div:not(.entry-row-outer):nth-child(odd)  { background: var(--paper-3); }
-/* Index-based stripes for real entry rows — immune to skeleton sibling count. */
+/* Index-based stripes for real entry rows — immune to pending-capture sibling count. */
 #entries-body > .entry-row-outer--light { background: var(--paper-3); }
 #entries-body > .entry-row-outer--dark  { background: #f2ede5; }
 #entries-body > div.is-selected {
@@ -2836,36 +2836,44 @@ google-cast-launcher.video-tv-btn {
 /* Push content above the fixed AudioBar when it is visible */
 body.has-audio-bar { padding-bottom: 56px; }
 
-/* ── Skeleton entry row ─────────────────────────────────────────────────── */
-@keyframes skeleton-shimmer {
-  0%   { background-position: 200% center; }
-  100% { background-position: -200% center; }
+/* ── In-progress entry row ──────────────────────────────────────────────── */
+.in-progress-entry-row {
+  box-sizing: border-box;
+  min-width: 0;
+  padding: 7px 22px;
+  gap: 9px;
+  color: var(--muted);
+  white-space: nowrap;
 }
-
-.skeleton-cell {
-  display: inline-block;
-  border-radius: 3px;
-  background: linear-gradient(90deg, var(--paper-2) 25%, var(--line-soft) 50%, var(--paper-2) 75%);
-  background-size: 200% 100%;
-  animation: skeleton-shimmer 1.8s ease-in-out infinite;
-}
-
-/* Row container — flex row matching #entries-body > div layout */
-.skeleton-row {
-  display: flex;
-  align-items: center;
-  background: var(--paper-3);
-}
-.skeleton-row > div {
-  padding: 7px 10px;
+.in-progress-entry-row__spinner {
+  width: 16px;
+  height: 16px;
+  border-width: 2px;
+  color: var(--accent);
   flex-shrink: 0;
-  overflow: hidden;
 }
-.skeleton-row .col-added { padding-left: 22px; }
-.skeleton-row > div:last-child { padding-right: 22px; }
+.in-progress-entry-row__locator {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11.5px;
+}
+.in-progress-entry-row__status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  color: var(--muted-2);
+  font-size: 11.5px;
+}
+.in-progress-entry-row__kind {
+  font-size: 10.5px;
+  opacity: 0.85;
+}
 
 @media (pointer: coarse) {
-  .skeleton-row .col-added { padding-left: 10px; }
+  .in-progress-entry-row { padding-inline: 10px; }
 }
 
 /* ── Child entry expansion ───────────────────────────────────────────────── */
