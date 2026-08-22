@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState, useCallback } from 'react'
-import { submitCapture, pollCaptureJob, probeCapture, probePlaylist, getInstanceSettings, uploadFile, deleteUpload } from '../api'
+import { submitCapture, submitTextCapture, pollCaptureJob, probeCapture, probePlaylist, getInstanceSettings, uploadFile, deleteUpload } from '../api'
 
 let nextItemId = 1
 
@@ -140,6 +140,30 @@ function makeFileItem(filename) {
     uploadStatus: 'uploading',
     uploadLocator: null,
     uploadError: null,
+    // Fields present for submission-logic compatibility
+    locator: '',
+    quality: 'best',
+    probeState: 'idle',
+    probeQualities: null,
+    probeHasAudio: false,
+    playlistProbeState: 'idle',
+    playlistInfo: null,
+    playlistItems: null,
+    playlistQuality: null,
+    playlistExpanded: false,
+    syncEnabled: false,
+    error: null,
+    status: 'idle',
+  }
+}
+
+function makeTextItem() {
+  return {
+    id: nextItemId++,
+    kind: 'text',
+    title: '',
+    body: '',
+    mime: 'text/markdown',
     // Fields present for submission-logic compatibility
     locator: '',
     quality: 'best',
@@ -430,9 +454,30 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     onToastRef.current(text, null, type, headline)
   }
 
-  async function submitBgJob(locator, quality, batchId, extraExtensions = {}) {
+  async function submitBgJob(submission, batchId) {
     const aid = archiveIdRef.current
     const id = crypto.randomUUID?.() ?? `job-${Date.now()}-${Math.random()}`
+
+    // Text submission
+    if (submission.type === 'text') {
+      try {
+        const job = await submitTextCapture(aid, { title: submission.title, body: submission.body, mime: submission.mime })
+        const locator = `text:${submission.title}`
+        // Notify App to add skeleton + persist
+        onJobStartedRef.current?.({ id, jobUid: job.job_uid, locator, archiveId: aid })
+        startPolling(id, job.job_uid, locator, aid, batchId)
+      } catch (e) {
+        const msg = e.message || 'Submission failed.'
+        onToastRef.current(msg, `text:${submission.title}`)
+        settleBatch(batchId, 'failed', `text:${submission.title}`)
+      }
+      return
+    }
+
+    // URL/file submission
+    const locator = submission.locator
+    const quality = submission.quality
+    const extraExtensions = submission.extraExtensions || {}
     // Capture session options at call time (synchronous — before first await)
     const extensions = {
       ublock_enabled: ublockEnabled,
@@ -466,16 +511,18 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     // Guard against the Enter-key shortcut in CaptureRow bypassing the
     // disabled button — uploads must be complete before archiving starts.
     if (items.some(it => it.kind === 'file' && it.uploadStatus === 'uploading')) return
-    const toSubmit = items.filter(it =>
-      it.kind === 'file' ? (it.uploadStatus === 'done' && it.uploadLocator) : it.locator.trim()
-    )
+    const toSubmit = items.filter(it => {
+      if (it.kind === 'file') return it.uploadStatus === 'done' && it.uploadLocator
+      if (it.kind === 'text') return it.title.trim() && it.body.trim()
+      return it.locator.trim()
+    })
     if (toSubmit.length === 0) return
-    if (toSubmit.some(it => it.kind !== 'file' && hasConflict(it))) return
-    if (toSubmit.some(it => it.kind !== 'file' && (
+    if (toSubmit.some(it => it.kind !== 'file' && it.kind !== 'text' && hasConflict(it))) return
+    if (toSubmit.some(it => it.kind !== 'file' && it.kind !== 'text' && (
         it.probeState === 'probing' ||
         (isPlaylistSource(it.locator) && it.playlistProbeState !== 'done'))))
       return
-    if (toSubmit.some(it => it.kind !== 'file' && Array.isArray(it.playlistItems) && it.playlistItems.length === 0)) return
+    if (toSubmit.some(it => it.kind !== 'file' && it.kind !== 'text' && Array.isArray(it.playlistItems) && it.playlistItems.length === 0)) return
     const batchId = toSubmit.length > 1
       ? (crypto.randomUUID?.() ?? `batch-${Date.now()}`)
       : null
@@ -485,9 +532,13 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     // Capture all submission data before any state changes
     const submissions = toSubmit.map(it => {
       if (it.kind === 'file') {
-        return { locator: it.uploadLocator, quality: 'best', extraExtensions: {} }
+        return { type: 'file', locator: it.uploadLocator, quality: 'best', extraExtensions: {} }
+      }
+      if (it.kind === 'text') {
+        return { type: 'text', title: it.title.trim(), body: it.body.trim(), mime: it.mime }
       }
       return {
+        type: 'url',
         locator: it.locator.trim(),
         quality: it.playlistItems !== null ? null : (it.quality || 'best'),
         extraExtensions: it.playlistItems !== null
@@ -502,8 +553,8 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     setItems([makeItem()])
     dialogRef.current?.close()
     // Submit each in background
-    submissions.forEach(({ locator, quality, extraExtensions }) =>
-      submitBgJob(locator, quality, batchId, extraExtensions)
+    submissions.forEach(submission =>
+      submitBgJob(submission, batchId)
     )
   }
 
@@ -687,16 +738,18 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
 
 
   const anyUploading = items.some(it => it.kind === 'file' && it.uploadStatus === 'uploading')
-  const pendingCount = items.filter(it =>
-    it.kind === 'file' ? (it.uploadStatus === 'done' && it.uploadLocator) : it.locator.trim()
-  ).length
-  const anyConflict = items.some(it => it.kind !== 'file' && hasConflict(it))
+  const pendingCount = items.filter(it => {
+    if (it.kind === 'file') return it.uploadStatus === 'done' && it.uploadLocator
+    if (it.kind === 'text') return it.title.trim() && it.body.trim()
+    return it.locator.trim()
+  }).length
+  const anyConflict = items.some(it => it.kind !== 'file' && it.kind !== 'text' && hasConflict(it))
   // True if any playlist row has had all its videos deleted — archive would be a no-op.
   const anyEmptyPlaylist = items.some(it =>
-    it.kind !== 'file' && Array.isArray(it.playlistItems) && it.playlistItems.length === 0
+    it.kind !== 'file' && it.kind !== 'text' && Array.isArray(it.playlistItems) && it.playlistItems.length === 0
   )
   const anyProbing = items.some(it =>
-    it.kind !== 'file' && (
+    it.kind !== 'file' && it.kind !== 'text' && (
       it.probeState === 'probing' ||
       // For playlist sources block unless probe completed successfully:
       // idle = debounce not yet fired; probing = in flight; error = no quality data.
@@ -734,6 +787,17 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
                 key={item.id}
                 item={item}
                 onRemove={() => removeRow(item.id)}
+              />
+            ) : item.kind === 'text' ? (
+              <CaptureTextRow
+                key={item.id}
+                item={item}
+                autoFocus={idx === items.length - 1}
+                onTitleChange={val => setItems(prev => prev.map(it => it.id === item.id ? { ...it, title: val } : it))}
+                onBodyChange={val => setItems(prev => prev.map(it => it.id === item.id ? { ...it, body: val } : it))}
+                onMimeChange={val => setItems(prev => prev.map(it => it.id === item.id ? { ...it, mime: val } : it))}
+                onRemove={() => removeRow(item.id)}
+                onSubmit={handleArchive}
               />
             ) : (
               <CaptureRow
@@ -780,6 +844,12 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
               <line x1="5.5" y1="10.5" x2="8.5" y2="10.5"/>
             </svg>
             Upload file
+          </button>
+          <button type="button" className="capture-add-row capture-add-text" onClick={() => setItems(prev => [...prev, makeTextItem()])}>
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M2 3h12M2 7h12M2 11h8"/>
+            </svg>
+            Add text
           </button>
         </div>
 
@@ -1136,6 +1206,66 @@ function CaptureFileRow({ item, onRemove }) {
       {errored && (
         <p className="capture-row-error">{item.uploadError || 'Upload failed'}</p>
       )}
+    </div>
+  )
+}
+
+function CaptureTextRow({ item, autoFocus, onTitleChange, onBodyChange, onMimeChange, onRemove, onSubmit }) {
+  const titleInputRef = useRef(null)
+
+  useEffect(() => {
+    if (autoFocus) {
+      titleInputRef.current?.focus()
+    }
+  }, [autoFocus]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  return (
+    <div className="capture-row capture-text-row">
+      <div className="capture-row-main">
+        <span className="capture-text-icon" aria-hidden="true">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" style={{ width: 14, height: 14 }}>
+            <path d="M2 3h12M2 7h12M2 11h8"/>
+          </svg>
+        </span>
+        <div className="capture-text-inputs">
+          <input
+            ref={titleInputRef}
+            className="capture-text-input capture-text-title"
+            type="text"
+            placeholder="Title"
+            value={item.title}
+            onChange={e => onTitleChange(e.target.value)}
+            maxLength={500}
+          />
+          <textarea
+            className="capture-text-input capture-text-body"
+            placeholder="Body (markdown or plain text)"
+            value={item.body}
+            onChange={e => onBodyChange(e.target.value)}
+            rows={6}
+          />
+          <div className="capture-text-footer">
+            <select
+              className="capture-text-mime"
+              value={item.mime}
+              onChange={e => onMimeChange(e.target.value)}
+            >
+              <option value="text/markdown">Markdown</option>
+              <option value="text/plain">Plain text</option>
+            </select>
+          </div>
+        </div>
+        <button
+          type="button"
+          className="capture-row-action capture-row-remove"
+          onClick={onRemove}
+          aria-label="Remove"
+        >
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+            <line x1="3" y1="3" x2="13" y2="13"/><line x1="13" y1="3" x2="3" y2="13"/>
+          </svg>
+        </button>
+      </div>
     </div>
   )
 }
