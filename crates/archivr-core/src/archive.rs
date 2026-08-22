@@ -36,6 +36,14 @@ pub struct EntrySummary {
     pub cacheable_bytes: i64,
 }
 
+/// One stored LLM summary, as exposed over the API.
+///
+/// Aliased rather than redefined: the DB row is already the exact shape the
+/// frontend needs, and a second near-identical struct would only add a mapping
+/// step to keep in sync. The `View` name exists because `EntrySummary` in this
+/// module is the *entry listing* row, an unrelated thing.
+pub use crate::database::EntrySummaryRecord as EntrySummaryView;
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct EntryDetail {
     pub summary: EntrySummary,
@@ -43,6 +51,9 @@ pub struct EntryDetail {
     pub source_metadata_json: String,
     pub display_metadata_json: Option<String>,
     pub artifacts: Vec<EntryArtifactSummary>,
+    /// Most recently updated summary for this entry, if any has ever been
+    /// requested. Always `None` on a fresh capture — summarization is manual.
+    pub latest_summary: Option<EntrySummaryView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -343,12 +354,15 @@ pub fn get_entry_detail(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
+    let latest_summary = database::latest_entry_summary(conn, entry_id)?;
+
     Ok(Some(EntryDetail {
         summary,
         structured_root_relpath,
         source_metadata_json,
         display_metadata_json,
         artifacts,
+        latest_summary,
     }))
 }
 
