@@ -81,7 +81,7 @@ There are two user-facing binaries:
 
 | Binary | Purpose |
 |---|---|
-| `archivr` | CLI for initializing archives and capturing material into one archive |
+| `archivr` | CLI for initializing archives and capturing material into one archive (also `yt-dlp status\|update`) |
 | `archivr-server` | Web server for browsing one or more existing archives |
 
 The CLI writes archive data:
@@ -128,6 +128,15 @@ sequenceDiagram
   CLI->>User: terminal result
 ```
 
+**Pasted text short-circuits most of that.** `perform_text_capture` (`capture.rs`) is not a `Source`
+route: there is no locator to classify, no URL probe, and no downloader subprocess. It validates the
+title (non-empty, ≤ 500 chars), the body (non-empty, ≤ 2 MiB) and the MIME type (`text/plain` or
+`text/markdown` only), then calls `downloader/text.rs` to write the bytes into `store/temp/<timestamp>/`
+and hash them. From there it rejoins the normal path — dedup into `raw/A/B/HASH.EXT`, then run, entry
+and artifact rows. The server exposes it as `POST /api/archives/:archive_id/captures/text`, and the UI
+drives it from `CaptureTextRow` in `CaptureDialog.jsx`; entries produced this way render through
+`TextPreview.jsx`.
+
 ## Web Capture Pipeline
 
 Web pages (`Source::WebPage`) take a longer path than yt-dlp or tweets:
@@ -158,6 +167,66 @@ sequenceDiagram
   Server-->>Browser: JSON
 ```
 
+## LLM Summaries
+
+Summaries are a **post-capture, manually triggered** subsystem. Nothing in `capture.rs` calls the
+summarizer; a summary exists only because someone pressed generate in the Summary section of
+`ContextRail.jsx`.
+
+`crates/archivr-core/src/summarizer.rs` defines one `SummaryProvider` trait with four implementations:
+Anthropic HTTP, OpenAI-compatible HTTP, the local `claude` CLI, and the local `codex` CLI. Each is
+built purely from environment variables (`provider_from_env`), so no key or model name is ever written
+into archive data. `PROMPT_VERSION` in the same file stamps every row, so changing the prompt
+invalidates the cache instead of silently mixing generations.
+
+`entry_summaries` (schema in `database.rs`) is that cache, unique on
+(`entry_id`, `provider_kind`, `provider_model`, `prompt_version`, `input_sha256`) — the same entry
+summarised by two providers, two models, or after a prompt change yields distinct rows, while a repeat
+request with identical inputs reuses one. Rows move `pending` → `running` → `completed` | `failed`,
+mirroring how capture jobs are tracked, and the frontend polls until the row leaves `running`.
+
+```mermaid
+flowchart LR
+  UI["ContextRail Summary"] -->|POST .../summary| Server
+  Server --> Input["build_summary_input()"]
+  Input --> Artifacts["entry artifacts on disk"]
+  Server --> Row["entry_summaries: pending → running"]
+  Server --> Provider["SummaryProvider (HTTP or CLI)"]
+  Provider --> Row2["completed / failed"]
+  UI -->|GET .../summary poll| Row2
+```
+
+**Tweet threads are why the artifact lookup is special.** For most entries `build_summary_input` reads
+the single `primary_media` artifact. A `tweet` or `tweet_thread` entry has no `primary_media` — it has
+N `raw_tweet_json` artifacts, one per status in the thread. So the summarizer selects on the
+`raw_tweet_json` role instead, loads **all** matching artifacts in order, and joins them with
+`\n\n---\n\n`; a `---` line reads as a hard paragraph break to every model, keeping individual
+statuses from bleeding into one another. Any change to how thread artifacts are stored has to be
+mirrored here.
+
+## yt-dlp Lifecycle
+
+There is no single yt-dlp. Up to three can exist on one machine:
+
+1. **The flake pin** — the `ytDlp` derivation in `flake.nix` fetches an exact release zipapp from
+   `github.com/yt-dlp/yt-dlp/releases` and wraps it with `python312` + `ffmpeg`. Both the `archivr` and
+   `archivr-server` wrappers export it as `ARCHIVR_YT_DLP`.
+2. **A state-dir install** — `archivr yt-dlp update` downloads the latest zipapp and installs it
+   atomically (staged file, then rename) at `<state_dir>/yt-dlp/yt-dlp` with a sibling `.version`
+   sentinel that lets repeat runs skip the download.
+3. **Whatever is on PATH** — the historical behaviour, and the last-resort fallback.
+
+`resolve_yt_dlp()` in `downloader/ytdlp.rs` picks between them once per process (cached in a
+`OnceLock`): `ARCHIVR_YT_DLP_FORCE` wins outright if it points at a real file; otherwise the pinned and
+state-dir candidates are probed with `--version` and the newest wins — yt-dlp versions are `YYYY.MM.DD`,
+so plain string ordering is chronological — with exact ties going to the state-dir copy the user
+deliberately installed. If neither exists, it falls back to bare `yt-dlp`. `archivr yt-dlp status`
+prints every candidate, its version, and the winner.
+
+Three ways to move the version forward: the weekly `.github/workflows/update-ytdlp.yml` cron (reads the
+current pin, queries the GitHub releases API, re-hashes with `nix hash file --sri`, rewrites the `ytDlp`
+block and opens a PR), `archivr yt-dlp update` for one machine, or editing `flake.nix` by hand.
+
 ## Where To Edit
 
 | Feature kind | Edit here |
@@ -167,6 +236,10 @@ sequenceDiagram
 | Archive opening, listing entries, entry detail, runs | `crates/archivr-core/src/archive.rs` |
 | Download/save behavior | `crates/archivr-core/src/downloader/` |
 | YouTube playlist/channel download, playlist probe, sync mode | `crates/archivr-core/src/downloader/ytdlp.rs` and `capture.rs` |
+| Which yt-dlp binary runs (resolver, state dir, version probe) | `crates/archivr-core/src/downloader/ytdlp.rs` |
+| Pasted-text capture (staging, hashing, MIME allowlist) | `crates/archivr-core/src/downloader/text.rs` and `capture.rs` |
+| LLM summary providers, prompt, `PROMPT_VERSION`, input building | `crates/archivr-core/src/summarizer.rs` |
+| `entry_summaries` schema and summary CRUD | `crates/archivr-core/src/database.rs` |
 | CLI commands, argument parsing, terminal output | `crates/archivr-cli/src/main.rs` |
 | Server API routes | `crates/archivr-server/src/routes.rs` |
 | Auth model (users, sessions, tokens, roles) | `crates/archivr-server/src/auth.rs` |
@@ -174,6 +247,9 @@ sequenceDiagram
 | Frontend root state + routing | `frontend/src/App.jsx` |
 | Frontend API client | `frontend/src/api.js` |
 | Frontend components | `frontend/src/components/` |
+| Summary UI (provider selector, generate, polling) | `frontend/src/components/ContextRail.jsx` |
+| Text/Markdown entry preview | `frontend/src/components/TextPreview.jsx` |
+| "Add text" capture row | `frontend/src/components/CaptureDialog.jsx` |
 | Frontend styling | `frontend/src/styles.css` |
 
 ## Practical Feature Rule
