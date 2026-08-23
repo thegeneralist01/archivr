@@ -185,6 +185,13 @@ summarised by two providers, two models, or after a prompt change yields distinc
 request with identical inputs reuses one. Rows move `pending` → `running` → `completed` | `failed`,
 mirroring how capture jobs are tracked, and the frontend polls until the row leaves `running`.
 
+The summary path is deliberately explicit: UI consent (`Include attached images`) → core selection → input digest and
+cache lookup → provider transport → `pending`/`running`/`completed` lifecycle. Text is the default. When consent is
+present, `SummaryBuildOptions::include_images` admits only bounded `media` image candidates and the digest includes both
+the flag and selected blob identity, MIME type, and size. The core is still synchronous; the server owns the blocking
+boundary. Anthropic HTTP, OpenAI-compatible HTTP, and Codex can transport the selected image data; Claude CLI receives
+text only.
+
 ```mermaid
 flowchart LR
   UI["ContextRail Summary"] -->|POST .../summary| Server
@@ -196,13 +203,14 @@ flowchart LR
   UI -->|GET .../summary poll| Row2
 ```
 
-**Tweet threads are why the artifact lookup is special.** For most entries `build_summary_input` reads
+**X Articles and tweet threads are why the artifact lookup is special.** For most entries `build_summary_input` reads
 the single `primary_media` artifact. A `tweet` or `tweet_thread` entry has no `primary_media` — it has
 N `raw_tweet_json` artifacts, one per status in the thread. So the summarizer selects on the
 `raw_tweet_json` role instead, loads **all** matching artifacts in order, and joins them with
 `\n\n---\n\n`; a `---` line reads as a hard paragraph break to every model, keeping individual
-statuses from bleeding into one another. Any change to how thread artifacts are stored has to be
-mirrored here.
+statuses from bleeding into one another. For an X Article, the reducer prefers article text over the tweet's body:
+`plain_text`, then flattened ordered blocks, then `preview_text`, then `summary_text`; only then does it fall back to
+`full_text`/`text`/`content`/`body`. Any change to article reduction or thread status storage must be mirrored here.
 
 ## yt-dlp Lifecycle
 
@@ -272,7 +280,8 @@ The server both reads and writes archive data. Capture jobs are asynchronous: `P
 
 **Auth model.** A separate `archivr-auth.sqlite` (path derived from the server config directory) holds users, sessions, and API tokens. Role bits are `u32` flags (`GUEST`, `USER`, `ADMIN`, `OWNER`) so a single bitmask value covers assignment, checks, and visibility. The middleware stack is `setup_guard` → `login_rate_limit` → `security_headers`; route families are classified `READ / ADMIN / WRITE / STATIC` in `routes.rs`.
 
-**Search** is client-side filtering over entries the frontend has already fetched.
+**Search** is server-side free-text filtering over entry fields and the latest completed summary. The summary JSON is
+searched as text, so generated `tags` participate. Older completed summaries stay searchable while a newer request is
+pending or failed; rows with no completed summary contribute no summary-derived match.
 
 **Admin view** covers mounted archives, users, sessions, and API tokens.
-
