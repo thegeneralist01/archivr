@@ -42,13 +42,13 @@ export async function fetchEntrySummary(archiveId, entryUid) {
 // caller polls fetchEntrySummary either way.
 // The server returns 400 with the exact missing env var name when a provider is
 // unconfigured, so its body is surfaced verbatim rather than replaced.
-export async function requestEntrySummary(archiveId, entryUid, { provider, force = false } = {}) {
+export async function requestEntrySummary(archiveId, entryUid, { provider, force = false, includeImages = false } = {}) {
   const resp = await fetch(
     `/api/archives/${archiveId}/entries/${entryUid}/summary`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ provider, force }),
+      body: JSON.stringify({ provider, force, include_images: includeImages }),
     }
   );
   if (!resp.ok) {
