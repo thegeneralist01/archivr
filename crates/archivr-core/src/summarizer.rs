@@ -14,6 +14,7 @@
 //! of any file the archive would otherwise persist.
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine;
 use std::{
     env,
     io::Write,
@@ -31,6 +32,13 @@ use crate::{archive::ArchivePaths, database, hash};
 /// so a bump makes every stored summary regenerate on next request instead of
 /// silently mixing outputs from two different prompts.
 pub const PROMPT_VERSION: &str = "v1-2026-08-22";
+
+/// Maximum number of explicitly opted-in local images supplied to a summary.
+pub const MAX_SUMMARY_IMAGES: usize = 4;
+/// Maximum byte size for one explicitly opted-in image.
+pub const MAX_SUMMARY_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+/// Maximum combined byte size for explicitly opted-in images.
+pub const MAX_SUMMARY_IMAGE_TOTAL_BYTES: u64 = 12 * 1024 * 1024;
 
 /// Upper bound on characters fed to a model. Archived pages run to hundreds of
 /// kilobytes; past this point we are paying for tokens that do not change a
@@ -61,6 +69,24 @@ short or empty to summarize, still return the object and say so in \"summary\"."
 
 // ── Request / output types ─────────────────────────────────────────────────
 
+/// Controls optional material included while building a summary request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SummaryBuildOptions {
+    pub include_images: bool,
+}
+
+/// An archived image that was explicitly selected for a summary request.
+///
+/// `archive_file` is an absolute local path, kept inside the archive store and
+/// never exposed through an API response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryImage {
+    pub sha256: String,
+    pub mime_type: String,
+    pub byte_size: u64,
+    pub archive_file: PathBuf,
+}
+
 /// Everything the prompt builder needs about one entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SummaryRequest {
@@ -69,6 +95,7 @@ pub struct SummaryRequest {
     pub source_kind: String,
     pub entity_kind: String,
     pub content: String,
+    pub images: Vec<SummaryImage>,
 }
 
 /// What a provider produced. `model` is echoed back because HTTP providers may
@@ -269,25 +296,75 @@ fn http_client(timeout_secs: u64) -> Result<reqwest::blocking::Client> {
 
 /// Body builder kept separate from the transport so it can be unit-tested
 /// without a network round-trip.
-pub fn anthropic_request_body(model: &str, request: &SummaryRequest) -> serde_json::Value {
-    serde_json::json!({
+fn read_image_base64(image: &SummaryImage) -> Result<String> {
+    let bytes = std::fs::read(&image.archive_file)
+        .with_context(|| format!("failed to read summary image {}", image.archive_file.display()))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+pub fn anthropic_request_body(model: &str, request: &SummaryRequest) -> Result<serde_json::Value> {
+    if request.images.is_empty() {
+        return Ok(serde_json::json!({
         "model": model,
         "max_tokens": 1024,
         "messages": [{
             "role": "user",
             "content": build_combined_prompt(request),
         }],
-    })
+        }));
+    }
+
+    let mut content = vec![serde_json::json!({
+        "type": "text",
+        "text": build_combined_prompt(request),
+    })];
+    for image in &request.images {
+        content.push(serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": image.mime_type,
+                "data": read_image_base64(image)?,
+            },
+        }));
+    }
+    Ok(serde_json::json!({
+        "model": model,
+        "max_tokens": 1024,
+        "messages": [{ "role": "user", "content": content }],
+    }))
 }
 
-pub fn openai_request_body(model: &str, request: &SummaryRequest) -> serde_json::Value {
-    serde_json::json!({
+pub fn openai_request_body(model: &str, request: &SummaryRequest) -> Result<serde_json::Value> {
+    if request.images.is_empty() {
+        return Ok(serde_json::json!({
         "model": model,
         "messages": [
             { "role": "system", "content": SYSTEM_PROMPT },
             { "role": "user", "content": build_user_prompt(request) },
         ],
-    })
+        }));
+    }
+
+    let mut content = vec![serde_json::json!({
+        "type": "text",
+        "text": build_user_prompt(request),
+    })];
+    for image in &request.images {
+        content.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!("data:{};base64,{}", image.mime_type, read_image_base64(image)?),
+            },
+        }));
+    }
+    Ok(serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": SYSTEM_PROMPT },
+            { "role": "user", "content": content },
+        ],
+    }))
 }
 
 struct AnthropicHttpProvider(HttpProviderConfig);
@@ -300,7 +377,7 @@ impl SummaryProvider for AnthropicHttpProvider {
         Some(&self.0.model)
     }
     fn summarize(&self, request: &SummaryRequest) -> Result<SummaryOutput> {
-        let body = anthropic_request_body(&self.0.model, request);
+        let body = anthropic_request_body(&self.0.model, request)?;
         let resp = http_client(self.0.timeout_secs)?
             .post(&self.0.endpoint)
             .header("x-api-key", &self.0.api_key)
@@ -340,7 +417,7 @@ impl SummaryProvider for OpenAiCompatibleProvider {
         Some(&self.0.model)
     }
     fn summarize(&self, request: &SummaryRequest) -> Result<SummaryOutput> {
-        let body = openai_request_body(&self.0.model, request);
+        let body = openai_request_body(&self.0.model, request)?;
         let resp = http_client(self.0.timeout_secs)?
             .post(&self.0.endpoint)
             .header("authorization", format!("Bearer {}", self.0.api_key))
@@ -469,6 +546,9 @@ impl SummaryProvider for ClaudeCliProvider {
         self.0.model.as_deref()
     }
     fn summarize(&self, request: &SummaryRequest) -> Result<SummaryOutput> {
+        if !request.images.is_empty() {
+            bail!("Claude CLI cannot attach local images; choose an HTTP provider or Codex CLI");
+        }
         // `claude -p --output-format text` is the documented one-shot
         // ("print") mode of the Claude Code CLI: it reads the prompt from
         // stdin, writes the answer to stdout, and exits.
@@ -530,21 +610,43 @@ mod codex {
         if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
     }
 
-    pub fn run(cfg: &CliProviderConfig, prompt: &str) -> Result<String> {
+    pub fn primary_args(
+        images: &[SummaryImage],
+        out_path: &Path,
+        model: Option<&str>,
+    ) -> Vec<String> {
+        let mut args = vec!["exec".into()];
+        for image in images {
+            args.push("--image".into());
+            args.push(image.archive_file.to_string_lossy().into_owned());
+        }
+        args.push("--output-last-message".into());
+        args.push(out_path.to_string_lossy().into_owned());
+        if let Some(model) = model {
+            args.push("--model".into());
+            args.push(model.into());
+        }
+        args.push("-".into());
+        args
+    }
+
+    pub fn positional_args(
+        images: &[SummaryImage],
+        out_path: &Path,
+        model: Option<&str>,
+        prompt: &str,
+    ) -> Vec<String> {
+        let mut args = primary_args(images, out_path, model);
+        args.pop();
+        args.push(prompt.into());
+        args
+    }
+
+    pub fn run(cfg: &CliProviderConfig, prompt: &str, images: &[SummaryImage]) -> Result<String> {
         let out_path = last_message_temp_path();
-        let out_str = out_path.to_string_lossy().into_owned();
 
         // Primary: stdin prompt + --output-last-message.
-        let mut primary: Vec<String> = vec![
-            "exec".into(),
-            "--output-last-message".into(),
-            out_str.clone(),
-        ];
-        if let Some(model) = cfg.model.as_deref() {
-            primary.push("--model".into());
-            primary.push(model.into());
-        }
-        primary.push("-".into());
+        let primary = primary_args(images, &out_path, cfg.model.as_deref());
         let primary_refs: Vec<&str> = primary.iter().map(String::as_str).collect();
 
         let primary_err = match run_cli(&cfg.executable, &primary_refs, prompt, cfg.timeout_secs) {
@@ -554,6 +656,7 @@ mod codex {
                 }
                 // Codex succeeded but wrote nothing to the file — extremely
                 // rare, but treat as a soft failure so we try the fallback.
+                let _ = std::fs::remove_file(&out_path);
                 anyhow!("codex produced no last-message output")
             }
             Err(e) => {
@@ -563,16 +666,7 @@ mod codex {
         };
 
         // Fallback: positional prompt, no stdin, same --output-last-message.
-        let mut fb: Vec<String> = vec![
-            "exec".into(),
-            "--output-last-message".into(),
-            out_str.clone(),
-        ];
-        if let Some(model) = cfg.model.as_deref() {
-            fb.push("--model".into());
-            fb.push(model.into());
-        }
-        fb.push(prompt.into());
+        let fb = positional_args(images, &out_path, cfg.model.as_deref(), prompt);
         let out = Command::new(&cfg.executable)
             .args(&fb)
             .output()
@@ -595,6 +689,7 @@ mod codex {
         }
         // Last resort — the child succeeded but wrote nothing to the file. Fall
         // back to raw stdout so the caller has *something* to normalize.
+        let _ = std::fs::remove_file(&out_path);
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     }
 }
@@ -609,7 +704,7 @@ impl SummaryProvider for CodexCliProvider {
         self.0.model.as_deref()
     }
     fn summarize(&self, request: &SummaryRequest) -> Result<SummaryOutput> {
-        let out = codex::run(&self.0, &build_combined_prompt(request))?;
+        let out = codex::run(&self.0, &build_combined_prompt(request), &request.images)?;
         Ok(SummaryOutput {
             text: out,
             model: self.0.model.clone(),
@@ -804,7 +899,104 @@ fn load_summary_artifacts(
     Ok(rows)
 }
 
-pub fn build_summary_input(paths: &ArchivePaths, entry_uid: &str) -> Result<SummaryInput> {
+fn matching_image_mime(extension: &str, mime_type: &str) -> bool {
+    matches!(
+        (extension, mime_type),
+        ("jpg" | "jpeg", "image/jpeg")
+            | ("png", "image/png")
+            | ("webp", "image/webp")
+            | ("gif", "image/gif")
+            | ("avif", "image/avif")
+    )
+}
+
+/// Loads media artifacts in their insertion order and keeps only bounded,
+/// supported image files that resolve inside the archive store.
+fn load_summary_image_candidates(
+    conn: &rusqlite::Connection,
+    store_path: &Path,
+    entry_id: i64,
+) -> Result<Vec<SummaryImage>> {
+    let canonical_store = store_path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize store path: {}", store_path.display()))?;
+    let mut stmt = conn.prepare(
+        "SELECT b.sha256, b.mime_type, b.extension, b.byte_size, ea.relpath
+         FROM entry_artifacts ea
+         JOIN blobs b ON b.id = ea.blob_id
+         WHERE ea.entry_id = ?1 AND ea.artifact_role = 'media'
+         ORDER BY ea.id ASC",
+    )?;
+    let rows = stmt
+        .query_map([entry_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut images = Vec::new();
+    let mut total_bytes = 0_u64;
+    for (sha256, mime_type, extension, byte_size, relpath) in rows {
+        let Some(mime_type) = mime_type else {
+            continue;
+        };
+        let Some(extension) = extension else {
+            continue;
+        };
+        let extension = extension.to_ascii_lowercase();
+        let mime_type = mime_type.to_ascii_lowercase();
+        let Ok(byte_size) = u64::try_from(byte_size) else {
+            continue;
+        };
+        if !matching_image_mime(&extension, &mime_type)
+            || byte_size > MAX_SUMMARY_IMAGE_BYTES
+            || images.len() >= MAX_SUMMARY_IMAGES
+            || total_bytes.saturating_add(byte_size) > MAX_SUMMARY_IMAGE_TOTAL_BYTES
+        {
+            continue;
+        }
+
+        let archive_file = match store_path.join(relpath).canonicalize() {
+            Ok(path) if path.starts_with(&canonical_store) => path,
+            _ => continue,
+        };
+        total_bytes += byte_size;
+        images.push(SummaryImage {
+            sha256,
+            mime_type,
+            byte_size,
+            archive_file,
+        });
+    }
+    Ok(images)
+}
+
+fn summary_input_digest(content: &str, include_images: bool, images: &[SummaryImage]) -> String {
+    let mut preimage = Vec::with_capacity(content.len() + 32 + images.len() * 128);
+    preimage.extend_from_slice(content.as_bytes());
+    preimage.extend_from_slice(b"\0images=");
+    preimage.extend_from_slice(if include_images { b"1" } else { b"0" });
+    for image in images {
+        preimage.push(0);
+        preimage.extend_from_slice(image.sha256.as_bytes());
+        preimage.push(0);
+        preimage.extend_from_slice(image.mime_type.as_bytes());
+        preimage.push(0);
+        preimage.extend_from_slice(image.byte_size.to_string().as_bytes());
+    }
+    hash::hash_bytes(&preimage)
+}
+
+pub fn build_summary_input(
+    paths: &ArchivePaths,
+    entry_uid: &str,
+    options: SummaryBuildOptions,
+) -> Result<SummaryInput> {
     let conn = database::open_or_initialize(&paths.archive_path)?;
     let (entry_id, title, source_kind, entity_kind) = conn
         .query_row(
@@ -882,7 +1074,12 @@ pub fn build_summary_input(paths: &ArchivePaths, entry_uid: &str) -> Result<Summ
     } else {
         content
     };
-    let input_sha256 = hash::hash_bytes(content.as_bytes());
+    let images = if options.include_images {
+        load_summary_image_candidates(&conn, &paths.store_path, entry_id)?
+    } else {
+        Vec::new()
+    };
+    let input_sha256 = summary_input_digest(&content, options.include_images, &images);
 
     Ok(SummaryInput {
         request: SummaryRequest {
@@ -891,6 +1088,7 @@ pub fn build_summary_input(paths: &ArchivePaths, entry_uid: &str) -> Result<Summ
             source_kind,
             entity_kind,
             content,
+            images,
         },
         input_sha256,
     })
@@ -942,6 +1140,7 @@ pub fn normalize_summary_json(raw: &str) -> String {
 pub fn summarize_entry(
     archive_paths: &ArchivePaths,
     entry_uid: &str,
+    options: SummaryBuildOptions,
     provider: &dyn SummaryProvider,
     prompt_version: &str,
 ) -> Result<database::EntrySummaryRecord> {
@@ -949,7 +1148,7 @@ pub fn summarize_entry(
     let entry_id = database::entry_id_for_uid(&conn, entry_uid)?
         .ok_or_else(|| anyhow!("entry not found: {entry_uid}"))?;
 
-    let input = build_summary_input(archive_paths, entry_uid)?;
+    let input = build_summary_input(archive_paths, entry_uid, options)?;
     let summary_uid = database::upsert_pending_entry_summary(
         &conn,
         entry_id,
@@ -1023,7 +1222,22 @@ mod tests {
             source_kind: "web".into(),
             entity_kind: "page".into(),
             content: "Body text.".into(),
+            images: Vec::new(),
         }
+    }
+
+    fn image_request() -> (tempfile::TempDir, SummaryRequest) {
+        let temp = tempfile::tempdir().unwrap();
+        let image_file = temp.path().join("fixture.png");
+        std::fs::write(&image_file, [0_u8, 1, 2, 3]).unwrap();
+        let mut request = sample_request();
+        request.images.push(SummaryImage {
+            sha256: "fixture-sha".into(),
+            mime_type: "image/png".into(),
+            byte_size: 4,
+            archive_file: image_file,
+        });
+        (temp, request)
     }
 
     #[test]
@@ -1150,7 +1364,7 @@ mod tests {
 
     #[test]
     fn anthropic_body_has_required_shape() {
-        let body = anthropic_request_body("claude-3-5-sonnet-latest", &sample_request());
+        let body = anthropic_request_body("claude-3-5-sonnet-latest", &sample_request()).unwrap();
         assert_eq!(body["model"], "claude-3-5-sonnet-latest");
         assert_eq!(body["max_tokens"], 1024);
         assert_eq!(body["messages"][0]["role"], "user");
@@ -1164,7 +1378,7 @@ mod tests {
 
     #[test]
     fn openai_body_splits_system_and_user_roles() {
-        let body = openai_request_body("gpt-4o-mini", &sample_request());
+        let body = openai_request_body("gpt-4o-mini", &sample_request()).unwrap();
         assert_eq!(body["model"], "gpt-4o-mini");
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["role"], "user");
@@ -1180,6 +1394,77 @@ mod tests {
                 .unwrap()
                 .contains("\"tldr\"")
         );
+    }
+
+    #[test]
+    fn anthropic_request_body_attaches_base64_images() {
+        let (_temp, request) = image_request();
+        let body = anthropic_request_body("claude", &request).unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert!(content[0]["text"].as_str().unwrap().contains("Body text."));
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "AAECAw==");
+    }
+
+    #[test]
+    fn openai_request_body_attaches_data_url_images() {
+        let (_temp, request) = image_request();
+        let body = openai_request_body("gpt", &request).unwrap();
+        let content = body["messages"][1]["content"].as_array().unwrap();
+        assert!(content[0]["text"].as_str().unwrap().contains("Body text."));
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,AAECAw=="
+        );
+    }
+
+    #[test]
+    fn codex_primary_arguments_put_images_before_output_path() {
+        let (_temp, request) = image_request();
+        let args = codex::primary_args(&request.images, Path::new("/tmp/output"), None);
+        assert_eq!(args[0], "exec");
+        let image_at = args.iter().position(|arg| arg == "--image").unwrap();
+        let output_at = args
+            .iter()
+            .position(|arg| arg == "--output-last-message")
+            .unwrap();
+        assert!(image_at < output_at);
+        assert_eq!(args[image_at + 1], request.images[0].archive_file.to_string_lossy());
+        assert_eq!(args.last().unwrap(), "-");
+    }
+
+    #[test]
+    fn codex_positional_arguments_put_images_before_output_path() {
+        let (_temp, request) = image_request();
+        let args = codex::positional_args(
+            &request.images,
+            Path::new("/tmp/output"),
+            None,
+            "prompt",
+        );
+        let image_at = args.iter().position(|arg| arg == "--image").unwrap();
+        let output_at = args
+            .iter()
+            .position(|arg| arg == "--output-last-message")
+            .unwrap();
+        assert!(image_at < output_at);
+        assert_eq!(args[image_at + 1], request.images[0].archive_file.to_string_lossy());
+        assert_eq!(args.last().unwrap(), "prompt");
+    }
+
+    #[test]
+    fn claude_rejects_images_before_spawning() {
+        let (_temp, request) = image_request();
+        let provider = ClaudeCliProvider(CliProviderConfig {
+            executable: PathBuf::from("definitely-not-a-claude-binary"),
+            model: None,
+            timeout_secs: 1,
+        });
+        let err = provider.summarize(&request).unwrap_err().to_string();
+        assert!(err.contains("Claude CLI cannot attach local images"), "got: {err}");
     }
 
     #[test]
@@ -1395,8 +1680,192 @@ mod tests {
             .unwrap();
         }
 
-        let input = build_summary_input(&paths, &entry.entry_uid).unwrap();
+        let input = build_summary_input(&paths, &entry.entry_uid, SummaryBuildOptions::default()).unwrap();
         assert!(input.request.content.contains("First article body.\n\n---\n\nArticle 2\n\nSecond article body."));
+    }
+
+    fn summary_image_fixture() -> (tempfile::TempDir, ArchivePaths, database::ArchivedEntry) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = crate::archive::initialize_archive(
+            temp.path(),
+            &temp.path().join("store"),
+            "Test archive",
+            false,
+        )
+        .unwrap();
+        let conn = database::open_or_initialize(&paths.archive_path).unwrap();
+        let user_id = database::ensure_default_user(&conn).unwrap();
+        let run = database::create_archive_run(&conn, user_id, 1).unwrap();
+        let source_id = database::upsert_source_identity(
+            &conn,
+            "web",
+            "page",
+            Some("summary-image-test"),
+            Some("https://example.test/summary-image-test"),
+            "https://example.test/summary-image-test",
+        )
+        .unwrap();
+        let entry = database::create_archived_entry(
+            &conn,
+            &database::NewEntry {
+                source_identity_id: source_id,
+                archive_run_id: run.id,
+                parent_entry_id: None,
+                root_entry_id: None,
+                created_by_user_id: user_id,
+                owned_by_user_id: user_id,
+                source_kind: "web".to_string(),
+                entity_kind: "page".to_string(),
+                title: Some("Image test".to_string()),
+                visibility: "private".to_string(),
+                representation_kind: "webpage".to_string(),
+                source_metadata_json: "{}".to_string(),
+                display_metadata_json: None,
+            },
+        )
+        .unwrap();
+
+        let text_relpath = "raw/summary-image-test.txt";
+        std::fs::write(paths.store_path.join(text_relpath), "Summary source text.").unwrap();
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id: entry.id,
+                artifact_role: "primary_media".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: text_relpath.to_string(),
+                blob_id: None,
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+        (temp, paths, entry)
+    }
+
+    fn add_summary_image_artifact(
+        paths: &ArchivePaths,
+        entry_id: i64,
+        ordinal: usize,
+        role: &str,
+        extension: &str,
+        mime_type: &str,
+        byte_size: u64,
+    ) {
+        let conn = database::open_or_initialize(&paths.archive_path).unwrap();
+        let relpath = format!("raw/summary-image-{ordinal}.{extension}");
+        std::fs::write(paths.store_path.join(&relpath), "image fixture").unwrap();
+        let blob_id = database::upsert_blob(
+            &conn,
+            &database::BlobRecord {
+                sha256: format!("summary-image-{ordinal:02}"),
+                byte_size: byte_size.try_into().unwrap(),
+                mime_type: Some(mime_type.to_string()),
+                extension: Some(extension.to_string()),
+                raw_relpath: relpath.clone(),
+            },
+        )
+        .unwrap();
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id,
+                artifact_role: role.to_string(),
+                storage_area: "raw".to_string(),
+                relpath,
+                blob_id: Some(blob_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn summary_image_selection_filters_candidates_and_stops_at_image_count() {
+        let (_temp, paths, entry) = summary_image_fixture();
+        add_summary_image_artifact(&paths, entry.id, 0, "avatar", "jpg", "image/jpeg", 1);
+        add_summary_image_artifact(&paths, entry.id, 1, "video", "mp4", "video/mp4", 1);
+        add_summary_image_artifact(&paths, entry.id, 2, "audio", "mp3", "audio/mpeg", 1);
+        add_summary_image_artifact(&paths, entry.id, 3, "media", "svg", "image/svg+xml", 1);
+        add_summary_image_artifact(&paths, entry.id, 4, "media", "png", "image/jpeg", 1);
+        add_summary_image_artifact(
+            &paths,
+            entry.id,
+            5,
+            "media",
+            "jpg",
+            "image/jpeg",
+            MAX_SUMMARY_IMAGE_BYTES + 1,
+        );
+        add_summary_image_artifact(&paths, entry.id, 6, "media", "jpg", "image/jpeg", 1);
+        add_summary_image_artifact(&paths, entry.id, 7, "media", "png", "image/png", 2);
+        add_summary_image_artifact(&paths, entry.id, 8, "media", "webp", "image/webp", 3);
+        add_summary_image_artifact(&paths, entry.id, 9, "media", "gif", "image/gif", 4);
+        add_summary_image_artifact(&paths, entry.id, 10, "media", "avif", "image/avif", 5);
+
+        let text_only = build_summary_input(
+            &paths,
+            &entry.entry_uid,
+            SummaryBuildOptions { include_images: false },
+        )
+        .unwrap();
+        let visual = build_summary_input(
+            &paths,
+            &entry.entry_uid,
+            SummaryBuildOptions { include_images: true },
+        )
+        .unwrap();
+
+        assert!(text_only.request.images.is_empty());
+        assert_ne!(text_only.input_sha256, visual.input_sha256);
+        assert_eq!(visual.request.images.len(), MAX_SUMMARY_IMAGES);
+        assert_eq!(
+            visual
+                .request
+                .images
+                .iter()
+                .map(|image| image.sha256.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "summary-image-06",
+                "summary-image-07",
+                "summary-image-08",
+                "summary-image-09",
+            ]
+        );
+        assert!(visual
+            .request
+            .images
+            .iter()
+            .all(|image| image.byte_size <= MAX_SUMMARY_IMAGE_BYTES));
+    }
+
+    #[test]
+    fn summary_image_selection_enforces_aggregate_limit_and_keeps_scanning() {
+        let (_temp, paths, entry) = summary_image_fixture();
+        add_summary_image_artifact(&paths, entry.id, 0, "media", "jpg", "image/jpeg", 4 * 1024 * 1024);
+        add_summary_image_artifact(&paths, entry.id, 1, "media", "png", "image/png", 4 * 1024 * 1024);
+        add_summary_image_artifact(&paths, entry.id, 2, "media", "webp", "image/webp", 4 * 1024 * 1024);
+        add_summary_image_artifact(&paths, entry.id, 3, "media", "gif", "image/gif", 1);
+
+        let visual = build_summary_input(
+            &paths,
+            &entry.entry_uid,
+            SummaryBuildOptions { include_images: true },
+        )
+        .unwrap();
+
+        assert_eq!(visual.request.images.len(), 3);
+        assert_eq!(
+            visual.request.images.iter().map(|image| image.byte_size).sum::<u64>(),
+            MAX_SUMMARY_IMAGE_TOTAL_BYTES
+        );
+        assert!(visual
+            .request
+            .images
+            .iter()
+            .all(|image| image.sha256 != "summary-image-03"));
     }
 
     // ── Output normalization ───────────────────────────────────────────────

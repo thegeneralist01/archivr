@@ -523,6 +523,8 @@ struct SummaryRequestBody {
     provider: String,
     #[serde(default)]
     force: bool,
+    #[serde(default)]
+    include_images: bool,
 }
 
 /// `GET /api/archives/:id/entries/:uid/summary`
@@ -553,7 +555,8 @@ async fn entry_summary_handler(
 
 /// `POST /api/archives/:id/entries/:uid/summary`
 ///
-/// Manual-only summary generation. Body: `{ "provider": "...", "force": false }`.
+/// Manual-only summary generation. Body: `{ "provider": "...", "force": false,
+/// "include_images": false }`.
 ///
 /// Provider configuration and content extraction are both resolved *before*
 /// spawning, so a missing env var or an unsummarizable artifact comes back as a
@@ -577,7 +580,15 @@ async fn request_entry_summary_handler(
     //    variable name, which is the whole point of returning it as a 400.
     let provider_cfg = summarizer::provider_from_env(&body.provider)
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+    if body.include_images && matches!(provider_cfg, summarizer::ProviderConfig::ClaudeCli(_)) {
+        return Err(ApiError::bad_request(
+            "Claude CLI cannot attach local images; choose an HTTP provider or Codex CLI",
+        ));
+    }
     let provider = summarizer::provider_from_config(provider_cfg);
+    let summary_options = summarizer::SummaryBuildOptions {
+        include_images: body.include_images,
+    };
 
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let entry_id = database::entry_id_for_uid(&conn, &entry_uid)?
@@ -585,7 +596,7 @@ async fn request_entry_summary_handler(
 
     // 2. Extract the same content the summarizer will feed the model, so the
     //    digest below is the identical cache key summarize_entry will compute.
-    let input = summarizer::build_summary_input(&archive_paths, &entry_uid)
+    let input = summarizer::build_summary_input(&archive_paths, &entry_uid, summary_options)
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
 
     // 3. Cache hit: identical entry + provider + model + prompt + input.
@@ -624,13 +635,20 @@ async fn request_entry_summary_handler(
     let archive_path = mounted.archive_path.clone();
     let entry_uid_bg = entry_uid.clone();
     let summary_uid_bg = summary_uid.clone();
+    let summary_options_bg = summary_options;
     tokio::task::spawn_blocking(move || {
         // summarize_entry owns the pending → running → completed/failed
         // transitions for this same row (the cache key is identical, so the
         // upsert above and the one inside it resolve to one row). We only have
         // to catch the case where it fails before it can record anything.
         if let Err(e) =
-            summarizer::summarize_entry(&archive_paths, &entry_uid_bg, provider.as_ref(), summarizer::PROMPT_VERSION)
+            summarizer::summarize_entry(
+                &archive_paths,
+                &entry_uid_bg,
+                summary_options_bg,
+                provider.as_ref(),
+                summarizer::PROMPT_VERSION,
+            )
         {
             eprintln!("warn: summary {summary_uid_bg}: {e:#}");
             if let Ok(conn) = database::open_or_initialize(&archive_path) {
@@ -2997,6 +3015,46 @@ mod tests {
         .unwrap()
     }
 
+    fn add_summary_test_artifact(
+        archive_path: &std::path::Path,
+        entry_id: i64,
+        relpath: &str,
+        role: &str,
+        mime_type: &str,
+        contents: &[u8],
+    ) {
+        let paths = archive::read_archive_paths(archive_path).unwrap();
+        let full_path = paths.store_path.join(relpath);
+        std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+        std::fs::write(&full_path, contents).unwrap();
+
+        let conn = database::open_or_initialize(archive_path).unwrap();
+        let blob_id = database::upsert_blob(
+            &conn,
+            &database::BlobRecord {
+                sha256: format!("test-summary-{}", relpath.replace('/', "-")),
+                byte_size: contents.len().try_into().unwrap(),
+                mime_type: Some(mime_type.to_string()),
+                extension: relpath.rsplit('.').next().map(str::to_string),
+                raw_relpath: relpath.to_string(),
+            },
+        )
+        .unwrap();
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id,
+                artifact_role: role.to_string(),
+                storage_area: "raw".to_string(),
+                relpath: relpath.to_string(),
+                blob_id: Some(blob_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+    }
+
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -3006,6 +3064,110 @@ mod tests {
 
     fn json_body(payload: &serde_json::Value) -> Body {
         Body::from(serde_json::to_vec(payload).unwrap())
+    }
+
+    #[tokio::test]
+    async fn summary_include_images_rejects_claude_cli_without_creating_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        let session_cookie = make_test_session(&auth_path);
+
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/archives/test/entries/{}/summary", entry.entry_uid))
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({
+                        "provider": "claude_cli",
+                        "include_images": true,
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await["error"],
+            "Claude CLI cannot attach local images; choose an HTTP provider or Codex CLI"
+        );
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        assert!(database::latest_entry_summary(&conn, entry.id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn summary_include_images_uses_distinct_cache_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        add_summary_test_artifact(
+            &archive_path,
+            entry.id,
+            "raw/summary-test.html",
+            "primary_media",
+            "text/html",
+            b"<article>summary fixture</article>",
+        );
+        add_summary_test_artifact(
+            &archive_path,
+            entry.id,
+            "raw/summary-test.jpg",
+            "media",
+            "image/jpeg",
+            b"image fixture",
+        );
+        let session_cookie = make_test_session(&auth_path);
+        let previous_codex_cli = std::env::var_os("ARCHIVR_CODEX_CLI");
+        unsafe { std::env::set_var("ARCHIVR_CODEX_CLI", "/usr/bin/false") };
+
+        let text_response = app(registry.clone(), auth_path.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/archives/test/entries/{}/summary", entry.entry_uid))
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({ "provider": "codex_cli" })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(text_response.status(), StatusCode::ACCEPTED);
+
+        let image_response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/archives/test/entries/{}/summary", entry.entry_uid))
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({
+                        "provider": "codex_cli",
+                        "include_images": true,
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(image_response.status(), StatusCode::ACCEPTED);
+        match previous_codex_cli {
+            Some(value) => unsafe { std::env::set_var("ARCHIVR_CODEX_CLI", value) },
+            None => unsafe { std::env::remove_var("ARCHIVR_CODEX_CLI") },
+        }
+
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let input_hashes: Vec<String> = conn
+            .prepare("SELECT input_sha256 FROM entry_summaries WHERE entry_id = ?1")
+            .unwrap()
+            .query_map([entry.id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(input_hashes.len(), 2);
+        assert_ne!(input_hashes[0], input_hashes[1]);
     }
 
     #[tokio::test]
