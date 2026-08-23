@@ -682,16 +682,64 @@ fn decode_entities(s: &str) -> String {
 /// Pulls the human text out of a scraped tweet JSON payload, tolerating both
 /// the flat shape and a `{ "tweet": { … } }` wrapper, and appending any thread
 /// entries so a self-reply chain summarizes as one piece.
-pub fn extract_tweet_text(json: &serde_json::Value) -> Option<String> {
-    fn one(v: &serde_json::Value) -> Option<String> {
-        for key in ["full_text", "text", "content", "body"] {
-            if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
-                if !s.trim().is_empty() {
-                    return Some(s.to_string());
-                }
+fn nonempty_string(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn flatten_article_blocks(v: &serde_json::Value, out: &mut Vec<String>) {
+    const TEXT_KEYS: &[&str] = &["text", "plain_text", "content", "body", "title", "heading"];
+
+    match v {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                flatten_article_blocks(item, out);
             }
         }
-        None
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                if TEXT_KEYS.contains(&key.as_str()) {
+                    if let Some(text) = value.as_str().filter(|text| !text.trim().is_empty()) {
+                        out.push(text.to_string());
+                    }
+                }
+                flatten_article_blocks(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn article_text(status: &serde_json::Value) -> Option<String> {
+    let article = status.get("article")?;
+    article.as_object()?;
+    let title = nonempty_string(article, "title");
+    let body = nonempty_string(article, "plain_text")
+        .or_else(|| {
+            let mut blocks = Vec::new();
+            if let Some(value) = article.get("blocks") {
+                flatten_article_blocks(value, &mut blocks);
+            }
+            (!blocks.is_empty()).then(|| blocks.join("\n\n"))
+        })
+        .or_else(|| nonempty_string(article, "preview_text"))
+        .or_else(|| nonempty_string(article, "summary_text"))?;
+
+    Some(match title.as_deref() {
+        Some(title) => format!("{title}\n\n{body}"),
+        None => body,
+    })
+}
+
+pub fn extract_tweet_text(json: &serde_json::Value) -> Option<String> {
+    fn one(v: &serde_json::Value) -> Option<String> {
+        article_text(v).or_else(|| {
+            ["full_text", "text", "content", "body"]
+                .into_iter()
+                .find_map(|key| nonempty_string(v, key))
+        })
     }
     let root = json.get("tweet").unwrap_or(json);
     let mut parts: Vec<String> = Vec::new();
@@ -1197,6 +1245,141 @@ mod tests {
         assert_eq!(extract_tweet_text(&threaded).unwrap(), "first\n\nsecond");
 
         assert!(extract_tweet_text(&serde_json::json!({ "id": 1 })).is_none());
+    }
+
+    #[test]
+    fn extract_tweet_text_prefers_x_article_plain_text_over_tco_body() {
+        let tweet = serde_json::json!({
+            "full_text": "https://t.co/article",
+            "article": { "title": "Skin guide", "plain_text": "Use sunscreen daily." }
+        });
+        assert_eq!(
+            extract_tweet_text(&tweet).as_deref(),
+            Some("Skin guide\n\nUse sunscreen daily.")
+        );
+    }
+
+    #[test]
+    fn extract_tweet_text_uses_article_blocks_when_plain_text_is_empty() {
+        let tweet = serde_json::json!({"article": {
+            "title": "Blocks", "plain_text": " ",
+            "blocks": [
+                {"text": "First", "id": "ignored", "media_url": "https://example.test/image"},
+                {"children": [{"text": "Second", "enabled": true}]}
+            ]
+        }});
+        assert_eq!(
+            extract_tweet_text(&tweet).as_deref(),
+            Some("Blocks\n\nFirst\n\nSecond")
+        );
+    }
+
+    #[test]
+    fn extract_tweet_text_falls_back_from_article_preview_to_summary_then_tweet_body() {
+        let preview = serde_json::json!({
+            "full_text": "https://t.co/fallback",
+            "article": { "title": "Preview", "preview_text": "Preview copy", "summary_text": "Later" }
+        });
+        assert_eq!(
+            extract_tweet_text(&preview).as_deref(),
+            Some("Preview\n\nPreview copy")
+        );
+
+        let summary = serde_json::json!({
+            "full_text": "https://t.co/fallback",
+            "article": { "title": "Summary", "summary_text": "Summary copy" }
+        });
+        assert_eq!(
+            extract_tweet_text(&summary).as_deref(),
+            Some("Summary\n\nSummary copy")
+        );
+
+        let empty_article = serde_json::json!({
+            "full_text": "https://t.co/fallback",
+            "article": { "title": "Only a title", "blocks": [{"id": "not text"}] }
+        });
+        assert_eq!(
+            extract_tweet_text(&empty_article).as_deref(),
+            Some("https://t.co/fallback")
+        );
+    }
+
+    #[test]
+    fn build_summary_input_joins_article_backed_tweet_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = crate::archive::initialize_archive(
+            temp.path(),
+            &temp.path().join("store"),
+            "Test archive",
+            false,
+        )
+        .unwrap();
+        let conn = database::open_or_initialize(&paths.archive_path).unwrap();
+        let user_id = database::ensure_default_user(&conn).unwrap();
+        let run = database::create_archive_run(&conn, user_id, 1).unwrap();
+        let source_id = database::upsert_source_identity(
+            &conn,
+            "twitter",
+            "tweet_thread",
+            Some("thread-1"),
+            Some("https://x.com/example/status/1"),
+            "x:thread-1",
+        )
+        .unwrap();
+        let entry = database::create_archived_entry(
+            &conn,
+            &database::NewEntry {
+                source_identity_id: source_id,
+                archive_run_id: run.id,
+                parent_entry_id: None,
+                root_entry_id: None,
+                created_by_user_id: user_id,
+                owned_by_user_id: user_id,
+                source_kind: "twitter".to_string(),
+                entity_kind: "tweet_thread".to_string(),
+                title: Some("Article thread".to_string()),
+                visibility: "private".to_string(),
+                representation_kind: "tweet_thread".to_string(),
+                source_metadata_json: "{}".to_string(),
+                display_metadata_json: None,
+            },
+        )
+        .unwrap();
+
+        for (ordinal, (relpath, body)) in [
+            ("raw_tweets/article-one.json", "First article body."),
+            ("raw_tweets/article-two.json", "Second article body."),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = paths.store_path.join(relpath);
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "full_text": format!("https://t.co/{ordinal}"),
+                    "article": { "title": format!("Article {}", ordinal + 1), "plain_text": body }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            database::add_entry_artifact(
+                &conn,
+                &database::NewArtifact {
+                    entry_id: entry.id,
+                    artifact_role: "raw_tweet_json".to_string(),
+                    storage_area: "raw_tweets".to_string(),
+                    relpath: relpath.to_string(),
+                    blob_id: None,
+                    logical_path: None,
+                    metadata_json: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let input = build_summary_input(&paths, &entry.entry_uid).unwrap();
+        assert!(input.request.content.contains("First article body.\n\n---\n\nArticle 2\n\nSecond article body."));
     }
 
     // ── Output normalization ───────────────────────────────────────────────
