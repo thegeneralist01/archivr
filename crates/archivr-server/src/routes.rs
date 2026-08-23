@@ -29,7 +29,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use archivr_core::{archive, capture, database, downloader};
+use archivr_core::{archive, capture, database, downloader, summarizer};
 use axum::{
     Json, Router,
     extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, Request, State},
@@ -267,6 +267,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/archives/:archive_id/entries/:entry_uid/rearchive",
             post(rearchive_handler),
+        )
+        .route(
+            "/api/archives/:archive_id/entries/:entry_uid/summary",
+            get(entry_summary_handler).post(request_entry_summary_handler),
         )
         .route(
             "/api/archives/:archive_id/entries/:entry_uid/favicon",
@@ -512,6 +516,148 @@ async fn entry_detail(
     let detail = archive::get_entry_detail(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
     Ok(Json(detail))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SummaryRequestBody {
+    provider: String,
+    #[serde(default)]
+    force: bool,
+}
+
+/// `GET /api/archives/:id/entries/:uid/summary`
+///
+/// Read-only, gated exactly like entry detail: a guest may read a summary only
+/// for an entry whose content they could already read. Returns
+/// `{ entry_uid, summary }` with a null summary when none has been requested,
+/// which is also what the frontend polls while a job is running.
+async fn entry_summary_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((archive_id, entry_uid)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    if matches!(auth_user, AuthUser::Guest)
+        && !database::is_entry_publicly_accessible(&conn, &entry_uid)?
+    {
+        return Err(ApiError::unauthorized("login required"));
+    }
+    let entry_id = database::entry_id_for_uid(&conn, &entry_uid)?
+        .ok_or(ApiError::not_found("entry not found"))?;
+    let summary = database::latest_entry_summary(&conn, entry_id)?;
+    Ok(Json(
+        serde_json::json!({ "entry_uid": entry_uid, "summary": summary }),
+    ))
+}
+
+/// `POST /api/archives/:id/entries/:uid/summary`
+///
+/// Manual-only summary generation. Body: `{ "provider": "...", "force": false }`.
+///
+/// Provider configuration and content extraction are both resolved *before*
+/// spawning, so a missing env var or an unsummarizable artifact comes back as a
+/// synchronous 400 naming the exact problem rather than as a background job the
+/// caller has to poll only to learn about a config typo.
+///
+/// Returns 200 with the existing row when an identical cache key already
+/// completed and `force` is false; otherwise 202 with a pending row.
+async fn request_entry_summary_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((archive_id, entry_uid)): Path<(String, String)>,
+    Json(body): Json<SummaryRequestBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let archive_paths =
+        archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;
+
+    // 1. Provider config from the environment. The error text carries the exact
+    //    variable name, which is the whole point of returning it as a 400.
+    let provider_cfg = summarizer::provider_from_env(&body.provider)
+        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+    let provider = summarizer::provider_from_config(provider_cfg);
+
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let entry_id = database::entry_id_for_uid(&conn, &entry_uid)?
+        .ok_or(ApiError::not_found("entry not found"))?;
+
+    // 2. Extract the same content the summarizer will feed the model, so the
+    //    digest below is the identical cache key summarize_entry will compute.
+    let input = summarizer::build_summary_input(&archive_paths, &entry_uid)
+        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+
+    // 3. Cache hit: identical entry + provider + model + prompt + input.
+    if !body.force {
+        if let Some(existing) = database::find_entry_summary(
+            &conn,
+            entry_id,
+            provider.kind(),
+            provider.model(),
+            summarizer::PROMPT_VERSION,
+            &input.input_sha256,
+        )? {
+            if existing.status == "completed" {
+                return Ok((
+                    StatusCode::OK,
+                    serde_json::to_value(&existing)
+                        .map(Json)
+                        .map_err(|e| ApiError::internal(&e.to_string()))?,
+                ));
+            }
+        }
+    }
+
+    // 4. Claim the row up front so the 202 can name it and the client can poll
+    //    immediately, before the worker thread has done anything.
+    let summary_uid = database::upsert_pending_entry_summary(
+        &conn,
+        entry_id,
+        provider.kind(),
+        provider.model(),
+        summarizer::PROMPT_VERSION,
+        &input.input_sha256,
+    )?;
+    drop(conn);
+
+    let archive_path = mounted.archive_path.clone();
+    let entry_uid_bg = entry_uid.clone();
+    let summary_uid_bg = summary_uid.clone();
+    tokio::task::spawn_blocking(move || {
+        // summarize_entry owns the pending → running → completed/failed
+        // transitions for this same row (the cache key is identical, so the
+        // upsert above and the one inside it resolve to one row). We only have
+        // to catch the case where it fails before it can record anything.
+        if let Err(e) =
+            summarizer::summarize_entry(&archive_paths, &entry_uid_bg, provider.as_ref(), summarizer::PROMPT_VERSION)
+        {
+            eprintln!("warn: summary {summary_uid_bg}: {e:#}");
+            if let Ok(conn) = database::open_or_initialize(&archive_path) {
+                if let Ok(Some(row)) = database::get_entry_summary_by_uid(&conn, &summary_uid_bg) {
+                    if row.status != "failed" {
+                        database::update_entry_summary_status(
+                            &conn,
+                            &summary_uid_bg,
+                            "failed",
+                            None,
+                            Some(&format!("{e:#}")),
+                        )
+                        .ok();
+                    }
+                }
+            }
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "summary_uid": summary_uid,
+            "status": "pending",
+            "entry_uid": entry_uid,
+        })),
+    ))
 }
 
 async fn list_runs(

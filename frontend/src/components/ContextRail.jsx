@@ -1,8 +1,39 @@
 import { useState, useEffect, useRef } from 'react'
-import { fetchEntryTags, assignTag, removeTag, listEntryCollections, listCollections, addEntryToCollection, updateEntryTitle, deleteEntry, rearchiveEntry, pollCaptureJob } from '../api'
+import { fetchEntryTags, assignTag, removeTag, listEntryCollections, listCollections, addEntryToCollection, updateEntryTitle, deleteEntry, rearchiveEntry, pollCaptureJob, fetchEntrySummary, requestEntrySummary } from '../api'
 import { formatTimestamp, formatBytes, valueText, sourceIconSvg, displayPath } from '../utils'
 
 const VIS_LABEL = { 0: 'Private', 1: 'Public', 2: 'Users only', 3: 'Public' }
+
+// Provider labels are display-only; the values are the provider_kind strings
+// the server persists in entry_summaries.provider_kind.
+const SUMMARY_PROVIDERS = [
+  { value: 'anthropic_http', label: 'Anthropic API' },
+  { value: 'openai_compatible', label: 'OpenAI-compatible API' },
+  { value: 'claude_cli', label: 'Claude CLI' },
+  { value: 'codex_cli', label: 'Codex CLI' },
+]
+const PROVIDER_LABEL = Object.fromEntries(SUMMARY_PROVIDERS.map(p => [p.value, p.label]))
+const SUMMARY_PROVIDER_KEY = 'archivr:summary:provider'
+const SUMMARY_POLL_MS = 1500
+
+// Summaries are stored as the raw JSON string the model produced (normalized
+// server-side to {tldr, summary, tags}). Parsing can still fail for rows written
+// by an older prompt version, so fall back to showing the text as-is rather than
+// hiding a summary the user can perfectly well read.
+function parseSummaryText(text) {
+  if (!text) return null
+  try {
+    const parsed = JSON.parse(text)
+    if (parsed && typeof parsed === 'object') {
+      return {
+        tldr: typeof parsed.tldr === 'string' ? parsed.tldr : '',
+        summary: typeof parsed.summary === 'string' ? parsed.summary : '',
+        tags: Array.isArray(parsed.tags) ? parsed.tags.filter(t => typeof t === 'string') : [],
+      }
+    }
+  } catch { /* not JSON — fall through */ }
+  return { tldr: '', summary: text, tags: [] }
+}
 
 
 const ExternalIcon = () => (
@@ -25,6 +56,20 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
   const rearchivePollRef = useRef(null)
   const [fontsOpen, setFontsOpen] = useState(false)
   useEffect(() => { setFontsOpen(false) }, [detail?.summary?.entry_uid])
+
+  // ── Summary state ───────────────────────────────────────────────────────
+  // `summary` mirrors the server row. It is seeded from detail.latest_summary so
+  // the section renders immediately on selection, then kept fresh by polling
+  // only while a job is non-terminal.
+  const [summary, setSummary] = useState(null)
+  const [summaryError, setSummaryError] = useState('')
+  const [summaryBusy, setSummaryBusy] = useState(false)
+  const [summaryProvider, setSummaryProvider] = useState(() => {
+    try {
+      return sessionStorage.getItem(SUMMARY_PROVIDER_KEY) || SUMMARY_PROVIDERS[0].value
+    } catch { return SUMMARY_PROVIDERS[0].value }
+  })
+  const summaryPollRef = useRef(null)
 
   // ── Bulk-panel state ────────────────────────────────────────────────────
   const isBulk = selectedUids?.size >= 2
@@ -75,6 +120,80 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
       clearInterval(rearchivePollRef.current)
     }
   }, [])
+
+  // Seed the summary from the entry detail payload and stop any poll left over
+  // from the previously selected entry.
+  useEffect(() => {
+    clearInterval(summaryPollRef.current)
+    summaryPollRef.current = null
+    setSummary(detail?.latest_summary ?? null)
+    setSummaryError('')
+    setSummaryBusy(false)
+  }, [detail?.summary?.entry_uid])
+
+  // Poll only while the latest summary is non-terminal. Anchoring the effect on
+  // the status (rather than starting a timer inside the click handler) means a
+  // job still running when the user navigates away and back is picked up again.
+  const summaryStatus = summary?.status
+  useEffect(() => {
+    clearInterval(summaryPollRef.current)
+    summaryPollRef.current = null
+    if (summaryStatus !== 'pending' && summaryStatus !== 'running') return
+    if (!archiveId || !detail?.summary?.entry_uid) return
+    const entryUid = detail.summary.entry_uid
+    summaryPollRef.current = setInterval(async () => {
+      try {
+        const res = await fetchEntrySummary(archiveId, entryUid)
+        setSummary(res.summary ?? null)
+        const st = res.summary?.status
+        if (st !== 'pending' && st !== 'running') {
+          clearInterval(summaryPollRef.current)
+          summaryPollRef.current = null
+          setSummaryBusy(false)
+          if (st === 'completed') onDetailRefresh?.()
+        }
+      } catch {
+        // A transient poll failure is not worth tearing the section down; the
+        // next tick retries, and a real failure lands as status === 'failed'.
+      }
+    }, SUMMARY_POLL_MS)
+    return () => {
+      clearInterval(summaryPollRef.current)
+      summaryPollRef.current = null
+    }
+  }, [summaryStatus, archiveId, detail?.summary?.entry_uid])
+
+  useEffect(() => () => clearInterval(summaryPollRef.current), [])
+
+  async function handleGenerateSummary(force = false) {
+    if (!archiveId || !detail?.summary?.entry_uid || summaryBusy) return
+    setSummaryBusy(true)
+    setSummaryError('')
+    try {
+      const res = await requestEntrySummary(archiveId, detail.summary.entry_uid, {
+        provider: summaryProvider,
+        force,
+      })
+      if (res.status === 'completed') {
+        // 200 cache hit: the response *is* the row, no polling needed.
+        setSummary(res)
+        setSummaryBusy(false)
+        onDetailRefresh?.()
+      } else {
+        // 202: seed a local pending row so the poll effect starts immediately
+        // rather than waiting a tick for the first GET.
+        setSummary({ ...(res ?? {}), status: 'pending' })
+      }
+    } catch (e) {
+      setSummaryError(e.message || 'Summary request failed')
+      setSummaryBusy(false)
+    }
+  }
+
+  function handleProviderChange(value) {
+    setSummaryProvider(value)
+    try { sessionStorage.setItem(SUMMARY_PROVIDER_KEY, value) } catch { /* private mode */ }
+  }
 
   // Fetch available collections whenever archiveId is available
   useEffect(() => {
@@ -434,6 +553,80 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
               Preview
             </button>
           )}
+
+          {(() => {
+            // Public sessions get read-only treatment: the completed text if the
+            // server's visibility gate let the detail through at all, and never
+            // the provider selector or Generate button.
+            const parsed = summary?.status === 'completed'
+              ? parseSummaryText(summary.summary_text)
+              : null
+            const running = summary?.status === 'pending' || summary?.status === 'running'
+            if (isPublicSession && !parsed) return null
+            return (
+              <div className="rail-section rail-summary">
+                <div className="rail-section-heading">Summary</div>
+
+                {parsed && (
+                  <div className="rail-summary-body">
+                    {parsed.tldr && <p className="rail-summary-tldr">{parsed.tldr}</p>}
+                    {parsed.summary && <p className="rail-summary-text">{parsed.summary}</p>}
+                    {parsed.tags.length > 0 && (
+                      <div className="rail-summary-tags">
+                        {parsed.tags.map(t => (
+                          <span key={t} className="rail-summary-tag">{t}</span>
+                        ))}
+                      </div>
+                    )}
+                    <p className="rail-summary-provider">
+                      {PROVIDER_LABEL[summary.provider_kind] || summary.provider_kind}
+                      {summary.provider_model ? ` \u00b7 ${summary.provider_model}` : ''}
+                    </p>
+                  </div>
+                )}
+
+                {running && (
+                  <p className="rail-summary-status">
+                    <span className="rail-summary-spinner" aria-hidden="true" />
+                    {'Generating\u2026'}
+                  </p>
+                )}
+
+                {summary?.status === 'failed' && summary.error_text && !isPublicSession && (
+                  <p className="form-msg form-msg--err" style={{ margin: '0 0 8px' }}>
+                    {summary.error_text}
+                  </p>
+                )}
+                {summaryError && (
+                  <p className="form-msg form-msg--err" style={{ margin: '0 0 8px' }}>
+                    {summaryError}
+                  </p>
+                )}
+
+                {!isPublicSession && !running && (
+                  <div className="rail-summary-controls">
+                    <select
+                      className="rail-summary-select"
+                      value={summaryProvider}
+                      onChange={e => handleProviderChange(e.target.value)}
+                      aria-label="Summary provider"
+                    >
+                      {SUMMARY_PROVIDERS.map(p => (
+                        <option key={p.value} value={p.value}>{p.label}</option>
+                      ))}
+                    </select>
+                    <button
+                      className="rail-rearchive-btn"
+                      onClick={() => handleGenerateSummary(!!parsed)}
+                      disabled={summaryBusy}
+                    >
+                      {summaryBusy ? '\u2026' : parsed ? 'Regenerate' : 'Generate'}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )
+          })()}
 
           <div className="meta-list">
             {metaRows.filter(([, v]) => v != null && v !== '').map(([label, value]) => (

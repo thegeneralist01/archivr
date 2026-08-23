@@ -3118,3 +3118,64 @@ body.has-audio-bar { padding-bottom: 56px; }
   cursor: pointer;
 }
 .capture-sync-row input[type=checkbox] { cursor: pointer; }
+
+/* ── Summary rail section ────────────────────────────────────────────────── */
+/* Reuses .rail-section spacing and .rail-rearchive-btn for the action button;
+   only the summary-specific typography and the provider row are new here. */
+.rail-summary-body { margin-bottom: 10px; }
+.rail-summary-tldr {
+  margin: 0 0 8px;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--ink);
+  line-height: 1.45;
+}
+.rail-summary-text {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--ink);
+  line-height: 1.55;
+}
+.rail-summary-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 8px; }
+.rail-summary-tag {
+  font-size: 11px;
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+}
+.rail-summary-provider {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted-2);
+  letter-spacing: 0.02em;
+}
+.rail-summary-status {
+  display: flex; align-items: center; gap: 7px;
+  margin: 0 0 8px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.rail-summary-spinner {
+  width: 11px; height: 11px;
+  border: 1.5px solid var(--line);
+  border-top-color: var(--muted);
+  border-radius: 50%;
+  animation: rail-summary-spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes rail-summary-spin { to { transform: rotate(360deg); } }
+/* Respect a reduced-motion preference: the text alone still conveys the state. */
+@media (prefers-reduced-motion: reduce) {
+  .rail-summary-spinner { animation: none; }
+}
+.rail-summary-controls { display: flex; flex-direction: column; gap: 6px; }
+.rail-summary-select {
+  width: 100%;
+  padding: 5px 8px;
+  font-size: 12.5px;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
