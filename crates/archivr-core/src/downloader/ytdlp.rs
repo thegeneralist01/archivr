@@ -4,12 +4,116 @@ use std::{
     env,
     path::{Path, PathBuf},
     process::Command,
+    sync::OnceLock,
 };
 use uuid::Uuid;
 use serde_json;
 
 use crate::downloader::cookies::{domain_from_url, write_netscape_cookie_file};
 use crate::hash::hash_file;
+
+/// Env var that force-pins a specific yt-dlp binary, bypassing version comparison.
+pub const YT_DLP_FORCE_ENV: &str = "ARCHIVR_YT_DLP_FORCE";
+/// Env var set by the nix flake wrapper, pointing at the pinned yt-dlp.
+pub const YT_DLP_ENV: &str = "ARCHIVR_YT_DLP";
+/// Override for the mutable state directory (used by `archivr yt-dlp` and tests).
+pub const STATE_DIR_ENV: &str = "ARCHIVR_STATE_DIR";
+
+static RESOLVED_YT_DLP: OnceLock<PathBuf> = OnceLock::new();
+
+/// Mutable per-user state directory for archivr.
+///
+/// `ARCHIVR_STATE_DIR` wins if set. Otherwise this mirrors what `dirs::state_dir()`
+/// would give us without taking on the dependency: `~/Library/Application Support`
+/// on macOS, `$XDG_STATE_HOME` (default `~/.local/state`) elsewhere.
+pub fn state_dir() -> Option<PathBuf> {
+    if let Some(dir) = env::var_os(STATE_DIR_ENV) {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+
+    let home = PathBuf::from(env::var_os("HOME").filter(|h| !h.is_empty())?);
+
+    if cfg!(target_os = "macos") {
+        Some(home.join("Library").join("Application Support").join("archivr"))
+    } else {
+        let base = env::var_os("XDG_STATE_HOME")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local").join("state"));
+        Some(base.join("archivr"))
+    }
+}
+
+/// Path of the user-installed (self-updated) yt-dlp inside the state dir.
+pub fn state_dir_yt_dlp() -> Option<PathBuf> {
+    state_dir().map(|d| d.join("yt-dlp").join("yt-dlp"))
+}
+
+/// The nix-pinned yt-dlp advertised via `ARCHIVR_YT_DLP`, if it exists on disk.
+pub fn pinned_yt_dlp() -> Option<PathBuf> {
+    let p = PathBuf::from(env::var_os(YT_DLP_ENV).filter(|v| !v.is_empty())?);
+    p.is_file().then_some(p)
+}
+
+/// Runs `<binary> --version` and returns the trimmed stdout.
+///
+/// yt-dlp versions are `YYYY.MM.DD`, so plain string ordering is chronological
+/// ordering — no semver parsing needed.
+pub fn probe_version(binary: &Path) -> Option<String> {
+    let out = Command::new(binary).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!version.is_empty()).then_some(version)
+}
+
+/// The candidate yt-dlp binaries, in priority order for tie-breaking
+/// (later entries win ties, so the deliberately-installed state-dir copy is last).
+pub fn yt_dlp_candidates() -> Vec<(&'static str, PathBuf)> {
+    let mut candidates = Vec::new();
+    if let Some(p) = pinned_yt_dlp() {
+        candidates.push(("env (ARCHIVR_YT_DLP)", p));
+    }
+    if let Some(p) = state_dir_yt_dlp() {
+        if p.is_file() {
+            candidates.push(("state-dir", p));
+        }
+    }
+    candidates
+}
+
+/// Picks the yt-dlp binary to run, without consulting the process-wide cache.
+///
+/// Priority: `ARCHIVR_YT_DLP_FORCE` > newest of (pinned, state-dir) by version
+/// string > bare `yt-dlp` (PATH lookup, the historical behaviour).
+pub fn resolve_yt_dlp_uncached() -> PathBuf {
+    if let Some(forced) = env::var_os(YT_DLP_FORCE_ENV).filter(|v| !v.is_empty()) {
+        let forced = PathBuf::from(forced);
+        if forced.is_file() {
+            return forced;
+        }
+    }
+
+    yt_dlp_candidates()
+        .into_iter()
+        .filter_map(|(_, path)| probe_version(&path).map(|v| (v, path)))
+        // `max_by` keeps the *last* maximum, and the state-dir candidate is last,
+        // so an exact version tie resolves in favour of the user's own install.
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, path)| path)
+        .unwrap_or_else(|| PathBuf::from("yt-dlp"))
+}
+
+/// Cached [`resolve_yt_dlp_uncached`] — `--version` is spawned at most once
+/// per process no matter how many yt-dlp calls the run makes.
+pub fn resolve_yt_dlp() -> PathBuf {
+    RESOLVED_YT_DLP
+        .get_or_init(resolve_yt_dlp_uncached)
+        .clone()
+}
 
 /// A single item in a flat playlist listing from `fetch_playlist_info`.
 #[derive(Debug)]
@@ -164,7 +268,7 @@ pub fn download(
 ) -> Result<(String, String)> {
     println!("Downloading with yt-dlp: {path}");
 
-    let ytdlp = env::var("ARCHIVR_YT_DLP").unwrap_or_else(|_| "yt-dlp".to_string());
+    let ytdlp = resolve_yt_dlp();
     let is_audio = quality == Some("audio");
 
     let temp_dir = store_path.join("temp").join(timestamp);
@@ -207,7 +311,7 @@ pub fn download(
         .arg("-o")
         .arg(&out_template)
         .output()
-        .with_context(|| format!("failed to spawn {ytdlp} process"));
+        .with_context(|| format!("failed to spawn {} process", ytdlp.display()));
 
     // Remove cookie file immediately regardless of outcome.
     if let Some(cf) = &cookie_file {
@@ -253,7 +357,7 @@ fn find_downloaded_file(temp_dir: &Path, timestamp: &str) -> Result<PathBuf> {
 /// On failure (non-zero exit or no stdout), prints the captured stderr
 /// to stderr (for debugging) then returns `None` so callers can proceed.
 pub fn fetch_metadata(path: &str, cookies: &HashMap<String, String>) -> Option<String> {
-    let ytdlp = std::env::var("ARCHIVR_YT_DLP").unwrap_or_else(|_| "yt-dlp".to_string());
+    let ytdlp = resolve_yt_dlp();
 
     // Write a temp cookie file if needed; UUID-named to avoid collisions.
     let cookie_file: Option<PathBuf> = if !cookies.is_empty() {
@@ -342,7 +446,7 @@ fn normalize_item_url(
 /// Returns an error if yt-dlp fails, the output is not valid JSON, or
 /// the root `_type` is not `"playlist"`.
 pub fn fetch_playlist_info(url: &str, cookies: &HashMap<String, String>) -> Result<PlaylistInfo> {
-    let ytdlp = std::env::var("ARCHIVR_YT_DLP").unwrap_or_else(|_| "yt-dlp".to_string());
+    let ytdlp = resolve_yt_dlp();
 
     let cookie_file: Option<PathBuf> = if !cookies.is_empty() {
         let domain = domain_from_url(url);
@@ -366,7 +470,7 @@ pub fn fetch_playlist_info(url: &str, cookies: &HashMap<String, String>) -> Resu
     if let Some(cf) = &cookie_file {
         let _ = std::fs::remove_file(cf);
     }
-    let out = out.with_context(|| format!("failed to spawn {ytdlp}"))?;
+    let out = out.with_context(|| format!("failed to spawn {}", ytdlp.display()))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("yt-dlp -J --flat-playlist failed for {url}: {stderr}");
@@ -425,7 +529,7 @@ pub fn probe_playlist_qualities(
     url: &str,
     cookies: &HashMap<String, String>,
 ) -> Result<PlaylistProbeResult> {
-    let ytdlp = std::env::var("ARCHIVR_YT_DLP").unwrap_or_else(|_| "yt-dlp".to_string());
+    let ytdlp = resolve_yt_dlp();
 
     let cookie_file: Option<PathBuf> = if !cookies.is_empty() {
         let domain = domain_from_url(url);
@@ -449,7 +553,7 @@ pub fn probe_playlist_qualities(
     if let Some(cf) = &cookie_file {
         let _ = std::fs::remove_file(cf);
     }
-    let out = out.with_context(|| format!("failed to spawn {ytdlp}"))?;
+    let out = out.with_context(|| format!("failed to spawn {}", ytdlp.display()))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("yt-dlp -J failed for {url}: {stderr}");
@@ -501,7 +605,131 @@ pub fn probe_playlist_qualities(
 
 #[cfg(test)]
 mod tests {
-    use super::{available_video_heights, has_audio_track, quality_format};
+    use super::{
+        available_video_heights, has_audio_track, quality_format, resolve_yt_dlp_uncached,
+        state_dir, STATE_DIR_ENV, YT_DLP_ENV, YT_DLP_FORCE_ENV,
+    };
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Env vars are process-global, so resolver tests take turns.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Clears every env var the resolver reads and hands back the serialising guard.
+    fn env_guard() -> MutexGuard<'static, ()> {
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for key in [YT_DLP_FORCE_ENV, YT_DLP_ENV, STATE_DIR_ENV] {
+            unsafe { std::env::remove_var(key) };
+        }
+        guard
+    }
+
+    /// Writes an executable stub that reports `version` when asked for `--version`.
+    fn fake_yt_dlp(path: &Path, version: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("#!/bin/sh\necho {version}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[test]
+    fn resolve_yt_dlp_prefers_state_dir_when_newer() {
+        let _guard = env_guard();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let pinned = tmp.path().join("nix/yt-dlp");
+        fake_yt_dlp(&pinned, "2026.08.19");
+
+        let state = tmp.path().join("state");
+        fake_yt_dlp(&state.join("yt-dlp/yt-dlp"), "2026.09.01");
+
+        unsafe {
+            std::env::set_var(YT_DLP_ENV, &pinned);
+            std::env::set_var(STATE_DIR_ENV, &state);
+        }
+
+        assert_eq!(resolve_yt_dlp_uncached(), state.join("yt-dlp/yt-dlp"));
+    }
+
+    #[test]
+    fn resolve_yt_dlp_prefers_pinned_when_newer() {
+        let _guard = env_guard();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let pinned = tmp.path().join("nix/yt-dlp");
+        fake_yt_dlp(&pinned, "2026.09.15");
+
+        let state = tmp.path().join("state");
+        fake_yt_dlp(&state.join("yt-dlp/yt-dlp"), "2026.08.19");
+
+        unsafe {
+            std::env::set_var(YT_DLP_ENV, &pinned);
+            std::env::set_var(STATE_DIR_ENV, &state);
+        }
+
+        assert_eq!(resolve_yt_dlp_uncached(), pinned);
+    }
+
+    #[test]
+    fn resolve_yt_dlp_breaks_version_ties_toward_state_dir() {
+        let _guard = env_guard();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let pinned = tmp.path().join("nix/yt-dlp");
+        fake_yt_dlp(&pinned, "2026.09.01");
+
+        let state = tmp.path().join("state");
+        fake_yt_dlp(&state.join("yt-dlp/yt-dlp"), "2026.09.01");
+
+        unsafe {
+            std::env::set_var(YT_DLP_ENV, &pinned);
+            std::env::set_var(STATE_DIR_ENV, &state);
+        }
+
+        assert_eq!(resolve_yt_dlp_uncached(), state.join("yt-dlp/yt-dlp"));
+    }
+
+    #[test]
+    fn resolve_yt_dlp_honours_force_override_regardless_of_version() {
+        let _guard = env_guard();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let forced = tmp.path().join("forced/yt-dlp");
+        fake_yt_dlp(&forced, "2020.01.01");
+
+        let state = tmp.path().join("state");
+        fake_yt_dlp(&state.join("yt-dlp/yt-dlp"), "2026.09.01");
+
+        unsafe {
+            std::env::set_var(YT_DLP_FORCE_ENV, &forced);
+            std::env::set_var(STATE_DIR_ENV, &state);
+        }
+
+        assert_eq!(resolve_yt_dlp_uncached(), forced);
+    }
+
+    #[test]
+    fn resolve_yt_dlp_falls_back_to_bare_when_no_candidate_exists() {
+        let _guard = env_guard();
+        let tmp = tempfile::tempdir().unwrap();
+
+        unsafe {
+            std::env::set_var(YT_DLP_ENV, tmp.path().join("missing/yt-dlp"));
+            std::env::set_var(STATE_DIR_ENV, tmp.path().join("empty-state"));
+        }
+
+        assert_eq!(resolve_yt_dlp_uncached(), PathBuf::from("yt-dlp"));
+    }
+
+    #[test]
+    fn state_dir_override_wins_over_platform_default() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var(STATE_DIR_ENV, "/tmp/archivr-state-override") };
+        assert_eq!(state_dir(), Some(PathBuf::from("/tmp/archivr-state-override")));
+    }
 
     #[test]
     fn quality_format_audio() {
