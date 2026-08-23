@@ -14,6 +14,7 @@
 //! of any file the archive would otherwise persist.
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine;
 use std::{
     env,
     io::Write,
@@ -295,25 +296,75 @@ fn http_client(timeout_secs: u64) -> Result<reqwest::blocking::Client> {
 
 /// Body builder kept separate from the transport so it can be unit-tested
 /// without a network round-trip.
-pub fn anthropic_request_body(model: &str, request: &SummaryRequest) -> serde_json::Value {
-    serde_json::json!({
+fn read_image_base64(image: &SummaryImage) -> Result<String> {
+    let bytes = std::fs::read(&image.archive_file)
+        .with_context(|| format!("failed to read summary image {}", image.archive_file.display()))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+pub fn anthropic_request_body(model: &str, request: &SummaryRequest) -> Result<serde_json::Value> {
+    if request.images.is_empty() {
+        return Ok(serde_json::json!({
         "model": model,
         "max_tokens": 1024,
         "messages": [{
             "role": "user",
             "content": build_combined_prompt(request),
         }],
-    })
+        }));
+    }
+
+    let mut content = vec![serde_json::json!({
+        "type": "text",
+        "text": build_combined_prompt(request),
+    })];
+    for image in &request.images {
+        content.push(serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": image.mime_type,
+                "data": read_image_base64(image)?,
+            },
+        }));
+    }
+    Ok(serde_json::json!({
+        "model": model,
+        "max_tokens": 1024,
+        "messages": [{ "role": "user", "content": content }],
+    }))
 }
 
-pub fn openai_request_body(model: &str, request: &SummaryRequest) -> serde_json::Value {
-    serde_json::json!({
+pub fn openai_request_body(model: &str, request: &SummaryRequest) -> Result<serde_json::Value> {
+    if request.images.is_empty() {
+        return Ok(serde_json::json!({
         "model": model,
         "messages": [
             { "role": "system", "content": SYSTEM_PROMPT },
             { "role": "user", "content": build_user_prompt(request) },
         ],
-    })
+        }));
+    }
+
+    let mut content = vec![serde_json::json!({
+        "type": "text",
+        "text": build_user_prompt(request),
+    })];
+    for image in &request.images {
+        content.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!("data:{};base64,{}", image.mime_type, read_image_base64(image)?),
+            },
+        }));
+    }
+    Ok(serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": SYSTEM_PROMPT },
+            { "role": "user", "content": content },
+        ],
+    }))
 }
 
 struct AnthropicHttpProvider(HttpProviderConfig);
@@ -326,7 +377,7 @@ impl SummaryProvider for AnthropicHttpProvider {
         Some(&self.0.model)
     }
     fn summarize(&self, request: &SummaryRequest) -> Result<SummaryOutput> {
-        let body = anthropic_request_body(&self.0.model, request);
+        let body = anthropic_request_body(&self.0.model, request)?;
         let resp = http_client(self.0.timeout_secs)?
             .post(&self.0.endpoint)
             .header("x-api-key", &self.0.api_key)
@@ -366,7 +417,7 @@ impl SummaryProvider for OpenAiCompatibleProvider {
         Some(&self.0.model)
     }
     fn summarize(&self, request: &SummaryRequest) -> Result<SummaryOutput> {
-        let body = openai_request_body(&self.0.model, request);
+        let body = openai_request_body(&self.0.model, request)?;
         let resp = http_client(self.0.timeout_secs)?
             .post(&self.0.endpoint)
             .header("authorization", format!("Bearer {}", self.0.api_key))
@@ -495,6 +546,9 @@ impl SummaryProvider for ClaudeCliProvider {
         self.0.model.as_deref()
     }
     fn summarize(&self, request: &SummaryRequest) -> Result<SummaryOutput> {
+        if !request.images.is_empty() {
+            bail!("Claude CLI cannot attach local images; choose an HTTP provider or Codex CLI");
+        }
         // `claude -p --output-format text` is the documented one-shot
         // ("print") mode of the Claude Code CLI: it reads the prompt from
         // stdin, writes the answer to stdout, and exits.
@@ -556,21 +610,43 @@ mod codex {
         if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
     }
 
-    pub fn run(cfg: &CliProviderConfig, prompt: &str) -> Result<String> {
+    pub fn primary_args(
+        images: &[SummaryImage],
+        out_path: &Path,
+        model: Option<&str>,
+    ) -> Vec<String> {
+        let mut args = vec!["exec".into()];
+        for image in images {
+            args.push("--image".into());
+            args.push(image.archive_file.to_string_lossy().into_owned());
+        }
+        args.push("--output-last-message".into());
+        args.push(out_path.to_string_lossy().into_owned());
+        if let Some(model) = model {
+            args.push("--model".into());
+            args.push(model.into());
+        }
+        args.push("-".into());
+        args
+    }
+
+    pub fn positional_args(
+        images: &[SummaryImage],
+        out_path: &Path,
+        model: Option<&str>,
+        prompt: &str,
+    ) -> Vec<String> {
+        let mut args = primary_args(images, out_path, model);
+        args.pop();
+        args.push(prompt.into());
+        args
+    }
+
+    pub fn run(cfg: &CliProviderConfig, prompt: &str, images: &[SummaryImage]) -> Result<String> {
         let out_path = last_message_temp_path();
-        let out_str = out_path.to_string_lossy().into_owned();
 
         // Primary: stdin prompt + --output-last-message.
-        let mut primary: Vec<String> = vec![
-            "exec".into(),
-            "--output-last-message".into(),
-            out_str.clone(),
-        ];
-        if let Some(model) = cfg.model.as_deref() {
-            primary.push("--model".into());
-            primary.push(model.into());
-        }
-        primary.push("-".into());
+        let primary = primary_args(images, &out_path, cfg.model.as_deref());
         let primary_refs: Vec<&str> = primary.iter().map(String::as_str).collect();
 
         let primary_err = match run_cli(&cfg.executable, &primary_refs, prompt, cfg.timeout_secs) {
@@ -580,6 +656,7 @@ mod codex {
                 }
                 // Codex succeeded but wrote nothing to the file — extremely
                 // rare, but treat as a soft failure so we try the fallback.
+                let _ = std::fs::remove_file(&out_path);
                 anyhow!("codex produced no last-message output")
             }
             Err(e) => {
@@ -589,16 +666,7 @@ mod codex {
         };
 
         // Fallback: positional prompt, no stdin, same --output-last-message.
-        let mut fb: Vec<String> = vec![
-            "exec".into(),
-            "--output-last-message".into(),
-            out_str.clone(),
-        ];
-        if let Some(model) = cfg.model.as_deref() {
-            fb.push("--model".into());
-            fb.push(model.into());
-        }
-        fb.push(prompt.into());
+        let fb = positional_args(images, &out_path, cfg.model.as_deref(), prompt);
         let out = Command::new(&cfg.executable)
             .args(&fb)
             .output()
@@ -621,6 +689,7 @@ mod codex {
         }
         // Last resort — the child succeeded but wrote nothing to the file. Fall
         // back to raw stdout so the caller has *something* to normalize.
+        let _ = std::fs::remove_file(&out_path);
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     }
 }
@@ -635,7 +704,7 @@ impl SummaryProvider for CodexCliProvider {
         self.0.model.as_deref()
     }
     fn summarize(&self, request: &SummaryRequest) -> Result<SummaryOutput> {
-        let out = codex::run(&self.0, &build_combined_prompt(request))?;
+        let out = codex::run(&self.0, &build_combined_prompt(request), &request.images)?;
         Ok(SummaryOutput {
             text: out,
             model: self.0.model.clone(),
@@ -1157,6 +1226,20 @@ mod tests {
         }
     }
 
+    fn image_request() -> (tempfile::TempDir, SummaryRequest) {
+        let temp = tempfile::tempdir().unwrap();
+        let image_file = temp.path().join("fixture.png");
+        std::fs::write(&image_file, [0_u8, 1, 2, 3]).unwrap();
+        let mut request = sample_request();
+        request.images.push(SummaryImage {
+            sha256: "fixture-sha".into(),
+            mime_type: "image/png".into(),
+            byte_size: 4,
+            archive_file: image_file,
+        });
+        (temp, request)
+    }
+
     #[test]
     fn provider_from_env_anthropic_uses_defaults_when_only_key_is_set() {
         let _g = ENV_LOCK.lock().unwrap();
@@ -1281,7 +1364,7 @@ mod tests {
 
     #[test]
     fn anthropic_body_has_required_shape() {
-        let body = anthropic_request_body("claude-3-5-sonnet-latest", &sample_request());
+        let body = anthropic_request_body("claude-3-5-sonnet-latest", &sample_request()).unwrap();
         assert_eq!(body["model"], "claude-3-5-sonnet-latest");
         assert_eq!(body["max_tokens"], 1024);
         assert_eq!(body["messages"][0]["role"], "user");
@@ -1295,7 +1378,7 @@ mod tests {
 
     #[test]
     fn openai_body_splits_system_and_user_roles() {
-        let body = openai_request_body("gpt-4o-mini", &sample_request());
+        let body = openai_request_body("gpt-4o-mini", &sample_request()).unwrap();
         assert_eq!(body["model"], "gpt-4o-mini");
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["role"], "user");
@@ -1311,6 +1394,77 @@ mod tests {
                 .unwrap()
                 .contains("\"tldr\"")
         );
+    }
+
+    #[test]
+    fn anthropic_request_body_attaches_base64_images() {
+        let (_temp, request) = image_request();
+        let body = anthropic_request_body("claude", &request).unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert!(content[0]["text"].as_str().unwrap().contains("Body text."));
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "AAECAw==");
+    }
+
+    #[test]
+    fn openai_request_body_attaches_data_url_images() {
+        let (_temp, request) = image_request();
+        let body = openai_request_body("gpt", &request).unwrap();
+        let content = body["messages"][1]["content"].as_array().unwrap();
+        assert!(content[0]["text"].as_str().unwrap().contains("Body text."));
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,AAECAw=="
+        );
+    }
+
+    #[test]
+    fn codex_primary_arguments_put_images_before_output_path() {
+        let (_temp, request) = image_request();
+        let args = codex::primary_args(&request.images, Path::new("/tmp/output"), None);
+        assert_eq!(args[0], "exec");
+        let image_at = args.iter().position(|arg| arg == "--image").unwrap();
+        let output_at = args
+            .iter()
+            .position(|arg| arg == "--output-last-message")
+            .unwrap();
+        assert!(image_at < output_at);
+        assert_eq!(args[image_at + 1], request.images[0].archive_file.to_string_lossy());
+        assert_eq!(args.last().unwrap(), "-");
+    }
+
+    #[test]
+    fn codex_positional_arguments_put_images_before_output_path() {
+        let (_temp, request) = image_request();
+        let args = codex::positional_args(
+            &request.images,
+            Path::new("/tmp/output"),
+            None,
+            "prompt",
+        );
+        let image_at = args.iter().position(|arg| arg == "--image").unwrap();
+        let output_at = args
+            .iter()
+            .position(|arg| arg == "--output-last-message")
+            .unwrap();
+        assert!(image_at < output_at);
+        assert_eq!(args[image_at + 1], request.images[0].archive_file.to_string_lossy());
+        assert_eq!(args.last().unwrap(), "prompt");
+    }
+
+    #[test]
+    fn claude_rejects_images_before_spawning() {
+        let (_temp, request) = image_request();
+        let provider = ClaudeCliProvider(CliProviderConfig {
+            executable: PathBuf::from("definitely-not-a-claude-binary"),
+            model: None,
+            timeout_secs: 1,
+        });
+        let err = provider.summarize(&request).unwrap_err().to_string();
+        assert!(err.contains("Claude CLI cannot attach local images"), "got: {err}");
     }
 
     #[test]
