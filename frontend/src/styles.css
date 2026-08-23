@@ -3285,3 +3285,51 @@ body.has-audio-bar { padding-bottom: 56px; }
   border: 1px solid var(--line);
   border-radius: 4px;
 }
+
+/* ── Text / Markdown preview ────────────────────────────────────────────── */
+.text-preview {
+  padding: 32px 40px 48px;
+  max-width: 780px;
+  margin: 0 auto;
+  font-family: var(--sans);
+  color: var(--ink);
+  overflow: auto;
+  height: 100%;
+  box-sizing: border-box;
+}
+.text-preview--loading,
+.text-preview--error {
+  padding: 24px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.text-preview--error { color: var(--accent); }
+.text-preview__title {
+  font-family: var(--serif, var(--sans));
+  font-size: 22px;
+  font-weight: 600;
+  margin: 0 0 20px;
+  line-height: 1.25;
+  color: var(--ink);
+}
+.text-preview__body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13.5px;
+  line-height: 1.65;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: var(--r2);
+  padding: 16px 18px;
+  margin: 0;
+}
+.text-preview__mime {
+  margin-top: 12px;
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: .04em;
+  text-align: right;
+}
