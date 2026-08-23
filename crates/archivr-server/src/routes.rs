@@ -585,7 +585,11 @@ async fn request_entry_summary_handler(
 
     // 2. Extract the same content the summarizer will feed the model, so the
     //    digest below is the identical cache key summarize_entry will compute.
-    let input = summarizer::build_summary_input(&archive_paths, &entry_uid)
+    let input = summarizer::build_summary_input(
+        &archive_paths,
+        &entry_uid,
+        summarizer::SummaryBuildOptions::default(),
+    )
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
 
     // 3. Cache hit: identical entry + provider + model + prompt + input.
@@ -630,7 +634,13 @@ async fn request_entry_summary_handler(
         // upsert above and the one inside it resolve to one row). We only have
         // to catch the case where it fails before it can record anything.
         if let Err(e) =
-            summarizer::summarize_entry(&archive_paths, &entry_uid_bg, provider.as_ref(), summarizer::PROMPT_VERSION)
+            summarizer::summarize_entry(
+                &archive_paths,
+                &entry_uid_bg,
+                summarizer::SummaryBuildOptions::default(),
+                provider.as_ref(),
+                summarizer::PROMPT_VERSION,
+            )
         {
             eprintln!("warn: summary {summary_uid_bg}: {e:#}");
             if let Ok(conn) = database::open_or_initialize(&archive_path) {

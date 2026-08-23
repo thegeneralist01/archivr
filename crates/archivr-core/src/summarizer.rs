@@ -32,6 +32,13 @@ use crate::{archive::ArchivePaths, database, hash};
 /// silently mixing outputs from two different prompts.
 pub const PROMPT_VERSION: &str = "v1-2026-08-22";
 
+/// Maximum number of explicitly opted-in local images supplied to a summary.
+pub const MAX_SUMMARY_IMAGES: usize = 4;
+/// Maximum byte size for one explicitly opted-in image.
+pub const MAX_SUMMARY_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+/// Maximum combined byte size for explicitly opted-in images.
+pub const MAX_SUMMARY_IMAGE_TOTAL_BYTES: u64 = 12 * 1024 * 1024;
+
 /// Upper bound on characters fed to a model. Archived pages run to hundreds of
 /// kilobytes; past this point we are paying for tokens that do not change a
 /// five-sentence summary. Truncation happens *before* hashing so the cache key
@@ -61,6 +68,24 @@ short or empty to summarize, still return the object and say so in \"summary\"."
 
 // ── Request / output types ─────────────────────────────────────────────────
 
+/// Controls optional material included while building a summary request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SummaryBuildOptions {
+    pub include_images: bool,
+}
+
+/// An archived image that was explicitly selected for a summary request.
+///
+/// `archive_file` is an absolute local path, kept inside the archive store and
+/// never exposed through an API response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryImage {
+    pub sha256: String,
+    pub mime_type: String,
+    pub byte_size: u64,
+    pub archive_file: PathBuf,
+}
+
 /// Everything the prompt builder needs about one entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SummaryRequest {
@@ -69,6 +94,7 @@ pub struct SummaryRequest {
     pub source_kind: String,
     pub entity_kind: String,
     pub content: String,
+    pub images: Vec<SummaryImage>,
 }
 
 /// What a provider produced. `model` is echoed back because HTTP providers may
@@ -804,7 +830,104 @@ fn load_summary_artifacts(
     Ok(rows)
 }
 
-pub fn build_summary_input(paths: &ArchivePaths, entry_uid: &str) -> Result<SummaryInput> {
+fn matching_image_mime(extension: &str, mime_type: &str) -> bool {
+    matches!(
+        (extension, mime_type),
+        ("jpg" | "jpeg", "image/jpeg")
+            | ("png", "image/png")
+            | ("webp", "image/webp")
+            | ("gif", "image/gif")
+            | ("avif", "image/avif")
+    )
+}
+
+/// Loads media artifacts in their insertion order and keeps only bounded,
+/// supported image files that resolve inside the archive store.
+fn load_summary_image_candidates(
+    conn: &rusqlite::Connection,
+    store_path: &Path,
+    entry_id: i64,
+) -> Result<Vec<SummaryImage>> {
+    let canonical_store = store_path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize store path: {}", store_path.display()))?;
+    let mut stmt = conn.prepare(
+        "SELECT b.sha256, b.mime_type, b.extension, b.byte_size, ea.relpath
+         FROM entry_artifacts ea
+         JOIN blobs b ON b.id = ea.blob_id
+         WHERE ea.entry_id = ?1 AND ea.artifact_role = 'media'
+         ORDER BY ea.id ASC",
+    )?;
+    let rows = stmt
+        .query_map([entry_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut images = Vec::new();
+    let mut total_bytes = 0_u64;
+    for (sha256, mime_type, extension, byte_size, relpath) in rows {
+        let Some(mime_type) = mime_type else {
+            continue;
+        };
+        let Some(extension) = extension else {
+            continue;
+        };
+        let extension = extension.to_ascii_lowercase();
+        let mime_type = mime_type.to_ascii_lowercase();
+        let Ok(byte_size) = u64::try_from(byte_size) else {
+            continue;
+        };
+        if !matching_image_mime(&extension, &mime_type)
+            || byte_size > MAX_SUMMARY_IMAGE_BYTES
+            || images.len() >= MAX_SUMMARY_IMAGES
+            || total_bytes.saturating_add(byte_size) > MAX_SUMMARY_IMAGE_TOTAL_BYTES
+        {
+            continue;
+        }
+
+        let archive_file = match store_path.join(relpath).canonicalize() {
+            Ok(path) if path.starts_with(&canonical_store) => path,
+            _ => continue,
+        };
+        total_bytes += byte_size;
+        images.push(SummaryImage {
+            sha256,
+            mime_type,
+            byte_size,
+            archive_file,
+        });
+    }
+    Ok(images)
+}
+
+fn summary_input_digest(content: &str, include_images: bool, images: &[SummaryImage]) -> String {
+    let mut preimage = Vec::with_capacity(content.len() + 32 + images.len() * 128);
+    preimage.extend_from_slice(content.as_bytes());
+    preimage.extend_from_slice(b"\0images=");
+    preimage.extend_from_slice(if include_images { b"1" } else { b"0" });
+    for image in images {
+        preimage.push(0);
+        preimage.extend_from_slice(image.sha256.as_bytes());
+        preimage.push(0);
+        preimage.extend_from_slice(image.mime_type.as_bytes());
+        preimage.push(0);
+        preimage.extend_from_slice(image.byte_size.to_string().as_bytes());
+    }
+    hash::hash_bytes(&preimage)
+}
+
+pub fn build_summary_input(
+    paths: &ArchivePaths,
+    entry_uid: &str,
+    options: SummaryBuildOptions,
+) -> Result<SummaryInput> {
     let conn = database::open_or_initialize(&paths.archive_path)?;
     let (entry_id, title, source_kind, entity_kind) = conn
         .query_row(
@@ -882,7 +1005,12 @@ pub fn build_summary_input(paths: &ArchivePaths, entry_uid: &str) -> Result<Summ
     } else {
         content
     };
-    let input_sha256 = hash::hash_bytes(content.as_bytes());
+    let images = if options.include_images {
+        load_summary_image_candidates(&conn, &paths.store_path, entry_id)?
+    } else {
+        Vec::new()
+    };
+    let input_sha256 = summary_input_digest(&content, options.include_images, &images);
 
     Ok(SummaryInput {
         request: SummaryRequest {
@@ -891,6 +1019,7 @@ pub fn build_summary_input(paths: &ArchivePaths, entry_uid: &str) -> Result<Summ
             source_kind,
             entity_kind,
             content,
+            images,
         },
         input_sha256,
     })
@@ -942,6 +1071,7 @@ pub fn normalize_summary_json(raw: &str) -> String {
 pub fn summarize_entry(
     archive_paths: &ArchivePaths,
     entry_uid: &str,
+    options: SummaryBuildOptions,
     provider: &dyn SummaryProvider,
     prompt_version: &str,
 ) -> Result<database::EntrySummaryRecord> {
@@ -949,7 +1079,7 @@ pub fn summarize_entry(
     let entry_id = database::entry_id_for_uid(&conn, entry_uid)?
         .ok_or_else(|| anyhow!("entry not found: {entry_uid}"))?;
 
-    let input = build_summary_input(archive_paths, entry_uid)?;
+    let input = build_summary_input(archive_paths, entry_uid, options)?;
     let summary_uid = database::upsert_pending_entry_summary(
         &conn,
         entry_id,
@@ -1023,6 +1153,7 @@ mod tests {
             source_kind: "web".into(),
             entity_kind: "page".into(),
             content: "Body text.".into(),
+            images: Vec::new(),
         }
     }
 
@@ -1395,8 +1526,192 @@ mod tests {
             .unwrap();
         }
 
-        let input = build_summary_input(&paths, &entry.entry_uid).unwrap();
+        let input = build_summary_input(&paths, &entry.entry_uid, SummaryBuildOptions::default()).unwrap();
         assert!(input.request.content.contains("First article body.\n\n---\n\nArticle 2\n\nSecond article body."));
+    }
+
+    fn summary_image_fixture() -> (tempfile::TempDir, ArchivePaths, database::ArchivedEntry) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = crate::archive::initialize_archive(
+            temp.path(),
+            &temp.path().join("store"),
+            "Test archive",
+            false,
+        )
+        .unwrap();
+        let conn = database::open_or_initialize(&paths.archive_path).unwrap();
+        let user_id = database::ensure_default_user(&conn).unwrap();
+        let run = database::create_archive_run(&conn, user_id, 1).unwrap();
+        let source_id = database::upsert_source_identity(
+            &conn,
+            "web",
+            "page",
+            Some("summary-image-test"),
+            Some("https://example.test/summary-image-test"),
+            "https://example.test/summary-image-test",
+        )
+        .unwrap();
+        let entry = database::create_archived_entry(
+            &conn,
+            &database::NewEntry {
+                source_identity_id: source_id,
+                archive_run_id: run.id,
+                parent_entry_id: None,
+                root_entry_id: None,
+                created_by_user_id: user_id,
+                owned_by_user_id: user_id,
+                source_kind: "web".to_string(),
+                entity_kind: "page".to_string(),
+                title: Some("Image test".to_string()),
+                visibility: "private".to_string(),
+                representation_kind: "webpage".to_string(),
+                source_metadata_json: "{}".to_string(),
+                display_metadata_json: None,
+            },
+        )
+        .unwrap();
+
+        let text_relpath = "raw/summary-image-test.txt";
+        std::fs::write(paths.store_path.join(text_relpath), "Summary source text.").unwrap();
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id: entry.id,
+                artifact_role: "primary_media".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: text_relpath.to_string(),
+                blob_id: None,
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+        (temp, paths, entry)
+    }
+
+    fn add_summary_image_artifact(
+        paths: &ArchivePaths,
+        entry_id: i64,
+        ordinal: usize,
+        role: &str,
+        extension: &str,
+        mime_type: &str,
+        byte_size: u64,
+    ) {
+        let conn = database::open_or_initialize(&paths.archive_path).unwrap();
+        let relpath = format!("raw/summary-image-{ordinal}.{extension}");
+        std::fs::write(paths.store_path.join(&relpath), "image fixture").unwrap();
+        let blob_id = database::upsert_blob(
+            &conn,
+            &database::BlobRecord {
+                sha256: format!("summary-image-{ordinal:02}"),
+                byte_size: byte_size.try_into().unwrap(),
+                mime_type: Some(mime_type.to_string()),
+                extension: Some(extension.to_string()),
+                raw_relpath: relpath.clone(),
+            },
+        )
+        .unwrap();
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id,
+                artifact_role: role.to_string(),
+                storage_area: "raw".to_string(),
+                relpath,
+                blob_id: Some(blob_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn summary_image_selection_filters_candidates_and_stops_at_image_count() {
+        let (_temp, paths, entry) = summary_image_fixture();
+        add_summary_image_artifact(&paths, entry.id, 0, "avatar", "jpg", "image/jpeg", 1);
+        add_summary_image_artifact(&paths, entry.id, 1, "video", "mp4", "video/mp4", 1);
+        add_summary_image_artifact(&paths, entry.id, 2, "audio", "mp3", "audio/mpeg", 1);
+        add_summary_image_artifact(&paths, entry.id, 3, "media", "svg", "image/svg+xml", 1);
+        add_summary_image_artifact(&paths, entry.id, 4, "media", "png", "image/jpeg", 1);
+        add_summary_image_artifact(
+            &paths,
+            entry.id,
+            5,
+            "media",
+            "jpg",
+            "image/jpeg",
+            MAX_SUMMARY_IMAGE_BYTES + 1,
+        );
+        add_summary_image_artifact(&paths, entry.id, 6, "media", "jpg", "image/jpeg", 1);
+        add_summary_image_artifact(&paths, entry.id, 7, "media", "png", "image/png", 2);
+        add_summary_image_artifact(&paths, entry.id, 8, "media", "webp", "image/webp", 3);
+        add_summary_image_artifact(&paths, entry.id, 9, "media", "gif", "image/gif", 4);
+        add_summary_image_artifact(&paths, entry.id, 10, "media", "avif", "image/avif", 5);
+
+        let text_only = build_summary_input(
+            &paths,
+            &entry.entry_uid,
+            SummaryBuildOptions { include_images: false },
+        )
+        .unwrap();
+        let visual = build_summary_input(
+            &paths,
+            &entry.entry_uid,
+            SummaryBuildOptions { include_images: true },
+        )
+        .unwrap();
+
+        assert!(text_only.request.images.is_empty());
+        assert_ne!(text_only.input_sha256, visual.input_sha256);
+        assert_eq!(visual.request.images.len(), MAX_SUMMARY_IMAGES);
+        assert_eq!(
+            visual
+                .request
+                .images
+                .iter()
+                .map(|image| image.sha256.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "summary-image-06",
+                "summary-image-07",
+                "summary-image-08",
+                "summary-image-09",
+            ]
+        );
+        assert!(visual
+            .request
+            .images
+            .iter()
+            .all(|image| image.byte_size <= MAX_SUMMARY_IMAGE_BYTES));
+    }
+
+    #[test]
+    fn summary_image_selection_enforces_aggregate_limit_and_keeps_scanning() {
+        let (_temp, paths, entry) = summary_image_fixture();
+        add_summary_image_artifact(&paths, entry.id, 0, "media", "jpg", "image/jpeg", 4 * 1024 * 1024);
+        add_summary_image_artifact(&paths, entry.id, 1, "media", "png", "image/png", 4 * 1024 * 1024);
+        add_summary_image_artifact(&paths, entry.id, 2, "media", "webp", "image/webp", 4 * 1024 * 1024);
+        add_summary_image_artifact(&paths, entry.id, 3, "media", "gif", "image/gif", 1);
+
+        let visual = build_summary_input(
+            &paths,
+            &entry.entry_uid,
+            SummaryBuildOptions { include_images: true },
+        )
+        .unwrap();
+
+        assert_eq!(visual.request.images.len(), 3);
+        assert_eq!(
+            visual.request.images.iter().map(|image| image.byte_size).sum::<u64>(),
+            MAX_SUMMARY_IMAGE_TOTAL_BYTES
+        );
+        assert!(visual
+            .request
+            .images
+            .iter()
+            .all(|image| image.sha256 != "summary-image-03"));
     }
 
     // ── Output normalization ───────────────────────────────────────────────
