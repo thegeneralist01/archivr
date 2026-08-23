@@ -2,10 +2,12 @@ import VideoPreview from './VideoPreview';
 import IframePreview from './IframePreview';
 import ImagePreview from './ImagePreview';
 import TweetPreview from './TweetPreview';
+import TextPreview from './TextPreview';
 
 const VIDEO_EXTS = new Set(['mp4', 'webm', 'mov', 'mkv', 'avi', 'm4v', 'ogv']);
 const AUDIO_EXTS = new Set(['mp3', 'ogg', 'm4a', 'opus', 'wav', 'flac', 'aac']);
 const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'svg', 'bmp']);
+const TEXT_EXTS  = new Set(['md', 'markdown', 'txt']);
 const CONTENT_TYPES = {
   mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime',
   mkv: 'video/x-matroska', avi: 'video/x-msvideo', m4v: 'video/mp4', ogv: 'video/ogg',
@@ -131,7 +133,20 @@ export default function PreviewPanel({ archiveId, entry, detail, fullPage, onXAr
     );
   }
 
-  // 7. Image
+  // 6b. Plain text / Markdown
+  if (TEXT_EXTS.has(ext)) {
+    return (
+      <div className="preview-panel" style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
+        <TextPreview
+          src={primaryMediaUrl}
+          mime={primaryArtifact.mime_type}
+          title={summary.title}
+        />
+      </div>
+    );
+  }
+
+    // 7. Image
   if (IMAGE_EXTS.has(ext)) {
     return (
       <div className="preview-panel" style={{ height: '100%' }}>
