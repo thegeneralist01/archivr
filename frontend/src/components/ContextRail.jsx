@@ -69,6 +69,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
       return sessionStorage.getItem(SUMMARY_PROVIDER_KEY) || SUMMARY_PROVIDERS[0].value
     } catch { return SUMMARY_PROVIDERS[0].value }
   })
+  const [includeSummaryImages, setIncludeSummaryImages] = useState(false)
   const summaryPollRef = useRef(null)
 
   // ── Bulk-panel state ────────────────────────────────────────────────────
@@ -129,6 +130,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
     setSummary(detail?.latest_summary ?? null)
     setSummaryError('')
     setSummaryBusy(false)
+    setIncludeSummaryImages(false)
   }, [detail?.summary?.entry_uid])
 
   // Poll only while the latest summary is non-terminal. Anchoring the effect on
@@ -173,6 +175,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
       const res = await requestEntrySummary(archiveId, detail.summary.entry_uid, {
         provider: summaryProvider,
         force,
+        includeImages: includeSummaryImages,
       })
       if (res.status === 'completed') {
         // 200 cache hit: the response *is* the row, no polling needed.
@@ -192,6 +195,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
 
   function handleProviderChange(value) {
     setSummaryProvider(value)
+    if (value === 'claude_cli') setIncludeSummaryImages(false)
     try { sessionStorage.setItem(SUMMARY_PROVIDER_KEY, value) } catch { /* private mode */ }
   }
 
@@ -615,6 +619,22 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
                         <option key={p.value} value={p.value}>{p.label}</option>
                       ))}
                     </select>
+                    <div className={`rail-summary-image-option${summaryProvider === 'claude_cli' ? ' rail-summary-image-option--disabled' : ''}`}>
+                      <label className="rail-summary-image-option__label">
+                        <input
+                          type="checkbox"
+                          checked={includeSummaryImages}
+                          disabled={summaryProvider === 'claude_cli'}
+                          onChange={e => setIncludeSummaryImages(e.target.checked)}
+                        />
+                        Include attached images
+                      </label>
+                      <p className="rail-summary-image-option__note">
+                        {summaryProvider === 'claude_cli'
+                          ? 'Claude CLI cannot attach local images. Choose an HTTP provider or Codex CLI.'
+                          : 'Selected archived images are sent to the chosen provider. Up to 4 supported images (5 MiB each, 12 MiB total) can be attached; unsupported or oversized artifacts are skipped.'}
+                      </p>
+                    </div>
                     <button
                       className="rail-rearchive-btn"
                       onClick={() => handleGenerateSummary(!!parsed)}
