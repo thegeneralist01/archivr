@@ -92,6 +92,35 @@
               cp -r . $out/
             '';
           };
+          # yt-dlp — pinned to a specific GitHub release rather than pulled through
+          # nixpkgs. Rationale: YouTube frequently rotates player-signature/API
+          # surfaces, and yt-dlp ships updates on a days-to-weeks cadence; even
+          # nixos-unstable often lags by months. When the binary is stale,
+          # captures fail with HTTP 403 on formats the old client can't
+          # authenticate. Fetching the zipapp directly (a Python zipapp with a
+          # `#!/usr/bin/env python3` shebang) lets us bump the version + hash in
+          # one place without waiting on nixpkgs. Wrapped so `python3` and
+          # `ffmpeg` — the two runtime deps for muxed downloads — are always on
+          # PATH regardless of the caller's environment.
+          #
+          # Bumping: replace `version`, then run `nix hash file <url>` on the
+          # new zipapp URL and paste the sri output into `hash`.
+          ytDlp = pkgs.stdenv.mkDerivation {
+            pname = "yt-dlp";
+            version = "2026.08.19";
+            src = pkgs.fetchurl {
+              url = "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp";
+              hash = "sha256-H6ZzPDfqb7Ucma2P54Xnt+XzJGybmAIwMp1Pty7Y1NY=";
+            };
+            dontUnpack = true;
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            installPhase = ''
+              mkdir -p $out/bin
+              install -m 0755 $src $out/bin/yt-dlp
+              wrapProgram $out/bin/yt-dlp \
+                --prefix PATH : ${lib.makeBinPath [ pkgs.python3 pkgs.ffmpeg ]}
+            '';
+          };
           version = "0.1.0";
           src = pkgs.lib.cleanSource ./.;
           cargoLock = {
@@ -139,7 +168,7 @@
             version = "0.1.0";
             nativeBuildInputs = [ pkgs.makeWrapper ];
             buildInputs = [
-              pkgs.yt-dlp
+              ytDlp
               pkgs.single-file-cli
               tweetPython
             ] ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.chromium ];
@@ -150,7 +179,7 @@
               cp ${./vendor/twitter/scrape_user_tweet_contents.py} $out/libexec/archivr/scrape_user_tweet_contents.py
               chmod +x $out/libexec/archivr/scrape_user_tweet_contents.py
               makeWrapper $out/libexec/archivr/archivr $out/bin/archivr \
-                --set ARCHIVR_YT_DLP ${pkgs.yt-dlp}/bin/yt-dlp \
+                --set ARCHIVR_YT_DLP ${ytDlp}/bin/yt-dlp \
                 --set ARCHIVR_SINGLE_FILE ${pkgs.single-file-cli}/bin/single-file \
                 ${lib.optionalString pkgs.stdenv.isLinux "--set ARCHIVR_CHROME ${pkgs.chromium}/bin/chromium"} \
                 --set ARCHIVR_TWEET_PYTHON ${tweetPython}/bin/python3 \
@@ -159,7 +188,7 @@
                 --set ARCHIVR_COOKIE_EXT ${isdcac} \
                 --prefix PATH : ${
                   lib.makeBinPath ([
-                    pkgs.yt-dlp
+                    ytDlp
                     pkgs.single-file-cli
                     tweetPython
                   ] ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.chromium ])
@@ -170,7 +199,7 @@
             pname = "archivr-server-wrapped";
             inherit version;
             nativeBuildInputs = [ pkgs.makeWrapper ];
-            buildInputs = [ tweetPython pkgs.single-file-cli ] ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.chromium ];
+            buildInputs = [ ytDlp tweetPython pkgs.single-file-cli ] ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.chromium ];
             phases = [ "installPhase" ];
             installPhase = ''
               mkdir -p $out/bin $out/libexec/archivr-server $out/share/archivr-server/static
@@ -180,12 +209,14 @@
               cp -r ${./crates/archivr-server/static}/* $out/share/archivr-server/static/
               makeWrapper $out/libexec/archivr-server/archivr-server $out/bin/archivr-server \
                 --set ARCHIVR_STATIC_DIR $out/share/archivr-server/static \
+                --set ARCHIVR_YT_DLP ${ytDlp}/bin/yt-dlp \
                 --set ARCHIVR_SINGLE_FILE ${pkgs.single-file-cli}/bin/single-file \
                 ${lib.optionalString pkgs.stdenv.isLinux "--set ARCHIVR_CHROME ${pkgs.chromium}/bin/chromium"} \
                 --set ARCHIVR_TWEET_PYTHON ${tweetPython}/bin/python3 \
                 --set ARCHIVR_TWEET_SCRAPER $out/libexec/archivr-server/scrape_user_tweet_contents.py \
                 --set ARCHIVR_UBLOCK_EXT ${ublockLite} \
-                --set ARCHIVR_COOKIE_EXT ${isdcac}
+                --set ARCHIVR_COOKIE_EXT ${isdcac} \
+                --prefix PATH : ${lib.makeBinPath ([ ytDlp pkgs.single-file-cli tweetPython ] ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.chromium ])}
             '';
           };
           archivr-all = pkgs.symlinkJoin {
