@@ -97,6 +97,7 @@ dependencies = [
  "chrono",
  "clap",
  "regex",
+ "reqwest",
  "rusqlite",
  "serde_json",
 ]
