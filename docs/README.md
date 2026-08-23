@@ -25,9 +25,12 @@ Archivr is a self-hosted tool for capturing and preserving digital content — Y
 - [Supported Inputs](#supported-inputs)
   - [YouTube playlists and channels](#youtube-playlists-and-channels)
   - [Video quality and audio-only](#video-quality-and-audio-only)
+  - [Text notes](#text-notes)
 - [Configuration](#configuration)
   - [TOML config file](#toml-config-file)
   - [Environment variables](#environment-variables)
+    - [LLM providers](#llm-providers)
+- [Keeping yt-dlp fresh](#keeping-yt-dlp-fresh)
 - [Deployment](#deployment)
   - [Security](#security)
   - [NixOS](#hosting-on-nixos)
@@ -45,6 +48,9 @@ Archivr is a self-hosted tool for capturing and preserving digital content — Y
 - **Multiple archives** — the server mounts any number of separate archives from a single TOML config
 - **Role-based auth** — Guest / User / Admin / Owner roles; session cookies and API tokens; Argon2 passwords
 - **Quality selection** — choose video quality or audio-only per capture; a live metadata probe populates the selector before download
+- **LLM summaries** — regenerable per-entry summary via the Anthropic HTTP API, an OpenAI-compatible HTTP API, a local `claude` CLI, or a local `codex` CLI; triggered manually from the entry rail, never automatically on capture
+- **Text notes** — capture a plain-text or Markdown note with a title and no URL; the note is stored as a normal deduplicated blob and previews in-browser
+- **In-progress capture indicator** — running captures appear as a compact spinner row in the entries list until they finish, replacing the earlier grey skeleton block
 
 ## Quick Start
 
@@ -161,6 +167,16 @@ The `POST /api/archives/:id/captures` endpoint accepts an optional `quality` fie
 
 `"audio"` selects the most efficient native audio track without re-encoding (Opus/WebM preferred, then AAC/M4A). Omitting `quality` or passing `"best"` downloads at the highest available quality.
 
+### Text notes
+
+Not every capture has a URL. **Add text** in the capture dialog takes a title and a body and turns them into a
+self-contained entry — useful for a scrap of prose, a quote, or a note attached to the surrounding archive. The
+body is stored verbatim; no network fetch happens.
+
+Two body types are accepted: `text/markdown` (saved as `.md`) and `text/plain` (saved as `.txt`). Anything else is
+rejected. The body lands in `store/raw/…` under its SHA3-256 content hash, exactly like every other capture, so an
+identical note captured twice is stored once.
+
 ## Configuration
 
 ### TOML config file
@@ -191,7 +207,8 @@ See `docker/config.example.toml` for a complete annotated example.
 |---|---|---|
 | `ARCHIVR_BIND` | `127.0.0.1:8080` | Bind address; overrides `bind` in TOML |
 | `ARCHIVR_STATIC_DIR` | `crates/archivr-server/static` | Pre-built frontend asset directory |
-| `ARCHIVR_YT_DLP` | `yt-dlp` | yt-dlp binary used for video and social downloads |
+| `ARCHIVR_YT_DLP` | `yt-dlp` | yt-dlp binary used for video and social downloads; the Nix wrappers point this at the pinned release |
+| `ARCHIVR_YT_DLP_FORCE` | — | Absolute path to a yt-dlp binary that MUST be used, bypassing the resolver. Prefer `ARCHIVR_YT_DLP` unless you are overriding for a specific run |
 | `ARCHIVR_SINGLE_FILE` | `single-file` | single-file-cli binary for web page archiving |
 | `ARCHIVR_CHROME` | `chromium` | Chromium executable passed to single-file |
 | `ARCHIVR_CHROME_ARGS` | — | Extra space-separated Chromium flags (Docker sets `--no-sandbox`) |
@@ -200,6 +217,81 @@ See `docker/config.example.toml` for a complete annotated example.
 | `ARCHIVR_TWEET_PYTHON` | `python3` | Python executable for the tweet scraper |
 
 The Nix wrapper and Docker image set `ARCHIVR_STATIC_DIR`, `ARCHIVR_SINGLE_FILE`, and `ARCHIVR_CHROME` automatically.
+
+#### LLM providers
+
+Summaries are opt-in and provider-agnostic. Only the variables for the provider you actually select are read; the two
+HTTP providers refuse to start without their API key.
+
+| Variable | Default | Description |
+|---|---|---|
+| `ARCHIVR_ANTHROPIC_API_KEY` | *(required for `anthropic_http`)* | API key for the Anthropic Messages API |
+| `ARCHIVR_ANTHROPIC_URL` | `https://api.anthropic.com/v1/messages` | Endpoint override, e.g. an internal proxy |
+| `ARCHIVR_ANTHROPIC_MODEL` | `claude-3-5-sonnet-latest` | Model id used for Anthropic summaries |
+| `ARCHIVR_OPENAI_API_KEY` | *(required for `openai_compatible`)* | API key for any OpenAI-compatible endpoint |
+| `ARCHIVR_OPENAI_URL` | `https://api.openai.com/v1/chat/completions` | Endpoint override; point this at a local server to run offline |
+| `ARCHIVR_OPENAI_MODEL` | `gpt-4o-mini` | Model id used for OpenAI-compatible summaries |
+| `ARCHIVR_CLAUDE_CLI` | *(auto-discovered)* | Path to a local `claude` binary |
+| `ARCHIVR_CLAUDE_MODEL` | *(the CLI's own default)* | Optional model override for the local Claude CLI |
+| `ARCHIVR_CODEX_CLI` | *(auto-discovered)* | Path to a local `codex` binary |
+| `ARCHIVR_CODEX_MODEL` | *(the CLI's own default)* | Optional model override for the local Codex CLI |
+| `ARCHIVR_SUMMARY_HTTP_TIMEOUT` | `120` | Seconds before an HTTP-provider summary is killed |
+| `ARCHIVR_SUMMARY_CLI_TIMEOUT` | `300` | Seconds before a CLI-provider summary is killed |
+
+When `ARCHIVR_CLAUDE_CLI` / `ARCHIVR_CODEX_CLI` is unset the binary is auto-discovered, in this order: the well-known
+absolute paths, then `$HOME/.local/bin/<name>`, then the bare name resolved through `PATH`. Note that `PATH` is
+consulted **last** — if a stale binary sits at one of the well-known paths it wins over a newer one on `PATH`, so set
+the variable explicitly when you have both. The well-known paths are `/opt/homebrew/bin/claude` and
+`/usr/local/bin/claude` for Claude, and `/Applications/ChatGPT.app/Contents/Resources/codex`,
+`/opt/homebrew/bin/codex`, and `/usr/local/bin/codex` for Codex.
+
+## Keeping yt-dlp fresh
+
+yt-dlp is the download engine behind every video and social capture. YouTube rotates its player-signature and API
+surfaces on a days-to-weeks cadence, so a binary that worked last month starts returning HTTP 403 on downloads. Keeping
+it current is ordinary maintenance, not an emergency.
+
+**What ships.** `flake.nix` pins a specific yt-dlp release fetched straight from `github.com/yt-dlp/yt-dlp/releases`,
+not from nixpkgs — that channel usually lags months behind. The `archivr-server` and `archivr` wrappers set
+`ARCHIVR_YT_DLP` to that pinned binary.
+
+**How the resolver picks.** At runtime archivr probes `--version` on each candidate — the pinned binary from
+`ARCHIVR_YT_DLP` and any user-installed binary at `<state_dir>/yt-dlp/yt-dlp` — and runs the newest. An exact version
+tie resolves in favour of your own install. Setting `ARCHIVR_YT_DLP_FORCE=/path/to/yt-dlp` bypasses the comparison
+entirely. The state dir is `~/Library/Application Support/archivr` on macOS, and `$XDG_STATE_HOME/archivr` (default
+`~/.local/state/archivr`) elsewhere.
+
+There are three ways to get a fresh version, cheapest first.
+
+**1. Self-update — no rebuild required.**
+
+```sh
+archivr yt-dlp status                        # every candidate, its version, and which one wins
+archivr yt-dlp update                        # download the latest zipapp into the state dir
+archivr yt-dlp update --version 2026.09.15   # pin a specific release tag
+```
+
+The released artifact is a Python zipapp, so this path needs `python3` on `PATH` at run time.
+
+**2. Automatic weekly bump.** `.github/workflows/update-ytdlp.yml` runs every Monday at 06:00 UTC, queries GitHub for
+the latest release, and opens a PR bumping `version` and `hash` in `flake.nix` via `peter-evans/create-pull-request`.
+It also accepts `workflow_dispatch` for an on-demand run.
+
+**3. Manual bump**, when you need it now and do not want to wait for the weekly:
+
+```sh
+NEW=$(curl -s https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest | jq -r .tag_name)
+HASH=$(nix hash file --sri --type sha256 <(curl -sL "https://github.com/yt-dlp/yt-dlp/releases/download/${NEW}/yt-dlp"))
+
+# In flake.nix, inside the `ytDlp = pkgs.stdenv.mkDerivation { … }` block:
+#   version = "OLD";                   → version = "$NEW";
+#   url  = ".../download/OLD/yt-dlp";  → .../download/$NEW/yt-dlp
+#   hash = "sha256-OLD…";              → hash = "$HASH";
+
+nix build .#archivr-server
+./result/bin/archivr yt-dlp status   # the env row should report the new version
+git commit -am "chore(nix): yt-dlp OLD → $NEW"
+```
 
 ## Deployment
 
@@ -286,6 +378,11 @@ The image compiles the Rust binary in a separate build stage; only runtime depen
 
 Runtime dependencies beyond Rust and Node: `yt-dlp`, Chromium, `single-file` (Node), Python 3 with `twitter-api-client`, `ffmpeg`. `nix develop` provides the dev subset.
 
+Entry summaries are served by one of four interchangeable providers — `anthropic_http`, `openai_compatible`,
+`claude_cli`, or `codex_cli` — each configured entirely through the environment; see
+[LLM providers](#llm-providers) for the full variable list. The `archivr` CLI itself exposes `archive`, `init`, and
+`yt-dlp status` / `yt-dlp update`; summaries are triggered from the web UI rather than the command line.
+
 ```sh
 # Rust (workspace root)
 cargo build
@@ -307,3 +404,4 @@ nix build .#archivr-server
 ## License
 
 MIT — see [LICENSE](../LICENSE.md).
+\n
