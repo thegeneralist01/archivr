@@ -736,6 +736,26 @@ fn extension_of(relpath: &str) -> String {
 /// Returns a descriptive error rather than a summary for artifact kinds v1 does
 /// not handle (video, audio, images): the caller surfaces it to the UI, and a
 /// clear "unsupported" beats an empty or hallucinated summary.
+fn load_summary_artifacts(
+    conn: &rusqlite::Connection,
+    entry_id: i64,
+    artifact_role: &str,
+) -> Result<Vec<(String, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT ea.relpath, b.mime_type
+         FROM entry_artifacts ea
+         LEFT JOIN blobs b ON b.id = ea.blob_id
+         WHERE ea.entry_id = ?1 AND ea.artifact_role = ?2
+         ORDER BY ea.id ASC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![entry_id, artifact_role], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 pub fn build_summary_input(paths: &ArchivePaths, entry_uid: &str) -> Result<SummaryInput> {
     let conn = database::open_or_initialize(&paths.archive_path)?;
     let (entry_id, title, source_kind, entity_kind) = conn
@@ -754,45 +774,56 @@ pub fn build_summary_input(paths: &ArchivePaths, entry_uid: &str) -> Result<Summ
         )
         .map_err(|_| anyhow!("entry not found: {entry_uid}"))?;
 
-    let (relpath, mime): (String, Option<String>) = conn
-        .query_row(
-            "SELECT ea.relpath, b.mime_type
-             FROM entry_artifacts ea
-             LEFT JOIN blobs b ON b.id = ea.blob_id
-             WHERE ea.entry_id = ?1 AND ea.artifact_role = 'primary_media'
-             ORDER BY ea.id ASC LIMIT 1",
-            [entry_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|_| anyhow!("entry {entry_uid} has no primary_media artifact to summarize"))?;
+    // Tweets and tweet threads use `raw_tweet_json` rather than `primary_media`,
+    // and a THREAD is materialized as N separate JSON files (one per status).
+    // Load every matching artifact in insertion order so a thread summarizes
+    // as the whole conversation, not just its first status.
+    let is_tweetish = matches!(entity_kind.as_str(), "tweet" | "tweet_thread");
+    let primary_role = if is_tweetish { "raw_tweet_json" } else { "primary_media" };
+    let mut artifacts = load_summary_artifacts(&conn, entry_id, primary_role)?;
+    if artifacts.is_empty() && is_tweetish {
+        // Older archives may have stored tweet payloads under `primary_media`.
+        artifacts = load_summary_artifacts(&conn, entry_id, "primary_media")?;
+    }
+    if artifacts.is_empty() {
+        bail!("entry {entry_uid} has no {primary_role} artifact to summarize");
+    }
 
-    let abs = paths.store_path.join(&relpath);
-    let ext = extension_of(&relpath);
-    let mime = mime.unwrap_or_default();
+    let mut pieces: Vec<String> = Vec::with_capacity(artifacts.len());
+    for (relpath, mime_opt) in &artifacts {
+        let abs = paths.store_path.join(relpath);
+        let ext = extension_of(relpath);
+        let mime = mime_opt.clone().unwrap_or_default();
 
-    let content = if ext == "md" || ext == "markdown" || ext == "txt" || mime.starts_with("text/markdown") || mime == "text/plain" {
-        std::fs::read_to_string(&abs)
-            .with_context(|| format!("failed to read {}", abs.display()))?
-    } else if ext == "html" || ext == "htm" || mime.starts_with("text/html") {
-        let raw = std::fs::read_to_string(&abs)
-            .with_context(|| format!("failed to read {}", abs.display()))?;
-        strip_html(&raw)
-    } else if ext == "json" || mime == "application/json" {
-        let raw = std::fs::read_to_string(&abs)
-            .with_context(|| format!("failed to read {}", abs.display()))?;
-        let parsed: serde_json::Value = serde_json::from_str(&raw)
-            .with_context(|| format!("{} is not valid JSON", abs.display()))?;
-        extract_tweet_text(&parsed)
-            .ok_or_else(|| anyhow!("no text content available for this entry kind — v1 unsupported"))?
-    } else {
-        bail!(
-            "no text content available for this entry kind — v1 unsupported \
-             (primary artifact {relpath}, mime {})",
-            if mime.is_empty() { "unknown" } else { &mime }
-        );
-    };
-
-    let content = content.trim().to_string();
+        let piece = if ext == "md" || ext == "markdown" || ext == "txt"
+            || mime.starts_with("text/markdown") || mime == "text/plain"
+        {
+            std::fs::read_to_string(&abs)
+                .with_context(|| format!("failed to read {}", abs.display()))?
+        } else if ext == "html" || ext == "htm" || mime.starts_with("text/html") {
+            let raw = std::fs::read_to_string(&abs)
+                .with_context(|| format!("failed to read {}", abs.display()))?;
+            strip_html(&raw)
+        } else if ext == "json" || mime == "application/json" {
+            let raw = std::fs::read_to_string(&abs)
+                .with_context(|| format!("failed to read {}", abs.display()))?;
+            let parsed: serde_json::Value = serde_json::from_str(&raw)
+                .with_context(|| format!("{} is not valid JSON", abs.display()))?;
+            extract_tweet_text(&parsed).unwrap_or_default()
+        } else {
+            bail!(
+                "no text content available for this entry kind — v1 unsupported \
+                 (artifact {relpath}, mime {})",
+                if mime.is_empty() { "unknown" } else { &mime }
+            );
+        };
+        if !piece.trim().is_empty() {
+            pieces.push(piece);
+        }
+    }
+    // Thread joiner: `---` on its own line reads as a paragraph break to both
+    // humans and models. Single-piece entries never render the separator.
+    let content = pieces.join("\n\n---\n\n").trim().to_string();
     if content.is_empty() {
         bail!("no text content available for this entry kind — v1 unsupported (extracted text was empty)");
     }
