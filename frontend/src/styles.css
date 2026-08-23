@@ -952,6 +952,104 @@ select {
   line-height: 1.45;
 }
 
+/* ── Text-capture row ───────────────────────────────────────────────────
+   A text row breaks the [dot][one-line-input][×] shape used by URL and
+   file rows: it stacks a title, a multi-line body, and a small footer
+   (mime selector). Everything lives inside .capture-text-inputs so the
+   outer flex-row still gives us [icon][content][×] alignment.               */
+
+.capture-text-row > .capture-row-main {
+  /* Icon and remove button sit at the top of the block, not centered on
+     the tall textarea. */
+  align-items: flex-start;
+}
+
+.capture-text-icon {
+  flex-shrink: 0;
+  width: 20px;
+  height: 44px;                    /* matches .capture-text-title height */
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+}
+
+.capture-text-inputs {
+  flex: 1 1 auto;
+  min-width: 0;                    /* let the textarea shrink inside flex */
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.capture-text-input {
+  width: 100%;
+  border: 1px solid var(--line);
+  background: var(--field);
+  color: var(--ink);
+  border-radius: var(--r2);
+  outline: none;
+  transition: border-color .15s ease, box-shadow .15s ease;
+  font-family: inherit;
+}
+.capture-text-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.capture-text-title {
+  height: 44px;
+  padding: 0 14px;
+  font-size: 15px;
+}
+
+.capture-text-body {
+  min-height: 140px;
+  padding: 10px 14px;
+  font-size: 14px;
+  line-height: 1.55;
+  resize: vertical;
+}
+.capture-text-body::placeholder,
+.capture-text-title::placeholder {
+  color: var(--muted);
+}
+
+.capture-text-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-end;       /* mime selector sits under the body */
+}
+
+/* Mime selector: reuse the small chip styling of .capture-quality. */
+.capture-text-mime {
+  flex-shrink: 0;
+  height: 28px;
+  padding: 0 26px 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 12px;
+  cursor: pointer;
+  outline: none;
+  transition: border-color .15s;
+  /* Custom caret so it doesn't look like an unstyled OS dropdown. */
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none' stroke='%23888' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'><path d='M3 4.5l3 3 3-3'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+}
+.capture-text-mime:hover  { border-color: var(--accent-2); }
+.capture-text-mime:focus  { border-color: var(--accent); }
+
+/* Remove button on text row: pin to top so tall bodies don't push it. */
+.capture-text-row .capture-row-action {
+  margin-top: 8px;
+}
+
+
 /* Add-another button */
 .capture-add-row {
   display: flex;
