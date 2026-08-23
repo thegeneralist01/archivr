@@ -163,6 +163,34 @@ fn env_timeout(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Resolve a CLI executable path.
+///
+/// Priority: `env_name` override → first `well_known_absolute` path that
+/// exists → `HOME/.local/bin/<bare>` if it exists → bare name (relies on the
+/// server's PATH). The macOS defaults matter for `codex`, which the ChatGPT
+/// desktop app installs at `/Applications/ChatGPT.app/Contents/Resources/codex`
+/// and does not add to PATH.
+fn resolve_cli(env_name: &str, well_known_absolute: &[&str], bare: &str) -> PathBuf {
+    if let Some(explicit) = optional_env(env_name) {
+        return PathBuf::from(explicit);
+    }
+    for candidate in well_known_absolute {
+        let p = Path::new(candidate);
+        if p.is_file() {
+            return p.to_path_buf();
+        }
+    }
+    if let Some(home) = env::var_os("HOME") {
+        let mut p = PathBuf::from(home);
+        p.push(".local/bin");
+        p.push(bare);
+        if p.is_file() {
+            return p;
+        }
+    }
+    PathBuf::from(bare)
+}
+
 /// Builds a provider configuration for `kind` purely from the environment.
 pub fn provider_from_env(kind: &str) -> Result<ProviderConfig> {
     match kind {
@@ -179,12 +207,24 @@ pub fn provider_from_env(kind: &str) -> Result<ProviderConfig> {
             timeout_secs: env_timeout("ARCHIVR_SUMMARY_HTTP_TIMEOUT", DEFAULT_HTTP_TIMEOUT_SECS),
         })),
         "claude_cli" => Ok(ProviderConfig::ClaudeCli(CliProviderConfig {
-            executable: PathBuf::from(env_or("ARCHIVR_CLAUDE_CLI", "claude")),
+            executable: resolve_cli(
+                "ARCHIVR_CLAUDE_CLI",
+                &["/opt/homebrew/bin/claude", "/usr/local/bin/claude"],
+                "claude",
+            ),
             model: optional_env("ARCHIVR_CLAUDE_MODEL"),
             timeout_secs: env_timeout("ARCHIVR_SUMMARY_CLI_TIMEOUT", DEFAULT_CLI_TIMEOUT_SECS),
         })),
         "codex_cli" => Ok(ProviderConfig::CodexCli(CliProviderConfig {
-            executable: PathBuf::from(env_or("ARCHIVR_CODEX_CLI", "codex")),
+            executable: resolve_cli(
+                "ARCHIVR_CODEX_CLI",
+                &[
+                    "/Applications/ChatGPT.app/Contents/Resources/codex",
+                    "/opt/homebrew/bin/codex",
+                    "/usr/local/bin/codex",
+                ],
+                "codex",
+            ),
             model: optional_env("ARCHIVR_CODEX_MODEL"),
             timeout_secs: env_timeout("ARCHIVR_SUMMARY_CLI_TIMEOUT", DEFAULT_CLI_TIMEOUT_SECS),
         })),
@@ -448,48 +488,114 @@ impl SummaryProvider for ClaudeCliProvider {
 /// Codex invocation lives in its own module because its one-shot interface is
 /// the least stable of the four.
 ///
-/// Primary form is `codex exec -`, which reads the prompt from stdin. Older
-/// builds only accept the prompt as a positional argument, so a failure to
-/// spawn/parse falls back to `codex exec <prompt>`.
-///
-/// TESTED: neither form was exercised end-to-end — `codex` is not installed on
-/// the machine this was written on (`which codex` → not found). The `claude`
-/// CLI path *was* smoke-tested. Treat the codex path as best-effort until
-/// someone with the binary confirms it.
+/// Primary form is `codex exec --output-last-message <file> -`, which reads the
+/// prompt from stdin and writes ONLY the final assistant message to `<file>`.
+/// Without `--output-last-message`, stdout is polluted with a header
+/// (`OpenAI Codex vX`, session id, model, sandbox, …) and a footer
+/// (`tokens used`, message replay), and the JSON extractor can pick up the
+/// echoed user prompt instead of the real answer. Older builds that reject
+/// `-` as stdin marker fall back to a positional prompt.
 mod codex {
     use super::*;
 
+    /// A short-lived path in the OS temp dir. Unique per (pid, wall time) so
+    /// concurrent summarizations don't collide.
+    fn last_message_temp_path() -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        env::temp_dir().join(format!(
+            "archivr-codex-{}-{}.txt",
+            std::process::id(),
+            stamp
+        ))
+    }
+
+    fn missing_binary_hint(cfg: &CliProviderConfig) -> &'static str {
+        // Only nudge users about the env var when we're running the default
+        // bare "codex" and it failed — an explicit ARCHIVR_CODEX_CLI path
+        // failure is their configuration, not a discovery gap.
+        if cfg.executable == Path::new("codex") {
+            " (hint: set ARCHIVR_CODEX_CLI to your codex binary; on macOS the              ChatGPT desktop app installs it at              /Applications/ChatGPT.app/Contents/Resources/codex)"
+        } else {
+            ""
+        }
+    }
+
+    fn read_and_cleanup(path: &Path) -> Option<String> {
+        let out = std::fs::read_to_string(path).ok()?;
+        let _ = std::fs::remove_file(path);
+        let trimmed = out.trim();
+        if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+    }
+
     pub fn run(cfg: &CliProviderConfig, prompt: &str) -> Result<String> {
-        let mut args: Vec<String> = vec!["exec".into(), "-".into()];
+        let out_path = last_message_temp_path();
+        let out_str = out_path.to_string_lossy().into_owned();
+
+        // Primary: stdin prompt + --output-last-message.
+        let mut primary: Vec<String> = vec![
+            "exec".into(),
+            "--output-last-message".into(),
+            out_str.clone(),
+        ];
         if let Some(model) = cfg.model.as_deref() {
-            args.push("--model".into());
-            args.push(model.into());
+            primary.push("--model".into());
+            primary.push(model.into());
         }
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        match run_cli(&cfg.executable, &arg_refs, prompt, cfg.timeout_secs) {
-            Ok(out) => Ok(out),
-            Err(primary) => {
-                // Fallback: prompt as a positional argument, no stdin.
-                let mut fb: Vec<String> = vec!["exec".into()];
-                if let Some(model) = cfg.model.as_deref() {
-                    fb.push("--model".into());
-                    fb.push(model.into());
+        primary.push("-".into());
+        let primary_refs: Vec<&str> = primary.iter().map(String::as_str).collect();
+
+        let primary_err = match run_cli(&cfg.executable, &primary_refs, prompt, cfg.timeout_secs) {
+            Ok(_) => {
+                if let Some(text) = read_and_cleanup(&out_path) {
+                    return Ok(text);
                 }
-                fb.push(prompt.into());
-                let out = Command::new(&cfg.executable)
-                    .args(&fb)
-                    .output()
-                    .with_context(|| format!("codex `exec -` failed ({primary:#}); positional fallback also failed to spawn"))?;
-                if !out.status.success() {
-                    bail!(
-                        "codex `exec -` failed ({primary:#}); positional fallback exited with {}: {}",
-                        out.status,
-                        truncate_for_error(&String::from_utf8_lossy(&out.stderr))
-                    );
-                }
-                Ok(String::from_utf8_lossy(&out.stdout).to_string())
+                // Codex succeeded but wrote nothing to the file — extremely
+                // rare, but treat as a soft failure so we try the fallback.
+                anyhow!("codex produced no last-message output")
             }
+            Err(e) => {
+                let _ = std::fs::remove_file(&out_path);
+                e
+            }
+        };
+
+        // Fallback: positional prompt, no stdin, same --output-last-message.
+        let mut fb: Vec<String> = vec![
+            "exec".into(),
+            "--output-last-message".into(),
+            out_str.clone(),
+        ];
+        if let Some(model) = cfg.model.as_deref() {
+            fb.push("--model".into());
+            fb.push(model.into());
         }
+        fb.push(prompt.into());
+        let out = Command::new(&cfg.executable)
+            .args(&fb)
+            .output()
+            .with_context(|| {
+                format!(
+                    "codex `exec -` failed ({primary_err:#}); positional fallback also failed to spawn{}",
+                    missing_binary_hint(cfg)
+                )
+            })?;
+        if !out.status.success() {
+            let _ = std::fs::remove_file(&out_path);
+            bail!(
+                "codex `exec -` failed ({primary_err:#}); positional fallback exited with {}: {}",
+                out.status,
+                truncate_for_error(&String::from_utf8_lossy(&out.stderr))
+            );
+        }
+        if let Some(text) = read_and_cleanup(&out_path) {
+            return Ok(text);
+        }
+        // Last resort — the child succeeded but wrote nothing to the file. Fall
+        // back to raw stdout so the caller has *something* to normalize.
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
     }
 }
 
@@ -902,14 +1008,30 @@ mod tests {
         let ProviderConfig::ClaudeCli(c) = provider_from_env("claude_cli").unwrap() else {
             panic!("wrong variant")
         };
-        assert_eq!(c.executable, PathBuf::from("claude"));
+        // Same rationale as the codex case below: resolve_cli may discover a
+        // well-known install path, so accept either the bare name or any
+        // file-name-`claude` path.
+        assert!(
+            c.executable == PathBuf::from("claude")
+                || c.executable.file_name().map(|f| f == "claude").unwrap_or(false),
+            "unexpected claude executable: {}",
+            c.executable.display()
+        );
         assert_eq!(c.model, None);
         assert_eq!(c.timeout_secs, DEFAULT_CLI_TIMEOUT_SECS);
 
         let ProviderConfig::CodexCli(c) = provider_from_env("codex_cli").unwrap() else {
             panic!("wrong variant")
         };
-        assert_eq!(c.executable, PathBuf::from("codex"));
+        // Either the well-known ChatGPT.app path (if present on this host) or
+        // the bare `codex` fallback is acceptable — `resolve_cli` is
+        // deliberately opportunistic.
+        assert!(
+            c.executable == PathBuf::from("codex")
+                || c.executable.file_name().map(|f| f == "codex").unwrap_or(false),
+            "unexpected codex executable: {}",
+            c.executable.display()
+        );
     }
 
     #[test]
