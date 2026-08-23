@@ -118,7 +118,7 @@
               mkdir -p $out/bin
               install -m 0755 $src $out/bin/yt-dlp
               wrapProgram $out/bin/yt-dlp \
-                --prefix PATH : ${lib.makeBinPath [ pkgs.python3 pkgs.ffmpeg ]}
+                --prefix PATH : ${lib.makeBinPath [ pkgs.python312 pkgs.ffmpeg ]}
             '';
           };
           version = "0.1.0";
