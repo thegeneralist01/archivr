@@ -44,11 +44,11 @@ Archivr is a self-hosted tool for capturing and preserving digital content — Y
 - **Web pages** — full self-contained HTML snapshots via SingleFile + Chromium; optional Freedium mirror for paywalled articles; reader mode
 - **Local files** — import any file from disk by `file://` path
 - **Deduplication** — SHA3-256 content-addressed blob store shared across all captures; identical files are stored once
-- **Tags and search** — hierarchical tag tree, full-text search, filterable entry list
+- **Tags and search** — hierarchical tag tree, full-text search (including the latest completed summary and its generated JSON tags), filterable entry list
 - **Multiple archives** — the server mounts any number of separate archives from a single TOML config
 - **Role-based auth** — Guest / User / Admin / Owner roles; session cookies and API tokens; Argon2 passwords
 - **Quality selection** — choose video quality or audio-only per capture; a live metadata probe populates the selector before download
-- **LLM summaries** — regenerable per-entry summary via the Anthropic HTTP API, an OpenAI-compatible HTTP API, a local `claude` CLI, or a local `codex` CLI; triggered manually from the entry rail, never automatically on capture
+- **LLM summaries** — regenerable per-entry summary via the Anthropic HTTP API, an OpenAI-compatible HTTP API, a local `claude` CLI, or a local `codex` CLI; triggered manually from the entry rail, never automatically on capture; text-only by default, with an explicit `Include attached images` option
 - **Text notes** — capture a plain-text or Markdown note with a title and no URL; the note is stored as a normal deduplicated blob and previews in-browser
 - **In-progress capture indicator** — running captures appear as a compact spinner row in the entries list until they finish, replacing the earlier grey skeleton block
 
@@ -220,8 +220,22 @@ The Nix wrapper and Docker image set `ARCHIVR_STATIC_DIR`, `ARCHIVR_SINGLE_FILE`
 
 #### LLM providers
 
-Summaries are opt-in and provider-agnostic. Only the variables for the provider you actually select are read; the two
-HTTP providers refuse to start without their API key.
+Summaries are manual and provider-agnostic. Only the variables for the provider you actually select are read; the two
+HTTP providers refuse to start without their API key. They are text-only by default. Selecting `Include attached images`
+explicitly sends eligible archived image data to the chosen provider; it is never attached automatically.
+
+| Provider | Attached images |
+|---|---|
+| Anthropic HTTP | Supported |
+| OpenAI-compatible HTTP | Supported |
+| Codex CLI | Supported |
+| Claude CLI | Not supported |
+
+Image inclusion considers only `media` artifacts with `jpg`, `jpeg`, `png`, `webp`, `gif`, or `avif` files. At most four
+images are sent, each no larger than 5 MiB and no more than 12 MiB in total.
+
+Free-text entry search also matches the latest completed summary text and its generated JSON tags. Entries with no
+summary, or only a pending or failed summary, get no summary-derived match.
 
 | Variable | Default | Description |
 |---|---|---|
