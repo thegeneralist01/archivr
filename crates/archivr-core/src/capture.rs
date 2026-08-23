@@ -1918,6 +1918,172 @@ pub fn perform_capture(
     })
 }
 
+/// Archives user-supplied plain text or Markdown content.
+///
+/// # Arguments
+/// * `archive_paths` - Path configuration for the archive
+/// * `title` - User-supplied title (non-empty, trimmed, capped at 500 chars)
+/// * `body` - Text content (non-empty, capped at 2 MiB)
+/// * `mime` - MIME type: "text/plain" or "text/markdown"
+/// * `archive_id` - Optional archive ID (used for job tracking if provided)
+///
+/// # Returns
+/// * `CaptureResult` with the run UID and status
+///
+/// # Errors
+/// * Empty or oversized title/body
+/// * Unsupported MIME type
+/// * Database or file system errors
+pub fn perform_text_capture(
+    archive_paths: &ArchivePaths,
+    title: &str,
+    body: &str,
+    mime: &str,
+    _archive_id: Option<&str>,
+) -> Result<CaptureResult> {
+    // Validate title
+    let title = title.trim();
+    if title.is_empty() {
+        anyhow::bail!("title must not be empty");
+    }
+    if title.len() > 500 {
+        anyhow::bail!("title must not exceed 500 characters");
+    }
+
+    // Validate body
+    let body = body.trim();
+    if body.is_empty() {
+        anyhow::bail!("body must not be empty");
+    }
+    if body.len() > 2 * 1024 * 1024 {
+        anyhow::bail!("body must not exceed 2 MiB");
+    }
+
+    // Validate MIME type
+    if mime != "text/plain" && mime != "text/markdown" {
+        anyhow::bail!("unsupported MIME type: {mime}. Must be 'text/plain' or 'text/markdown'");
+    }
+
+    // Generate timestamp
+    let timestamp = format!(
+        "{}-{}",
+        Local::now().format("%Y-%m-%dT%H-%M-%S%.3f"),
+        Uuid::new_v4().simple(),
+    );
+    let store_path = &archive_paths.store_path;
+
+    // Initialize database
+    let conn = database::open_or_initialize(&archive_paths.archive_path)?;
+    let user_id = database::ensure_default_user(&conn)?;
+
+    // Create run and item
+    let run = database::create_archive_run(&conn, user_id, 1)?;
+    let source_kind = "text";
+    let entity_kind = "document";
+    let item = database::create_archive_run_item(
+        &conn,
+        run.id,
+        None,
+        0,
+        &format!("text:{}", title),
+        None,
+        source_kind,
+        entity_kind,
+    )?;
+
+    // Stage the text content
+    let staged_text = downloader::text::save(body.as_bytes(), mime, store_path, &timestamp)?;
+
+    // Check if hash already exists
+    let file_extension = format!(".{}", staged_text.extension);
+    let hash_exists = hash_exists(&staged_text.hash, &file_extension, store_path)?;
+
+    if !hash_exists {
+        // Move staged file to raw storage
+        move_temp_to_raw(&staged_text.staged_path, &staged_text.hash, store_path)?;
+    }
+
+    // Clean up temp directory
+    let _ = fs::remove_dir_all(store_path.join("temp").join(&timestamp));
+
+    // Create blob record
+    let raw_relpath = raw_relative_path_from_hash(&staged_text.hash, &file_extension)?;
+    let blob = database::BlobRecord {
+        sha256: staged_text.hash.clone(),
+        byte_size: staged_text.byte_size as i64,
+        mime_type: Some(mime.to_string()),
+        extension: Some(staged_text.extension.clone()),
+        raw_relpath: path_to_store_string(&raw_relpath),
+    };
+    let blob_id = database::upsert_blob(&conn, &blob)?;
+
+    // Create source identity
+    let canonical_locator = format!("text:{}", staged_text.hash);
+    let source_identity_id = database::upsert_source_identity(
+        &conn,
+        source_kind,
+        entity_kind,
+        None,
+        Some(&canonical_locator),
+        &canonical_locator,
+    )?;
+
+    // Create entry
+    let entry = database::create_archived_entry(
+        &conn,
+        &database::NewEntry {
+            source_identity_id,
+            archive_run_id: run.id,
+            parent_entry_id: None,
+            root_entry_id: None,
+            created_by_user_id: user_id,
+            owned_by_user_id: user_id,
+            source_kind: source_kind.to_string(),
+            entity_kind: entity_kind.to_string(),
+            title: Some(title.to_string()),
+            visibility: "private".to_string(),
+            representation_kind: "text".to_string(),
+            source_metadata_json: json!({
+                "requested_locator": format!("text:{}", title),
+                "canonical_locator": canonical_locator,
+                "mime_type": mime
+            })
+            .to_string(),
+            display_metadata_json: None,
+        },
+    )?;
+
+    // Create structured root directory
+    create_structured_root(store_path, &entry)?;
+
+    // Create primary_media artifact
+    database::add_entry_artifact(
+        &conn,
+        &database::NewArtifact {
+            entry_id: entry.id,
+            artifact_role: "primary_media".to_string(),
+            storage_area: "raw".to_string(),
+            relpath: blob.raw_relpath,
+            blob_id: Some(blob_id),
+            logical_path: None,
+            metadata_json: None,
+        },
+    )?;
+
+    // Complete the run item
+    database::complete_archive_run_item(&conn, item.id, entry.id)?;
+    database::refresh_entry_cached_bytes(&conn, entry.id)?;
+    database::finish_archive_run(&conn, run.id)?;
+
+    Ok(CaptureResult {
+        run_uid: run.run_uid.clone(),
+        status: "completed".to_string(),
+        completed_child_count: 0,
+        ublock_skipped: false,
+        cookie_ext_skipped: false,
+    })
+}
+
 /// Result of a tweet re-archive operation.
 #[derive(Debug, serde::Serialize)]
 pub struct RearchiveResult {
@@ -2626,6 +2792,195 @@ mod tests {
             Source::Local,
             "existing filesystem paths should be archived as local files"
         );
+    }
+
+    #[test]
+    fn test_text_capture_markdown() {
+        let base_path = env::temp_dir().join(format!(
+            "archivr-text-test-{}",
+            Local::now().format("%Y%m%d%H%M%S%3f")
+        ));
+        let _ = fs::remove_dir_all(&base_path);
+        fs::create_dir_all(&base_path).unwrap();
+
+        let store_path = base_path.join("store");
+        let archive_path = base_path.join(".archivr");
+
+        // Initialize archive structure
+        archive::initialize_store_directories(&store_path).unwrap();
+        fs::create_dir_all(&archive_path).unwrap();
+        fs::write(archive_path.join("name"), "test-archive").unwrap();
+        fs::write(archive_path.join("store_path"), store_path.to_str().unwrap()).unwrap();
+
+        let archive_paths = ArchivePaths {
+            archive_path: archive_path.clone(),
+            store_path: store_path.clone(),
+            name: "test-archive".to_string(),
+        };
+
+        let title = "My Markdown Note";
+        let body = "# Heading\n\nSome **bold** text.";
+        let mime = "text/markdown";
+
+        let result = perform_text_capture(&archive_paths, title, body, mime, None).unwrap();
+
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.completed_child_count, 0);
+        assert!(!result.ublock_skipped);
+        assert!(!result.cookie_ext_skipped);
+
+        // Verify entry was created
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let default_coll_id = database::ensure_default_collection(&conn).unwrap();
+        let entries = archive::list_entries_for_collection(&conn, default_coll_id, 0xFFFFFFFF).unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.title, Some(title.to_string()));
+        assert_eq!(entry.source_kind, "text");
+        assert_eq!(entry.entity_kind, "document");
+
+        // Clean up
+        let _ = fs::remove_dir_all(&base_path);
+    }
+
+    #[test]
+    fn test_text_capture_plain() {
+        let base_path = env::temp_dir().join(format!(
+            "archivr-text-plain-test-{}",
+            Local::now().format("%Y%m%d%H%M%S%3f")
+        ));
+        let _ = fs::remove_dir_all(&base_path);
+        fs::create_dir_all(&base_path).unwrap();
+
+        let store_path = base_path.join("store");
+        let archive_path = base_path.join(".archivr");
+
+        // Initialize archive structure
+        archive::initialize_store_directories(&store_path).unwrap();
+        fs::create_dir_all(&archive_path).unwrap();
+        fs::write(archive_path.join("name"), "test-archive").unwrap();
+        fs::write(archive_path.join("store_path"), store_path.to_str().unwrap()).unwrap();
+
+        let archive_paths = ArchivePaths {
+            archive_path: archive_path.clone(),
+            store_path: store_path.clone(),
+            name: "test-archive".to_string(),
+        };
+
+        let title = "Plain Text Note";
+        let body = "Just plain text content.";
+        let mime = "text/plain";
+
+        let result = perform_text_capture(&archive_paths, title, body, mime, None).unwrap();
+
+        assert_eq!(result.status, "completed");
+
+        // Verify entry was created
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let default_coll_id = database::ensure_default_collection(&conn).unwrap();
+        let entries = archive::list_entries_for_collection(&conn, default_coll_id, 0xFFFFFFFF).unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.title, Some(title.to_string()));
+
+        // Clean up
+        let _ = fs::remove_dir_all(&base_path);
+    }
+
+    #[test]
+    fn test_text_capture_rejects_empty_title() {
+        let base_path = env::temp_dir().join(format!(
+            "archivr-text-empty-title-test-{}",
+            Local::now().format("%Y%m%d%H%M%S%3f")
+        ));
+        let _ = fs::remove_dir_all(&base_path);
+        fs::create_dir_all(&base_path).unwrap();
+
+        let store_path = base_path.join("store");
+        let archive_path = base_path.join(".archivr");
+        archive::initialize_store_directories(&store_path).unwrap();
+        fs::create_dir_all(&archive_path).unwrap();
+        fs::write(archive_path.join("name"), "test-archive").unwrap();
+        fs::write(archive_path.join("store_path"), store_path.to_str().unwrap()).unwrap();
+
+        let archive_paths = ArchivePaths {
+            archive_path,
+            store_path,
+            name: "test-archive".to_string(),
+        };
+
+        let result = perform_text_capture(&archive_paths, "", "Some body", "text/plain", None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("title must not be empty"));
+
+        // Clean up
+        let _ = fs::remove_dir_all(&base_path);
+    }
+
+    #[test]
+    fn test_text_capture_rejects_empty_body() {
+        let base_path = env::temp_dir().join(format!(
+            "archivr-text-empty-body-test-{}",
+            Local::now().format("%Y%m%d%H%M%S%3f")
+        ));
+        let _ = fs::remove_dir_all(&base_path);
+        fs::create_dir_all(&base_path).unwrap();
+
+        let store_path = base_path.join("store");
+        let archive_path = base_path.join(".archivr");
+        archive::initialize_store_directories(&store_path).unwrap();
+        fs::create_dir_all(&archive_path).unwrap();
+        fs::write(archive_path.join("name"), "test-archive").unwrap();
+        fs::write(archive_path.join("store_path"), store_path.to_str().unwrap()).unwrap();
+
+        let archive_paths = ArchivePaths {
+            archive_path,
+            store_path,
+            name: "test-archive".to_string(),
+        };
+
+        let result = perform_text_capture(&archive_paths, "Some Title", "", "text/plain", None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("body must not be empty"));
+
+        // Clean up
+        let _ = fs::remove_dir_all(&base_path);
+    }
+
+    #[test]
+    fn test_text_capture_rejects_bad_mime() {
+        let base_path = env::temp_dir().join(format!(
+            "archivr-text-bad-mime-test-{}",
+            Local::now().format("%Y%m%d%H%M%S%3f")
+        ));
+        let _ = fs::remove_dir_all(&base_path);
+        fs::create_dir_all(&base_path).unwrap();
+
+        let store_path = base_path.join("store");
+        let archive_path = base_path.join(".archivr");
+        archive::initialize_store_directories(&store_path).unwrap();
+        fs::create_dir_all(&archive_path).unwrap();
+        fs::write(archive_path.join("name"), "test-archive").unwrap();
+        fs::write(archive_path.join("store_path"), store_path.to_str().unwrap()).unwrap();
+
+        let archive_paths = ArchivePaths {
+            archive_path,
+            store_path,
+            name: "test-archive".to_string(),
+        };
+
+        let result = perform_text_capture(
+            &archive_paths,
+            "Title",
+            "Body",
+            "text/html",
+            None,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsupported MIME type"));
+
+        // Clean up
+        let _ = fs::remove_dir_all(&base_path);
     }
 
     #[test]

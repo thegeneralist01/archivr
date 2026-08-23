@@ -275,6 +275,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/archives/:archive_id/blobs/:sha256", get(serve_blob))
         .route("/api/archives/:archive_id/runs", get(list_runs))
         .route("/api/archives/:archive_id/captures", post(capture_handler))
+        .route("/api/archives/:archive_id/captures/text", post(capture_text_handler))
         .route(
             "/api/archives/:archive_id/uploads",
             post(upload_handler)
@@ -923,6 +924,14 @@ struct CaptureBody {
 }
 
 #[derive(Debug, serde::Deserialize)]
+struct CaptureTextBody {
+    title: String,
+    body: String,
+    /// MIME type: "text/plain" or "text/markdown" (defaults to "text/markdown")
+    mime: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct ProbeQuery {
     locator: String,
 }
@@ -1177,6 +1186,102 @@ async fn capture_handler(
                         let _ = std::fs::remove_dir(parent);
                     }
                 }
+            }
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "job_uid": job_uid, "status": "pending" })),
+    ))
+}
+
+async fn capture_text_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(archive_id): Path<String>,
+    Json(body): Json<CaptureTextBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+
+    // Validate title and body
+    if body.title.trim().is_empty() {
+        return Err(ApiError::bad_request("title must not be empty"));
+    }
+    if body.body.trim().is_empty() {
+        return Err(ApiError::bad_request("body must not be empty"));
+    }
+
+    // Determine MIME type (default to markdown)
+    let mime = body.mime.as_deref().unwrap_or("text/markdown");
+
+    // Validate MIME type
+    if mime != "text/plain" && mime != "text/markdown" {
+        return Err(ApiError::bad_request(
+            "unsupported MIME type: must be 'text/plain' or 'text/markdown'"
+        ));
+    }
+
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let archive_paths =
+        archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;
+
+    // Create job record in the archive DB.
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let job_uid = database::create_capture_job(&conn, &archive_id)?;
+    drop(conn);
+
+    // Spawn background text capture.
+    let title = body.title.trim().to_string();
+    let text_body = body.body.trim().to_string();
+    let mime_str = mime.to_string();
+    let job_uid_bg = job_uid.clone();
+    let archive_path = mounted.archive_path.clone();
+    let archive_id_bg = archive_id.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let conn = match database::open_or_initialize(&archive_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("warn: capture job {job_uid_bg}: db open failed: {e:#}");
+                return;
+            }
+        };
+        database::update_capture_job_status(&conn, &job_uid_bg, "running", None, None, None).ok();
+
+        match capture::perform_text_capture(
+            &archive_paths,
+            &title,
+            &text_body,
+            &mime_str,
+            Some(&archive_id_bg),
+        ) {
+            Ok(result) => {
+                let job_status = if result.status == "completed" {
+                    "completed"
+                } else {
+                    "failed"
+                };
+                database::update_capture_job_status(
+                    &conn,
+                    &job_uid_bg,
+                    job_status,
+                    Some(&result.run_uid),
+                    None,
+                    None,
+                )
+                .ok();
+            }
+            Err(e) => {
+                database::update_capture_job_status(
+                    &conn,
+                    &job_uid_bg,
+                    "failed",
+                    None,
+                    Some(&format!("{e:#}")),
+                    None,
+                )
+                .ok();
             }
         }
     });
@@ -3678,6 +3783,143 @@ mod tests {
                 .as_str()
                 .is_some_and(|e| e.contains("invalid quality"))
         );
+    }
+
+    #[tokio::test]
+    async fn text_capture_post_returns_accepted_with_job_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures/text")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(
+                        r#"{"title":"Test Note","body":"Test content","mime":"text/markdown"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["job_uid"].as_str().is_some(),
+            "response must have job_uid"
+        );
+        assert_eq!(json["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn text_capture_rejects_empty_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures/text")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(
+                        r#"{"title":"","body":"Test content","mime":"text/plain"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("title must not be empty")));
+    }
+
+    #[tokio::test]
+    async fn text_capture_rejects_empty_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures/text")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(
+                        r#"{"title":"Test Note","body":"","mime":"text/plain"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("body must not be empty")));
+    }
+
+    #[tokio::test]
+    async fn text_capture_rejects_unsupported_mime() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures/text")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(
+                        r#"{"title":"Test Note","body":"Test content","mime":"text/html"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("unsupported MIME type")));
+    }
+
+    #[tokio::test]
+    async fn text_capture_requires_auth() {
+        let (test_app, _dir) = make_test_app();
+        let response = test_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures/text")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"title":"Test","body":"Content"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

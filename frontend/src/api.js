@@ -174,6 +174,24 @@ export async function submitCapture(archiveId, locator, quality = null, extensio
   return res.json(); // { job_uid, status: "pending" }
 }
 
+export async function submitTextCapture(archiveId, {title, body, mime = 'text/markdown'}) {
+  const payload = { title, body };
+  if (mime && mime !== 'text/markdown') payload.mime = mime;
+
+  const res = await fetch(`/api/archives/${archiveId}/captures/text`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    const err = new Error(body.error || `HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json(); // { job_uid, status: "pending" }
+}
+
 // Returns { has_video: bool, qualities: string[] } e.g. { has_video: true, qualities: ["1080p","720p","480p"] }
 // Throws on network error; returns { has_video: false, qualities: [] } on non-video locators.
 export async function probeCapture(archiveId, locator) {
