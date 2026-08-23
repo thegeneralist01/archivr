@@ -1275,6 +1275,23 @@ mod tests {
     }
 
     #[test]
+    fn extract_tweet_text_keeps_article_block_object_field_order() {
+        let tweet: serde_json::Value = serde_json::from_str(
+            r#"{
+                "article": {
+                    "title": "Ordered block",
+                    "blocks": [{"heading": "Opening", "content": "Body copy"}]
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            extract_tweet_text(&tweet).as_deref(),
+            Some("Ordered block\n\nOpening\n\nBody copy")
+        );
+    }
+
+    #[test]
     fn extract_tweet_text_falls_back_from_article_preview_to_summary_then_tweet_body() {
         let preview = serde_json::json!({
             "full_text": "https://t.co/fallback",
