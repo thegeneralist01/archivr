@@ -51,6 +51,12 @@ pub fn state_dir_yt_dlp() -> Option<PathBuf> {
     state_dir().map(|d| d.join("yt-dlp").join("yt-dlp"))
 }
 
+/// The explicit yt-dlp override, if it points to a file on disk.
+pub fn forced_yt_dlp() -> Option<PathBuf> {
+    let p = PathBuf::from(env::var_os(YT_DLP_FORCE_ENV).filter(|v| !v.is_empty())?);
+    p.is_file().then_some(p)
+}
+
 /// The nix-pinned yt-dlp advertised via `ARCHIVR_YT_DLP`, if it exists on disk.
 pub fn pinned_yt_dlp() -> Option<PathBuf> {
     let p = PathBuf::from(env::var_os(YT_DLP_ENV).filter(|v| !v.is_empty())?);
@@ -90,11 +96,8 @@ pub fn yt_dlp_candidates() -> Vec<(&'static str, PathBuf)> {
 /// Priority: `ARCHIVR_YT_DLP_FORCE` > newest of (pinned, state-dir) by version
 /// string > bare `yt-dlp` (PATH lookup, the historical behaviour).
 pub fn resolve_yt_dlp_uncached() -> PathBuf {
-    if let Some(forced) = env::var_os(YT_DLP_FORCE_ENV).filter(|v| !v.is_empty()) {
-        let forced = PathBuf::from(forced);
-        if forced.is_file() {
-            return forced;
-        }
+    if let Some(forced) = forced_yt_dlp() {
+        return forced;
     }
 
     yt_dlp_candidates()

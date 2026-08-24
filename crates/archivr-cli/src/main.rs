@@ -3,7 +3,7 @@ use archivr_core::{
     archive,
     capture::CaptureConfig,
     downloader::ytdlp::{
-        pinned_yt_dlp, probe_version, resolve_yt_dlp, state_dir, state_dir_yt_dlp,
+        forced_yt_dlp, pinned_yt_dlp, probe_version, resolve_yt_dlp, state_dir, state_dir_yt_dlp,
     },
 };
 use clap::{Parser, Subcommand};
@@ -147,22 +147,32 @@ fn yt_dlp_state_dir() -> Result<PathBuf> {
         .context("could not determine a state directory (is $HOME set?)")
 }
 
-/// Renders one `status` row. Missing candidates show an em dash.
-fn status_row(role: &str, path: Option<&Path>, chosen: &Path) {
+/// Formats one `status` row. Missing candidates show an em dash.
+fn format_status_row(role: &str, path: Option<&Path>, chosen: &Path) -> String {
     match path {
         Some(p) => {
             let version = probe_version(p).unwrap_or_else(|| "—".to_string());
             let star = if p == chosen { "*" } else { "" };
-            println!("{role}\t{}\t{version}\t{star}", p.display());
+            format!("{role}\t{}\t{version}\t{star}", p.display())
         }
-        None => println!("{role}\t—\t—\t"),
+        None => format!("{role}\t—\t—\t"),
     }
+}
+
+/// Prints one `status` row. Missing candidates show an em dash.
+fn status_row(role: &str, path: Option<&Path>, chosen: &Path) {
+    println!("{}", format_status_row(role, path, chosen));
 }
 
 fn yt_dlp_status() -> Result<()> {
     let chosen = resolve_yt_dlp();
 
     println!("role\tpath\tversion\tchosen");
+    status_row(
+        "force (ARCHIVR_YT_DLP_FORCE)",
+        forced_yt_dlp().as_deref(),
+        &chosen,
+    );
     status_row("env (ARCHIVR_YT_DLP)", pinned_yt_dlp().as_deref(), &chosen);
 
     // Show the state-dir slot even when empty, so users can see where an
@@ -288,4 +298,49 @@ fn yt_dlp_update(requested_version: Option<&str>) -> Result<()> {
     println!("archivr will now prefer it whenever it is newer than the pinned binary (ARCHIVR_YT_DLP).");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_status_row;
+    use archivr_core::downloader::ytdlp::{
+        forced_yt_dlp, resolve_yt_dlp_uncached, YT_DLP_FORCE_ENV,
+    };
+    use std::path::Path;
+
+    fn fake_yt_dlp(path: &Path, version: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("#!/bin/sh\necho {version}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[test]
+    fn forced_candidate_is_rendered_and_selected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let forced = tmp.path().join("forced/yt-dlp");
+        fake_yt_dlp(&forced, "2020.01.01");
+        unsafe { std::env::set_var(YT_DLP_FORCE_ENV, &forced) };
+
+        let candidate = forced_yt_dlp();
+        assert_eq!(candidate.as_deref(), Some(forced.as_path()));
+        let chosen = resolve_yt_dlp_uncached();
+        assert_eq!(chosen, forced);
+        assert_eq!(
+            format_status_row(
+                "force (ARCHIVR_YT_DLP_FORCE)",
+                candidate.as_deref(),
+                &chosen,
+            ),
+            format!(
+                "force (ARCHIVR_YT_DLP_FORCE)\t{}\t2020.01.01\t*",
+                forced.display()
+            )
+        );
+
+        unsafe { std::env::remove_var(YT_DLP_FORCE_ENV) };
+    }
 }
