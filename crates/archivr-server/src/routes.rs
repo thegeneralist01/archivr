@@ -612,10 +612,12 @@ async fn request_entry_summary_handler(
         Pending { input: summarizer::SummaryInput, summary_uid: String },
     }
     let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<PreflightOutcome> {
-        let input = summarizer::build_summary_input(&preflight_paths, &preflight_uid, summary_options)?;
         let conn = database::open_or_initialize(&preflight_paths.archive_path)?;
         let entry_id = database::entry_id_for_uid(&conn, &preflight_uid)?
             .ok_or_else(|| anyhow::anyhow!("entry not found"))?;
+        // Preserve the route's historical 404 before attempting content
+        // extraction, whose own missing-entry error includes the uid.
+        let input = summarizer::build_summary_input(&preflight_paths, &preflight_uid, summary_options)?;
         if !force {
             if let Some(existing) = database::find_entry_summary(
                 &conn, entry_id, &provider_kind, provider_model.as_deref(),
@@ -3169,6 +3171,35 @@ mod tests {
         assert!(!error.contains("raw/"));
         assert!(!error.contains("mime"));
         assert!(!error.contains("v1 unsupported"));
+    }
+
+    #[tokio::test]
+    async fn summary_request_for_missing_entry_returns_not_found_before_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _archive_path, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let previous_codex_cli = std::env::var_os("ARCHIVR_CODEX_CLI");
+        unsafe { std::env::set_var("ARCHIVR_CODEX_CLI", "/usr/bin/false") };
+
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/entries/ent_missing/summary")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({ "provider": "codex_cli" })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        match previous_codex_cli {
+            Some(value) => unsafe { std::env::set_var("ARCHIVR_CODEX_CLI", value) },
+            None => unsafe { std::env::remove_var("ARCHIVR_CODEX_CLI") },
+        }
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["error"], "entry not found");
     }
 
     #[tokio::test]
