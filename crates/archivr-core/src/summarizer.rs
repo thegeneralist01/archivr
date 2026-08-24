@@ -40,6 +40,15 @@ pub const MAX_SUMMARY_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 /// Maximum combined byte size for explicitly opted-in images.
 pub const MAX_SUMMARY_IMAGE_TOTAL_BYTES: u64 = 12 * 1024 * 1024;
 
+/// User-safe copy for entries whose archived artifacts do not contain
+/// summarizable text. Keep this separate from provider and archive failures.
+pub const UNSUPPORTED_SUMMARY_CONTENT_HEADING: &str = "This entry can’t be summarized yet.";
+pub const UNSUPPORTED_SUMMARY_CONTENT_DETAIL: &str = "It doesn’t contain archived text that a summary provider can read. Summaries currently support text notes, web pages, X posts and threads, and X Articles. Video, audio, and image-only entries need a transcript or text source.";
+pub const UNSUPPORTED_SUMMARY_CONTENT_MESSAGE: &str = concat!(
+    "This entry can’t be summarized yet.\n\n",
+    "It doesn’t contain archived text that a summary provider can read. Summaries currently support text notes, web pages, X posts and threads, and X Articles. Video, audio, and image-only entries need a transcript or text source."
+);
+
 /// Upper bound on characters fed to a model. Archived pages run to hundreds of
 /// kilobytes; past this point we are paying for tokens that do not change a
 /// five-sentence summary. Truncation happens *before* hashing so the cache key
@@ -48,6 +57,28 @@ const MAX_INPUT_CHARS: usize = 48_000;
 
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_CLI_TIMEOUT_SECS: u64 = 300;
+
+#[derive(Debug)]
+struct UnsupportedSummaryContent;
+
+impl std::fmt::Display for UnsupportedSummaryContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("unsupported summary content")
+    }
+}
+
+impl std::error::Error for UnsupportedSummaryContent {}
+
+fn unsupported_summary_content_error() -> anyhow::Error {
+    anyhow::Error::new(UnsupportedSummaryContent)
+}
+
+/// True only for expected, pre-provider summary-input limitations.
+pub fn is_unsupported_summary_content_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<UnsupportedSummaryContent>().is_some())
+}
 
 /// The instruction half of the prompt. JSON output is requested because parsing
 /// prose out of a free-form answer is the single most fragile part of an LLM
@@ -1026,7 +1057,7 @@ pub fn build_summary_input(
         artifacts = load_summary_artifacts(&conn, entry_id, "primary_media")?;
     }
     if artifacts.is_empty() {
-        bail!("entry {entry_uid} has no {primary_role} artifact to summarize");
+        return Err(unsupported_summary_content_error());
     }
 
     let mut pieces: Vec<String> = Vec::with_capacity(artifacts.len());
@@ -1051,11 +1082,7 @@ pub fn build_summary_input(
                 .with_context(|| format!("{} is not valid JSON", abs.display()))?;
             extract_tweet_text(&parsed).unwrap_or_default()
         } else {
-            bail!(
-                "no text content available for this entry kind — v1 unsupported \
-                 (artifact {relpath}, mime {})",
-                if mime.is_empty() { "unknown" } else { &mime }
-            );
+            return Err(unsupported_summary_content_error());
         };
         if !piece.trim().is_empty() {
             pieces.push(piece);
@@ -1065,7 +1092,7 @@ pub fn build_summary_input(
     // humans and models. Single-piece entries never render the separator.
     let content = pieces.join("\n\n---\n\n").trim().to_string();
     if content.is_empty() {
-        bail!("no text content available for this entry kind — v1 unsupported (extracted text was empty)");
+        return Err(unsupported_summary_content_error());
     }
     // Truncate on a char boundary, then hash: the digest must describe the
     // bytes actually sent, or the cache would key on content the model never saw.
@@ -1741,6 +1768,69 @@ mod tests {
         )
         .unwrap();
         (temp, paths, entry)
+    }
+
+    #[test]
+    fn unsupported_summary_content_errors_are_classified_without_relabeling_other_errors() {
+        let (_temp, paths, entry) = summary_image_fixture();
+        let conn = database::open_or_initialize(&paths.archive_path).unwrap();
+        conn.execute(
+            "DELETE FROM entry_artifacts WHERE entry_id = ?1",
+            [entry.id],
+        )
+        .unwrap();
+
+        let no_artifact = build_summary_input(&paths, &entry.entry_uid, SummaryBuildOptions::default())
+            .unwrap_err();
+        assert!(is_unsupported_summary_content_error(&no_artifact));
+
+        add_summary_image_artifact(
+            &paths,
+            entry.id,
+            99,
+            "primary_media",
+            "mp4",
+            "video/mp4",
+            1,
+        );
+        let video = build_summary_input(&paths, &entry.entry_uid, SummaryBuildOptions::default())
+            .unwrap_err();
+        assert!(is_unsupported_summary_content_error(&video));
+
+        let conn = database::open_or_initialize(&paths.archive_path).unwrap();
+        conn.execute(
+            "DELETE FROM entry_artifacts WHERE entry_id = ?1",
+            [entry.id],
+        )
+        .unwrap();
+        let empty_relpath = "raw/empty-summary.txt";
+        std::fs::write(paths.store_path.join(empty_relpath), "").unwrap();
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id: entry.id,
+                artifact_role: "primary_media".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: empty_relpath.to_string(),
+                blob_id: None,
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+        drop(conn);
+        let empty_text = build_summary_input(&paths, &entry.entry_uid, SummaryBuildOptions::default())
+            .unwrap_err();
+        assert!(is_unsupported_summary_content_error(&empty_text));
+
+        std::fs::remove_file(paths.store_path.join(empty_relpath)).unwrap();
+        let read_error = build_summary_input(&paths, &entry.entry_uid, SummaryBuildOptions::default())
+            .unwrap_err();
+        assert!(!is_unsupported_summary_content_error(&read_error));
+        assert_eq!(UNSUPPORTED_SUMMARY_CONTENT_MESSAGE, "This entry can’t be summarized yet.\n\nIt doesn’t contain archived text that a summary provider can read. Summaries currently support text notes, web pages, X posts and threads, and X Articles. Video, audio, and image-only entries need a transcript or text source.");
+
+        assert!(!is_unsupported_summary_content_error(&anyhow!("provider timeout")));
+        assert!(!is_unsupported_summary_content_error(&anyhow!("entry not found: {}", entry.entry_uid)));
     }
 
     fn add_summary_image_artifact(

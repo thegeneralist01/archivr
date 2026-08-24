@@ -597,7 +597,13 @@ async fn request_entry_summary_handler(
     // 2. Extract the same content the summarizer will feed the model, so the
     //    digest below is the identical cache key summarize_entry will compute.
     let input = summarizer::build_summary_input(&archive_paths, &entry_uid, summary_options)
-        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+        .map_err(|e| {
+            if summarizer::is_unsupported_summary_content_error(&e) {
+                ApiError::bad_request(summarizer::UNSUPPORTED_SUMMARY_CONTENT_MESSAGE)
+            } else {
+                ApiError::bad_request(&format!("{e:#}"))
+            }
+        })?;
 
     // 3. Cache hit: identical entry + provider + model + prompt + input.
     if !body.force {
@@ -651,20 +657,7 @@ async fn request_entry_summary_handler(
             )
         {
             eprintln!("warn: summary {summary_uid_bg}: {e:#}");
-            if let Ok(conn) = database::open_or_initialize(&archive_path) {
-                if let Ok(Some(row)) = database::get_entry_summary_by_uid(&conn, &summary_uid_bg) {
-                    if row.status != "failed" {
-                        database::update_entry_summary_status(
-                            &conn,
-                            &summary_uid_bg,
-                            "failed",
-                            None,
-                            Some(&format!("{e:#}")),
-                        )
-                        .ok();
-                    }
-                }
-            }
+            record_background_summary_failure(&archive_path, &summary_uid_bg, &e);
         }
     });
 
@@ -676,6 +669,35 @@ async fn request_entry_summary_handler(
             "entry_uid": entry_uid,
         })),
     ))
+}
+
+fn summary_failure_error_text(error: &anyhow::Error) -> String {
+    if summarizer::is_unsupported_summary_content_error(error) {
+        summarizer::UNSUPPORTED_SUMMARY_CONTENT_MESSAGE.to_string()
+    } else {
+        format!("{error:#}")
+    }
+}
+
+fn record_background_summary_failure(
+    archive_path: &std::path::Path,
+    summary_uid: &str,
+    error: &anyhow::Error,
+) {
+    if let Ok(conn) = database::open_or_initialize(archive_path) {
+        if let Ok(Some(row)) = database::get_entry_summary_by_uid(&conn, summary_uid) {
+            if row.status != "failed" {
+                database::update_entry_summary_status(
+                    &conn,
+                    summary_uid,
+                    "failed",
+                    None,
+                    Some(&summary_failure_error_text(error)),
+                )
+                .ok();
+            }
+        }
+    }
 }
 
 async fn list_runs(
@@ -3096,6 +3118,101 @@ mod tests {
         );
         let conn = database::open_or_initialize(&archive_path).unwrap();
         assert!(database::latest_entry_summary(&conn, entry.id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn summary_preflight_returns_safe_message_for_unsupported_video_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        add_summary_test_artifact(
+            &archive_path,
+            entry.id,
+            "raw/private-video.mp4",
+            "primary_media",
+            "video/mp4",
+            b"video fixture",
+        );
+        let session_cookie = make_test_session(&auth_path);
+        let previous_codex_cli = std::env::var_os("ARCHIVR_CODEX_CLI");
+        unsafe { std::env::set_var("ARCHIVR_CODEX_CLI", "/usr/bin/false") };
+
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/archives/test/entries/{}/summary", entry.entry_uid))
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({ "provider": "codex_cli" })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        match previous_codex_cli {
+            Some(value) => unsafe { std::env::set_var("ARCHIVR_CODEX_CLI", value) },
+            None => unsafe { std::env::remove_var("ARCHIVR_CODEX_CLI") },
+        }
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = body_json(response).await["error"].as_str().unwrap().to_string();
+        assert_eq!(error, summarizer::UNSUPPORTED_SUMMARY_CONTENT_MESSAGE);
+        assert!(!error.contains("raw/"));
+        assert!(!error.contains("mime"));
+        assert!(!error.contains("v1 unsupported"));
+    }
+
+    #[test]
+    fn background_summary_failure_stores_safe_copy_only_for_unsupported_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_registry, archive_path, _auth_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        add_summary_test_artifact(
+            &archive_path,
+            entry.id,
+            "raw/private-video.mp4",
+            "primary_media",
+            "video/mp4",
+            b"video fixture",
+        );
+        let unsupported = summarizer::build_summary_input(
+            &archive::read_archive_paths(&archive_path).unwrap(),
+            &entry.entry_uid,
+            summarizer::SummaryBuildOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            summary_failure_error_text(&unsupported),
+            summarizer::UNSUPPORTED_SUMMARY_CONTENT_MESSAGE
+        );
+
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let summary_uid = database::upsert_pending_entry_summary(
+            &conn,
+            entry.id,
+            "codex_cli",
+            Some("test"),
+            summarizer::PROMPT_VERSION,
+            "unsupported-content-test",
+        )
+        .unwrap();
+        drop(conn);
+        record_background_summary_failure(&archive_path, &summary_uid, &unsupported);
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let stored = database::get_entry_summary_by_uid(&conn, &summary_uid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "failed");
+        assert_eq!(
+            stored.error_text.as_deref(),
+            Some(summarizer::UNSUPPORTED_SUMMARY_CONTENT_MESSAGE)
+        );
+
+        let provider = anyhow::anyhow!("provider response was malformed");
+        assert_eq!(
+            summary_failure_error_text(&provider),
+            "provider response was malformed"
+        );
     }
 
     #[tokio::test]
