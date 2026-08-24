@@ -49,7 +49,7 @@ Archivr is a self-hosted tool for capturing and preserving digital content — Y
 - **Role-based auth** — Guest / User / Admin / Owner roles; session cookies and API tokens; Argon2 passwords
 - **Quality selection** — choose video quality or audio-only per capture; a live metadata probe populates the selector before download
 - **LLM summaries** — regenerable per-entry summary via the Anthropic HTTP API, an OpenAI-compatible HTTP API, a local `claude` CLI, or a local `codex` CLI; triggered manually from the entry rail, never automatically on capture; text-only by default, with an explicit `Include attached images` option
-- **Text notes** — capture a plain-text or Markdown note with a title and no URL; the note is stored as a normal deduplicated blob and previews in-browser
+- **Text notes** — capture a plain-text or Markdown note with a title and no URL; the byte-preserving note is stored as a normal deduplicated blob and opens in the usual entry-rail preview
 - **In-progress capture indicator** — running captures appear as a compact spinner row in the entries list until they finish, replacing the earlier grey skeleton block
 
 ## Quick Start
@@ -177,6 +177,8 @@ Two body types are accepted: `text/markdown` (saved as `.md`) and `text/plain` (
 rejected. The body lands in `store/raw/…` under its SHA3-256 content hash, exactly like every other capture, so an
 identical note captured twice is stored once.
 
+Text notes have no synthetic source URL: the original-URL field stays empty rather than inventing a `text:` locator.
+
 ## Configuration
 
 ### TOML config file
@@ -237,6 +239,14 @@ images are sent, each no larger than 5 MiB and no more than 12 MiB in total.
 Free-text entry search also matches the latest completed summary text and its generated JSON tags. Entries with no
 summary, or only a pending or failed summary, get no summary-derived match.
 
+Each request is cached under the provider and the **requested** model identifier. If a provider reports a more precise
+resolved model (for example, an alias's concrete version), the UI displays that resolved name as attribution without
+changing the cache identity.
+
+Summary attempts move from `pending` to `running` and then to `completed` or `failed`. On server startup, interrupted
+pending or running attempts are marked failed. Regenerating does not replace an earlier completed summary until the
+replacement succeeds, and public readers receive completed content only—never pending state or diagnostic errors.
+
 | Variable | Default | Description |
 |---|---|---|
 | `ARCHIVR_ANTHROPIC_API_KEY` | *(required for `anthropic_http`)* | API key for the Anthropic Messages API |
@@ -284,6 +294,8 @@ archivr yt-dlp status                        # every candidate, its version, and
 archivr yt-dlp update                        # download the latest zipapp into the state dir
 archivr yt-dlp update --version 2026.09.15   # pin a specific release tag
 ```
+
+When `ARCHIVR_YT_DLP_FORCE` applies, `status` shows that forced candidate and selects it as the winner.
 
 The released artifact is a Python zipapp, so this path needs `python3` on `PATH` at run time.
 
