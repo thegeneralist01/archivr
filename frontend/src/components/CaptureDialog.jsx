@@ -535,7 +535,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
         return { type: 'file', locator: it.uploadLocator, quality: 'best', extraExtensions: {} }
       }
       if (it.kind === 'text') {
-        return { type: 'text', title: it.title.trim(), body: it.body.trim(), mime: it.mime }
+        return { type: 'text', title: it.title.trim(), body: it.body, mime: it.mime }
       }
       return {
         type: 'url',
