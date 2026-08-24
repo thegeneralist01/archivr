@@ -1,6 +1,6 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -121,6 +121,8 @@ pub struct EntrySummaryRecord {
     pub summary_uid: String,
     pub entry_uid: String,
     pub provider_kind: String,
+    /// Model selected by the provider after resolving the requested cache-key alias.
+    pub resolved_model: Option<String>,
     pub provider_model: Option<String>,
     pub prompt_version: String,
     pub input_sha256: String,
@@ -350,6 +352,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             entry_id INTEGER NOT NULL REFERENCES archived_entries(id) ON DELETE CASCADE,
             provider_kind TEXT NOT NULL,
             provider_model TEXT,
+            resolved_model TEXT,
             prompt_version TEXT NOT NULL,
             input_sha256 TEXT NOT NULL,
             status TEXT NOT NULL CHECK(status IN ('pending','running','completed','failed')),
@@ -476,6 +479,12 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     // Migration: add notes_json column to existing capture_jobs tables.
     // Silently ignored when the column already exists (idempotent).
     let _ = conn.execute("ALTER TABLE capture_jobs ADD COLUMN notes_json TEXT", []);
+    // Provider responses may resolve a requested alias to a concrete model.
+    // Keep that display-only value outside the cache key.
+    let _ = conn.execute(
+        "ALTER TABLE entry_summaries ADD COLUMN resolved_model TEXT",
+        [],
+    );
     // Migration: add requires_auth column to existing collections tables.
     // Silently ignored when the column already exists (idempotent).
     let _ = conn.execute(
@@ -1403,7 +1412,8 @@ pub fn fail_stalled_capture_jobs(conn: &Connection) -> Result<usize> {
 
 /// `SELECT` list shared by every `entry_summaries` read, so all readers build
 /// an identical `EntrySummaryRecord` from the same column ordering.
-const ENTRY_SUMMARY_COLS: &str = "SELECT s.summary_uid, e.entry_uid, s.provider_kind, s.provider_model,
+const ENTRY_SUMMARY_COLS: &str =
+    "SELECT s.summary_uid, e.entry_uid, s.provider_kind, s.provider_model, s.resolved_model,
                 s.prompt_version, s.input_sha256, s.status, s.summary_text,
                 s.error_text, s.created_at, s.updated_at, s.completed_at
          FROM entry_summaries s
@@ -1416,17 +1426,16 @@ fn map_entry_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntrySummaryRe
         provider_kind: row.get(2)?,
         // '' is the stored stand-in for "this provider has no model"; see the
         // doc comment on EntrySummaryRecord for why it is not NULL.
-        provider_model: row
-            .get::<_, Option<String>>(3)?
-            .filter(|m| !m.is_empty()),
-        prompt_version: row.get(4)?,
-        input_sha256: row.get(5)?,
-        status: row.get(6)?,
-        summary_text: row.get(7)?,
-        error_text: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
-        completed_at: row.get(11)?,
+        provider_model: row.get::<_, Option<String>>(3)?.filter(|m| !m.is_empty()),
+        resolved_model: row.get(4)?,
+        prompt_version: row.get(5)?,
+        input_sha256: row.get(6)?,
+        status: row.get(7)?,
+        summary_text: row.get(8)?,
+        error_text: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+        completed_at: row.get(12)?,
     })
 }
 
@@ -1464,7 +1473,7 @@ pub fn upsert_pending_entry_summary(
               input_sha256, status, summary_text, error_text, created_at, updated_at, completed_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, NULL, ?7, ?7, NULL)
          ON CONFLICT(entry_id, provider_kind, provider_model, prompt_version, input_sha256)
-         DO UPDATE SET status = 'pending', summary_text = NULL, error_text = NULL,
+         DO UPDATE SET status = 'pending', summary_text = NULL, error_text = NULL, resolved_model = NULL,
                        completed_at = NULL, updated_at = ?7",
         rusqlite::params![
             summary_uid,
@@ -1488,6 +1497,25 @@ pub fn upsert_pending_entry_summary(
     Ok(stored)
 }
 
+/// Completes a summary while retaining the provider's concrete response model
+/// for display. The requested provider model remains the cache-key identity.
+pub fn update_entry_summary_completed(
+    conn: &Connection,
+    summary_uid: &str,
+    summary_text: &str,
+    resolved_model: Option<&str>,
+) -> Result<()> {
+    let now = now_timestamp();
+    conn.execute(
+        "UPDATE entry_summaries
+         SET status = 'completed', summary_text = ?1, error_text = NULL,
+             resolved_model = ?2, completed_at = ?3, updated_at = ?3
+         WHERE summary_uid = ?4",
+        rusqlite::params![summary_text, resolved_model, now, summary_uid],
+    )?;
+    Ok(())
+}
+
 /// Moves a summary row through `running` → `completed` / `failed`.
 /// `completed_at` is stamped only on the terminal `completed` transition.
 pub fn update_entry_summary_status(
@@ -1508,7 +1536,14 @@ pub fn update_entry_summary_status(
          SET status = ?1, summary_text = ?2, error_text = ?3,
              completed_at = ?4, updated_at = ?5
          WHERE summary_uid = ?6",
-        rusqlite::params![status, summary_text, error_text, completed_at, now, summary_uid],
+        rusqlite::params![
+            status,
+            summary_text,
+            error_text,
+            completed_at,
+            now,
+            summary_uid
+        ],
     )?;
     Ok(())
 }
@@ -1665,7 +1700,11 @@ pub fn finish_archive_run(conn: &Connection, run_id: i64) -> Result<()> {
         [run_id],
         |row| row.get(0),
     )?;
-    let status = if failed_count > 0 { "failed" } else { "completed" };
+    let status = if failed_count > 0 {
+        "failed"
+    } else {
+        "completed"
+    };
     conn.execute(
         "UPDATE archive_runs SET status = ?1, finished_at = ?2 WHERE id = ?3",
         params![status, now_timestamp(), run_id],
@@ -1901,9 +1940,8 @@ pub fn delete_entry(conn: &Connection, entry_uid: &str) -> Result<bool> {
     // (no grandchildren), so without `id = ?1` the set would be empty and
     // cascade_cached_bytes_after_subtree_delete would not recalculate shared-blob totals.
     let subtree_ids: Vec<i64> = {
-        let mut stmt = conn.prepare(
-            "SELECT id FROM archived_entries WHERE id = ?1 OR root_entry_id = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT id FROM archived_entries WHERE id = ?1 OR root_entry_id = ?1")?;
         stmt.query_map([entry_id], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?
     };
@@ -2554,7 +2592,6 @@ pub fn visibility_to_bits(visibility: &str) -> u32 {
     }
 }
 
-
 /// Returns the id of the '_default_' collection, creating it if absent.
 pub fn ensure_default_collection(conn: &Connection) -> Result<i64> {
     let now = now_timestamp();
@@ -2725,7 +2762,12 @@ pub fn get_entry_collection_memberships(
          WHERE ce.entry_id = ?1",
     )?;
     stmt.query_map([entry_id], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, i64>(3)? as u32))
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get::<_, i64>(3)? as u32,
+        ))
     })?
     .collect::<Result<_, _>>()
     .map_err(Into::into)
@@ -3283,7 +3325,10 @@ mod tests {
                 |row| row.get::<_, i64>(0).map(|v| v as u32),
             )
             .unwrap();
-        assert_eq!(default_bits, 2, "default collection should start USER-visible");
+        assert_eq!(
+            default_bits, 2,
+            "default collection should start USER-visible"
+        );
 
         // Create an entry with visibility = "private" (what capture always passes).
         let entry = create_entry_fixture(&conn, "private", None, None);
@@ -3331,7 +3376,10 @@ mod tests {
                 |row| row.get::<_, i64>(0).map(|v| v as u32),
             )
             .unwrap();
-        assert_eq!(public_bits, 3, "collection default=public should produce bits=3");
+        assert_eq!(
+            public_bits, 3,
+            "collection default=public should produce bits=3"
+        );
 
         // Child entries must NOT use the collection default — they keep
         // visibility_to_bits(entry.visibility) so parent-child visibility
@@ -3344,7 +3392,10 @@ mod tests {
                 |row| row.get::<_, i64>(0).map(|v| v as u32),
             )
             .unwrap();
-        assert_eq!(child_bits, 0, "child entries must use visibility_to_bits, not collection default");
+        assert_eq!(
+            child_bits, 0,
+            "child entries must use visibility_to_bits, not collection default"
+        );
     }
 
     #[test]
@@ -3680,11 +3731,9 @@ mod tests {
         assert_eq!(cs_new.full_path, "/natural-science/cs");
 
         // /science/cs/algorithms must have moved
-        assert!(
-            get_tag_by_path(&conn, "/science/cs/algorithms")
-                .unwrap()
-                .is_none()
-        );
+        assert!(get_tag_by_path(&conn, "/science/cs/algorithms")
+            .unwrap()
+            .is_none());
         let algo_new = get_tag_by_uid(&conn, &algo.tag_uid).unwrap().unwrap();
         assert_eq!(algo_new.full_path, "/natural-science/cs/algorithms");
     }
@@ -4373,29 +4422,49 @@ mod tests {
 
         // Root item (parent_item_id IS NULL) — mirrors what record_container_entry does.
         let root_item = create_archive_run_item(
-            &c, run.id, None, 0, "https://example.com/pl", None, "youtube", "playlist",
-        ).unwrap();
+            &c,
+            run.id,
+            None,
+            0,
+            "https://example.com/pl",
+            None,
+            "youtube",
+            "playlist",
+        )
+        .unwrap();
         // Child item (parent_item_id IS NOT NULL).
         let child_item = create_archive_run_item(
-            &c, run.id, Some(root_item.id), 1, "https://example.com/v1", None, "youtube", "video",
-        ).unwrap();
+            &c,
+            run.id,
+            Some(root_item.id),
+            1,
+            "https://example.com/v1",
+            None,
+            "youtube",
+            "video",
+        )
+        .unwrap();
 
         // Complete both — marks archive_runs.completed_count = 2.
         c.execute(
             "UPDATE archive_run_items SET status = 'completed' WHERE id IN (?1, ?2)",
             rusqlite::params![root_item.id, child_item.id],
-        ).unwrap();
+        )
+        .unwrap();
         refresh_run_counters(&c, run.id).unwrap();
 
-        let total: i64 = c.query_row(
-            "SELECT completed_count FROM archive_runs WHERE id = ?1", [run.id], |r| r.get(0),
-        ).unwrap();
+        let total: i64 = c
+            .query_row(
+                "SELECT completed_count FROM archive_runs WHERE id = ?1",
+                [run.id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(total, 2, "both items completed: DB counter must be 2");
 
         let child_count = get_run_completed_child_count(&c, run.id).unwrap();
         assert_eq!(child_count, 1, "only the child item must be counted");
     }
-
 
     // ── entry_summaries ────────────────────────────────────────────────────
 
@@ -4419,6 +4488,41 @@ mod tests {
             .unwrap();
         assert_eq!(exists, 1);
         assert!(latest_entry_summary(&c, entry.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn initialize_schema_migrates_resolved_model_for_existing_summary_table() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE entry_summaries (
+                id INTEGER PRIMARY KEY,
+                summary_uid TEXT NOT NULL UNIQUE,
+                entry_id INTEGER NOT NULL,
+                provider_kind TEXT NOT NULL,
+                provider_model TEXT,
+                prompt_version TEXT NOT NULL,
+                input_sha256 TEXT NOT NULL,
+                status TEXT NOT NULL,
+                summary_text TEXT,
+                error_text TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                UNIQUE(entry_id, provider_kind, provider_model, prompt_version, input_sha256)
+            );",
+        )
+        .unwrap();
+
+        initialize_schema(&c).unwrap();
+
+        let has_resolved_model: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('entry_summaries') WHERE name = 'resolved_model'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_resolved_model, 1);
     }
 
     #[test]
@@ -4452,6 +4556,48 @@ mod tests {
     }
 
     #[test]
+    fn entry_summary_keeps_requested_model_for_cache_and_resolved_model_for_display() {
+        let c = conn();
+        let entry = create_entry_fixture(&c, "private", None, None);
+        let uid = upsert_pending_entry_summary(
+            &c,
+            entry.id,
+            "anthropic_http",
+            Some("claude-3-5-sonnet-latest"),
+            "v1",
+            "sha1",
+        )
+        .unwrap();
+
+        update_entry_summary_completed(&c, &uid, "summary", Some("claude-3-5-sonnet-20241022"))
+            .unwrap();
+        let rec = get_entry_summary_by_uid(&c, &uid).unwrap().unwrap();
+
+        assert_eq!(
+            rec.provider_model.as_deref(),
+            Some("claude-3-5-sonnet-latest")
+        );
+        assert_eq!(
+            rec.resolved_model.as_deref(),
+            Some("claude-3-5-sonnet-20241022")
+        );
+        assert_eq!(
+            find_entry_summary(
+                &c,
+                entry.id,
+                "anthropic_http",
+                Some("claude-3-5-sonnet-latest"),
+                "v1",
+                "sha1",
+            )
+            .unwrap()
+            .unwrap()
+            .summary_uid,
+            uid,
+        );
+    }
+
+    #[test]
     fn entry_summary_failure_records_error_and_no_completed_at() {
         let c = conn();
         let entry = create_entry_fixture(&c, "private", None, None);
@@ -4474,7 +4620,10 @@ mod tests {
         // Regenerating the same key must reset the row in place, not add a second.
         let second =
             upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "sha").unwrap();
-        assert_eq!(first, second, "same cache key must keep the same summary_uid");
+        assert_eq!(
+            first, second,
+            "same cache key must keep the same summary_uid"
+        );
 
         let n: i64 = c
             .query_row("SELECT COUNT(*) FROM entry_summaries", [], |r| r.get(0))
@@ -4530,9 +4679,16 @@ mod tests {
             .unwrap();
         assert_eq!(hit.summary_uid, uid);
         assert!(
-            find_entry_summary(&c, entry.id, "openai_compatible", Some("gpt"), "v1", "changed")
-                .unwrap()
-                .is_none(),
+            find_entry_summary(
+                &c,
+                entry.id,
+                "openai_compatible",
+                Some("gpt"),
+                "v1",
+                "changed"
+            )
+            .unwrap()
+            .is_none(),
             "a changed input digest must miss the cache"
         );
     }
@@ -4546,7 +4702,13 @@ mod tests {
         update_entry_summary_status(&c, &a, "completed", Some("first"), None).unwrap();
         update_entry_summary_status(&c, &b, "completed", Some("second"), None).unwrap();
         // Same-timestamp ties break on id DESC, so the later insert wins either way.
-        assert_eq!(latest_entry_summary(&c, entry.id).unwrap().unwrap().summary_uid, b);
+        assert_eq!(
+            latest_entry_summary(&c, entry.id)
+                .unwrap()
+                .unwrap()
+                .summary_uid,
+            b
+        );
     }
 
     #[test]
@@ -4573,7 +4735,10 @@ mod tests {
     fn entry_id_for_uid_resolves_and_misses() {
         let c = conn();
         let entry = create_entry_fixture(&c, "private", None, None);
-        assert_eq!(entry_id_for_uid(&c, &entry.entry_uid).unwrap(), Some(entry.id));
+        assert_eq!(
+            entry_id_for_uid(&c, &entry.entry_uid).unwrap(),
+            Some(entry.id)
+        );
         assert_eq!(entry_id_for_uid(&c, "ent_nope").unwrap(), None);
     }
 }
