@@ -1581,8 +1581,8 @@ pub fn perform_capture(
                     let (rewritten, fonts) =
                         downloader::font_extractor::extract_and_rewrite(&content, store_path, aid)
                             .unwrap_or_else(|_| (content.clone(), vec![])); // non-fatal
-                    // Extract title after font-stripping so the title tag is not buried
-                    // behind multi-MB embedded font data that would exceed the 256 KiB window.
+                                                                            // Extract title after font-stripping so the title tag is not buried
+                                                                            // behind multi-MB embedded font data that would exceed the 256 KiB window.
                     let title = downloader::singlefile::extract_html_title_str(&rewritten);
                     fs::write(&temp_html, rewritten.as_bytes())
                         .with_context(|| "failed to write rewritten HTML")?;
@@ -2829,7 +2829,11 @@ mod tests {
         archive::initialize_store_directories(&store_path).unwrap();
         fs::create_dir_all(&archive_path).unwrap();
         fs::write(archive_path.join("name"), "test-archive").unwrap();
-        fs::write(archive_path.join("store_path"), store_path.to_str().unwrap()).unwrap();
+        fs::write(
+            archive_path.join("store_path"),
+            store_path.to_str().unwrap(),
+        )
+        .unwrap();
 
         let archive_paths = ArchivePaths {
             archive_path: archive_path.clone(),
@@ -2851,7 +2855,8 @@ mod tests {
         // Verify entry was created
         let conn = database::open_or_initialize(&archive_path).unwrap();
         let default_coll_id = database::ensure_default_collection(&conn).unwrap();
-        let entries = archive::list_entries_for_collection(&conn, default_coll_id, 0xFFFFFFFF).unwrap();
+        let entries =
+            archive::list_entries_for_collection(&conn, default_coll_id, 0xFFFFFFFF).unwrap();
         assert_eq!(entries.len(), 1);
         let entry = &entries[0];
         assert_eq!(entry.title, Some(title.to_string()));
@@ -2878,7 +2883,11 @@ mod tests {
         archive::initialize_store_directories(&store_path).unwrap();
         fs::create_dir_all(&archive_path).unwrap();
         fs::write(archive_path.join("name"), "test-archive").unwrap();
-        fs::write(archive_path.join("store_path"), store_path.to_str().unwrap()).unwrap();
+        fs::write(
+            archive_path.join("store_path"),
+            store_path.to_str().unwrap(),
+        )
+        .unwrap();
 
         let archive_paths = ArchivePaths {
             archive_path: archive_path.clone(),
@@ -2897,7 +2906,8 @@ mod tests {
         // Verify entry was created
         let conn = database::open_or_initialize(&archive_path).unwrap();
         let default_coll_id = database::ensure_default_collection(&conn).unwrap();
-        let entries = archive::list_entries_for_collection(&conn, default_coll_id, 0xFFFFFFFF).unwrap();
+        let entries =
+            archive::list_entries_for_collection(&conn, default_coll_id, 0xFFFFFFFF).unwrap();
         assert_eq!(entries.len(), 1);
         let entry = &entries[0];
         assert_eq!(entry.title, Some(title.to_string()));
@@ -2920,7 +2930,11 @@ mod tests {
         archive::initialize_store_directories(&store_path).unwrap();
         fs::create_dir_all(&archive_path).unwrap();
         fs::write(archive_path.join("name"), "test-archive").unwrap();
-        fs::write(archive_path.join("store_path"), store_path.to_str().unwrap()).unwrap();
+        fs::write(
+            archive_path.join("store_path"),
+            store_path.to_str().unwrap(),
+        )
+        .unwrap();
 
         let archive_paths = ArchivePaths {
             archive_path,
@@ -2930,7 +2944,10 @@ mod tests {
 
         let result = perform_text_capture(&archive_paths, "", "Some body", "text/plain", None);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("title must not be empty"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("title must not be empty"));
 
         // Clean up
         let _ = fs::remove_dir_all(&base_path);
@@ -2950,7 +2967,11 @@ mod tests {
         archive::initialize_store_directories(&store_path).unwrap();
         fs::create_dir_all(&archive_path).unwrap();
         fs::write(archive_path.join("name"), "test-archive").unwrap();
-        fs::write(archive_path.join("store_path"), store_path.to_str().unwrap()).unwrap();
+        fs::write(
+            archive_path.join("store_path"),
+            store_path.to_str().unwrap(),
+        )
+        .unwrap();
 
         let archive_paths = ArchivePaths {
             archive_path,
@@ -2960,7 +2981,10 @@ mod tests {
 
         let result = perform_text_capture(&archive_paths, "Some Title", "", "text/plain", None);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("body must not be empty"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("body must not be empty"));
 
         // Clean up
         let _ = fs::remove_dir_all(&base_path);
@@ -2980,7 +3004,11 @@ mod tests {
         archive::initialize_store_directories(&store_path).unwrap();
         fs::create_dir_all(&archive_path).unwrap();
         fs::write(archive_path.join("name"), "test-archive").unwrap();
-        fs::write(archive_path.join("store_path"), store_path.to_str().unwrap()).unwrap();
+        fs::write(
+            archive_path.join("store_path"),
+            store_path.to_str().unwrap(),
+        )
+        .unwrap();
 
         let archive_paths = ArchivePaths {
             archive_path,
@@ -2988,15 +3016,12 @@ mod tests {
             name: "test-archive".to_string(),
         };
 
-        let result = perform_text_capture(
-            &archive_paths,
-            "Title",
-            "Body",
-            "text/html",
-            None,
-        );
+        let result = perform_text_capture(&archive_paths, "Title", "Body", "text/html", None);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unsupported MIME type"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported MIME type"));
 
         // Clean up
         let _ = fs::remove_dir_all(&base_path);
@@ -3022,12 +3047,15 @@ mod tests {
 
     #[test]
     fn test_record_tweet_entry_links_json_and_raw_artifacts() {
-        let store_path = env::temp_dir().join(format!(
-            "archivr-tweet-db-test-{}",
-            Local::now().format("%Y%m%d%H%M%S%3f")
-        ));
-        let _ = fs::remove_dir_all(&store_path);
-        archive::initialize_store_directories(&store_path).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let archive_paths = archive::initialize_archive(
+            temp.path(),
+            &temp.path().join("store"),
+            "Tweet summary test",
+            false,
+        )
+        .unwrap();
+        let store_path = &archive_paths.store_path;
         fs::create_dir_all(store_path.join("raw").join("a").join("b")).unwrap();
         fs::create_dir_all(store_path.join("raw").join("c").join("d")).unwrap();
         fs::write(
@@ -3051,14 +3079,14 @@ mod tests {
         fs::write(
             store_path.join("raw_tweets").join("tweet-123.json"),
             r#"{
+  "full_text": "Tweet body for summary selection.",
   "author": { "avatar_local_path": "raw/a/b/abcdef.jpg" },
   "entities": { "media": [{ "local_path": "raw/c/d/cdef01.jpg" }] }
 }"#,
         )
         .unwrap();
 
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        database::initialize_schema(&conn).unwrap();
+        let conn = database::open_or_initialize(&archive_paths.archive_path).unwrap();
         let user_id = database::ensure_default_user(&conn).unwrap();
         let run = database::create_archive_run(&conn, user_id, 1).unwrap();
         let item = database::create_archive_run_item(
@@ -3115,10 +3143,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(media_mime.as_deref(), Some("image/jpeg"));
+        let summary_input = crate::summarizer::build_summary_input(
+            &archive_paths,
+            &entry.entry_uid,
+            crate::summarizer::SummaryBuildOptions {
+                include_images: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(summary_input.request.images.len(), 1);
+        assert_eq!(summary_input.request.images[0].mime_type, "image/jpeg");
         assert_eq!(run_status, "completed");
         assert!(store_path.join(&entry.structured_root_relpath).is_dir());
-
-        let _ = fs::remove_dir_all(store_path);
     }
 
     mod title_tests {
