@@ -681,8 +681,10 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     files.forEach(file => {
       const newItem = makeFileItem(file.name)
       setItems(prev => {
-        // Replace a sole empty URL row with the file item; otherwise append
-        if (prev.length === 1 && prev[0].kind !== 'file' && !prev[0].locator.trim()) {
+        // Only a normal URL row can be replaced. Text drafts deliberately use
+        // an empty compatibility locator, but their title/body must survive a
+        // file attachment and remain independently archivable.
+        if (prev.length === 1 && !prev[0].kind && !prev[0].locator.trim()) {
           return [newItem]
         }
         return [...prev, newItem]
