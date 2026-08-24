@@ -349,7 +349,7 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             summary_uid TEXT NOT NULL UNIQUE,
             entry_id INTEGER NOT NULL REFERENCES archived_entries(id) ON DELETE CASCADE,
             provider_kind TEXT NOT NULL,
-            provider_model TEXT,
+            provider_model TEXT NOT NULL DEFAULT '',
             prompt_version TEXT NOT NULL,
             input_sha256 TEXT NOT NULL,
             status TEXT NOT NULL CHECK(status IN ('pending','running','completed','failed')),
@@ -357,11 +357,12 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             error_text TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            completed_at TEXT,
-            UNIQUE(entry_id, provider_kind, provider_model, prompt_version, input_sha256)
+            completed_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_entry_summaries_entry_updated
             ON entry_summaries(entry_id, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_entry_summaries_cache_lookup
+            ON entry_summaries(entry_id, provider_kind, provider_model, prompt_version, input_sha256, status);
         CREATE INDEX IF NOT EXISTS idx_capture_jobs_status ON capture_jobs(status);
         CREATE INDEX IF NOT EXISTS idx_archive_run_items_run_id ON archive_run_items(run_id);
         CREATE INDEX IF NOT EXISTS idx_archived_entries_source_identity_id ON archived_entries(source_identity_id);
@@ -482,6 +483,52 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         "ALTER TABLE collections ADD COLUMN requires_auth INTEGER NOT NULL DEFAULT 1",
         [],
     );
+
+    // Summary attempts used to be unique by cache key, which meant forced
+    // regeneration erased the last completed result. Rebuild that small table
+    // without the cache-key constraint while retaining all existing rows.
+    let summary_table_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'entry_summaries'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if summary_table_sql
+        .as_deref()
+        .is_some_and(|sql| sql.contains("UNIQUE(entry_id, provider_kind, provider_model, prompt_version, input_sha256)"))
+    {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE entry_summaries_rebuilt (
+                 id INTEGER PRIMARY KEY,
+                 summary_uid TEXT NOT NULL UNIQUE,
+                 entry_id INTEGER NOT NULL REFERENCES archived_entries(id) ON DELETE CASCADE,
+                 provider_kind TEXT NOT NULL,
+                 provider_model TEXT NOT NULL DEFAULT '',
+                 prompt_version TEXT NOT NULL,
+                 input_sha256 TEXT NOT NULL,
+                 status TEXT NOT NULL CHECK(status IN ('pending','running','completed','failed')),
+                 summary_text TEXT,
+                 error_text TEXT,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 completed_at TEXT
+             );
+             INSERT INTO entry_summaries_rebuilt
+             SELECT id, summary_uid, entry_id, provider_kind, COALESCE(provider_model, ''),
+                    prompt_version, input_sha256, status, summary_text, error_text,
+                    created_at, updated_at, completed_at
+             FROM entry_summaries;
+             DROP TABLE entry_summaries;
+             ALTER TABLE entry_summaries_rebuilt RENAME TO entry_summaries;
+             CREATE INDEX idx_entry_summaries_entry_updated
+                 ON entry_summaries(entry_id, updated_at DESC);
+             CREATE INDEX idx_entry_summaries_cache_lookup
+                 ON entry_summaries(entry_id, provider_kind, provider_model, prompt_version, input_sha256, status);
+             COMMIT;",
+        )?;
+    }
 
     Ok(())
 }
@@ -1394,6 +1441,21 @@ pub fn fail_stalled_capture_jobs(conn: &Connection) -> Result<usize> {
     Ok(n)
 }
 
+/// Marks summary attempts left pending or running by a previous process as
+/// failed. The message is deliberately stable and does not expose internals.
+pub fn fail_stalled_entry_summaries(conn: &Connection) -> Result<usize> {
+    let now = now_timestamp();
+    conn.execute(
+        "UPDATE entry_summaries
+         SET status = 'failed',
+             error_text = 'Summary generation was interrupted by a server restart.',
+             updated_at = ?1
+         WHERE status IN ('pending', 'running')",
+        [now],
+    )
+    .map_err(Into::into)
+}
+
 // ── entry_summaries ────────────────────────────────────────────────────────
 //
 // Summaries are a regenerable child record of an entry, never a column on
@@ -1441,12 +1503,10 @@ pub fn entry_id_for_uid(conn: &Connection, entry_uid: &str) -> Result<Option<i64
     .map_err(Into::into)
 }
 
-/// Creates (or resets to `pending`) the summary row for one cache key.
+/// Creates a fresh pending summary attempt for one cache key.
 ///
-/// The `ON CONFLICT` arm is what makes "Regenerate" work: re-requesting the same
-/// (entry, provider, model, prompt, input) reuses the existing row rather than
-/// violating the UNIQUE index, clearing any previous text/error so the UI does
-/// not show a stale result next to a running job. Returns the row's `summary_uid`.
+/// Attempts are intentionally not unique by cache key: a forced regeneration
+/// must leave an older completed result available while the new attempt runs.
 pub fn upsert_pending_entry_summary(
     conn: &Connection,
     entry_id: i64,
@@ -1462,10 +1522,7 @@ pub fn upsert_pending_entry_summary(
         "INSERT INTO entry_summaries
              (summary_uid, entry_id, provider_kind, provider_model, prompt_version,
               input_sha256, status, summary_text, error_text, created_at, updated_at, completed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, NULL, ?7, ?7, NULL)
-         ON CONFLICT(entry_id, provider_kind, provider_model, prompt_version, input_sha256)
-         DO UPDATE SET status = 'pending', summary_text = NULL, error_text = NULL,
-                       completed_at = NULL, updated_at = ?7",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, NULL, ?7, ?7, NULL)",
         rusqlite::params![
             summary_uid,
             entry_id,
@@ -1476,16 +1533,7 @@ pub fn upsert_pending_entry_summary(
             now
         ],
     )?;
-    // On the conflict path the pre-existing row keeps its original summary_uid,
-    // so read it back rather than returning the one we just generated.
-    let stored: String = conn.query_row(
-        "SELECT summary_uid FROM entry_summaries
-         WHERE entry_id = ?1 AND provider_kind = ?2 AND provider_model = ?3
-           AND prompt_version = ?4 AND input_sha256 = ?5",
-        rusqlite::params![entry_id, provider_kind, model, prompt_version, input_sha256],
-        |row| row.get(0),
-    )?;
-    Ok(stored)
+    Ok(summary_uid)
 }
 
 /// Moves a summary row through `running` → `completed` / `failed`.
@@ -1541,7 +1589,9 @@ pub fn find_entry_summary(
         &format!(
             "{ENTRY_SUMMARY_COLS}
              WHERE s.entry_id = ?1 AND s.provider_kind = ?2 AND s.provider_model = ?3
-               AND s.prompt_version = ?4 AND s.input_sha256 = ?5"
+               AND s.prompt_version = ?4 AND s.input_sha256 = ?5
+             ORDER BY CASE WHEN s.status = 'completed' THEN 0 ELSE 1 END,
+                      s.completed_at DESC, s.updated_at DESC, s.id DESC"
         ),
         rusqlite::params![
             entry_id,
@@ -1566,6 +1616,24 @@ pub fn latest_entry_summary(
         &format!(
             "{ENTRY_SUMMARY_COLS} WHERE s.entry_id = ?1
              ORDER BY s.updated_at DESC, s.id DESC LIMIT 1"
+        ),
+        [entry_id],
+        map_entry_summary,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// The most recent completed summary, excluding in-flight and failed attempts.
+/// This is the stable summary shown in entry detail and used by free-text search.
+pub fn latest_completed_entry_summary(
+    conn: &Connection,
+    entry_id: i64,
+) -> Result<Option<EntrySummaryRecord>> {
+    conn.query_row(
+        &format!(
+            "{ENTRY_SUMMARY_COLS} WHERE s.entry_id = ?1 AND s.status = 'completed'
+             ORDER BY s.completed_at DESC, s.updated_at DESC, s.id DESC LIMIT 1"
         ),
         [entry_id],
         map_entry_summary,
@@ -4464,33 +4532,72 @@ mod tests {
     }
 
     #[test]
-    fn upsert_pending_entry_summary_reuses_the_row_for_an_identical_cache_key() {
+    fn regenerating_a_completed_summary_creates_a_new_attempt_and_preserves_completion() {
         let c = conn();
         let entry = create_entry_fixture(&c, "private", None, None);
         let first =
             upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "sha").unwrap();
         update_entry_summary_status(&c, &first, "completed", Some("old"), None).unwrap();
 
-        // Regenerating the same key must reset the row in place, not add a second.
+        // Regeneration must retain the finished result while a new attempt runs.
         let second =
             upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "sha").unwrap();
-        assert_eq!(first, second, "same cache key must keep the same summary_uid");
+        assert_ne!(first, second, "regeneration needs a distinct attempt uid");
 
         let n: i64 = c
             .query_row("SELECT COUNT(*) FROM entry_summaries", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(n, 2);
 
-        let rec = get_entry_summary_by_uid(&c, &first).unwrap().unwrap();
+        let completed = get_entry_summary_by_uid(&c, &first).unwrap().unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.summary_text.as_deref(), Some("old"));
+        let rec = get_entry_summary_by_uid(&c, &second).unwrap().unwrap();
         assert_eq!(rec.status, "pending");
-        assert!(rec.summary_text.is_none(), "stale text must be cleared");
+        update_entry_summary_status(&c, &second, "failed", None, Some("boom")).unwrap();
+        assert_eq!(
+            latest_completed_entry_summary(&c, entry.id)
+                .unwrap()
+                .unwrap()
+                .summary_uid,
+            first,
+            "a failed regeneration must not replace the previous completed result"
+        );
     }
 
     #[test]
-    fn entry_summaries_with_no_model_still_dedupe() {
-        // Regression guard: a NULL provider_model would compare as distinct in
-        // SQLite's UNIQUE index, so the CLI providers (which have no model)
-        // would accumulate a new row on every regenerate. We store '' instead.
+    fn fail_stalled_entry_summaries_marks_pending_and_running_with_restart_message() {
+        let c = conn();
+        let entry = create_entry_fixture(&c, "private", None, None);
+        let pending = upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "a")
+            .unwrap();
+        let running = upsert_pending_entry_summary(&c, entry.id, "codex_cli", None, "v1", "b")
+            .unwrap();
+        let completed = upsert_pending_entry_summary(&c, entry.id, "anthropic_http", None, "v1", "c")
+            .unwrap();
+        update_entry_summary_status(&c, &running, "running", None, None).unwrap();
+        update_entry_summary_status(&c, &completed, "completed", Some("done"), None).unwrap();
+
+        assert_eq!(fail_stalled_entry_summaries(&c).unwrap(), 2);
+        for uid in [&pending, &running] {
+            let row = get_entry_summary_by_uid(&c, uid).unwrap().unwrap();
+            assert_eq!(row.status, "failed");
+            assert_eq!(
+                row.error_text.as_deref(),
+                Some("Summary generation was interrupted by a server restart.")
+            );
+            assert!(!row.updated_at.is_empty());
+        }
+        assert_eq!(
+            get_entry_summary_by_uid(&c, &completed).unwrap().unwrap().status,
+            "completed"
+        );
+    }
+
+    #[test]
+    fn entry_summaries_with_no_model_preserve_none_across_attempts() {
+        // CLI providers have no explicit model, so the stored empty-string
+        // sentinel must always map back to None even when attempts accumulate.
         let c = conn();
         let entry = create_entry_fixture(&c, "private", None, None);
         upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "sha").unwrap();
@@ -4498,7 +4605,7 @@ mod tests {
         let n: i64 = c
             .query_row("SELECT COUNT(*) FROM entry_summaries", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(n, 2);
         // …and it reads back as None, not as an empty-string model.
         let rec = latest_entry_summary(&c, entry.id).unwrap().unwrap();
         assert_eq!(rec.provider_model, None);
