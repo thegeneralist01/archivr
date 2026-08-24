@@ -951,7 +951,10 @@ fn register_tweet_artifacts(
         })?;
         for (role, raw_relpath) in tweet_raw_artifacts(&json_str)? {
             let raw_path = PathBuf::from(&raw_relpath);
-            let blob = blob_record_for_raw_relpath(store_path, &raw_path)?;
+            let mut blob = blob_record_for_raw_relpath(store_path, &raw_path)?;
+            if role == "media" {
+                blob.mime_type = tweet_media_image_mime(blob.extension.as_deref());
+            }
             let blob_id = database::upsert_blob(conn, &blob)?;
             database::add_entry_artifact(
                 conn,
@@ -1028,6 +1031,22 @@ fn record_tweet_entry(
 
     database::complete_archive_run_item(conn, item.id, entry.id)?;
     Ok(entry)
+}
+
+/// Trusted image MIME types emitted by the X downloader's media paths.
+///
+/// Tweet JSON has no MIME field for ordinary downloaded media. Restricting this
+/// inference to the explicit image extensions keeps binary video/audio and
+/// unknown extensions out of multimodal summary input.
+fn tweet_media_image_mime(extension: Option<&str>) -> Option<String> {
+    match extension?.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => Some("image/jpeg".to_string()),
+        "png" => Some("image/png".to_string()),
+        "webp" => Some("image/webp".to_string()),
+        "gif" => Some("image/gif".to_string()),
+        "avif" => Some("image/avif".to_string()),
+        _ => None,
+    }
 }
 
 fn tweet_raw_artifacts(tweet_json: &str) -> Result<Vec<(String, String)>> {
@@ -3025,7 +3044,7 @@ mod tests {
                 .join("raw")
                 .join("c")
                 .join("d")
-                .join("cdef01.mp4"),
+                .join("cdef01.jpg"),
             b"media",
         )
         .unwrap();
@@ -3033,7 +3052,7 @@ mod tests {
             store_path.join("raw_tweets").join("tweet-123.json"),
             r#"{
   "author": { "avatar_local_path": "raw/a/b/abcdef.jpg" },
-  "entities": { "media": [{ "local_path": "raw/c/d/cdef01.mp4" }] }
+  "entities": { "media": [{ "local_path": "raw/c/d/cdef01.jpg" }] }
 }"#,
         )
         .unwrap();
@@ -3088,6 +3107,14 @@ mod tests {
 
         assert_eq!(artifact_count, 3);
         assert_eq!(blob_count, 2);
+        let media_mime: Option<String> = conn
+            .query_row(
+                "SELECT b.mime_type FROM entry_artifacts ea JOIN blobs b ON b.id = ea.blob_id WHERE ea.entry_id = ?1 AND ea.artifact_role = 'media'",
+                [entry.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(media_mime.as_deref(), Some("image/jpeg"));
         assert_eq!(run_status, "completed");
         assert!(store_path.join(&entry.structured_root_relpath).is_dir());
 
