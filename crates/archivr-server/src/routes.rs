@@ -49,6 +49,9 @@ use rusqlite::OptionalExtension;
 
 const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
 const LOGIN_MAX_ATTEMPTS: usize = 5;
+const MAX_TEXT_CAPTURE_BODY_BYTES: usize = 2 * 1024 * 1024;
+// The request includes a small JSON envelope in addition to the text body.
+const MAX_TEXT_CAPTURE_REQUEST_BYTES: usize = MAX_TEXT_CAPTURE_BODY_BYTES + 64 * 1024;
 
 // Short-lived token granting unauthenticated access to one specific artifact.
 // Used so Cast / AirPlay devices (which carry no session cookie) can fetch media.
@@ -279,7 +282,11 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/archives/:archive_id/blobs/:sha256", get(serve_blob))
         .route("/api/archives/:archive_id/runs", get(list_runs))
         .route("/api/archives/:archive_id/captures", post(capture_handler))
-        .route("/api/archives/:archive_id/captures/text", post(capture_text_handler))
+        .route(
+            "/api/archives/:archive_id/captures/text",
+            post(capture_text_handler)
+                .layer(DefaultBodyLimit::max(MAX_TEXT_CAPTURE_REQUEST_BYTES)),
+        )
         .route(
             "/api/archives/:archive_id/uploads",
             post(upload_handler)
@@ -1413,6 +1420,9 @@ async fn capture_text_handler(
     }
     if body.body.trim().is_empty() {
         return Err(ApiError::bad_request("body must not be empty"));
+    }
+    if body.body.len() > MAX_TEXT_CAPTURE_BODY_BYTES {
+        return Err(ApiError::bad_request("body must not exceed 2 MiB"));
     }
 
     // Determine MIME type (default to markdown)
@@ -4363,6 +4373,63 @@ mod tests {
             "response must have job_uid"
         );
         assert_eq!(json["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn text_capture_accepts_a_body_just_below_two_mebibytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let body = "a".repeat(2 * 1024 * 1024 - 1);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures/text")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({
+                        "title": "Maximum-size note",
+                        "body": body,
+                        "mime": "text/plain"
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn text_capture_rejects_a_body_over_two_mebibytes_with_validation_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let body = "a".repeat(2 * 1024 * 1024 + 1);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures/text")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({
+                        "title": "Oversized note",
+                        "body": body,
+                        "mime": "text/plain"
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&response_body).unwrap();
+        assert_eq!(json["error"], "body must not exceed 2 MiB");
     }
 
     #[tokio::test]
