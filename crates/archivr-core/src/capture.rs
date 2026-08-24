@@ -2907,7 +2907,7 @@ mod tests {
             store_path: store_path.clone(),
             name: "test-archive".to_string(),
         };
-        let body = "  \n# Heading\n\nContent with a final newline\n\t ";
+        let body = "  \n# Heading\n\nContent with a final newline\n\t \n";
 
         perform_text_capture(
             &archive_paths,

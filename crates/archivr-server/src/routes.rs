@@ -4246,7 +4246,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (registry, archive_path, auth_path) = make_test_registry(&dir);
         let session_cookie = make_test_session(&auth_path);
-        let text_body = "  \n# Heading\n\nContent with a final newline\n\t ";
+        let text_body = "  \n# Heading\n\nContent with a final newline\n\t \n";
         let response = app(registry, auth_path)
             .oneshot(
                 Request::builder()
