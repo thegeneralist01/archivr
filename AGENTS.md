@@ -21,12 +21,17 @@ YouTube playlists and channels produce a **parent container entry** with each vi
 Pasted text takes a much shorter path: `perform_text_capture()` (`capture.rs`) skips source detection
 and every downloader shell-out — `downloader/text.rs` stages the body under `temp/`, hashes it, and the
 blob lands in `raw/` like any other artifact. Entrypoint is
-`POST /api/archives/:archive_id/captures/text`.
+`POST /api/archives/:archive_id/captures/text`. Its body is byte-preserving, its entry has no fabricated
+`original_url`, and its normal text preview opens from the entry rail.
 
 LLM summaries are a post-capture, manual-only subsystem: `crates/archivr-core/src/summarizer.rs` behind
 `GET`/`POST /api/archives/:archive_id/entries/:entry_uid/summary`, cached in the `entry_summaries`
 table per (entry, provider, model, prompt version, input hash). See `ARCHIVR-MENTAL-MODEL.md` for the
 provider set and the status lifecycle.
+
+The requested provider model is the cache identity; a provider-returned resolved model is display attribution.
+At startup, pending/running attempts interrupted by shutdown are failed. A regeneration keeps the previous completed
+summary visible until its replacement completes; public readers receive completed content only, never diagnostics.
 
 `SummaryBuildOptions` keeps summaries text-only unless `include_images` is set. The input digest includes that flag and
 the selected blobs' SHA-256, MIME types, and sizes, so a distinct image selection cannot reuse a text-only cache row.
@@ -96,9 +101,10 @@ No CI is configured; no rustfmt.toml/clippy.toml — default `cargo fmt`/`clippy
 - **yt-dlp is resolved, not just read**: `ARCHIVR_YT_DLP` (set by the flake wrappers) is only the
   *pinned candidate* handed to `resolve_yt_dlp()` (`downloader/ytdlp.rs`), which compares it against a
   self-updated copy in the state dir. `ARCHIVR_YT_DLP_FORCE` (absolute path) bypasses that comparison
-  entirely; `ARCHIVR_STATE_DIR` relocates the state dir. Never spawn bare `yt-dlp` — call the resolver.
+  entirely; `archivr yt-dlp status` shows and chooses that forced candidate when it applies; `ARCHIVR_STATE_DIR`
+  relocates the state dir. Never spawn bare `yt-dlp` — call the resolver.
 - **LLM summaries by env var**: `ARCHIVR_ANTHROPIC_API_KEY` / `ARCHIVR_ANTHROPIC_URL` / `ARCHIVR_ANTHROPIC_MODEL`, `ARCHIVR_OPENAI_API_KEY` / `ARCHIVR_OPENAI_URL` / `ARCHIVR_OPENAI_MODEL`, `ARCHIVR_CLAUDE_CLI` / `ARCHIVR_CLAUDE_MODEL`, `ARCHIVR_CODEX_CLI` / `ARCHIVR_CODEX_MODEL`, plus `ARCHIVR_SUMMARY_HTTP_TIMEOUT` (default 120s) and `ARCHIVR_SUMMARY_CLI_TIMEOUT` (default 300s). Same convention as above — never TOML, which also keeps API keys out of anything the archive persists. Summaries are manual-only: nothing in `capture.rs` triggers them. The two CLI vars are optional overrides: unset, `resolve_cli()` auto-discovers well-known absolute installs first (`/opt/homebrew/bin/claude`, `/usr/local/bin/claude`; `/Applications/ChatGPT.app/Contents/Resources/codex`, `/opt/homebrew/bin/codex`, `/usr/local/bin/codex`), then `$HOME/.local/bin/<name>`, then the bare name on PATH — the absolute defaults matter because the ChatGPT desktop app ships `codex` off PATH. Frontend static output is generated; never hand-edit `crates/archivr-server/static/`.
-- **Frontend**: JSX (no TypeScript), PascalCase components in `frontend/src/components/`, kebab-case CSS classes, plain CSS with custom properties in `styles.css` (no Tailwind/CSS-in-JS). No router — `App.jsx` parses `window.location.pathname` + `history.pushState`. State = `useState` + one `AuthContext`; `sessionStorage` for refresh-resilient dialog state (see `CaptureDialog.jsx` job polling, 500ms). All API calls through `frontend/src/api.js` with relative `/api/*` URLs — add new endpoints there, not inline `fetch`. In-progress captures render through `SkeletonEntryRow.jsx`, which is a compact spinner + locator + "Archiving…" line (with a playlist/channel hint), **not** a grey skeleton block — don't reintroduce placeholder shimmer. Layout comes from semantic classes (e.g. `.capture-text-row` in `styles.css`), never from fallthrough on a generic row class; give a new row shape its own class.
+- **Frontend**: JSX (no TypeScript), PascalCase components in `frontend/src/components/`, kebab-case CSS classes, plain CSS with custom properties in `styles.css` (no Tailwind/CSS-in-JS). No router — `App.jsx` parses `window.location.pathname` + `history.pushState`. State = `useState` + one `AuthContext`; `sessionStorage` for refresh-resilient dialog state (see `CaptureDialog.jsx` job polling, 500ms). All API calls through `frontend/src/api.js` with relative `/api/*` URLs — add new endpoints there, not inline `fetch`. Summary polling and generate callbacks must remain scoped to the currently selected entry; image-inclusion behavior is unchanged. In-progress captures render through `SkeletonEntryRow.jsx`, which is a compact spinner + locator + "Archiving…" line (with a playlist/channel hint), **not** a grey skeleton block — don't reintroduce placeholder shimmer. Layout comes from semantic classes (e.g. `.capture-text-row` in `styles.css`), never from fallthrough on a generic row class; give a new row shape its own class.
 - **CLI providers parse a file, not stdout**: `codex` is invoked as `codex exec --output-last-message <tempfile> -` (prompt on stdin) and the reply is read back from that file — raw stdout carries a runtime header, an echo of the user prompt, and a `tokens used` footer that the JSON extractor will happily mistake for the answer. There is a positional-prompt fallback for older builds that reject `-`. Keep any new CLI provider on the same "give me only the final message" contract.
 - **Naming (Rust)**: standard snake_case/PascalCase; visibility and roles are bitflag `u32`s, not enums.
 

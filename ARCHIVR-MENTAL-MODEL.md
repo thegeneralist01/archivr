@@ -134,7 +134,8 @@ title (non-empty, ≤ 500 chars), the body (non-empty, ≤ 2 MiB) and the MIME t
 `text/markdown` only), then calls `downloader/text.rs` to write the bytes into `store/temp/<timestamp>/`
 and hash them. From there it rejoins the normal path — dedup into `raw/A/B/HASH.EXT`, then run, entry
 and artifact rows. The server exposes it as `POST /api/archives/:archive_id/captures/text`, and the UI
-drives it from `CaptureTextRow` in `CaptureDialog.jsx`; entries produced this way render through
+drives it from `CaptureTextRow` in `CaptureDialog.jsx`. The body is preserved byte-for-byte, the entry's
+`original_url` remains empty (no fabricated `text:` URL), and its normal entry-rail preview renders through
 `TextPreview.jsx`.
 
 ## Web Capture Pipeline
@@ -180,10 +181,17 @@ into archive data. `PROMPT_VERSION` in the same file stamps every row, so changi
 invalidates the cache instead of silently mixing generations.
 
 `entry_summaries` (schema in `database.rs`) is that cache, unique on
-(`entry_id`, `provider_kind`, `provider_model`, `prompt_version`, `input_sha256`) — the same entry
-summarised by two providers, two models, or after a prompt change yields distinct rows, while a repeat
-request with identical inputs reuses one. Rows move `pending` → `running` → `completed` | `failed`,
-mirroring how capture jobs are tracked, and the frontend polls until the row leaves `running`.
+(`entry_id`, `provider_kind`, `provider_model`, `prompt_version`, `input_sha256`) — the requested provider
+model is the cache identity, so the same entry summarised by two providers, two requested models, or after a
+prompt change yields distinct rows, while a repeat request with identical inputs reuses one. When a provider
+returns its concrete resolved model, it is stored separately and displayed as attribution without changing that
+identity. Rows move `pending` → `running` → `completed` | `failed`, mirroring how capture jobs are tracked;
+the frontend polls only for the currently selected entry, and its generate callbacks are scoped to that same
+selection. Image-selection behavior remains unchanged.
+
+On startup the server marks interrupted `pending` or `running` attempts failed. Regeneration is non-destructive:
+the prior completed summary stays visible until a replacement completes successfully. Public readers receive only
+completed summary content, never pending/failed state or diagnostic error text.
 
 The summary path is deliberately explicit: UI consent (`Include attached images`) → core selection → input digest and
 cache lookup → provider transport → `pending`/`running`/`completed` lifecycle. Text is the default. When consent is
@@ -229,7 +237,8 @@ There is no single yt-dlp. Up to three can exist on one machine:
 state-dir candidates are probed with `--version` and the newest wins — yt-dlp versions are `YYYY.MM.DD`,
 so plain string ordering is chronological — with exact ties going to the state-dir copy the user
 deliberately installed. If neither exists, it falls back to bare `yt-dlp`. `archivr yt-dlp status`
-prints every candidate, its version, and the winner.
+prints every candidate, its version, and the winner; when the force variable applies, it includes that
+forced candidate and selects it as the winner.
 
 Three ways to move the version forward: the weekly `.github/workflows/update-ytdlp.yml` cron (reads the
 current pin, queries the GitHub releases API, re-hashes with `nix hash file --sri`, rewrites the `ytDlp`
