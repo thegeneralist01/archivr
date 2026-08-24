@@ -1680,8 +1680,10 @@ pub fn latest_completed_entry_summary(
     .map_err(Into::into)
 }
 
-/// The newest replacement attempt that has not completed. This includes failed
-/// rows so authenticated callers can show the failure beside a retained result.
+/// The newest non-completed replacement attempt after the retained completed
+/// result. This includes failed rows so authenticated callers can show a recent
+/// failure beside readable content, but suppresses historical failures after a
+/// newer successful regeneration.
 pub fn latest_entry_summary_attempt(
     conn: &Connection,
     entry_id: i64,
@@ -1689,6 +1691,17 @@ pub fn latest_entry_summary_attempt(
     conn.query_row(
         &format!(
             "{ENTRY_SUMMARY_COLS} WHERE s.entry_id = ?1 AND s.status != 'completed'
+               AND (
+                   NOT EXISTS (
+                       SELECT 1 FROM entry_summaries c
+                       WHERE c.entry_id = s.entry_id AND c.status = 'completed'
+                   )
+                   OR (s.updated_at, s.id) > (
+                       SELECT c.updated_at, c.id FROM entry_summaries c
+                       WHERE c.entry_id = s.entry_id AND c.status = 'completed'
+                       ORDER BY c.completed_at DESC, c.updated_at DESC, c.id DESC LIMIT 1
+                   )
+               )
              ORDER BY s.updated_at DESC, s.id DESC LIMIT 1"
         ),
         [entry_id],
@@ -4765,6 +4778,28 @@ mod tests {
         assert_eq!(
             latest_entry_summary_attempt(&c, entry.id).unwrap().unwrap().status,
             "failed"
+        );
+
+        let successful_replacement =
+            upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "newer").unwrap();
+        update_entry_summary_status(
+            &c,
+            &successful_replacement,
+            "completed",
+            Some("replacement"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            latest_completed_entry_summary(&c, entry.id)
+                .unwrap()
+                .unwrap()
+                .summary_uid,
+            successful_replacement
+        );
+        assert!(
+            latest_entry_summary_attempt(&c, entry.id).unwrap().is_none(),
+            "a failed attempt predating a successful replacement must not remain visible"
         );
     }
 
