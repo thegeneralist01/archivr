@@ -253,13 +253,19 @@ fn resolve_cli(env_name: &str, well_known_absolute: &[&str], bare: &str) -> Path
 pub fn provider_from_env(kind: &str) -> Result<ProviderConfig> {
     match kind {
         "anthropic_http" => Ok(ProviderConfig::AnthropicHttp(HttpProviderConfig {
-            endpoint: env_or("ARCHIVR_ANTHROPIC_URL", "https://api.anthropic.com/v1/messages"),
+            endpoint: env_or(
+                "ARCHIVR_ANTHROPIC_URL",
+                "https://api.anthropic.com/v1/messages",
+            ),
             api_key: required_env("ARCHIVR_ANTHROPIC_API_KEY")?,
             model: env_or("ARCHIVR_ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
             timeout_secs: env_timeout("ARCHIVR_SUMMARY_HTTP_TIMEOUT", DEFAULT_HTTP_TIMEOUT_SECS),
         })),
         "openai_compatible" => Ok(ProviderConfig::OpenAiCompatible(HttpProviderConfig {
-            endpoint: env_or("ARCHIVR_OPENAI_URL", "https://api.openai.com/v1/chat/completions"),
+            endpoint: env_or(
+                "ARCHIVR_OPENAI_URL",
+                "https://api.openai.com/v1/chat/completions",
+            ),
             api_key: required_env("ARCHIVR_OPENAI_API_KEY")?,
             model: env_or("ARCHIVR_OPENAI_MODEL", "gpt-4o-mini"),
             timeout_secs: env_timeout("ARCHIVR_SUMMARY_HTTP_TIMEOUT", DEFAULT_HTTP_TIMEOUT_SECS),
@@ -328,8 +334,12 @@ fn http_client(timeout_secs: u64) -> Result<reqwest::blocking::Client> {
 /// Body builder kept separate from the transport so it can be unit-tested
 /// without a network round-trip.
 fn read_image_base64(image: &SummaryImage) -> Result<String> {
-    let bytes = std::fs::read(&image.archive_file)
-        .with_context(|| format!("failed to read summary image {}", image.archive_file.display()))?;
+    let bytes = std::fs::read(&image.archive_file).with_context(|| {
+        format!(
+            "failed to read summary image {}",
+            image.archive_file.display()
+        )
+    })?;
     Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
@@ -420,7 +430,10 @@ impl SummaryProvider for AnthropicHttpProvider {
         let status = resp.status();
         let text = resp.text().unwrap_or_default();
         if !status.is_success() {
-            bail!("anthropic API returned {status}: {}", truncate_for_error(&text));
+            bail!(
+                "anthropic API returned {status}: {}",
+                truncate_for_error(&text)
+            );
         }
         parse_anthropic_response(&text)
     }
@@ -499,12 +512,7 @@ fn truncate_for_error(s: &str) -> String {
 /// the child if it overruns. stdin is written on a third thread because a
 /// 48 KB prompt can exceed the pipe buffer, and writing it inline would
 /// deadlock against a child that is waiting for us to read its output.
-fn run_cli(
-    executable: &Path,
-    args: &[&str],
-    prompt: &str,
-    timeout_secs: u64,
-) -> Result<String> {
+fn run_cli(executable: &Path, args: &[&str], prompt: &str, timeout_secs: u64) -> Result<String> {
     let mut child = Command::new(executable)
         .args(args)
         .stdin(Stdio::piped())
@@ -538,14 +546,13 @@ fn run_cli(
     });
 
     let collected = match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
-        Ok(res) => res.with_context(|| format!("failed to read stdout of {}", executable.display()))?,
+        Ok(res) => {
+            res.with_context(|| format!("failed to read stdout of {}", executable.display()))?
+        }
         Err(_) => {
             let _ = child.kill();
             let _ = child.wait();
-            bail!(
-                "{} timed out after {timeout_secs}s",
-                executable.display()
-            );
+            bail!("{} timed out after {timeout_secs}s", executable.display());
         }
     };
 
@@ -588,7 +595,12 @@ impl SummaryProvider for ClaudeCliProvider {
             args.push("--model");
             args.push(model);
         }
-        let out = run_cli(&self.0.executable, &args, &build_combined_prompt(request), self.0.timeout_secs)?;
+        let out = run_cli(
+            &self.0.executable,
+            &args,
+            &build_combined_prompt(request),
+            self.0.timeout_secs,
+        )?;
         Ok(SummaryOutput {
             text: out,
             model: self.0.model.clone(),
@@ -638,7 +650,11 @@ mod codex {
         let out = std::fs::read_to_string(path).ok()?;
         let _ = std::fs::remove_file(path);
         let trimmed = out.trim();
-        if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     }
 
     pub fn primary_args(
@@ -698,30 +714,21 @@ mod codex {
 
         // Fallback: positional prompt, no stdin, same --output-last-message.
         let fb = positional_args(images, &out_path, cfg.model.as_deref(), prompt);
-        let out = Command::new(&cfg.executable)
-            .args(&fb)
-            .output()
-            .with_context(|| {
-                format!(
-                    "codex `exec -` failed ({primary_err:#}); positional fallback also failed to spawn{}",
-                    missing_binary_hint(cfg)
-                )
-            })?;
-        if !out.status.success() {
+        let fb_refs: Vec<&str> = fb.iter().map(String::as_str).collect();
+        let out = run_cli(&cfg.executable, &fb_refs, "", cfg.timeout_secs).with_context(|| {
             let _ = std::fs::remove_file(&out_path);
-            bail!(
-                "codex `exec -` failed ({primary_err:#}); positional fallback exited with {}: {}",
-                out.status,
-                truncate_for_error(&String::from_utf8_lossy(&out.stderr))
-            );
-        }
+            format!(
+                "codex `exec -` failed ({primary_err:#}); positional fallback failed{}",
+                missing_binary_hint(cfg)
+            )
+        })?;
         if let Some(text) = read_and_cleanup(&out_path) {
             return Ok(text);
         }
         // Last resort — the child succeeded but wrote nothing to the file. Fall
         // back to raw stdout so the caller has *something* to normalize.
         let _ = std::fs::remove_file(&out_path);
-        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+        Ok(out)
     }
 }
 
@@ -771,7 +778,8 @@ pub fn strip_html(html: &str) -> String {
     .unwrap();
     let comments = regex::Regex::new(r"(?s)<!--.*?-->").unwrap();
     // Treat block-level closers as line breaks so paragraphs do not run together.
-    let breaks = regex::Regex::new(r"(?i)</\s*(p|div|br|li|h[1-6]|tr|section|article)\s*>").unwrap();
+    let breaks =
+        regex::Regex::new(r"(?i)</\s*(p|div|br|li|h[1-6]|tr|section|article)\s*>").unwrap();
     let tags = regex::Regex::new(r"(?s)<[^>]*>").unwrap();
     let spaces = regex::Regex::new(r"[ \t\r\f\v]+").unwrap();
     let blank_lines = regex::Regex::new(r"\n{3,}").unwrap();
@@ -782,11 +790,7 @@ pub fn strip_html(html: &str) -> String {
     let s = tags.replace_all(&s, " ");
     let s = decode_entities(&s);
     let s = spaces.replace_all(&s, " ");
-    let s = s
-        .lines()
-        .map(str::trim)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let s = s.lines().map(str::trim).collect::<Vec<_>>().join("\n");
     blank_lines.replace_all(&s, "\n\n").trim().to_string()
 }
 
@@ -948,9 +952,12 @@ fn load_summary_image_candidates(
     store_path: &Path,
     entry_id: i64,
 ) -> Result<Vec<SummaryImage>> {
-    let canonical_store = store_path
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize store path: {}", store_path.display()))?;
+    let canonical_store = store_path.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize store path: {}",
+            store_path.display()
+        )
+    })?;
     let mut stmt = conn.prepare(
         "SELECT b.sha256, b.mime_type, b.extension, b.byte_size, ea.relpath
          FROM entry_artifacts ea
@@ -1050,7 +1057,11 @@ pub fn build_summary_input(
     // Load every matching artifact in insertion order so a thread summarizes
     // as the whole conversation, not just its first status.
     let is_tweetish = matches!(entity_kind.as_str(), "tweet" | "tweet_thread");
-    let primary_role = if is_tweetish { "raw_tweet_json" } else { "primary_media" };
+    let primary_role = if is_tweetish {
+        "raw_tweet_json"
+    } else {
+        "primary_media"
+    };
     let mut artifacts = load_summary_artifacts(&conn, entry_id, primary_role)?;
     if artifacts.is_empty() && is_tweetish {
         // Older archives may have stored tweet payloads under `primary_media`.
@@ -1066,8 +1077,11 @@ pub fn build_summary_input(
         let ext = extension_of(relpath);
         let mime = mime_opt.clone().unwrap_or_default();
 
-        let piece = if ext == "md" || ext == "markdown" || ext == "txt"
-            || mime.starts_with("text/markdown") || mime == "text/plain"
+        let piece = if ext == "md"
+            || ext == "markdown"
+            || ext == "txt"
+            || mime.starts_with("text/markdown")
+            || mime == "text/plain"
         {
             std::fs::read_to_string(&abs)
                 .with_context(|| format!("failed to read {}", abs.display()))?
@@ -1162,8 +1176,9 @@ pub fn normalize_summary_json(raw: &str) -> String {
 /// Owns the whole row lifecycle (`pending` → `running` → `completed`/`failed`)
 /// so a caller running it on a background thread only has to handle the
 /// `Err` case. The `(entry_id, provider_kind, provider_model, prompt_version,
-/// input_sha256)` UNIQUE key means re-running against unchanged input reuses the
-/// same row rather than accumulating duplicates.
+/// input_sha256)` cache key identifies equivalent requests. Each generation is
+/// nevertheless recorded as a distinct attempt, so a forced regeneration cannot
+/// hide a prior completed result while the new attempt is pending or running.
 pub fn summarize_entry(
     archive_paths: &ArchivePaths,
     entry_uid: &str,
@@ -1184,12 +1199,7 @@ pub fn summarize_entry(
         prompt_version,
         &input.input_sha256,
     )?;
-    summarize_prebuilt_entry(
-        archive_paths,
-        input,
-        &summary_uid,
-        provider,
-    )
+    summarize_prebuilt_entry(archive_paths, input, &summary_uid, provider)
 }
 
 /// Runs a previously validated and claimed summary attempt.
@@ -1209,23 +1219,16 @@ pub fn summarize_prebuilt_entry(
     match provider.summarize(&input.request) {
         Ok(output) => {
             let text = normalize_summary_json(&output.text);
-            database::update_entry_summary_status(
+            database::update_entry_summary_completed(
                 &conn,
                 summary_uid,
-                "completed",
-                Some(&text),
-                None,
+                &text,
+                output.model.as_deref(),
             )?;
         }
         Err(e) => {
             let msg = format!("{e:#}");
-            database::update_entry_summary_status(
-                &conn,
-                summary_uid,
-                "failed",
-                None,
-                Some(&msg),
-            )?;
+            database::update_entry_summary_status(&conn, summary_uid, "failed", None, Some(&msg))?;
             return Err(e);
         }
     }
@@ -1317,7 +1320,9 @@ mod tests {
     fn provider_from_env_openai_missing_key_names_the_variable() {
         let _g = ENV_LOCK.lock().unwrap();
         clear_provider_env();
-        let err = provider_from_env("openai_compatible").unwrap_err().to_string();
+        let err = provider_from_env("openai_compatible")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("ARCHIVR_OPENAI_API_KEY"), "got: {err}");
     }
 
@@ -1327,7 +1332,10 @@ mod tests {
         clear_provider_env();
         unsafe {
             env::set_var("ARCHIVR_OPENAI_API_KEY", "k");
-            env::set_var("ARCHIVR_OPENAI_URL", "http://localhost:1234/v1/chat/completions");
+            env::set_var(
+                "ARCHIVR_OPENAI_URL",
+                "http://localhost:1234/v1/chat/completions",
+            );
             env::set_var("ARCHIVR_OPENAI_MODEL", "local-model");
             env::set_var("ARCHIVR_SUMMARY_HTTP_TIMEOUT", "7");
         }
@@ -1353,7 +1361,10 @@ mod tests {
         // file-name-`claude` path.
         assert!(
             c.executable == PathBuf::from("claude")
-                || c.executable.file_name().map(|f| f == "claude").unwrap_or(false),
+                || c.executable
+                    .file_name()
+                    .map(|f| f == "claude")
+                    .unwrap_or(false),
             "unexpected claude executable: {}",
             c.executable.display()
         );
@@ -1368,7 +1379,10 @@ mod tests {
         // deliberately opportunistic.
         assert!(
             c.executable == PathBuf::from("codex")
-                || c.executable.file_name().map(|f| f == "codex").unwrap_or(false),
+                || c.executable
+                    .file_name()
+                    .map(|f| f == "codex")
+                    .unwrap_or(false),
             "unexpected codex executable: {}",
             c.executable.display()
         );
@@ -1479,27 +1493,55 @@ mod tests {
             .position(|arg| arg == "--output-last-message")
             .unwrap();
         assert!(image_at < output_at);
-        assert_eq!(args[image_at + 1], request.images[0].archive_file.to_string_lossy());
+        assert_eq!(
+            args[image_at + 1],
+            request.images[0].archive_file.to_string_lossy()
+        );
         assert_eq!(args.last().unwrap(), "-");
     }
 
     #[test]
     fn codex_positional_arguments_put_images_before_output_path() {
         let (_temp, request) = image_request();
-        let args = codex::positional_args(
-            &request.images,
-            Path::new("/tmp/output"),
-            None,
-            "prompt",
-        );
+        let args =
+            codex::positional_args(&request.images, Path::new("/tmp/output"), None, "prompt");
         let image_at = args.iter().position(|arg| arg == "--image").unwrap();
         let output_at = args
             .iter()
             .position(|arg| arg == "--output-last-message")
             .unwrap();
         assert!(image_at < output_at);
-        assert_eq!(args[image_at + 1], request.images[0].archive_file.to_string_lossy());
+        assert_eq!(
+            args[image_at + 1],
+            request.images[0].archive_file.to_string_lossy()
+        );
         assert_eq!(args.last().unwrap(), "prompt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_positional_fallback_honors_cli_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("codex-fixture.sh");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nfor arg in \"$@\"; do [ \"$arg\" = \"-\" ] && exit 1; done\nsleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = CliProviderConfig {
+            executable,
+            model: None,
+            timeout_secs: 1,
+        };
+
+        let started = std::time::Instant::now();
+        let err = format!("{:#}", codex::run(&cfg, "prompt", &[]).unwrap_err());
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(err.contains("timed out after 1s"), "got: {err}");
     }
 
     #[test]
@@ -1511,12 +1553,16 @@ mod tests {
             timeout_secs: 1,
         });
         let err = provider.summarize(&request).unwrap_err().to_string();
-        assert!(err.contains("Claude CLI cannot attach local images"), "got: {err}");
+        assert!(
+            err.contains("Claude CLI cannot attach local images"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn parse_anthropic_response_extracts_text_and_model() {
-        let body = r#"{"model":"claude-3-5-sonnet-20241022","content":[{"type":"text","text":"hi"}]}"#;
+        let body =
+            r#"{"model":"claude-3-5-sonnet-20241022","content":[{"type":"text","text":"hi"}]}"#;
         let out = parse_anthropic_response(body).unwrap();
         assert_eq!(out.text, "hi");
         assert_eq!(out.model.as_deref(), Some("claude-3-5-sonnet-20241022"));
@@ -1559,7 +1605,10 @@ mod tests {
 
     #[test]
     fn strip_html_decodes_common_entities() {
-        assert_eq!(strip_html("<p>a &amp; b &nbsp;c</p>").replace('\u{a0}', " "), "a & b c");
+        assert_eq!(
+            strip_html("<p>a &amp; b &nbsp;c</p>").replace('\u{a0}', " "),
+            "a & b c"
+        );
     }
 
     #[test]
@@ -1727,8 +1776,14 @@ mod tests {
             .unwrap();
         }
 
-        let input = build_summary_input(&paths, &entry.entry_uid, SummaryBuildOptions::default()).unwrap();
-        assert!(input.request.content.contains("First article body.\n\n---\n\nArticle 2\n\nSecond article body."));
+        let input =
+            build_summary_input(&paths, &entry.entry_uid, SummaryBuildOptions::default()).unwrap();
+        assert!(
+            input
+                .request
+                .content
+                .contains("First article body.\n\n---\n\nArticle 2\n\nSecond article body.")
+        );
     }
 
     fn summary_image_fixture() -> (tempfile::TempDir, ArchivePaths, database::ArchivedEntry) {
@@ -1800,19 +1855,12 @@ mod tests {
         )
         .unwrap();
 
-        let no_artifact = build_summary_input(&paths, &entry.entry_uid, SummaryBuildOptions::default())
-            .unwrap_err();
+        let no_artifact =
+            build_summary_input(&paths, &entry.entry_uid, SummaryBuildOptions::default())
+                .unwrap_err();
         assert!(is_unsupported_summary_content_error(&no_artifact));
 
-        add_summary_image_artifact(
-            &paths,
-            entry.id,
-            99,
-            "primary_media",
-            "mp4",
-            "video/mp4",
-            1,
-        );
+        add_summary_image_artifact(&paths, entry.id, 99, "primary_media", "mp4", "video/mp4", 1);
         let video = build_summary_input(&paths, &entry.entry_uid, SummaryBuildOptions::default())
             .unwrap_err();
         assert!(is_unsupported_summary_content_error(&video));
@@ -1839,18 +1887,28 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        let empty_text = build_summary_input(&paths, &entry.entry_uid, SummaryBuildOptions::default())
-            .unwrap_err();
+        let empty_text =
+            build_summary_input(&paths, &entry.entry_uid, SummaryBuildOptions::default())
+                .unwrap_err();
         assert!(is_unsupported_summary_content_error(&empty_text));
 
         std::fs::remove_file(paths.store_path.join(empty_relpath)).unwrap();
-        let read_error = build_summary_input(&paths, &entry.entry_uid, SummaryBuildOptions::default())
-            .unwrap_err();
+        let read_error =
+            build_summary_input(&paths, &entry.entry_uid, SummaryBuildOptions::default())
+                .unwrap_err();
         assert!(!is_unsupported_summary_content_error(&read_error));
-        assert_eq!(UNSUPPORTED_SUMMARY_CONTENT_MESSAGE, "This entry can’t be summarized yet.\n\nIt doesn’t contain archived text that a summary provider can read. Summaries currently support text notes, web pages, X posts and threads, and X Articles. Video, audio, and image-only entries need a transcript or text source.");
+        assert_eq!(
+            UNSUPPORTED_SUMMARY_CONTENT_MESSAGE,
+            "This entry can’t be summarized yet.\n\nIt doesn’t contain archived text that a summary provider can read. Summaries currently support text notes, web pages, X posts and threads, and X Articles. Video, audio, and image-only entries need a transcript or text source."
+        );
 
-        assert!(!is_unsupported_summary_content_error(&anyhow!("provider timeout")));
-        assert!(!is_unsupported_summary_content_error(&anyhow!("entry not found: {}", entry.entry_uid)));
+        assert!(!is_unsupported_summary_content_error(&anyhow!(
+            "provider timeout"
+        )));
+        assert!(!is_unsupported_summary_content_error(&anyhow!(
+            "entry not found: {}",
+            entry.entry_uid
+        )));
     }
 
     fn add_summary_image_artifact(
@@ -1917,13 +1975,17 @@ mod tests {
         let text_only = build_summary_input(
             &paths,
             &entry.entry_uid,
-            SummaryBuildOptions { include_images: false },
+            SummaryBuildOptions {
+                include_images: false,
+            },
         )
         .unwrap();
         let visual = build_summary_input(
             &paths,
             &entry.entry_uid,
-            SummaryBuildOptions { include_images: true },
+            SummaryBuildOptions {
+                include_images: true,
+            },
         )
         .unwrap();
 
@@ -1944,38 +2006,112 @@ mod tests {
                 "summary-image-09",
             ]
         );
-        assert!(visual
-            .request
-            .images
-            .iter()
-            .all(|image| image.byte_size <= MAX_SUMMARY_IMAGE_BYTES));
+        assert!(
+            visual
+                .request
+                .images
+                .iter()
+                .all(|image| image.byte_size <= MAX_SUMMARY_IMAGE_BYTES)
+        );
     }
 
     #[test]
     fn summary_image_selection_enforces_aggregate_limit_and_keeps_scanning() {
         let (_temp, paths, entry) = summary_image_fixture();
-        add_summary_image_artifact(&paths, entry.id, 0, "media", "jpg", "image/jpeg", 4 * 1024 * 1024);
-        add_summary_image_artifact(&paths, entry.id, 1, "media", "png", "image/png", 4 * 1024 * 1024);
-        add_summary_image_artifact(&paths, entry.id, 2, "media", "webp", "image/webp", 4 * 1024 * 1024);
+        add_summary_image_artifact(
+            &paths,
+            entry.id,
+            0,
+            "media",
+            "jpg",
+            "image/jpeg",
+            4 * 1024 * 1024,
+        );
+        add_summary_image_artifact(
+            &paths,
+            entry.id,
+            1,
+            "media",
+            "png",
+            "image/png",
+            4 * 1024 * 1024,
+        );
+        add_summary_image_artifact(
+            &paths,
+            entry.id,
+            2,
+            "media",
+            "webp",
+            "image/webp",
+            4 * 1024 * 1024,
+        );
         add_summary_image_artifact(&paths, entry.id, 3, "media", "gif", "image/gif", 1);
 
         let visual = build_summary_input(
             &paths,
             &entry.entry_uid,
-            SummaryBuildOptions { include_images: true },
+            SummaryBuildOptions {
+                include_images: true,
+            },
         )
         .unwrap();
 
         assert_eq!(visual.request.images.len(), 3);
         assert_eq!(
-            visual.request.images.iter().map(|image| image.byte_size).sum::<u64>(),
+            visual
+                .request
+                .images
+                .iter()
+                .map(|image| image.byte_size)
+                .sum::<u64>(),
             MAX_SUMMARY_IMAGE_TOTAL_BYTES
         );
-        assert!(visual
-            .request
-            .images
-            .iter()
-            .all(|image| image.sha256 != "summary-image-03"));
+        assert!(
+            visual
+                .request
+                .images
+                .iter()
+                .all(|image| image.sha256 != "summary-image-03")
+        );
+    }
+
+    #[test]
+    fn summarize_entry_uses_requested_alias_for_cache_and_response_model_for_display() {
+        struct ResolvedModelProvider;
+
+        impl SummaryProvider for ResolvedModelProvider {
+            fn kind(&self) -> &'static str {
+                "anthropic_http"
+            }
+            fn model(&self) -> Option<&str> {
+                Some("claude-3-5-sonnet-latest")
+            }
+            fn summarize(&self, _: &SummaryRequest) -> Result<SummaryOutput> {
+                Ok(SummaryOutput {
+                    text: r#"{"tldr":"t","summary":"s","tags":[]}"#.to_string(),
+                    model: Some("claude-3-5-sonnet-20241022".to_string()),
+                })
+            }
+        }
+
+        let (_temp, paths, entry) = summary_image_fixture();
+        let record = summarize_entry(
+            &paths,
+            &entry.entry_uid,
+            SummaryBuildOptions::default(),
+            &ResolvedModelProvider,
+            "v1",
+        )
+        .unwrap();
+
+        assert_eq!(
+            record.provider_model.as_deref(),
+            Some("claude-3-5-sonnet-latest")
+        );
+        assert_eq!(
+            record.resolved_model.as_deref(),
+            Some("claude-3-5-sonnet-20241022")
+        );
     }
 
     // ── Output normalization ───────────────────────────────────────────────
@@ -1997,7 +2133,8 @@ mod tests {
 
     #[test]
     fn normalize_summary_json_recovers_json_wrapped_in_prose() {
-        let raw = "Sure! Here you go:\n{\"tldr\":\"t\",\"summary\":\"s\",\"tags\":[]}\nHope that helps.";
+        let raw =
+            "Sure! Here you go:\n{\"tldr\":\"t\",\"summary\":\"s\",\"tags\":[]}\nHope that helps.";
         let v: serde_json::Value = serde_json::from_str(&normalize_summary_json(raw)).unwrap();
         assert_eq!(v["tldr"], "t");
     }
@@ -2024,13 +2161,17 @@ mod tests {
 
     #[test]
     fn run_cli_kills_a_child_that_overruns_its_timeout() {
-        let err = run_cli(Path::new("sleep"), &["30"], "", 1).unwrap_err().to_string();
+        let err = run_cli(Path::new("sleep"), &["30"], "", 1)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("timed out"), "got: {err}");
     }
 
     #[test]
     fn run_cli_reports_a_nonzero_exit() {
-        let err = run_cli(Path::new("false"), &[], "", 30).unwrap_err().to_string();
+        let err = run_cli(Path::new("false"), &[], "", 30)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("exited with"), "got: {err}");
     }
 }

@@ -590,7 +590,9 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
                     )}
                     <p className="rail-summary-provider">
                       {PROVIDER_LABEL[summary.provider_kind] || summary.provider_kind}
-                      {summary.provider_model ? ` \u00b7 ${summary.provider_model}` : ''}
+                      {summary.resolved_model || summary.provider_model
+                        ? ` \u00b7 ${summary.resolved_model || summary.provider_model}`
+                        : ''}
                     </p>
                   </div>
                 )}
