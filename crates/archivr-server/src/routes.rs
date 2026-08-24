@@ -1430,7 +1430,7 @@ async fn capture_text_handler(
 
     // Spawn background text capture.
     let title = body.title.trim().to_string();
-    let text_body = body.body.trim().to_string();
+    let text_body = body.body;
     let mime_str = mime.to_string();
     let job_uid_bg = job_uid.clone();
     let archive_path = mounted.archive_path.clone();
@@ -4341,6 +4341,71 @@ mod tests {
             "response must have job_uid"
         );
         assert_eq!(json["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn text_capture_post_preserves_intentional_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let text_body = "  \n# Heading\n\nContent with a final newline\n\t \n";
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures/text")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({
+                        "title": "Whitespace Note",
+                        "body": text_body,
+                        "mime": "text/markdown"
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let job_uid = serde_json::from_slice::<serde_json::Value>(&response_body).unwrap()["job_uid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let conn = archivr_core::database::open_or_initialize(&archive_path).unwrap();
+                let job = archivr_core::database::get_capture_job(&conn, &job_uid)
+                    .unwrap()
+                    .unwrap();
+                if job.status != "pending" && job.status != "running" {
+                    break job.status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("text capture job should finish");
+        assert_eq!(status, "completed");
+
+        let archive_paths = archivr_core::archive::read_archive_paths(&archive_path).unwrap();
+        let conn = archivr_core::database::open_or_initialize(&archive_path).unwrap();
+        let raw_relpath: String = conn
+            .query_row(
+                "SELECT b.raw_relpath
+                 FROM entry_artifacts ea
+                 JOIN blobs b ON b.id = ea.blob_id
+                 WHERE ea.artifact_role = 'primary_media'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read(archive_paths.store_path.join(raw_relpath)).unwrap(),
+            text_body.as_bytes()
+        );
     }
 
     #[tokio::test]
