@@ -1,5 +1,5 @@
-async function getJson(url) {
-  const response = await fetch(url);
+async function getJson(url, options) {
+  const response = await fetch(url, options);
   if (!response.ok) {
     throw new Error(`${response.status} ${response.statusText}`);
   }
@@ -33,8 +33,8 @@ export async function fetchEntryDetail(archiveId, entryUid) {
 // Summaries are generated on demand, never at capture time. GET is safe for
 // public sessions (the server applies the same visibility gate as entry detail).
 
-export async function fetchEntrySummary(archiveId, entryUid) {
-  return getJson(`/api/archives/${archiveId}/entries/${entryUid}/summary`);
+export async function fetchEntrySummary(archiveId, entryUid, { signal } = {}) {
+  return getJson(`/api/archives/${archiveId}/entries/${entryUid}/summary`, { signal });
 }
 
 // Kicks off generation. Resolves to either an existing completed summary (200)
@@ -42,13 +42,14 @@ export async function fetchEntrySummary(archiveId, entryUid) {
 // caller polls fetchEntrySummary either way.
 // The server returns 400 with the exact missing env var name when a provider is
 // unconfigured, so its body is surfaced verbatim rather than replaced.
-export async function requestEntrySummary(archiveId, entryUid, { provider, force = false, includeImages = false } = {}) {
+export async function requestEntrySummary(archiveId, entryUid, { provider, force = false, includeImages = false, signal } = {}) {
   const resp = await fetch(
     `/api/archives/${archiveId}/entries/${entryUid}/summary`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ provider, force, include_images: includeImages }),
+      signal,
     }
   );
   if (!resp.ok) {
@@ -61,6 +62,15 @@ export async function requestEntrySummary(archiveId, entryUid, { provider, force
     throw new Error(message || `Summary request failed (${resp.status})`);
   }
   return resp.json();
+}
+
+// Text artifacts are served by the same entry-artifact endpoint as previews.
+// Keep credentials explicit because this helper is also used by public/private
+// archive views, and preserve the previous concise HTTP error contract.
+export async function fetchArtifactText(src, { signal } = {}) {
+  const response = await fetch(src, { credentials: 'same-origin', signal });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.text();
 }
 
 export async function fetchEntryChildren(archiveId, entryUid) {

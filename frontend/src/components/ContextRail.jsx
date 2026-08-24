@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useLayoutEffect, useRef } from 'react'
 import { fetchEntryTags, assignTag, removeTag, listEntryCollections, listCollections, addEntryToCollection, updateEntryTitle, deleteEntry, rearchiveEntry, pollCaptureJob, fetchEntrySummary, requestEntrySummary } from '../api'
 import { formatTimestamp, formatBytes, valueText, sourceIconSvg, displayPath } from '../utils'
 
@@ -74,6 +74,15 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
   })
   const [includeSummaryImages, setIncludeSummaryImages] = useState(false)
   const summaryPollRef = useRef(null)
+  const summaryPollAbortRef = useRef(null)
+  const summaryGenerateAbortRef = useRef(null)
+  const summarySelectionRef = useRef(null)
+  // Update before effects run from the list selection, not detail: detail can
+  // briefly describe the previously selected entry while its replacement loads.
+  const summarySelectionKey = archiveId && selectedEntry?.entry_uid
+    ? `${archiveId}:${selectedEntry.entry_uid}`
+    : null
+  summarySelectionRef.current = summarySelectionKey
 
   // ── Bulk-panel state ────────────────────────────────────────────────────
   const isBulk = selectedUids?.size >= 2
@@ -127,14 +136,19 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
 
   // Seed the summary from the entry detail payload and stop any poll left over
   // from the previously selected entry.
-  useEffect(() => {
+  useLayoutEffect(() => {
     clearInterval(summaryPollRef.current)
     summaryPollRef.current = null
-    setSummary(detail?.latest_summary ?? null)
+    summaryPollAbortRef.current?.abort()
+    summaryPollAbortRef.current = null
+    summaryGenerateAbortRef.current?.abort()
+    summaryGenerateAbortRef.current = null
+    const detailMatchesSelection = detail?.summary?.entry_uid === selectedEntry?.entry_uid
+    setSummary(detailMatchesSelection ? detail.latest_summary ?? null : null)
     setSummaryError('')
     setSummaryBusy(false)
     setIncludeSummaryImages(false)
-  }, [detail?.summary?.entry_uid])
+  }, [archiveId, selectedEntry?.entry_uid, detail?.summary?.entry_uid])
 
   // Poll only while the latest summary is non-terminal. Anchoring the effect on
   // the status (rather than starting a timer inside the click handler) means a
@@ -146,53 +160,78 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
     if (summaryStatus !== 'pending' && summaryStatus !== 'running') return
     if (!archiveId || !detail?.summary?.entry_uid) return
     const entryUid = detail.summary.entry_uid
-    summaryPollRef.current = setInterval(async () => {
+    const selectionKey = `${archiveId}:${entryUid}`
+    if (summarySelectionKey !== selectionKey) return
+    const controller = new AbortController()
+    summaryPollAbortRef.current = controller
+    const poll = async () => {
       try {
-        const res = await fetchEntrySummary(archiveId, entryUid)
+        const res = await fetchEntrySummary(archiveId, entryUid, { signal: controller.signal })
+        if (controller.signal.aborted || summarySelectionRef.current !== selectionKey) return
         setSummary(res.summary ?? null)
         const st = res.summary?.status
         if (st !== 'pending' && st !== 'running') {
-          clearInterval(summaryPollRef.current)
-          summaryPollRef.current = null
+          clearInterval(intervalId)
+          if (summaryPollRef.current === intervalId) summaryPollRef.current = null
           setSummaryBusy(false)
-          if (st === 'completed') onDetailRefresh?.()
+          if (st === 'completed' && summarySelectionRef.current === selectionKey) onDetailRefresh?.()
         }
-      } catch {
+      } catch (e) {
+        if (controller.signal.aborted || summarySelectionRef.current !== selectionKey) return
         // A transient poll failure is not worth tearing the section down; the
         // next tick retries, and a real failure lands as status === 'failed'.
       }
-    }, SUMMARY_POLL_MS)
-    return () => {
-      clearInterval(summaryPollRef.current)
-      summaryPollRef.current = null
     }
-  }, [summaryStatus, archiveId, detail?.summary?.entry_uid])
+    const intervalId = setInterval(poll, SUMMARY_POLL_MS)
+    summaryPollRef.current = intervalId
+    return () => {
+      clearInterval(intervalId)
+      if (summaryPollRef.current === intervalId) summaryPollRef.current = null
+      controller.abort()
+      if (summaryPollAbortRef.current === controller) summaryPollAbortRef.current = null
+    }
+  }, [summaryStatus, archiveId, selectedEntry?.entry_uid, detail?.summary?.entry_uid, summarySelectionKey])
 
-  useEffect(() => () => clearInterval(summaryPollRef.current), [])
+  useEffect(() => () => {
+    clearInterval(summaryPollRef.current)
+    summaryPollAbortRef.current?.abort()
+    summaryGenerateAbortRef.current?.abort()
+  }, [])
 
   async function handleGenerateSummary(force = false) {
     if (!archiveId || !detail?.summary?.entry_uid || summaryBusy) return
+    const entryUid = detail.summary.entry_uid
+    const selectionKey = `${archiveId}:${entryUid}`
+    if (summarySelectionRef.current !== selectionKey) return
+    const controller = new AbortController()
+    summaryGenerateAbortRef.current?.abort()
+    summaryGenerateAbortRef.current = controller
     setSummaryBusy(true)
     setSummaryError('')
     try {
-      const res = await requestEntrySummary(archiveId, detail.summary.entry_uid, {
+      const res = await requestEntrySummary(archiveId, entryUid, {
         provider: summaryProvider,
         force,
         includeImages: includeSummaryImages,
+        signal: controller.signal,
       })
+      if (controller.signal.aborted || summarySelectionRef.current !== selectionKey) return
       if (res.status === 'completed') {
         // 200 cache hit: the response *is* the row, no polling needed.
         setSummary(res)
         setSummaryBusy(false)
-        onDetailRefresh?.()
+        if (summarySelectionRef.current === selectionKey) onDetailRefresh?.()
       } else {
         // 202: seed a local pending row so the poll effect starts immediately
         // rather than waiting a tick for the first GET.
         setSummary({ ...(res ?? {}), status: 'pending' })
       }
     } catch (e) {
+      if (controller.signal.aborted || summarySelectionRef.current !== selectionKey) return
       setSummaryError(e.message || 'Summary request failed')
       setSummaryBusy(false)
+    } finally {
+      if (summaryGenerateAbortRef.current === controller) summaryGenerateAbortRef.current = null
     }
   }
 
@@ -402,7 +441,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
   ] : []
 
   const AUDIO_EXTS = new Set(['mp3','ogg','m4a','opus','wav','flac','aac'])
-  const PREVIEW_EXTS = new Set(['mp4','webm','mov','mkv','avi','m4v','ogv','pdf','html','htm','jpg','jpeg','png','gif','webp','avif','svg','bmp'])
+  const PREVIEW_EXTS = new Set(['mp4','webm','mov','mkv','avi','m4v','ogv','pdf','html','htm','md','markdown','txt','jpg','jpeg','png','gif','webp','avif','svg','bmp'])
   const primaryMediaIdx = detail ? detail.artifacts.findIndex(a => a.artifact_role === 'primary_media') : -1
   const primaryMedia = primaryMediaIdx >= 0 ? detail.artifacts[primaryMediaIdx] : null
   const pmExt = primaryMedia ? primaryMedia.relpath.split('.').pop().toLowerCase() : ''

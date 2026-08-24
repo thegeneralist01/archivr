@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { fetchArtifactText } from '../api'
 
 /**
  * Renders the primary_media artifact of a text/document entry as plain text.
@@ -13,17 +14,15 @@ export default function TextPreview({ src, mime, title }) {
   const [error, setError] = useState(null)
 
   useEffect(() => {
-    let cancelled = false
+    const controller = new AbortController()
     setText(null)
     setError(null)
-    fetch(src, { credentials: 'same-origin' })
-      .then(r => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`)
-        return r.text()
+    fetchArtifactText(src, { signal: controller.signal })
+      .then(setText)
+      .catch(e => {
+        if (e.name !== 'AbortError') setError(e.message || String(e))
       })
-      .then(t => { if (!cancelled) setText(t) })
-      .catch(e => { if (!cancelled) setError(e.message || String(e)) })
-    return () => { cancelled = true }
+    return () => controller.abort()
   }, [src])
 
   if (error) {
