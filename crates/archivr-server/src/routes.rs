@@ -513,8 +513,13 @@ async fn entry_detail(
             return Err(ApiError::unauthorized("login required"));
         }
     }
-    let detail = archive::get_entry_detail(&conn, &entry_uid)?
+    let mut detail = archive::get_entry_detail(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
+    if matches!(auth_user, AuthUser::Guest) {
+        let entry_id = database::entry_id_for_uid(&conn, &entry_uid)?
+            .ok_or(ApiError::not_found("entry not found"))?;
+        detail.latest_summary = database::latest_completed_entry_summary(&conn, entry_id)?;
+    }
     Ok(Json(detail))
 }
 
@@ -547,7 +552,11 @@ async fn entry_summary_handler(
     }
     let entry_id = database::entry_id_for_uid(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
-    let summary = database::latest_entry_summary(&conn, entry_id)?;
+    let summary = if matches!(auth_user, AuthUser::Guest) {
+        database::latest_completed_entry_summary(&conn, entry_id)?
+    } else {
+        database::latest_entry_summary(&conn, entry_id)?
+    };
     Ok(Json(
         serde_json::json!({ "entry_uid": entry_uid, "summary": summary }),
     ))
@@ -590,70 +599,72 @@ async fn request_entry_summary_handler(
         include_images: body.include_images,
     };
 
-    let conn = database::open_or_initialize(&mounted.archive_path)?;
-    let entry_id = database::entry_id_for_uid(&conn, &entry_uid)?
-        .ok_or(ApiError::not_found("entry not found"))?;
-
-    // 2. Extract the same content the summarizer will feed the model, so the
-    //    digest below is the identical cache key summarize_entry will compute.
-    let input = summarizer::build_summary_input(&archive_paths, &entry_uid, summary_options)
-        .map_err(|e| {
-            if summarizer::is_unsupported_summary_content_error(&e) {
-                ApiError::bad_request(summarizer::UNSUPPORTED_SUMMARY_CONTENT_MESSAGE)
-            } else {
-                ApiError::bad_request(&format!("{e:#}"))
-            }
-        })?;
-
-    // 3. Cache hit: identical entry + provider + model + prompt + input.
-    if !body.force {
-        if let Some(existing) = database::find_entry_summary(
-            &conn,
-            entry_id,
-            provider.kind(),
-            provider.model(),
-            summarizer::PROMPT_VERSION,
-            &input.input_sha256,
-        )? {
-            if existing.status == "completed" {
-                return Ok((
-                    StatusCode::OK,
-                    serde_json::to_value(&existing)
-                        .map(Json)
-                        .map_err(|e| ApiError::internal(&e.to_string()))?,
-                ));
+    // 2. Preflight extraction and SQLite cache/attempt work are synchronous
+    // core operations, so keep them off the Axum runtime. This also means the
+    // input claimed here is passed directly to the provider worker below.
+    let preflight_paths = archive_paths.clone();
+    let preflight_uid = entry_uid.clone();
+    let provider_kind = provider.kind().to_string();
+    let provider_model = provider.model().map(str::to_string);
+    let force = body.force;
+    enum PreflightOutcome {
+        Cached(database::EntrySummaryRecord),
+        Pending { input: summarizer::SummaryInput, summary_uid: String },
+    }
+    let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<PreflightOutcome> {
+        let conn = database::open_or_initialize(&preflight_paths.archive_path)?;
+        let entry_id = database::entry_id_for_uid(&conn, &preflight_uid)?
+            .ok_or_else(|| anyhow::anyhow!("entry not found"))?;
+        // Preserve the route's historical 404 before attempting content
+        // extraction, whose own missing-entry error includes the uid.
+        let input = summarizer::build_summary_input(&preflight_paths, &preflight_uid, summary_options)?;
+        if !force {
+            if let Some(existing) = database::find_entry_summary(
+                &conn, entry_id, &provider_kind, provider_model.as_deref(),
+                summarizer::PROMPT_VERSION, &input.input_sha256,
+            )? {
+                if existing.status == "completed" {
+                    return Ok(PreflightOutcome::Cached(existing));
+                }
             }
         }
-    }
-
-    // 4. Claim the row up front so the 202 can name it and the client can poll
-    //    immediately, before the worker thread has done anything.
-    let summary_uid = database::upsert_pending_entry_summary(
-        &conn,
-        entry_id,
-        provider.kind(),
-        provider.model(),
-        summarizer::PROMPT_VERSION,
-        &input.input_sha256,
-    )?;
-    drop(conn);
+        let summary_uid = database::upsert_pending_entry_summary(
+            &conn, entry_id, &provider_kind, provider_model.as_deref(),
+            summarizer::PROMPT_VERSION, &input.input_sha256,
+        )?;
+        Ok(PreflightOutcome::Pending { input, summary_uid })
+    })
+    .await
+    .map_err(|e| ApiError::internal(&format!("summary preflight task failed: {e}")))?
+    .map_err(|e| {
+        if summarizer::is_unsupported_summary_content_error(&e) {
+            ApiError::bad_request(summarizer::UNSUPPORTED_SUMMARY_CONTENT_MESSAGE)
+        } else if format!("{e:#}") == "entry not found" {
+            ApiError::not_found("entry not found")
+        } else {
+            ApiError::bad_request(&format!("{e:#}"))
+        }
+    })?;
+    let (input, summary_uid) = match outcome {
+        PreflightOutcome::Cached(existing) => return Ok((
+            StatusCode::OK,
+            serde_json::to_value(&existing).map(Json)
+                .map_err(|e| ApiError::internal(&e.to_string()))?,
+        )),
+        PreflightOutcome::Pending { input, summary_uid } => (input, summary_uid),
+    };
 
     let archive_path = mounted.archive_path.clone();
-    let entry_uid_bg = entry_uid.clone();
     let summary_uid_bg = summary_uid.clone();
-    let summary_options_bg = summary_options;
     tokio::task::spawn_blocking(move || {
-        // summarize_entry owns the pending → running → completed/failed
-        // transitions for this same row (the cache key is identical, so the
-        // upsert above and the one inside it resolve to one row). We only have
-        // to catch the case where it fails before it can record anything.
+        // The input and attempt were claimed during blocking preflight, so no
+        // row is reset and no archive content is read twice.
         if let Err(e) =
-            summarizer::summarize_entry(
+            summarizer::summarize_prebuilt_entry(
                 &archive_paths,
-                &entry_uid_bg,
-                summary_options_bg,
+                input,
+                &summary_uid_bg,
                 provider.as_ref(),
-                summarizer::PROMPT_VERSION,
             )
         {
             eprintln!("warn: summary {summary_uid_bg}: {e:#}");
@@ -3160,6 +3171,97 @@ mod tests {
         assert!(!error.contains("raw/"));
         assert!(!error.contains("mime"));
         assert!(!error.contains("v1 unsupported"));
+    }
+
+    #[tokio::test]
+    async fn summary_request_for_missing_entry_returns_not_found_before_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _archive_path, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let previous_codex_cli = std::env::var_os("ARCHIVR_CODEX_CLI");
+        unsafe { std::env::set_var("ARCHIVR_CODEX_CLI", "/usr/bin/false") };
+
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/entries/ent_missing/summary")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({ "provider": "codex_cli" })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        match previous_codex_cli {
+            Some(value) => unsafe { std::env::set_var("ARCHIVR_CODEX_CLI", value) },
+            None => unsafe { std::env::remove_var("ARCHIVR_CODEX_CLI") },
+        }
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["error"], "entry not found");
+    }
+
+    #[tokio::test]
+    async fn public_summary_endpoints_hide_failed_diagnostics_but_authenticated_users_keep_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        let session = make_test_session(&auth_path);
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let summary_uid = database::upsert_pending_entry_summary(
+            &conn, entry.id, "codex_cli", None, summarizer::PROMPT_VERSION, "failed-public-test",
+        )
+        .unwrap();
+        database::update_entry_summary_status(
+            &conn, &summary_uid, "failed", None, Some("provider secret: raw diagnostic"),
+        )
+        .unwrap();
+        drop(conn);
+        let collection = api_make_collection(
+            registry.clone(), auth_path.clone(), &session, "Public summaries", "public-summaries", 3, false,
+        )
+        .await;
+        api_add_to_coll(
+            registry.clone(), auth_path.clone(), &session, &collection, &entry.entry_uid, 3,
+        )
+        .await;
+
+        let public_summary = app(registry.clone(), auth_path.clone())
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}/summary", entry.entry_uid))
+                .body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(public_summary.status(), StatusCode::OK);
+        assert!(body_json(public_summary).await["summary"].is_null());
+
+        let public_detail = app(registry.clone(), auth_path.clone())
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}", entry.entry_uid))
+                .body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(public_detail.status(), StatusCode::OK);
+        assert!(body_json(public_detail).await["latest_summary"].is_null());
+
+        let authenticated_summary = app(registry.clone(), auth_path.clone())
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}/summary", entry.entry_uid))
+                .header("cookie", &session)
+                .body(Body::empty()).unwrap())
+            .await.unwrap();
+        let authenticated_summary = body_json(authenticated_summary).await;
+        assert_eq!(authenticated_summary["summary"]["status"], "failed");
+        assert_eq!(authenticated_summary["summary"]["error_text"], "provider secret: raw diagnostic");
+
+        let authenticated_detail = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}", entry.entry_uid))
+                .header("cookie", &session)
+                .body(Body::empty()).unwrap())
+            .await.unwrap();
+        let authenticated_detail = body_json(authenticated_detail).await;
+        assert_eq!(authenticated_detail["latest_summary"]["status"], "failed");
+        assert_eq!(authenticated_detail["latest_summary"]["error_text"], "provider secret: raw diagnostic");
     }
 
     #[test]

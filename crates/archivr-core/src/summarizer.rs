@@ -1184,14 +1184,34 @@ pub fn summarize_entry(
         prompt_version,
         &input.input_sha256,
     )?;
-    database::update_entry_summary_status(&conn, &summary_uid, "running", None, None)?;
+    summarize_prebuilt_entry(
+        archive_paths,
+        input,
+        &summary_uid,
+        provider,
+    )
+}
+
+/// Runs a previously validated and claimed summary attempt.
+///
+/// The server uses this after doing its preflight in a blocking task, avoiding
+/// a second filesystem/SQLite extraction and ensuring provider output updates
+/// the exact pending row returned to the caller.
+pub fn summarize_prebuilt_entry(
+    archive_paths: &ArchivePaths,
+    input: SummaryInput,
+    summary_uid: &str,
+    provider: &dyn SummaryProvider,
+) -> Result<database::EntrySummaryRecord> {
+    let conn = database::open_or_initialize(&archive_paths.archive_path)?;
+    database::update_entry_summary_status(&conn, summary_uid, "running", None, None)?;
 
     match provider.summarize(&input.request) {
         Ok(output) => {
             let text = normalize_summary_json(&output.text);
             database::update_entry_summary_status(
                 &conn,
-                &summary_uid,
+                summary_uid,
                 "completed",
                 Some(&text),
                 None,
@@ -1201,7 +1221,7 @@ pub fn summarize_entry(
             let msg = format!("{e:#}");
             database::update_entry_summary_status(
                 &conn,
-                &summary_uid,
+                summary_uid,
                 "failed",
                 None,
                 Some(&msg),
@@ -1210,7 +1230,7 @@ pub fn summarize_entry(
         }
     }
 
-    database::get_entry_summary_by_uid(&conn, &summary_uid)?
+    database::get_entry_summary_by_uid(&conn, summary_uid)?
         .ok_or_else(|| anyhow!("summary row disappeared after write"))
 }
 
