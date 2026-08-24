@@ -50,8 +50,9 @@ use rusqlite::OptionalExtension;
 const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
 const LOGIN_MAX_ATTEMPTS: usize = 5;
 const MAX_TEXT_CAPTURE_BODY_BYTES: usize = 2 * 1024 * 1024;
-// The request includes a small JSON envelope in addition to the text body.
-const MAX_TEXT_CAPTURE_REQUEST_BYTES: usize = MAX_TEXT_CAPTURE_BODY_BYTES + 64 * 1024;
+// JSON can expand each body byte into a six-byte `\\u00XX` escape sequence,
+// plus a small request envelope.
+const MAX_TEXT_CAPTURE_REQUEST_BYTES: usize = MAX_TEXT_CAPTURE_BODY_BYTES * 6 + 64 * 1024;
 
 // Short-lived token granting unauthenticated access to one specific artifact.
 // Used so Cast / AirPlay devices (which carry no session cookie) can fetch media.
@@ -4390,6 +4391,32 @@ mod tests {
                     .header("cookie", &session_cookie)
                     .body(json_body(&serde_json::json!({
                         "title": "Maximum-size note",
+                        "body": body,
+                        "mime": "text/plain"
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn text_capture_accepts_a_two_mebibyte_body_with_json_escaped_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let body = "\0".repeat(2 * 1024 * 1024);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures/text")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({
+                        "title": "Escaped control note",
                         "body": body,
                         "mime": "text/plain"
                     })))
