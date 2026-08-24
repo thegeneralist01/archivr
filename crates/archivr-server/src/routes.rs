@@ -513,8 +513,13 @@ async fn entry_detail(
             return Err(ApiError::unauthorized("login required"));
         }
     }
-    let detail = archive::get_entry_detail(&conn, &entry_uid)?
+    let mut detail = archive::get_entry_detail(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
+    if matches!(auth_user, AuthUser::Guest) {
+        let entry_id = database::entry_id_for_uid(&conn, &entry_uid)?
+            .ok_or(ApiError::not_found("entry not found"))?;
+        detail.latest_summary = database::latest_completed_entry_summary(&conn, entry_id)?;
+    }
     Ok(Json(detail))
 }
 
@@ -547,7 +552,11 @@ async fn entry_summary_handler(
     }
     let entry_id = database::entry_id_for_uid(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
-    let summary = database::latest_entry_summary(&conn, entry_id)?;
+    let summary = if matches!(auth_user, AuthUser::Guest) {
+        database::latest_completed_entry_summary(&conn, entry_id)?
+    } else {
+        database::latest_entry_summary(&conn, entry_id)?
+    };
     Ok(Json(
         serde_json::json!({ "entry_uid": entry_uid, "summary": summary }),
     ))
@@ -3160,6 +3169,68 @@ mod tests {
         assert!(!error.contains("raw/"));
         assert!(!error.contains("mime"));
         assert!(!error.contains("v1 unsupported"));
+    }
+
+    #[tokio::test]
+    async fn public_summary_endpoints_hide_failed_diagnostics_but_authenticated_users_keep_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        let session = make_test_session(&auth_path);
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let summary_uid = database::upsert_pending_entry_summary(
+            &conn, entry.id, "codex_cli", None, summarizer::PROMPT_VERSION, "failed-public-test",
+        )
+        .unwrap();
+        database::update_entry_summary_status(
+            &conn, &summary_uid, "failed", None, Some("provider secret: raw diagnostic"),
+        )
+        .unwrap();
+        drop(conn);
+        let collection = api_make_collection(
+            registry.clone(), auth_path.clone(), &session, "Public summaries", "public-summaries", 3, false,
+        )
+        .await;
+        api_add_to_coll(
+            registry.clone(), auth_path.clone(), &session, &collection, &entry.entry_uid, 3,
+        )
+        .await;
+
+        let public_summary = app(registry.clone(), auth_path.clone())
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}/summary", entry.entry_uid))
+                .body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(public_summary.status(), StatusCode::OK);
+        assert!(body_json(public_summary).await["summary"].is_null());
+
+        let public_detail = app(registry.clone(), auth_path.clone())
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}", entry.entry_uid))
+                .body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(public_detail.status(), StatusCode::OK);
+        assert!(body_json(public_detail).await["latest_summary"].is_null());
+
+        let authenticated_summary = app(registry.clone(), auth_path.clone())
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}/summary", entry.entry_uid))
+                .header("cookie", &session)
+                .body(Body::empty()).unwrap())
+            .await.unwrap();
+        let authenticated_summary = body_json(authenticated_summary).await;
+        assert_eq!(authenticated_summary["summary"]["status"], "failed");
+        assert_eq!(authenticated_summary["summary"]["error_text"], "provider secret: raw diagnostic");
+
+        let authenticated_detail = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}", entry.entry_uid))
+                .header("cookie", &session)
+                .body(Body::empty()).unwrap())
+            .await.unwrap();
+        let authenticated_detail = body_json(authenticated_detail).await;
+        assert_eq!(authenticated_detail["latest_summary"]["status"], "failed");
+        assert_eq!(authenticated_detail["latest_summary"]["error_text"], "provider secret: raw diagnostic");
     }
 
     #[test]
