@@ -51,9 +51,12 @@ pub struct EntryDetail {
     pub source_metadata_json: String,
     pub display_metadata_json: Option<String>,
     pub artifacts: Vec<EntryArtifactSummary>,
-    /// Most recently updated summary for this entry, if any has ever been
-    /// requested. Always `None` on a fresh capture — summarization is manual.
+    /// Most recent completed summary for this entry. Always `None` on a fresh
+    /// capture — summarization is manual.
     pub latest_summary: Option<EntrySummaryView>,
+    /// Latest non-completed generation attempt, kept separate so a replacement
+    /// never displaces readable completed content.
+    pub summary_attempt: Option<EntrySummaryView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -354,7 +357,8 @@ pub fn get_entry_detail(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let latest_summary = database::latest_entry_summary(conn, entry_id)?;
+    let latest_summary = database::latest_completed_entry_summary(conn, entry_id)?;
+    let summary_attempt = database::latest_entry_summary_attempt(conn, entry_id)?;
 
     Ok(Some(EntryDetail {
         summary,
@@ -363,6 +367,7 @@ pub fn get_entry_detail(
         display_metadata_json,
         artifacts,
         latest_summary,
+        summary_attempt,
     }))
 }
 

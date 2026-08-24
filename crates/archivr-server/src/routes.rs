@@ -519,6 +519,7 @@ async fn entry_detail(
         let entry_id = database::entry_id_for_uid(&conn, &entry_uid)?
             .ok_or(ApiError::not_found("entry not found"))?;
         detail.latest_summary = database::latest_completed_entry_summary(&conn, entry_id)?;
+        detail.summary_attempt = None;
     }
     Ok(Json(detail))
 }
@@ -552,14 +553,19 @@ async fn entry_summary_handler(
     }
     let entry_id = database::entry_id_for_uid(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
-    let summary = if matches!(auth_user, AuthUser::Guest) {
-        database::latest_completed_entry_summary(&conn, entry_id)?
+    let (summary, attempt) = if matches!(auth_user, AuthUser::Guest) {
+        (database::latest_completed_entry_summary(&conn, entry_id)?, None)
     } else {
-        database::latest_entry_summary(&conn, entry_id)?
+        (
+            database::latest_completed_entry_summary(&conn, entry_id)?,
+            database::latest_entry_summary_attempt(&conn, entry_id)?,
+        )
     };
-    Ok(Json(
-        serde_json::json!({ "entry_uid": entry_uid, "summary": summary }),
-    ))
+    let mut body = serde_json::json!({ "entry_uid": entry_uid, "summary": summary });
+    if !matches!(auth_user, AuthUser::Guest) {
+        body["attempt"] = serde_json::to_value(attempt)?;
+    }
+    Ok(Json(body))
 }
 
 /// `POST /api/archives/:id/entries/:uid/summary`
@@ -3209,6 +3215,14 @@ mod tests {
         let entry = make_test_entry(&archive_path);
         let session = make_test_session(&auth_path);
         let conn = database::open_or_initialize(&archive_path).unwrap();
+        let completed_uid = database::upsert_pending_entry_summary(
+            &conn, entry.id, "codex_cli", None, summarizer::PROMPT_VERSION, "completed-public-test",
+        )
+        .unwrap();
+        database::update_entry_summary_status(
+            &conn, &completed_uid, "completed", Some("previous completed summary"), None,
+        )
+        .unwrap();
         let summary_uid = database::upsert_pending_entry_summary(
             &conn, entry.id, "codex_cli", None, summarizer::PROMPT_VERSION, "failed-public-test",
         )
@@ -3233,7 +3247,9 @@ mod tests {
                 .body(Body::empty()).unwrap())
             .await.unwrap();
         assert_eq!(public_summary.status(), StatusCode::OK);
-        assert!(body_json(public_summary).await["summary"].is_null());
+        let public_summary = body_json(public_summary).await;
+        assert_eq!(public_summary["summary"]["summary_uid"], completed_uid);
+        assert!(public_summary.get("attempt").is_none());
 
         let public_detail = app(registry.clone(), auth_path.clone())
             .oneshot(Request::builder()
@@ -3241,7 +3257,9 @@ mod tests {
                 .body(Body::empty()).unwrap())
             .await.unwrap();
         assert_eq!(public_detail.status(), StatusCode::OK);
-        assert!(body_json(public_detail).await["latest_summary"].is_null());
+        let public_detail = body_json(public_detail).await;
+        assert_eq!(public_detail["latest_summary"]["summary_uid"], completed_uid);
+        assert!(public_detail["summary_attempt"].is_null());
 
         let authenticated_summary = app(registry.clone(), auth_path.clone())
             .oneshot(Request::builder()
@@ -3250,8 +3268,10 @@ mod tests {
                 .body(Body::empty()).unwrap())
             .await.unwrap();
         let authenticated_summary = body_json(authenticated_summary).await;
-        assert_eq!(authenticated_summary["summary"]["status"], "failed");
-        assert_eq!(authenticated_summary["summary"]["error_text"], "provider secret: raw diagnostic");
+        assert_eq!(authenticated_summary["summary"]["summary_uid"], completed_uid);
+        assert_eq!(authenticated_summary["summary"]["summary_text"], "previous completed summary");
+        assert_eq!(authenticated_summary["attempt"]["status"], "failed");
+        assert_eq!(authenticated_summary["attempt"]["error_text"], "provider secret: raw diagnostic");
 
         let authenticated_detail = app(registry, auth_path)
             .oneshot(Request::builder()
@@ -3260,8 +3280,10 @@ mod tests {
                 .body(Body::empty()).unwrap())
             .await.unwrap();
         let authenticated_detail = body_json(authenticated_detail).await;
-        assert_eq!(authenticated_detail["latest_summary"]["status"], "failed");
-        assert_eq!(authenticated_detail["latest_summary"]["error_text"], "provider secret: raw diagnostic");
+        assert_eq!(authenticated_detail["latest_summary"]["summary_uid"], completed_uid);
+        assert_eq!(authenticated_detail["latest_summary"]["summary_text"], "previous completed summary");
+        assert_eq!(authenticated_detail["summary_attempt"]["status"], "failed");
+        assert_eq!(authenticated_detail["summary_attempt"]["error_text"], "provider secret: raw diagnostic");
     }
 
     #[test]

@@ -1644,7 +1644,8 @@ pub fn find_entry_summary(
 }
 
 /// Most recently touched summary for an entry, whatever its status.
-/// Backs `EntryDetail.latest_summary` and the GET summary route.
+/// Used where a caller explicitly needs the most recent attempt regardless of
+/// whether it has completed.
 pub fn latest_entry_summary(
     conn: &Connection,
     entry_id: i64,
@@ -1671,6 +1672,24 @@ pub fn latest_completed_entry_summary(
         &format!(
             "{ENTRY_SUMMARY_COLS} WHERE s.entry_id = ?1 AND s.status = 'completed'
              ORDER BY s.completed_at DESC, s.updated_at DESC, s.id DESC LIMIT 1"
+        ),
+        [entry_id],
+        map_entry_summary,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// The newest replacement attempt that has not completed. This includes failed
+/// rows so authenticated callers can show the failure beside a retained result.
+pub fn latest_entry_summary_attempt(
+    conn: &Connection,
+    entry_id: i64,
+) -> Result<Option<EntrySummaryRecord>> {
+    conn.query_row(
+        &format!(
+            "{ENTRY_SUMMARY_COLS} WHERE s.entry_id = ?1 AND s.status != 'completed'
+             ORDER BY s.updated_at DESC, s.id DESC LIMIT 1"
         ),
         [entry_id],
         map_entry_summary,
@@ -4716,6 +4735,36 @@ mod tests {
                 .summary_uid,
             first,
             "a failed regeneration must not replace the previous completed result"
+        );
+    }
+
+    #[test]
+    fn latest_summary_attempt_is_separate_from_the_retained_completed_summary() {
+        let c = conn();
+        let entry = create_entry_fixture(&c, "private", None, None);
+        let completed =
+            upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "old").unwrap();
+        update_entry_summary_status(&c, &completed, "completed", Some("previous"), None).unwrap();
+        let pending =
+            upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "new").unwrap();
+
+        assert_eq!(
+            latest_completed_entry_summary(&c, entry.id).unwrap().unwrap().summary_uid,
+            completed
+        );
+        assert_eq!(
+            latest_entry_summary_attempt(&c, entry.id).unwrap().unwrap().summary_uid,
+            pending
+        );
+
+        update_entry_summary_status(&c, &pending, "failed", None, Some("boom")).unwrap();
+        assert_eq!(
+            latest_completed_entry_summary(&c, entry.id).unwrap().unwrap().summary_text.as_deref(),
+            Some("previous")
+        );
+        assert_eq!(
+            latest_entry_summary_attempt(&c, entry.id).unwrap().unwrap().status,
+            "failed"
         );
     }
 

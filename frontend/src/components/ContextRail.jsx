@@ -61,10 +61,10 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
   useEffect(() => { setFontsOpen(false) }, [detail?.summary?.entry_uid])
 
   // ── Summary state ───────────────────────────────────────────────────────
-  // `summary` mirrors the server row. It is seeded from detail.latest_summary so
-  // the section renders immediately on selection, then kept fresh by polling
-  // only while a job is non-terminal.
+  // A completed summary and its replacement attempt are intentionally separate:
+  // regeneration must not blank or overwrite readable content while it runs.
   const [summary, setSummary] = useState(null)
+  const [summaryAttempt, setSummaryAttempt] = useState(null)
   const [summaryError, setSummaryError] = useState('')
   const [summaryBusy, setSummaryBusy] = useState(false)
   const [summaryProvider, setSummaryProvider] = useState(() => {
@@ -145,19 +145,20 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
     summaryGenerateAbortRef.current = null
     const detailMatchesSelection = detail?.summary?.entry_uid === selectedEntry?.entry_uid
     setSummary(detailMatchesSelection ? detail.latest_summary ?? null : null)
+    setSummaryAttempt(detailMatchesSelection ? detail.summary_attempt ?? null : null)
     setSummaryError('')
     setSummaryBusy(false)
     setIncludeSummaryImages(false)
   }, [archiveId, selectedEntry?.entry_uid, detail?.summary?.entry_uid])
 
-  // Poll only while the latest summary is non-terminal. Anchoring the effect on
-  // the status (rather than starting a timer inside the click handler) means a
-  // job still running when the user navigates away and back is picked up again.
-  const summaryStatus = summary?.status
+  // Poll only while a replacement attempt is non-terminal. Anchoring the effect
+  // on its status means a job still running when the user navigates away and
+  // back is picked up again without displacing completed content.
+  const summaryAttemptStatus = summaryAttempt?.status
   useEffect(() => {
     clearInterval(summaryPollRef.current)
     summaryPollRef.current = null
-    if (summaryStatus !== 'pending' && summaryStatus !== 'running') return
+    if (summaryAttemptStatus !== 'pending' && summaryAttemptStatus !== 'running') return
     if (!archiveId || !detail?.summary?.entry_uid) return
     const entryUid = detail.summary.entry_uid
     const selectionKey = `${archiveId}:${entryUid}`
@@ -169,7 +170,8 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
         const res = await fetchEntrySummary(archiveId, entryUid, { signal: controller.signal })
         if (controller.signal.aborted || summarySelectionRef.current !== selectionKey) return
         setSummary(res.summary ?? null)
-        const st = res.summary?.status
+        setSummaryAttempt(res.attempt ?? null)
+        const st = res.attempt?.status
         if (st !== 'pending' && st !== 'running') {
           clearInterval(intervalId)
           if (summaryPollRef.current === intervalId) summaryPollRef.current = null
@@ -190,7 +192,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
       controller.abort()
       if (summaryPollAbortRef.current === controller) summaryPollAbortRef.current = null
     }
-  }, [summaryStatus, archiveId, selectedEntry?.entry_uid, detail?.summary?.entry_uid, summarySelectionKey])
+  }, [summaryAttemptStatus, archiveId, selectedEntry?.entry_uid, detail?.summary?.entry_uid, summarySelectionKey])
 
   useEffect(() => () => {
     clearInterval(summaryPollRef.current)
@@ -219,12 +221,13 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
       if (res.status === 'completed') {
         // 200 cache hit: the response *is* the row, no polling needed.
         setSummary(res)
+        setSummaryAttempt(null)
         setSummaryBusy(false)
         if (summarySelectionRef.current === selectionKey) onDetailRefresh?.()
       } else {
         // 202: seed a local pending row so the poll effect starts immediately
         // rather than waiting a tick for the first GET.
-        setSummary({ ...(res ?? {}), status: 'pending' })
+        setSummaryAttempt({ ...(res ?? {}), status: 'pending' })
       }
     } catch (e) {
       if (controller.signal.aborted || summarySelectionRef.current !== selectionKey) return
@@ -607,9 +610,9 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
             const parsed = summary?.status === 'completed'
               ? parseSummaryText(summary.summary_text)
               : null
-            const running = summary?.status === 'pending' || summary?.status === 'running'
+            const running = summaryAttempt?.status === 'pending' || summaryAttempt?.status === 'running'
             const unsupportedContent =
-              (summary?.status === 'failed' && summary.error_text === UNSUPPORTED_SUMMARY_CONTENT_MESSAGE) ||
+              (summaryAttempt?.status === 'failed' && summaryAttempt.error_text === UNSUPPORTED_SUMMARY_CONTENT_MESSAGE) ||
               summaryError === UNSUPPORTED_SUMMARY_CONTENT_MESSAGE
             if (isPublicSession && !parsed) return null
             return (
@@ -649,9 +652,9 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
                     <p className="rail-summary-info__detail">{UNSUPPORTED_SUMMARY_CONTENT_DETAIL}</p>
                   </div>
                 )}
-                {summary?.status === 'failed' && summary.error_text && !unsupportedContent && !isPublicSession && (
+                {summaryAttempt?.status === 'failed' && summaryAttempt.error_text && !unsupportedContent && !isPublicSession && (
                   <p className="form-msg form-msg--err rail-summary-error">
-                    {summary.error_text}
+                    {summaryAttempt.error_text}
                   </p>
                 )}
                 {summaryError && !unsupportedContent && (
