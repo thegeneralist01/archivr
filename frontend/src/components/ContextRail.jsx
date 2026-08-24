@@ -77,10 +77,10 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
   const summaryPollAbortRef = useRef(null)
   const summaryGenerateAbortRef = useRef(null)
   const summarySelectionRef = useRef(null)
-  // Update before effects run so a request settled during a new selection's
-  // render can never apply state or refresh the newly selected entry.
-  const summarySelectionKey = archiveId && detail?.summary?.entry_uid
-    ? `${archiveId}:${detail.summary.entry_uid}`
+  // Update before effects run from the list selection, not detail: detail can
+  // briefly describe the previously selected entry while its replacement loads.
+  const summarySelectionKey = archiveId && selectedEntry?.entry_uid
+    ? `${archiveId}:${selectedEntry.entry_uid}`
     : null
   summarySelectionRef.current = summarySelectionKey
 
@@ -143,11 +143,12 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
     summaryPollAbortRef.current = null
     summaryGenerateAbortRef.current?.abort()
     summaryGenerateAbortRef.current = null
-    setSummary(detail?.latest_summary ?? null)
+    const detailMatchesSelection = detail?.summary?.entry_uid === selectedEntry?.entry_uid
+    setSummary(detailMatchesSelection ? detail.latest_summary ?? null : null)
     setSummaryError('')
     setSummaryBusy(false)
     setIncludeSummaryImages(false)
-  }, [archiveId, detail?.summary?.entry_uid])
+  }, [archiveId, selectedEntry?.entry_uid, detail?.summary?.entry_uid])
 
   // Poll only while the latest summary is non-terminal. Anchoring the effect on
   // the status (rather than starting a timer inside the click handler) means a
@@ -160,6 +161,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
     if (!archiveId || !detail?.summary?.entry_uid) return
     const entryUid = detail.summary.entry_uid
     const selectionKey = `${archiveId}:${entryUid}`
+    if (summarySelectionKey !== selectionKey) return
     const controller = new AbortController()
     summaryPollAbortRef.current = controller
     const poll = async () => {
@@ -172,7 +174,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
           clearInterval(intervalId)
           if (summaryPollRef.current === intervalId) summaryPollRef.current = null
           setSummaryBusy(false)
-          if (st === 'completed') onDetailRefresh?.()
+          if (st === 'completed' && summarySelectionRef.current === selectionKey) onDetailRefresh?.()
         }
       } catch (e) {
         if (controller.signal.aborted || summarySelectionRef.current !== selectionKey) return
@@ -188,7 +190,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
       controller.abort()
       if (summaryPollAbortRef.current === controller) summaryPollAbortRef.current = null
     }
-  }, [summaryStatus, archiveId, detail?.summary?.entry_uid])
+  }, [summaryStatus, archiveId, selectedEntry?.entry_uid, detail?.summary?.entry_uid, summarySelectionKey])
 
   useEffect(() => () => {
     clearInterval(summaryPollRef.current)
@@ -200,6 +202,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
     if (!archiveId || !detail?.summary?.entry_uid || summaryBusy) return
     const entryUid = detail.summary.entry_uid
     const selectionKey = `${archiveId}:${entryUid}`
+    if (summarySelectionRef.current !== selectionKey) return
     const controller = new AbortController()
     summaryGenerateAbortRef.current?.abort()
     summaryGenerateAbortRef.current = controller
@@ -217,7 +220,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
         // 200 cache hit: the response *is* the row, no polling needed.
         setSummary(res)
         setSummaryBusy(false)
-        onDetailRefresh?.()
+        if (summarySelectionRef.current === selectionKey) onDetailRefresh?.()
       } else {
         // 202: seed a local pending row so the poll effect starts immediately
         // rather than waiting a tick for the first GET.
