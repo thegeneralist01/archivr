@@ -36,6 +36,14 @@ pub struct EntrySummary {
     pub cacheable_bytes: i64,
 }
 
+/// One stored LLM summary, as exposed over the API.
+///
+/// Aliased rather than redefined: the DB row is already the exact shape the
+/// frontend needs, and a second near-identical struct would only add a mapping
+/// step to keep in sync. The `View` name exists because `EntrySummary` in this
+/// module is the *entry listing* row, an unrelated thing.
+pub use crate::database::EntrySummaryRecord as EntrySummaryView;
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct EntryDetail {
     pub summary: EntrySummary,
@@ -43,6 +51,12 @@ pub struct EntryDetail {
     pub source_metadata_json: String,
     pub display_metadata_json: Option<String>,
     pub artifacts: Vec<EntryArtifactSummary>,
+    /// Most recent completed summary for this entry. Always `None` on a fresh
+    /// capture — summarization is manual.
+    pub latest_summary: Option<EntrySummaryView>,
+    /// Latest non-completed generation attempt, kept separate so a replacement
+    /// never displaces readable completed content.
+    pub summary_attempt: Option<EntrySummaryView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -343,12 +357,17 @@ pub fn get_entry_detail(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
+    let latest_summary = database::latest_completed_entry_summary(conn, entry_id)?;
+    let summary_attempt = database::latest_entry_summary_attempt(conn, entry_id)?;
+
     Ok(Some(EntryDetail {
         summary,
         structured_root_relpath,
         source_metadata_json,
         display_metadata_json,
         artifacts,
+        latest_summary,
+        summary_attempt,
     }))
 }
 
@@ -759,7 +778,14 @@ pub fn search_entries(
         sql.push_str(&format!(
             " AND (LOWER(e.title) LIKE ?{n} OR LOWER(si.canonical_url) LIKE ?{n} \
              OR LOWER(e.entry_uid) LIKE ?{n} OR LOWER(e.source_kind) LIKE ?{n} \
-             OR LOWER(e.entity_kind) LIKE ?{n} OR LOWER(e.visibility) LIKE ?{n})"
+             OR LOWER(e.entity_kind) LIKE ?{n} OR LOWER(e.visibility) LIKE ?{n} \
+             OR LOWER(COALESCE((\
+                 SELECT s.summary_text FROM entry_summaries s \
+                 WHERE s.entry_id = e.id AND s.status = 'completed' \
+                   AND s.summary_text IS NOT NULL \
+                 ORDER BY s.completed_at DESC, s.updated_at DESC, s.id DESC \
+                 LIMIT 1\
+             ), '')) LIKE ?{n})"
         ));
         params.push(term);
     }
@@ -1481,6 +1507,192 @@ mod tests {
         )
         .unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    fn entry_id_by_title(conn: &rusqlite::Connection, title: &str) -> i64 {
+        conn.query_row(
+            "SELECT id FROM archived_entries WHERE title = ?1",
+            [title],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn complete_summary(
+        conn: &rusqlite::Connection,
+        entry_id: i64,
+        cache_key: &str,
+        summary_text: &str,
+    ) -> String {
+        let uid = database::upsert_pending_entry_summary(
+            conn,
+            entry_id,
+            "test_provider",
+            None,
+            "v1",
+            cache_key,
+        )
+        .unwrap();
+        database::update_entry_summary_status(conn, &uid, "completed", Some(summary_text), None)
+            .unwrap();
+        uid
+    }
+
+    fn set_summary_timestamps(
+        conn: &rusqlite::Connection,
+        summary_uid: &str,
+        timestamp: &str,
+    ) {
+        conn.execute(
+            "UPDATE entry_summaries SET completed_at = ?1, updated_at = ?1 WHERE summary_uid = ?2",
+            rusqlite::params![timestamp, summary_uid],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn search_summary_json_tags_match_and_unrelated_text_is_absent() {
+        let conn = make_test_db_with_entries();
+        let entry_id = entry_id_by_title(&conn, "Resume Templates");
+        complete_summary(
+            &conn,
+            entry_id,
+            "tags",
+            r#"{"tags":["skincare","dermatology"]}"#,
+        );
+
+        let matches = search_entries(
+            &conn,
+            &SearchEntriesQuery {
+                q: Some("skincare".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].title.as_deref(), Some("Resume Templates"));
+
+        let unrelated = search_entries(
+            &conn,
+            &SearchEntriesQuery {
+                q: Some("neurology".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(unrelated.is_empty());
+    }
+
+    #[test]
+    fn search_summary_uses_only_the_newest_completed_row() {
+        let conn = make_test_db_with_entries();
+        let entry_id = entry_id_by_title(&conn, "Resume Templates");
+        let older = complete_summary(&conn, entry_id, "older", "legacy-skincare-term");
+        set_summary_timestamps(&conn, &older, "2026-01-01T00:00:00Z");
+        let newer = complete_summary(&conn, entry_id, "newer", "current-dermatology-term");
+        set_summary_timestamps(&conn, &newer, "2026-02-01T00:00:00Z");
+
+        let old_matches = search_entries(
+            &conn,
+            &SearchEntriesQuery {
+                q: Some("legacy-skincare-term".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(old_matches.is_empty());
+
+        let current_matches = search_entries(
+            &conn,
+            &SearchEntriesQuery {
+                q: Some("current-dermatology-term".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(current_matches.len(), 1);
+    }
+
+    #[test]
+    fn search_summary_keeps_latest_completed_when_newer_rows_are_pending_or_failed() {
+        let conn = make_test_db_with_entries();
+        let entry_id = entry_id_by_title(&conn, "Resume Templates");
+        let completed = complete_summary(&conn, entry_id, "completed", "retained-skincare-term");
+        set_summary_timestamps(&conn, &completed, "2026-01-01T00:00:00Z");
+
+        let pending = database::upsert_pending_entry_summary(
+            &conn,
+            entry_id,
+            "test_provider",
+            None,
+            "v1",
+            "pending",
+        )
+        .unwrap();
+        set_summary_timestamps(&conn, &pending, "2026-03-01T00:00:00Z");
+        let failed = database::upsert_pending_entry_summary(
+            &conn,
+            entry_id,
+            "test_provider",
+            None,
+            "v1",
+            "failed",
+        )
+        .unwrap();
+        database::update_entry_summary_status(&conn, &failed, "failed", None, Some("boom")).unwrap();
+        set_summary_timestamps(&conn, &failed, "2026-04-01T00:00:00Z");
+
+        let matches = search_entries(
+            &conn,
+            &SearchEntriesQuery {
+                q: Some("retained-skincare-term".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn search_summary_preserves_prefix_collection_and_visibility_scope() {
+        let conn = make_test_db_with_entries();
+        let entry_id = entry_id_by_title(&conn, "Polymarket tweet");
+        complete_summary(&conn, entry_id, "scoped", "scoped-skincare-term");
+        let tag = create_tag(&conn, "/summary-scope").unwrap();
+        database::assign_entry_to_tag(
+            &conn,
+            entry_id,
+            database::get_tag_by_uid(&conn, &tag.tag_uid).unwrap().unwrap().id,
+        )
+        .unwrap();
+        let collection = database::create_collection(&conn, "Summary scope", "summary-scope", 2, false)
+            .unwrap();
+        database::add_entry_to_collection(&conn, collection.id, entry_id, 2).unwrap();
+
+        let query = SearchEntriesQuery {
+            q: Some("scoped-skincare-term".to_string()),
+            source_kind: Some("x".to_string()),
+            entity_kind: Some("tweet".to_string()),
+            url: Some("x.com".to_string()),
+            title: Some("polymarket".to_string()),
+            after: Some("2020-01-01T00:00:00Z".to_string()),
+            before: Some("9999-01-01T00:00:00Z".to_string()),
+            tag: Some("/summary-scope".to_string()),
+            caller_bits: 1,
+            collection_id: Some(collection.id),
+        };
+        assert!(search_entries(&conn, &query).unwrap().is_empty());
+
+        let matches = search_entries(
+            &conn,
+            &SearchEntriesQuery {
+                caller_bits: 2,
+                ..query
+            },
+        )
+        .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].title.as_deref(), Some("Polymarket tweet"));
     }
 
     // ---- tag API tests ----

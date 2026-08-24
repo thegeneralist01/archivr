@@ -1,5 +1,5 @@
-async function getJson(url) {
-  const response = await fetch(url);
+async function getJson(url, options) {
+  const response = await fetch(url, options);
   if (!response.ok) {
     throw new Error(`${response.status} ${response.statusText}`);
   }
@@ -27,6 +27,50 @@ export async function searchEntries(archiveId, q, tag, collectionUid = null) {
 
 export async function fetchEntryDetail(archiveId, entryUid) {
   return getJson(`/api/archives/${archiveId}/entries/${entryUid}`);
+}
+
+// ── Entry summaries ────────────────────────────────────────────────────────
+// Summaries are generated on demand, never at capture time. GET is safe for
+// public sessions (the server applies the same visibility gate as entry detail).
+
+export async function fetchEntrySummary(archiveId, entryUid, { signal } = {}) {
+  return getJson(`/api/archives/${archiveId}/entries/${entryUid}/summary`, { signal });
+}
+
+// Kicks off generation. Resolves to either an existing completed summary (200)
+// or a freshly claimed pending row (202) — both carry a summary_uid, so the
+// caller polls fetchEntrySummary either way.
+// The server returns 400 with the exact missing env var name when a provider is
+// unconfigured, so its body is surfaced verbatim rather than replaced.
+export async function requestEntrySummary(archiveId, entryUid, { provider, force = false, includeImages = false, signal } = {}) {
+  const resp = await fetch(
+    `/api/archives/${archiveId}/entries/${entryUid}/summary`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider, force, include_images: includeImages }),
+      signal,
+    }
+  );
+  if (!resp.ok) {
+    // ApiError renders as { "error": "..." }; that message is the useful part
+    // (e.g. "missing required environment variable: ARCHIVR_ANTHROPIC_API_KEY"),
+    // so surface it verbatim instead of a generic status string.
+    const detail = await resp.text();
+    let message = detail.trim();
+    try { message = JSON.parse(detail).error || message } catch { /* non-JSON body */ }
+    throw new Error(message || `Summary request failed (${resp.status})`);
+  }
+  return resp.json();
+}
+
+// Text artifacts are served by the same entry-artifact endpoint as previews.
+// Keep credentials explicit because this helper is also used by public/private
+// archive views, and preserve the previous concise HTTP error contract.
+export async function fetchArtifactText(src, { signal } = {}) {
+  const response = await fetch(src, { credentials: 'same-origin', signal });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.text();
 }
 
 export async function fetchEntryChildren(archiveId, entryUid) {
@@ -161,6 +205,24 @@ export async function submitCapture(archiveId, locator, quality = null, extensio
     if (extensions.sync === true) payload.sync = true
   }
   const res = await fetch(`/api/archives/${archiveId}/captures`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    const err = new Error(body.error || `HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json(); // { job_uid, status: "pending" }
+}
+
+export async function submitTextCapture(archiveId, {title, body, mime = 'text/markdown'}) {
+  const payload = { title, body };
+  if (mime && mime !== 'text/markdown') payload.mime = mime;
+
+  const res = await fetch(`/api/archives/${archiveId}/captures/text`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),

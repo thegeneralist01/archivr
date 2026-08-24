@@ -1,8 +1,42 @@
-import { useState, useEffect, useRef } from 'react'
-import { fetchEntryTags, assignTag, removeTag, listEntryCollections, listCollections, addEntryToCollection, updateEntryTitle, deleteEntry, rearchiveEntry, pollCaptureJob } from '../api'
+import { useState, useEffect, useLayoutEffect, useRef } from 'react'
+import { fetchEntryTags, assignTag, removeTag, listEntryCollections, listCollections, addEntryToCollection, updateEntryTitle, deleteEntry, rearchiveEntry, pollCaptureJob, fetchEntrySummary, requestEntrySummary } from '../api'
 import { formatTimestamp, formatBytes, valueText, sourceIconSvg, displayPath } from '../utils'
 
 const VIS_LABEL = { 0: 'Private', 1: 'Public', 2: 'Users only', 3: 'Public' }
+
+// Provider labels are display-only; the values are the provider_kind strings
+// the server persists in entry_summaries.provider_kind.
+const SUMMARY_PROVIDERS = [
+  { value: 'anthropic_http', label: 'Anthropic API' },
+  { value: 'openai_compatible', label: 'OpenAI-compatible API' },
+  { value: 'claude_cli', label: 'Claude CLI' },
+  { value: 'codex_cli', label: 'Codex CLI' },
+]
+const PROVIDER_LABEL = Object.fromEntries(SUMMARY_PROVIDERS.map(p => [p.value, p.label]))
+const SUMMARY_PROVIDER_KEY = 'archivr:summary:provider'
+const SUMMARY_POLL_MS = 1500
+const UNSUPPORTED_SUMMARY_CONTENT_HEADING = 'This entry can’t be summarized yet.'
+const UNSUPPORTED_SUMMARY_CONTENT_DETAIL = 'It doesn’t contain archived text that a summary provider can read. Summaries currently support text notes, web pages, X posts and threads, and X Articles. Video, audio, and image-only entries need a transcript or text source.'
+const UNSUPPORTED_SUMMARY_CONTENT_MESSAGE = `${UNSUPPORTED_SUMMARY_CONTENT_HEADING}\n\n${UNSUPPORTED_SUMMARY_CONTENT_DETAIL}`
+
+// Summaries are stored as the raw JSON string the model produced (normalized
+// server-side to {tldr, summary, tags}). Parsing can still fail for rows written
+// by an older prompt version, so fall back to showing the text as-is rather than
+// hiding a summary the user can perfectly well read.
+function parseSummaryText(text) {
+  if (!text) return null
+  try {
+    const parsed = JSON.parse(text)
+    if (parsed && typeof parsed === 'object') {
+      return {
+        tldr: typeof parsed.tldr === 'string' ? parsed.tldr : '',
+        summary: typeof parsed.summary === 'string' ? parsed.summary : '',
+        tags: Array.isArray(parsed.tags) ? parsed.tags.filter(t => typeof t === 'string') : [],
+      }
+    }
+  } catch { /* not JSON — fall through */ }
+  return { tldr: '', summary: text, tags: [] }
+}
 
 
 const ExternalIcon = () => (
@@ -25,6 +59,30 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
   const rearchivePollRef = useRef(null)
   const [fontsOpen, setFontsOpen] = useState(false)
   useEffect(() => { setFontsOpen(false) }, [detail?.summary?.entry_uid])
+
+  // ── Summary state ───────────────────────────────────────────────────────
+  // A completed summary and its replacement attempt are intentionally separate:
+  // regeneration must not blank or overwrite readable content while it runs.
+  const [summary, setSummary] = useState(null)
+  const [summaryAttempt, setSummaryAttempt] = useState(null)
+  const [summaryError, setSummaryError] = useState('')
+  const [summaryBusy, setSummaryBusy] = useState(false)
+  const [summaryProvider, setSummaryProvider] = useState(() => {
+    try {
+      return sessionStorage.getItem(SUMMARY_PROVIDER_KEY) || SUMMARY_PROVIDERS[0].value
+    } catch { return SUMMARY_PROVIDERS[0].value }
+  })
+  const [includeSummaryImages, setIncludeSummaryImages] = useState(false)
+  const summaryPollRef = useRef(null)
+  const summaryPollAbortRef = useRef(null)
+  const summaryGenerateAbortRef = useRef(null)
+  const summarySelectionRef = useRef(null)
+  // Update before effects run from the list selection, not detail: detail can
+  // briefly describe the previously selected entry while its replacement loads.
+  const summarySelectionKey = archiveId && selectedEntry?.entry_uid
+    ? `${archiveId}:${selectedEntry.entry_uid}`
+    : null
+  summarySelectionRef.current = summarySelectionKey
 
   // ── Bulk-panel state ────────────────────────────────────────────────────
   const isBulk = selectedUids?.size >= 2
@@ -75,6 +133,116 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
       clearInterval(rearchivePollRef.current)
     }
   }, [])
+
+  // Seed the summary from the entry detail payload and stop any poll left over
+  // from the previously selected entry.
+  useLayoutEffect(() => {
+    clearInterval(summaryPollRef.current)
+    summaryPollRef.current = null
+    summaryPollAbortRef.current?.abort()
+    summaryPollAbortRef.current = null
+    summaryGenerateAbortRef.current?.abort()
+    summaryGenerateAbortRef.current = null
+    const detailMatchesSelection = detail?.summary?.entry_uid === selectedEntry?.entry_uid
+    setSummary(detailMatchesSelection ? detail.latest_summary ?? null : null)
+    setSummaryAttempt(detailMatchesSelection ? detail.summary_attempt ?? null : null)
+    setSummaryError('')
+    setSummaryBusy(false)
+    setIncludeSummaryImages(false)
+  }, [archiveId, selectedEntry?.entry_uid, detail?.summary?.entry_uid])
+
+  // Poll only while a replacement attempt is non-terminal. Anchoring the effect
+  // on its status means a job still running when the user navigates away and
+  // back is picked up again without displacing completed content.
+  const summaryAttemptStatus = summaryAttempt?.status
+  useEffect(() => {
+    clearInterval(summaryPollRef.current)
+    summaryPollRef.current = null
+    if (summaryAttemptStatus !== 'pending' && summaryAttemptStatus !== 'running') return
+    if (!archiveId || !detail?.summary?.entry_uid) return
+    const entryUid = detail.summary.entry_uid
+    const selectionKey = `${archiveId}:${entryUid}`
+    if (summarySelectionKey !== selectionKey) return
+    const controller = new AbortController()
+    summaryPollAbortRef.current = controller
+    const poll = async () => {
+      try {
+        const res = await fetchEntrySummary(archiveId, entryUid, { signal: controller.signal })
+        if (controller.signal.aborted || summarySelectionRef.current !== selectionKey) return
+        setSummary(res.summary ?? null)
+        setSummaryAttempt(res.attempt ?? null)
+        const st = res.attempt?.status
+        if (st !== 'pending' && st !== 'running') {
+          clearInterval(intervalId)
+          if (summaryPollRef.current === intervalId) summaryPollRef.current = null
+          setSummaryBusy(false)
+          if (st === 'completed' && summarySelectionRef.current === selectionKey) onDetailRefresh?.()
+        }
+      } catch (e) {
+        if (controller.signal.aborted || summarySelectionRef.current !== selectionKey) return
+        // A transient poll failure is not worth tearing the section down; the
+        // next tick retries, and a real failure lands as status === 'failed'.
+      }
+    }
+    const intervalId = setInterval(poll, SUMMARY_POLL_MS)
+    summaryPollRef.current = intervalId
+    return () => {
+      clearInterval(intervalId)
+      if (summaryPollRef.current === intervalId) summaryPollRef.current = null
+      controller.abort()
+      if (summaryPollAbortRef.current === controller) summaryPollAbortRef.current = null
+    }
+  }, [summaryAttemptStatus, archiveId, selectedEntry?.entry_uid, detail?.summary?.entry_uid, summarySelectionKey])
+
+  useEffect(() => () => {
+    clearInterval(summaryPollRef.current)
+    summaryPollAbortRef.current?.abort()
+    summaryGenerateAbortRef.current?.abort()
+  }, [])
+
+  async function handleGenerateSummary(force = false) {
+    if (!archiveId || !detail?.summary?.entry_uid || summaryBusy) return
+    const entryUid = detail.summary.entry_uid
+    const selectionKey = `${archiveId}:${entryUid}`
+    if (summarySelectionRef.current !== selectionKey) return
+    const controller = new AbortController()
+    summaryGenerateAbortRef.current?.abort()
+    summaryGenerateAbortRef.current = controller
+    setSummaryBusy(true)
+    setSummaryError('')
+    try {
+      const res = await requestEntrySummary(archiveId, entryUid, {
+        provider: summaryProvider,
+        force,
+        includeImages: includeSummaryImages,
+        signal: controller.signal,
+      })
+      if (controller.signal.aborted || summarySelectionRef.current !== selectionKey) return
+      if (res.status === 'completed') {
+        // 200 cache hit: the response *is* the row, no polling needed.
+        setSummary(res)
+        setSummaryAttempt(null)
+        setSummaryBusy(false)
+        if (summarySelectionRef.current === selectionKey) onDetailRefresh?.()
+      } else {
+        // 202: seed a local pending row so the poll effect starts immediately
+        // rather than waiting a tick for the first GET.
+        setSummaryAttempt({ ...(res ?? {}), status: 'pending' })
+      }
+    } catch (e) {
+      if (controller.signal.aborted || summarySelectionRef.current !== selectionKey) return
+      setSummaryError(e.message || 'Summary request failed')
+      setSummaryBusy(false)
+    } finally {
+      if (summaryGenerateAbortRef.current === controller) summaryGenerateAbortRef.current = null
+    }
+  }
+
+  function handleProviderChange(value) {
+    setSummaryProvider(value)
+    if (value === 'claude_cli') setIncludeSummaryImages(false)
+    try { sessionStorage.setItem(SUMMARY_PROVIDER_KEY, value) } catch { /* private mode */ }
+  }
 
   // Fetch available collections whenever archiveId is available
   useEffect(() => {
@@ -276,7 +444,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
   ] : []
 
   const AUDIO_EXTS = new Set(['mp3','ogg','m4a','opus','wav','flac','aac'])
-  const PREVIEW_EXTS = new Set(['mp4','webm','mov','mkv','avi','m4v','ogv','pdf','html','htm','jpg','jpeg','png','gif','webp','avif','svg','bmp'])
+  const PREVIEW_EXTS = new Set(['mp4','webm','mov','mkv','avi','m4v','ogv','pdf','html','htm','md','markdown','txt','jpg','jpeg','png','gif','webp','avif','svg','bmp'])
   const primaryMediaIdx = detail ? detail.artifacts.findIndex(a => a.artifact_role === 'primary_media') : -1
   const primaryMedia = primaryMediaIdx >= 0 ? detail.artifacts[primaryMediaIdx] : null
   const pmExt = primaryMedia ? primaryMedia.relpath.split('.').pop().toLowerCase() : ''
@@ -434,6 +602,107 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
               Preview
             </button>
           )}
+
+          {(() => {
+            // Public sessions get read-only treatment: the completed text if the
+            // server's visibility gate let the detail through at all, and never
+            // the provider selector or Generate button.
+            const parsed = summary?.status === 'completed'
+              ? parseSummaryText(summary.summary_text)
+              : null
+            const running = summaryAttempt?.status === 'pending' || summaryAttempt?.status === 'running'
+            const unsupportedContent =
+              (summaryAttempt?.status === 'failed' && summaryAttempt.error_text === UNSUPPORTED_SUMMARY_CONTENT_MESSAGE) ||
+              summaryError === UNSUPPORTED_SUMMARY_CONTENT_MESSAGE
+            if (isPublicSession && !parsed) return null
+            return (
+              <div className="rail-section rail-summary">
+                <div className="rail-section-heading">Summary</div>
+
+                {parsed && (
+                  <div className="rail-summary-body">
+                    {parsed.tldr && <p className="rail-summary-tldr">{parsed.tldr}</p>}
+                    {parsed.summary && <p className="rail-summary-text">{parsed.summary}</p>}
+                    {parsed.tags.length > 0 && (
+                      <div className="rail-summary-tags">
+                        {parsed.tags.map(t => (
+                          <span key={t} className="rail-summary-tag">{t}</span>
+                        ))}
+                      </div>
+                    )}
+                    <p className="rail-summary-provider">
+                      {PROVIDER_LABEL[summary.provider_kind] || summary.provider_kind}
+                      {summary.resolved_model || summary.provider_model
+                        ? ` \u00b7 ${summary.resolved_model || summary.provider_model}`
+                        : ''}
+                    </p>
+                  </div>
+                )}
+
+                {running && (
+                  <p className="rail-summary-status">
+                    <span className="rail-summary-spinner" aria-hidden="true" />
+                    {'Generating\u2026'}
+                  </p>
+                )}
+
+                {unsupportedContent && !isPublicSession && (
+                  <div className="rail-summary-info" role="status">
+                    <p className="rail-summary-info__heading">{UNSUPPORTED_SUMMARY_CONTENT_HEADING}</p>
+                    <p className="rail-summary-info__detail">{UNSUPPORTED_SUMMARY_CONTENT_DETAIL}</p>
+                  </div>
+                )}
+                {summaryAttempt?.status === 'failed' && summaryAttempt.error_text && !unsupportedContent && !isPublicSession && (
+                  <p className="form-msg form-msg--err rail-summary-error">
+                    {summaryAttempt.error_text}
+                  </p>
+                )}
+                {summaryError && !unsupportedContent && (
+                  <p className="form-msg form-msg--err rail-summary-error">
+                    {summaryError}
+                  </p>
+                )}
+
+                {!isPublicSession && !running && (
+                  <div className="rail-summary-controls">
+                    <select
+                      className="rail-summary-select"
+                      value={summaryProvider}
+                      onChange={e => handleProviderChange(e.target.value)}
+                      aria-label="Summary provider"
+                    >
+                      {SUMMARY_PROVIDERS.map(p => (
+                        <option key={p.value} value={p.value}>{p.label}</option>
+                      ))}
+                    </select>
+                    <div className={`rail-summary-image-option${summaryProvider === 'claude_cli' ? ' rail-summary-image-option--disabled' : ''}`}>
+                      <label className="rail-summary-image-option__label">
+                        <input
+                          type="checkbox"
+                          checked={includeSummaryImages}
+                          disabled={summaryProvider === 'claude_cli'}
+                          onChange={e => setIncludeSummaryImages(e.target.checked)}
+                        />
+                        Include attached images
+                      </label>
+                      <p className="rail-summary-image-option__note">
+                        {summaryProvider === 'claude_cli'
+                          ? 'Claude CLI cannot attach local images. Choose an HTTP provider or Codex CLI.'
+                          : 'Selected archived images are sent to the chosen provider. Up to 4 supported images (5 MiB each, 12 MiB total) can be attached; unsupported or oversized artifacts are skipped.'}
+                      </p>
+                    </div>
+                    <button
+                      className="rail-rearchive-btn"
+                      onClick={() => handleGenerateSummary(!!parsed)}
+                      disabled={summaryBusy}
+                    >
+                      {summaryBusy ? '\u2026' : parsed ? 'Regenerate' : 'Generate'}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )
+          })()}
 
           <div className="meta-list">
             {metaRows.filter(([, v]) => v != null && v !== '').map(([label, value]) => (

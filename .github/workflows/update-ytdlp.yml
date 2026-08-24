@@ -13,39 +13,126 @@ jobs:
       pull-requests: write
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      - uses: DeterminateSystems/nix-installer-action@main
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
 
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Enable Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: Get current yt-dlp version
-        id: before
+      - name: Read currently pinned yt-dlp version
+        id: current
         run: |
-          rev=$(jq -r '.nodes.nixpkgs.locked.rev' flake.lock)
-          version=$(nix eval --raw "github:nixos/nixpkgs/${rev}#yt-dlp.version")
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          current=$(sed -n '/ytDlp = pkgs.stdenv.mkDerivation/,/^          };$/{ s/^ *version = "\([^"]*\)";/\1/p; }' flake.nix | head -1)
+          if [ -z "$current" ]; then
+            echo "::error::Could not read the pinned yt-dlp version from flake.nix. Did the ytDlp derivation move or get renamed?"
+            exit 1
+          fi
+          echo "Currently pinned yt-dlp: $current"
+          echo "version=${current}" >> "$GITHUB_OUTPUT"
 
-      - name: Update nixpkgs
-        run: nix flake update nixpkgs
-
-      - name: Get new yt-dlp version
-        id: after
+      - name: Query latest yt-dlp release
+        id: latest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          rev=$(jq -r '.nodes.nixpkgs.locked.rev' flake.lock)
-          version=$(nix eval --raw "github:nixos/nixpkgs/${rev}#yt-dlp.version")
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          latest=$(curl -sSL \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest | jq -r .tag_name)
+          if [ -z "$latest" ] || [ "$latest" = "null" ]; then
+            echo "::error::Could not determine the latest yt-dlp release tag from the GitHub API."
+            exit 1
+          fi
+          echo "Latest yt-dlp release: $latest"
+          echo "version=${latest}" >> "$GITHUB_OUTPUT"
 
-      - name: Open PR if yt-dlp was updated
-        if: steps.before.outputs.version != steps.after.outputs.version
+      - name: Decide whether an update is needed
+        id: check
+        env:
+          CURRENT: ${{ steps.current.outputs.version }}
+          LATEST: ${{ steps.latest.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$CURRENT" = "$LATEST" ]; then
+            echo "Already at $CURRENT"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Update available: $CURRENT -> $LATEST"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute SRI hash of the new release
+        id: hash
+        if: steps.check.outputs.changed == 'true'
+        env:
+          LATEST: ${{ steps.latest.outputs.version }}
+        run: |
+          set -euo pipefail
+          curl -sSL --fail \
+            "https://github.com/yt-dlp/yt-dlp/releases/download/${LATEST}/yt-dlp" \
+            -o /tmp/yt-dlp
+          hash=$(nix hash file --sri --type sha256 /tmp/yt-dlp)
+          case "$hash" in
+            sha256-*) ;;
+            *)
+              echo "::error::Computed hash '${hash}' is not an SRI sha256 hash."
+              exit 1
+              ;;
+          esac
+          echo "SRI hash: $hash"
+          echo "hash=${hash}" >> "$GITHUB_OUTPUT"
+
+      - name: Rewrite the yt-dlp pin in flake.nix
+        if: steps.check.outputs.changed == 'true'
+        env:
+          CURRENT: ${{ steps.current.outputs.version }}
+          LATEST: ${{ steps.latest.outputs.version }}
+          HASH: ${{ steps.hash.outputs.hash }}
+        run: |
+          set -euo pipefail
+          sed -i \
+            -e "/ytDlp = pkgs.stdenv.mkDerivation/,/^          };\$/{ s|^\( *version = \"\)[^\"]*\(\";\)|\1${LATEST}\2|; }" \
+            -e "/ytDlp = pkgs.stdenv.mkDerivation/,/^          };\$/{ s|\(url = \"https://github.com/yt-dlp/yt-dlp/releases/download/\)[^/]*\(/yt-dlp\";\)|\1${LATEST}\2|; }" \
+            -e "/ytDlp = pkgs.stdenv.mkDerivation/,/^          };\$/{ s|^\( *hash = \"\)sha256-[^\"]*\(\";\)|\1${HASH}\2|; }" \
+            flake.nix
+
+          echo "--- git diff --stat ---"
+          git diff --stat flake.nix
+
+          changed_files=$(git diff --name-only)
+          if [ "$changed_files" != "flake.nix" ]; then
+            echo "::error::Expected only flake.nix to change, got: ${changed_files}"
+            exit 1
+          fi
+
+          occurrences=$(grep -c "$LATEST" flake.nix || true)
+          if [ "$occurrences" -ne 2 ]; then
+            echo "::error::Expected the new version ${LATEST} to appear twice in flake.nix (version line + URL), found ${occurrences}."
+            exit 1
+          fi
+
+          if ! grep -q "$HASH" flake.nix; then
+            echo "::error::New SRI hash was not written into flake.nix."
+            exit 1
+          fi
+
+          echo "Rewrote yt-dlp pin: ${CURRENT} -> ${LATEST}"
+
+      - name: Open pull request
+        if: steps.check.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
           branch: auto/yt-dlp-update
           delete-branch: true
-          commit-message: "chore: yt-dlp ${{ steps.before.outputs.version }} → ${{ steps.after.outputs.version }}"
-          title: "chore: yt-dlp ${{ steps.before.outputs.version }} → ${{ steps.after.outputs.version }}"
+          commit-message: "chore(nix): yt-dlp ${{ steps.current.outputs.version }} → ${{ steps.latest.outputs.version }}"
+          title: "chore(nix): yt-dlp ${{ steps.current.outputs.version }} → ${{ steps.latest.outputs.version }}"
           body: |
-            Automated `flake.lock` update. yt-dlp bumped from `${{ steps.before.outputs.version }}` to `${{ steps.after.outputs.version }}`.
+            Automated bump of the pinned yt-dlp release. Old: `${{ steps.current.outputs.version }}`. New: `${{ steps.latest.outputs.version }}`. SRI hash: `${{ steps.hash.outputs.hash }}`.
 
-            Triggered by the weekly nixpkgs check.
+            Upstream release: https://github.com/yt-dlp/yt-dlp/releases/tag/${{ steps.latest.outputs.version }}
           labels: dependencies

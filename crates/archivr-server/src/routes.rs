@@ -29,7 +29,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use archivr_core::{archive, capture, database, downloader};
+use archivr_core::{archive, capture, database, downloader, summarizer};
 use axum::{
     Json, Router,
     extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, Request, State},
@@ -49,6 +49,10 @@ use rusqlite::OptionalExtension;
 
 const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
 const LOGIN_MAX_ATTEMPTS: usize = 5;
+const MAX_TEXT_CAPTURE_BODY_BYTES: usize = 2 * 1024 * 1024;
+// JSON can expand each body byte into a six-byte `\\u00XX` escape sequence,
+// plus a small request envelope.
+const MAX_TEXT_CAPTURE_REQUEST_BYTES: usize = MAX_TEXT_CAPTURE_BODY_BYTES * 6 + 64 * 1024;
 
 // Short-lived token granting unauthenticated access to one specific artifact.
 // Used so Cast / AirPlay devices (which carry no session cookie) can fetch media.
@@ -269,12 +273,21 @@ pub fn app_with_state(state: AppState) -> Router {
             post(rearchive_handler),
         )
         .route(
+            "/api/archives/:archive_id/entries/:entry_uid/summary",
+            get(entry_summary_handler).post(request_entry_summary_handler),
+        )
+        .route(
             "/api/archives/:archive_id/entries/:entry_uid/favicon",
             get(serve_entry_favicon),
         )
         .route("/api/archives/:archive_id/blobs/:sha256", get(serve_blob))
         .route("/api/archives/:archive_id/runs", get(list_runs))
         .route("/api/archives/:archive_id/captures", post(capture_handler))
+        .route(
+            "/api/archives/:archive_id/captures/text",
+            post(capture_text_handler)
+                .layer(DefaultBodyLimit::max(MAX_TEXT_CAPTURE_REQUEST_BYTES)),
+        )
         .route(
             "/api/archives/:archive_id/uploads",
             post(upload_handler)
@@ -508,9 +521,208 @@ async fn entry_detail(
             return Err(ApiError::unauthorized("login required"));
         }
     }
-    let detail = archive::get_entry_detail(&conn, &entry_uid)?
+    let mut detail = archive::get_entry_detail(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
+    if matches!(auth_user, AuthUser::Guest) {
+        let entry_id = database::entry_id_for_uid(&conn, &entry_uid)?
+            .ok_or(ApiError::not_found("entry not found"))?;
+        detail.latest_summary = database::latest_completed_entry_summary(&conn, entry_id)?;
+        detail.summary_attempt = None;
+    }
     Ok(Json(detail))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SummaryRequestBody {
+    provider: String,
+    #[serde(default)]
+    force: bool,
+    #[serde(default)]
+    include_images: bool,
+}
+
+/// `GET /api/archives/:id/entries/:uid/summary`
+///
+/// Read-only, gated exactly like entry detail: a guest may read a summary only
+/// for an entry whose content they could already read. Returns
+/// `{ entry_uid, summary }` with a null summary when none has been requested,
+/// which is also what the frontend polls while a job is running.
+async fn entry_summary_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((archive_id, entry_uid)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    if matches!(auth_user, AuthUser::Guest)
+        && !database::is_entry_publicly_accessible(&conn, &entry_uid)?
+    {
+        return Err(ApiError::unauthorized("login required"));
+    }
+    let entry_id = database::entry_id_for_uid(&conn, &entry_uid)?
+        .ok_or(ApiError::not_found("entry not found"))?;
+    let (summary, attempt) = if matches!(auth_user, AuthUser::Guest) {
+        (database::latest_completed_entry_summary(&conn, entry_id)?, None)
+    } else {
+        (
+            database::latest_completed_entry_summary(&conn, entry_id)?,
+            database::latest_entry_summary_attempt(&conn, entry_id)?,
+        )
+    };
+    let mut body = serde_json::json!({ "entry_uid": entry_uid, "summary": summary });
+    if !matches!(auth_user, AuthUser::Guest) {
+        body["attempt"] = serde_json::to_value(attempt)?;
+    }
+    Ok(Json(body))
+}
+
+/// `POST /api/archives/:id/entries/:uid/summary`
+///
+/// Manual-only summary generation. Body: `{ "provider": "...", "force": false,
+/// "include_images": false }`.
+///
+/// Provider configuration and content extraction are both resolved *before*
+/// spawning, so a missing env var or an unsummarizable artifact comes back as a
+/// synchronous 400 naming the exact problem rather than as a background job the
+/// caller has to poll only to learn about a config typo.
+///
+/// Returns 200 with the existing row when an identical cache key already
+/// completed and `force` is false; otherwise 202 with a pending row.
+async fn request_entry_summary_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((archive_id, entry_uid)): Path<(String, String)>,
+    Json(body): Json<SummaryRequestBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let archive_paths =
+        archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;
+
+    // 1. Provider config from the environment. The error text carries the exact
+    //    variable name, which is the whole point of returning it as a 400.
+    let provider_cfg = summarizer::provider_from_env(&body.provider)
+        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+    if body.include_images && matches!(provider_cfg, summarizer::ProviderConfig::ClaudeCli(_)) {
+        return Err(ApiError::bad_request(
+            "Claude CLI cannot attach local images; choose an HTTP provider or Codex CLI",
+        ));
+    }
+    let provider = summarizer::provider_from_config(provider_cfg);
+    let summary_options = summarizer::SummaryBuildOptions {
+        include_images: body.include_images,
+    };
+
+    // 2. Preflight extraction and SQLite cache/attempt work are synchronous
+    // core operations, so keep them off the Axum runtime. This also means the
+    // input claimed here is passed directly to the provider worker below.
+    let preflight_paths = archive_paths.clone();
+    let preflight_uid = entry_uid.clone();
+    let provider_kind = provider.kind().to_string();
+    let provider_model = provider.model().map(str::to_string);
+    let force = body.force;
+    enum PreflightOutcome {
+        Cached(database::EntrySummaryRecord),
+        Pending { input: summarizer::SummaryInput, summary_uid: String },
+    }
+    let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<PreflightOutcome> {
+        let conn = database::open_or_initialize(&preflight_paths.archive_path)?;
+        let entry_id = database::entry_id_for_uid(&conn, &preflight_uid)?
+            .ok_or_else(|| anyhow::anyhow!("entry not found"))?;
+        // Preserve the route's historical 404 before attempting content
+        // extraction, whose own missing-entry error includes the uid.
+        let input = summarizer::build_summary_input(&preflight_paths, &preflight_uid, summary_options)?;
+        if !force {
+            if let Some(existing) = database::find_entry_summary(
+                &conn, entry_id, &provider_kind, provider_model.as_deref(),
+                summarizer::PROMPT_VERSION, &input.input_sha256,
+            )? {
+                if existing.status == "completed" {
+                    return Ok(PreflightOutcome::Cached(existing));
+                }
+            }
+        }
+        let summary_uid = database::upsert_pending_entry_summary(
+            &conn, entry_id, &provider_kind, provider_model.as_deref(),
+            summarizer::PROMPT_VERSION, &input.input_sha256,
+        )?;
+        Ok(PreflightOutcome::Pending { input, summary_uid })
+    })
+    .await
+    .map_err(|e| ApiError::internal(&format!("summary preflight task failed: {e}")))?
+    .map_err(|e| {
+        if summarizer::is_unsupported_summary_content_error(&e) {
+            ApiError::bad_request(summarizer::UNSUPPORTED_SUMMARY_CONTENT_MESSAGE)
+        } else if format!("{e:#}") == "entry not found" {
+            ApiError::not_found("entry not found")
+        } else {
+            ApiError::bad_request(&format!("{e:#}"))
+        }
+    })?;
+    let (input, summary_uid) = match outcome {
+        PreflightOutcome::Cached(existing) => return Ok((
+            StatusCode::OK,
+            serde_json::to_value(&existing).map(Json)
+                .map_err(|e| ApiError::internal(&e.to_string()))?,
+        )),
+        PreflightOutcome::Pending { input, summary_uid } => (input, summary_uid),
+    };
+
+    let archive_path = mounted.archive_path.clone();
+    let summary_uid_bg = summary_uid.clone();
+    tokio::task::spawn_blocking(move || {
+        // The input and attempt were claimed during blocking preflight, so no
+        // row is reset and no archive content is read twice.
+        if let Err(e) =
+            summarizer::summarize_prebuilt_entry(
+                &archive_paths,
+                input,
+                &summary_uid_bg,
+                provider.as_ref(),
+            )
+        {
+            eprintln!("warn: summary {summary_uid_bg}: {e:#}");
+            record_background_summary_failure(&archive_path, &summary_uid_bg, &e);
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "summary_uid": summary_uid,
+            "status": "pending",
+            "entry_uid": entry_uid,
+        })),
+    ))
+}
+
+fn summary_failure_error_text(error: &anyhow::Error) -> String {
+    if summarizer::is_unsupported_summary_content_error(error) {
+        summarizer::UNSUPPORTED_SUMMARY_CONTENT_MESSAGE.to_string()
+    } else {
+        format!("{error:#}")
+    }
+}
+
+fn record_background_summary_failure(
+    archive_path: &std::path::Path,
+    summary_uid: &str,
+    error: &anyhow::Error,
+) {
+    if let Ok(conn) = database::open_or_initialize(archive_path) {
+        if let Ok(Some(row)) = database::get_entry_summary_by_uid(&conn, summary_uid) {
+            if row.status != "failed" {
+                database::update_entry_summary_status(
+                    &conn,
+                    summary_uid,
+                    "failed",
+                    None,
+                    Some(&summary_failure_error_text(error)),
+                )
+                .ok();
+            }
+        }
+    }
 }
 
 async fn list_runs(
@@ -923,6 +1135,14 @@ struct CaptureBody {
 }
 
 #[derive(Debug, serde::Deserialize)]
+struct CaptureTextBody {
+    title: String,
+    body: String,
+    /// MIME type: "text/plain" or "text/markdown" (defaults to "text/markdown")
+    mime: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct ProbeQuery {
     locator: String,
 }
@@ -1177,6 +1397,105 @@ async fn capture_handler(
                         let _ = std::fs::remove_dir(parent);
                     }
                 }
+            }
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "job_uid": job_uid, "status": "pending" })),
+    ))
+}
+
+async fn capture_text_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(archive_id): Path<String>,
+    Json(body): Json<CaptureTextBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+
+    // Validate title and body
+    if body.title.trim().is_empty() {
+        return Err(ApiError::bad_request("title must not be empty"));
+    }
+    if body.body.trim().is_empty() {
+        return Err(ApiError::bad_request("body must not be empty"));
+    }
+    if body.body.len() > MAX_TEXT_CAPTURE_BODY_BYTES {
+        return Err(ApiError::bad_request("body must not exceed 2 MiB"));
+    }
+
+    // Determine MIME type (default to markdown)
+    let mime = body.mime.as_deref().unwrap_or("text/markdown");
+
+    // Validate MIME type
+    if mime != "text/plain" && mime != "text/markdown" {
+        return Err(ApiError::bad_request(
+            "unsupported MIME type: must be 'text/plain' or 'text/markdown'"
+        ));
+    }
+
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let archive_paths =
+        archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;
+
+    // Create job record in the archive DB.
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let job_uid = database::create_capture_job(&conn, &archive_id)?;
+    drop(conn);
+
+    // Spawn background text capture.
+    let title = body.title.trim().to_string();
+    let text_body = body.body;
+    let mime_str = mime.to_string();
+    let job_uid_bg = job_uid.clone();
+    let archive_path = mounted.archive_path.clone();
+    let archive_id_bg = archive_id.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let conn = match database::open_or_initialize(&archive_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("warn: capture job {job_uid_bg}: db open failed: {e:#}");
+                return;
+            }
+        };
+        database::update_capture_job_status(&conn, &job_uid_bg, "running", None, None, None).ok();
+
+        match capture::perform_text_capture(
+            &archive_paths,
+            &title,
+            &text_body,
+            &mime_str,
+            Some(&archive_id_bg),
+        ) {
+            Ok(result) => {
+                let job_status = if result.status == "completed" {
+                    "completed"
+                } else {
+                    "failed"
+                };
+                database::update_capture_job_status(
+                    &conn,
+                    &job_uid_bg,
+                    job_status,
+                    Some(&result.run_uid),
+                    None,
+                    None,
+                )
+                .ok();
+            }
+            Err(e) => {
+                database::update_capture_job_status(
+                    &conn,
+                    &job_uid_bg,
+                    "failed",
+                    None,
+                    Some(&format!("{e:#}")),
+                    None,
+                )
+                .ok();
             }
         }
     });
@@ -2746,6 +3065,46 @@ mod tests {
         .unwrap()
     }
 
+    fn add_summary_test_artifact(
+        archive_path: &std::path::Path,
+        entry_id: i64,
+        relpath: &str,
+        role: &str,
+        mime_type: &str,
+        contents: &[u8],
+    ) {
+        let paths = archive::read_archive_paths(archive_path).unwrap();
+        let full_path = paths.store_path.join(relpath);
+        std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+        std::fs::write(&full_path, contents).unwrap();
+
+        let conn = database::open_or_initialize(archive_path).unwrap();
+        let blob_id = database::upsert_blob(
+            &conn,
+            &database::BlobRecord {
+                sha256: format!("test-summary-{}", relpath.replace('/', "-")),
+                byte_size: contents.len().try_into().unwrap(),
+                mime_type: Some(mime_type.to_string()),
+                extension: relpath.rsplit('.').next().map(str::to_string),
+                raw_relpath: relpath.to_string(),
+            },
+        )
+        .unwrap();
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id,
+                artifact_role: role.to_string(),
+                storage_area: "raw".to_string(),
+                relpath: relpath.to_string(),
+                blob_id: Some(blob_id),
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+    }
+
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -2755,6 +3114,312 @@ mod tests {
 
     fn json_body(payload: &serde_json::Value) -> Body {
         Body::from(serde_json::to_vec(payload).unwrap())
+    }
+
+    #[tokio::test]
+    async fn summary_include_images_rejects_claude_cli_without_creating_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        let session_cookie = make_test_session(&auth_path);
+
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/archives/test/entries/{}/summary", entry.entry_uid))
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({
+                        "provider": "claude_cli",
+                        "include_images": true,
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await["error"],
+            "Claude CLI cannot attach local images; choose an HTTP provider or Codex CLI"
+        );
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        assert!(database::latest_entry_summary(&conn, entry.id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn summary_preflight_returns_safe_message_for_unsupported_video_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        add_summary_test_artifact(
+            &archive_path,
+            entry.id,
+            "raw/private-video.mp4",
+            "primary_media",
+            "video/mp4",
+            b"video fixture",
+        );
+        let session_cookie = make_test_session(&auth_path);
+        let previous_codex_cli = std::env::var_os("ARCHIVR_CODEX_CLI");
+        unsafe { std::env::set_var("ARCHIVR_CODEX_CLI", "/usr/bin/false") };
+
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/archives/test/entries/{}/summary", entry.entry_uid))
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({ "provider": "codex_cli" })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        match previous_codex_cli {
+            Some(value) => unsafe { std::env::set_var("ARCHIVR_CODEX_CLI", value) },
+            None => unsafe { std::env::remove_var("ARCHIVR_CODEX_CLI") },
+        }
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = body_json(response).await["error"].as_str().unwrap().to_string();
+        assert_eq!(error, summarizer::UNSUPPORTED_SUMMARY_CONTENT_MESSAGE);
+        assert!(!error.contains("raw/"));
+        assert!(!error.contains("mime"));
+        assert!(!error.contains("v1 unsupported"));
+    }
+
+    #[tokio::test]
+    async fn summary_request_for_missing_entry_returns_not_found_before_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _archive_path, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let previous_codex_cli = std::env::var_os("ARCHIVR_CODEX_CLI");
+        unsafe { std::env::set_var("ARCHIVR_CODEX_CLI", "/usr/bin/false") };
+
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/entries/ent_missing/summary")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({ "provider": "codex_cli" })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        match previous_codex_cli {
+            Some(value) => unsafe { std::env::set_var("ARCHIVR_CODEX_CLI", value) },
+            None => unsafe { std::env::remove_var("ARCHIVR_CODEX_CLI") },
+        }
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["error"], "entry not found");
+    }
+
+    #[tokio::test]
+    async fn public_summary_endpoints_hide_failed_diagnostics_but_authenticated_users_keep_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        let session = make_test_session(&auth_path);
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let completed_uid = database::upsert_pending_entry_summary(
+            &conn, entry.id, "codex_cli", None, summarizer::PROMPT_VERSION, "completed-public-test",
+        )
+        .unwrap();
+        database::update_entry_summary_status(
+            &conn, &completed_uid, "completed", Some("previous completed summary"), None,
+        )
+        .unwrap();
+        let summary_uid = database::upsert_pending_entry_summary(
+            &conn, entry.id, "codex_cli", None, summarizer::PROMPT_VERSION, "failed-public-test",
+        )
+        .unwrap();
+        database::update_entry_summary_status(
+            &conn, &summary_uid, "failed", None, Some("provider secret: raw diagnostic"),
+        )
+        .unwrap();
+        drop(conn);
+        let collection = api_make_collection(
+            registry.clone(), auth_path.clone(), &session, "Public summaries", "public-summaries", 3, false,
+        )
+        .await;
+        api_add_to_coll(
+            registry.clone(), auth_path.clone(), &session, &collection, &entry.entry_uid, 3,
+        )
+        .await;
+
+        let public_summary = app(registry.clone(), auth_path.clone())
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}/summary", entry.entry_uid))
+                .body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(public_summary.status(), StatusCode::OK);
+        let public_summary = body_json(public_summary).await;
+        assert_eq!(public_summary["summary"]["summary_uid"], completed_uid);
+        assert!(public_summary.get("attempt").is_none());
+
+        let public_detail = app(registry.clone(), auth_path.clone())
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}", entry.entry_uid))
+                .body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(public_detail.status(), StatusCode::OK);
+        let public_detail = body_json(public_detail).await;
+        assert_eq!(public_detail["latest_summary"]["summary_uid"], completed_uid);
+        assert!(public_detail["summary_attempt"].is_null());
+
+        let authenticated_summary = app(registry.clone(), auth_path.clone())
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}/summary", entry.entry_uid))
+                .header("cookie", &session)
+                .body(Body::empty()).unwrap())
+            .await.unwrap();
+        let authenticated_summary = body_json(authenticated_summary).await;
+        assert_eq!(authenticated_summary["summary"]["summary_uid"], completed_uid);
+        assert_eq!(authenticated_summary["summary"]["summary_text"], "previous completed summary");
+        assert_eq!(authenticated_summary["attempt"]["status"], "failed");
+        assert_eq!(authenticated_summary["attempt"]["error_text"], "provider secret: raw diagnostic");
+
+        let authenticated_detail = app(registry, auth_path)
+            .oneshot(Request::builder()
+                .uri(format!("/api/archives/test/entries/{}", entry.entry_uid))
+                .header("cookie", &session)
+                .body(Body::empty()).unwrap())
+            .await.unwrap();
+        let authenticated_detail = body_json(authenticated_detail).await;
+        assert_eq!(authenticated_detail["latest_summary"]["summary_uid"], completed_uid);
+        assert_eq!(authenticated_detail["latest_summary"]["summary_text"], "previous completed summary");
+        assert_eq!(authenticated_detail["summary_attempt"]["status"], "failed");
+        assert_eq!(authenticated_detail["summary_attempt"]["error_text"], "provider secret: raw diagnostic");
+    }
+
+    #[test]
+    fn background_summary_failure_stores_safe_copy_only_for_unsupported_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_registry, archive_path, _auth_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        add_summary_test_artifact(
+            &archive_path,
+            entry.id,
+            "raw/private-video.mp4",
+            "primary_media",
+            "video/mp4",
+            b"video fixture",
+        );
+        let unsupported = summarizer::build_summary_input(
+            &archive::read_archive_paths(&archive_path).unwrap(),
+            &entry.entry_uid,
+            summarizer::SummaryBuildOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            summary_failure_error_text(&unsupported),
+            summarizer::UNSUPPORTED_SUMMARY_CONTENT_MESSAGE
+        );
+
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let summary_uid = database::upsert_pending_entry_summary(
+            &conn,
+            entry.id,
+            "codex_cli",
+            Some("test"),
+            summarizer::PROMPT_VERSION,
+            "unsupported-content-test",
+        )
+        .unwrap();
+        drop(conn);
+        record_background_summary_failure(&archive_path, &summary_uid, &unsupported);
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let stored = database::get_entry_summary_by_uid(&conn, &summary_uid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "failed");
+        assert_eq!(
+            stored.error_text.as_deref(),
+            Some(summarizer::UNSUPPORTED_SUMMARY_CONTENT_MESSAGE)
+        );
+
+        let provider = anyhow::anyhow!("provider response was malformed");
+        assert_eq!(
+            summary_failure_error_text(&provider),
+            "provider response was malformed"
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_include_images_uses_distinct_cache_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        add_summary_test_artifact(
+            &archive_path,
+            entry.id,
+            "raw/summary-test.html",
+            "primary_media",
+            "text/html",
+            b"<article>summary fixture</article>",
+        );
+        add_summary_test_artifact(
+            &archive_path,
+            entry.id,
+            "raw/summary-test.jpg",
+            "media",
+            "image/jpeg",
+            b"image fixture",
+        );
+        let session_cookie = make_test_session(&auth_path);
+        let previous_codex_cli = std::env::var_os("ARCHIVR_CODEX_CLI");
+        unsafe { std::env::set_var("ARCHIVR_CODEX_CLI", "/usr/bin/false") };
+
+        let text_response = app(registry.clone(), auth_path.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/archives/test/entries/{}/summary", entry.entry_uid))
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({ "provider": "codex_cli" })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(text_response.status(), StatusCode::ACCEPTED);
+
+        let image_response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/archives/test/entries/{}/summary", entry.entry_uid))
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({
+                        "provider": "codex_cli",
+                        "include_images": true,
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(image_response.status(), StatusCode::ACCEPTED);
+        match previous_codex_cli {
+            Some(value) => unsafe { std::env::set_var("ARCHIVR_CODEX_CLI", value) },
+            None => unsafe { std::env::remove_var("ARCHIVR_CODEX_CLI") },
+        }
+
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let input_hashes: Vec<String> = conn
+            .prepare("SELECT input_sha256 FROM entry_summaries WHERE entry_id = ?1")
+            .unwrap()
+            .query_map([entry.id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(input_hashes.len(), 2);
+        assert_ne!(input_hashes[0], input_hashes[1]);
     }
 
     #[tokio::test]
@@ -3678,6 +4343,291 @@ mod tests {
                 .as_str()
                 .is_some_and(|e| e.contains("invalid quality"))
         );
+    }
+
+    #[tokio::test]
+    async fn text_capture_post_returns_accepted_with_job_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures/text")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(
+                        r#"{"title":"Test Note","body":"Test content","mime":"text/markdown"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["job_uid"].as_str().is_some(),
+            "response must have job_uid"
+        );
+        assert_eq!(json["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn text_capture_accepts_a_body_just_below_two_mebibytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let body = "a".repeat(2 * 1024 * 1024 - 1);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures/text")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({
+                        "title": "Maximum-size note",
+                        "body": body,
+                        "mime": "text/plain"
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn text_capture_accepts_a_two_mebibyte_body_with_json_escaped_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let body = "\0".repeat(2 * 1024 * 1024);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures/text")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({
+                        "title": "Escaped control note",
+                        "body": body,
+                        "mime": "text/plain"
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn text_capture_rejects_a_body_over_two_mebibytes_with_validation_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let body = "a".repeat(2 * 1024 * 1024 + 1);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures/text")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({
+                        "title": "Oversized note",
+                        "body": body,
+                        "mime": "text/plain"
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&response_body).unwrap();
+        assert_eq!(json["error"], "body must not exceed 2 MiB");
+    }
+
+    #[tokio::test]
+    async fn text_capture_post_preserves_intentional_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let text_body = "  \n# Heading\n\nContent with a final newline\n\t \n";
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures/text")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({
+                        "title": "Whitespace Note",
+                        "body": text_body,
+                        "mime": "text/markdown"
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let job_uid = serde_json::from_slice::<serde_json::Value>(&response_body).unwrap()["job_uid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let conn = archivr_core::database::open_or_initialize(&archive_path).unwrap();
+                let job = archivr_core::database::get_capture_job(&conn, &job_uid)
+                    .unwrap()
+                    .unwrap();
+                if job.status != "pending" && job.status != "running" {
+                    break job.status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("text capture job should finish");
+        assert_eq!(status, "completed");
+
+        let archive_paths = archivr_core::archive::read_archive_paths(&archive_path).unwrap();
+        let conn = archivr_core::database::open_or_initialize(&archive_path).unwrap();
+        let raw_relpath: String = conn
+            .query_row(
+                "SELECT b.raw_relpath
+                 FROM entry_artifacts ea
+                 JOIN blobs b ON b.id = ea.blob_id
+                 WHERE ea.artifact_role = 'primary_media'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read(archive_paths.store_path.join(raw_relpath)).unwrap(),
+            text_body.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn text_capture_rejects_empty_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures/text")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(
+                        r#"{"title":"","body":"Test content","mime":"text/plain"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("title must not be empty")));
+    }
+
+    #[tokio::test]
+    async fn text_capture_rejects_empty_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures/text")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(
+                        r#"{"title":"Test Note","body":"","mime":"text/plain"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("body must not be empty")));
+    }
+
+    #[tokio::test]
+    async fn text_capture_rejects_unsupported_mime() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures/text")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(
+                        r#"{"title":"Test Note","body":"Test content","mime":"text/html"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("unsupported MIME type")));
+    }
+
+    #[tokio::test]
+    async fn text_capture_requires_auth() {
+        let (test_app, _dir) = make_test_app();
+        let response = test_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures/text")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"title":"Test","body":"Content"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

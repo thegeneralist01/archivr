@@ -98,6 +98,17 @@ async fn main() -> Result<()> {
                 ),
                 _ => {}
             }
+            match archivr_core::database::fail_stalled_entry_summaries(&conn) {
+                Ok(n) if n > 0 => eprintln!(
+                    "info: marked {n} stalled summary attempt(s) as failed in '{}'",
+                    archive.id
+                ),
+                Err(e) => eprintln!(
+                    "warn: stalled summary cleanup failed for '{}': {e:#}",
+                    archive.id
+                ),
+                _ => {}
+            }
         }
     }
 

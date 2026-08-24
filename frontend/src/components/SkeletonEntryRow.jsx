@@ -1,23 +1,37 @@
-export default function SkeletonEntryRow() {
+const COLLECTION_MARKERS = [
+  'list=',
+  '/playlist/',
+  '/channel/',
+  'yt:playlist:',
+  'yt:channel:',
+  'ytm:playlist:',
+  'spotify:playlist:',
+  'spotify:album:',
+];
+
+function isCollectionLocator(locator) {
+  const normalized = locator.toLowerCase();
+  return COLLECTION_MARKERS.some(marker => normalized.includes(marker));
+}
+
+function truncateLocator(locator) {
+  return locator.length > 80 ? `${locator.slice(0, 79)}…` : locator;
+}
+
+export default function SkeletonEntryRow({ locator = '' }) {
+  const locatorText = String(locator);
+  const isCollection = isCollectionLocator(locatorText);
+
   return (
-    <div className="skeleton-row">
-      <div className="col-check" aria-hidden="true" />
-      <div className="col-added">
-        <span className="skeleton-cell" style={{ width: 108, height: 13 }} />
-      </div>
-      <div className="col-title" style={{ gap: '0.42em', display: 'flex', alignItems: 'center' }}>
-        <span className="skeleton-cell" style={{ width: 14, height: 14, borderRadius: '50%', flexShrink: 0 }} />
-        <span className="skeleton-cell" style={{ width: '58%', height: 13 }} />
-      </div>
-      <div className="col-type">
-        <span className="skeleton-cell" style={{ width: 58, height: 20, borderRadius: 99 }} />
-      </div>
-      <div className="col-size">
-        <span className="skeleton-cell" style={{ width: 44, height: 12 }} />
-      </div>
-      <div className="col-url">
-        <span className="skeleton-cell" style={{ width: '65%', height: 12 }} />
-      </div>
+    <div className="in-progress-entry-row" role="status" aria-live="polite">
+      <span className="cap-spinner in-progress-entry-row__spinner" aria-hidden="true" />
+      <span className="in-progress-entry-row__locator" title={locatorText}>
+        {truncateLocator(locatorText)}
+      </span>
+      <span className="in-progress-entry-row__status">
+        Archiving…
+        {isCollection && <span className="in-progress-entry-row__kind">(playlist)</span>}
+      </span>
     </div>
-  )
+  );
 }

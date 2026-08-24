@@ -110,6 +110,30 @@ pub struct CaptureJobRecord {
     pub updated_at: String,
 }
 
+/// One row of `entry_summaries` — a regenerable LLM summary of an entry.
+///
+/// `provider_model` is stored as `''` (not NULL) when a provider has no explicit
+/// model, because SQLite treats NULLs as distinct inside a UNIQUE index and a
+/// NULL model would defeat the `(entry_id, provider_kind, provider_model,
+/// prompt_version, input_sha256)` dedupe key. Readers map `''` back to `None`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EntrySummaryRecord {
+    pub summary_uid: String,
+    pub entry_uid: String,
+    pub provider_kind: String,
+    /// Model selected by the provider after resolving the requested cache-key alias.
+    pub resolved_model: Option<String>,
+    pub provider_model: Option<String>,
+    pub prompt_version: String,
+    pub input_sha256: String,
+    pub status: String,
+    pub summary_text: Option<String>,
+    pub error_text: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UserSummary {
     pub user_uid: String,
@@ -322,6 +346,26 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             created_at  TEXT NOT NULL,
             updated_at  TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS entry_summaries (
+            id INTEGER PRIMARY KEY,
+            summary_uid TEXT NOT NULL UNIQUE,
+            entry_id INTEGER NOT NULL REFERENCES archived_entries(id) ON DELETE CASCADE,
+            provider_kind TEXT NOT NULL,
+            provider_model TEXT NOT NULL DEFAULT '',
+            resolved_model TEXT,
+            prompt_version TEXT NOT NULL,
+            input_sha256 TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('pending','running','completed','failed')),
+            summary_text TEXT,
+            error_text TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_entry_summaries_entry_updated
+            ON entry_summaries(entry_id, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_entry_summaries_cache_lookup
+            ON entry_summaries(entry_id, provider_kind, provider_model, prompt_version, input_sha256, status);
         CREATE INDEX IF NOT EXISTS idx_capture_jobs_status ON capture_jobs(status);
         CREATE INDEX IF NOT EXISTS idx_archive_run_items_run_id ON archive_run_items(run_id);
         CREATE INDEX IF NOT EXISTS idx_archived_entries_source_identity_id ON archived_entries(source_identity_id);
@@ -436,12 +480,66 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     // Migration: add notes_json column to existing capture_jobs tables.
     // Silently ignored when the column already exists (idempotent).
     let _ = conn.execute("ALTER TABLE capture_jobs ADD COLUMN notes_json TEXT", []);
+    // Provider responses may resolve a requested alias to a concrete model.
+    // Keep that display-only value outside the cache key.
+    let _ = conn.execute(
+        "ALTER TABLE entry_summaries ADD COLUMN resolved_model TEXT",
+        [],
+    );
     // Migration: add requires_auth column to existing collections tables.
     // Silently ignored when the column already exists (idempotent).
     let _ = conn.execute(
         "ALTER TABLE collections ADD COLUMN requires_auth INTEGER NOT NULL DEFAULT 1",
         [],
     );
+
+    // Summary attempts used to be unique by cache key, which meant forced
+    // regeneration erased the last completed result. Rebuild that small table
+    // without the cache-key constraint while retaining all existing rows.
+    let summary_table_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'entry_summaries'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if summary_table_sql.as_deref().is_some_and(|sql| {
+        sql.contains(
+            "UNIQUE(entry_id, provider_kind, provider_model, prompt_version, input_sha256)",
+        )
+    }) {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE entry_summaries_rebuilt (
+                 id INTEGER PRIMARY KEY,
+                 summary_uid TEXT NOT NULL UNIQUE,
+                 entry_id INTEGER NOT NULL REFERENCES archived_entries(id) ON DELETE CASCADE,
+                 provider_kind TEXT NOT NULL,
+                 provider_model TEXT NOT NULL DEFAULT '',
+                 resolved_model TEXT,
+                 prompt_version TEXT NOT NULL,
+                 input_sha256 TEXT NOT NULL,
+                 status TEXT NOT NULL CHECK(status IN ('pending','running','completed','failed')),
+                 summary_text TEXT,
+                 error_text TEXT,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 completed_at TEXT
+             );
+             INSERT INTO entry_summaries_rebuilt
+             SELECT id, summary_uid, entry_id, provider_kind, COALESCE(provider_model, ''),
+                    resolved_model, prompt_version, input_sha256, status, summary_text, error_text,
+                    created_at, updated_at, completed_at
+             FROM entry_summaries;
+             DROP TABLE entry_summaries;
+             ALTER TABLE entry_summaries_rebuilt RENAME TO entry_summaries;
+             CREATE INDEX idx_entry_summaries_entry_updated
+                 ON entry_summaries(entry_id, updated_at DESC);
+             CREATE INDEX idx_entry_summaries_cache_lookup
+                 ON entry_summaries(entry_id, provider_kind, provider_model, prompt_version, input_sha256, status);
+             COMMIT;",
+        )?;
+    }
 
     Ok(())
 }
@@ -1354,6 +1452,265 @@ pub fn fail_stalled_capture_jobs(conn: &Connection) -> Result<usize> {
     Ok(n)
 }
 
+/// Marks summary attempts left pending or running by a previous process as
+/// failed. The message is deliberately stable and does not expose internals.
+pub fn fail_stalled_entry_summaries(conn: &Connection) -> Result<usize> {
+    let now = now_timestamp();
+    conn.execute(
+        "UPDATE entry_summaries
+         SET status = 'failed',
+             error_text = 'Summary generation was interrupted by a server restart.',
+             updated_at = ?1
+         WHERE status IN ('pending', 'running')",
+        [now],
+    )
+    .map_err(Into::into)
+}
+
+// ── entry_summaries ────────────────────────────────────────────────────────
+//
+// Summaries are a regenerable child record of an entry, never a column on
+// `archived_entries`: an entry can carry several (one per provider/model/prompt
+// version), and any of them can be thrown away and recomputed. Generation is
+// manual-only — nothing in `capture.rs` writes here.
+
+/// `SELECT` list shared by every `entry_summaries` read, so all readers build
+/// an identical `EntrySummaryRecord` from the same column ordering.
+const ENTRY_SUMMARY_COLS: &str =
+    "SELECT s.summary_uid, e.entry_uid, s.provider_kind, s.provider_model, s.resolved_model,
+                s.prompt_version, s.input_sha256, s.status, s.summary_text,
+                s.error_text, s.created_at, s.updated_at, s.completed_at
+         FROM entry_summaries s
+         JOIN archived_entries e ON e.id = s.entry_id";
+
+fn map_entry_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntrySummaryRecord> {
+    Ok(EntrySummaryRecord {
+        summary_uid: row.get(0)?,
+        entry_uid: row.get(1)?,
+        provider_kind: row.get(2)?,
+        // '' is the stored stand-in for "this provider has no model"; see the
+        // doc comment on EntrySummaryRecord for why it is not NULL.
+        provider_model: row.get::<_, Option<String>>(3)?.filter(|m| !m.is_empty()),
+        resolved_model: row.get(4)?,
+        prompt_version: row.get(5)?,
+        input_sha256: row.get(6)?,
+        status: row.get(7)?,
+        summary_text: row.get(8)?,
+        error_text: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+        completed_at: row.get(12)?,
+    })
+}
+
+/// Resolves `entry_uid` to its integer primary key. `Ok(None)` if absent.
+pub fn entry_id_for_uid(conn: &Connection, entry_uid: &str) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT id FROM archived_entries WHERE entry_uid = ?1",
+        [entry_uid],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Creates a fresh pending summary attempt for one cache key.
+///
+/// Attempts are intentionally not unique by cache key: a forced regeneration
+/// must leave an older completed result available while the new attempt runs.
+pub fn upsert_pending_entry_summary(
+    conn: &Connection,
+    entry_id: i64,
+    provider_kind: &str,
+    provider_model: Option<&str>,
+    prompt_version: &str,
+    input_sha256: &str,
+) -> Result<String> {
+    let summary_uid = format!("sum_{}", &Uuid::new_v4().simple().to_string()[..10]);
+    let now = now_timestamp();
+    let model = provider_model.unwrap_or("");
+    conn.execute(
+        "INSERT INTO entry_summaries
+             (summary_uid, entry_id, provider_kind, provider_model, prompt_version,
+              input_sha256, status, summary_text, error_text, created_at, updated_at, completed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, NULL, ?7, ?7, NULL)",
+        rusqlite::params![
+            summary_uid,
+            entry_id,
+            provider_kind,
+            model,
+            prompt_version,
+            input_sha256,
+            now
+        ],
+    )?;
+    Ok(summary_uid)
+}
+
+/// Completes a summary while retaining the provider's concrete response model
+/// for display. The requested provider model remains the cache-key identity.
+pub fn update_entry_summary_completed(
+    conn: &Connection,
+    summary_uid: &str,
+    summary_text: &str,
+    resolved_model: Option<&str>,
+) -> Result<()> {
+    let now = now_timestamp();
+    conn.execute(
+        "UPDATE entry_summaries
+         SET status = 'completed', summary_text = ?1, error_text = NULL,
+             resolved_model = ?2, completed_at = ?3, updated_at = ?3
+         WHERE summary_uid = ?4",
+        rusqlite::params![summary_text, resolved_model, now, summary_uid],
+    )?;
+    Ok(())
+}
+
+/// Moves a summary row through `running` → `completed` / `failed`.
+/// `completed_at` is stamped only on the terminal `completed` transition.
+pub fn update_entry_summary_status(
+    conn: &Connection,
+    summary_uid: &str,
+    status: &str,
+    summary_text: Option<&str>,
+    error_text: Option<&str>,
+) -> Result<()> {
+    let now = now_timestamp();
+    let completed_at = if status == "completed" {
+        Some(now.clone())
+    } else {
+        None
+    };
+    conn.execute(
+        "UPDATE entry_summaries
+         SET status = ?1, summary_text = ?2, error_text = ?3,
+             completed_at = ?4, updated_at = ?5
+         WHERE summary_uid = ?6",
+        rusqlite::params![
+            status,
+            summary_text,
+            error_text,
+            completed_at,
+            now,
+            summary_uid
+        ],
+    )?;
+    Ok(())
+}
+
+/// Returns one summary by its public uid.
+pub fn get_entry_summary_by_uid(
+    conn: &Connection,
+    summary_uid: &str,
+) -> Result<Option<EntrySummaryRecord>> {
+    conn.query_row(
+        &format!("{ENTRY_SUMMARY_COLS} WHERE s.summary_uid = ?1"),
+        [summary_uid],
+        map_entry_summary,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Looks up the row for one exact cache key — used to short-circuit a POST when
+/// a completed summary for identical input already exists and `force` is false.
+pub fn find_entry_summary(
+    conn: &Connection,
+    entry_id: i64,
+    provider_kind: &str,
+    provider_model: Option<&str>,
+    prompt_version: &str,
+    input_sha256: &str,
+) -> Result<Option<EntrySummaryRecord>> {
+    conn.query_row(
+        &format!(
+            "{ENTRY_SUMMARY_COLS}
+             WHERE s.entry_id = ?1 AND s.provider_kind = ?2 AND s.provider_model = ?3
+               AND s.prompt_version = ?4 AND s.input_sha256 = ?5
+             ORDER BY CASE WHEN s.status = 'completed' THEN 0 ELSE 1 END,
+                      s.completed_at DESC, s.updated_at DESC, s.id DESC"
+        ),
+        rusqlite::params![
+            entry_id,
+            provider_kind,
+            provider_model.unwrap_or(""),
+            prompt_version,
+            input_sha256
+        ],
+        map_entry_summary,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Most recently touched summary for an entry, whatever its status.
+/// Used where a caller explicitly needs the most recent attempt regardless of
+/// whether it has completed.
+pub fn latest_entry_summary(
+    conn: &Connection,
+    entry_id: i64,
+) -> Result<Option<EntrySummaryRecord>> {
+    conn.query_row(
+        &format!(
+            "{ENTRY_SUMMARY_COLS} WHERE s.entry_id = ?1
+             ORDER BY s.updated_at DESC, s.id DESC LIMIT 1"
+        ),
+        [entry_id],
+        map_entry_summary,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// The most recent completed summary, excluding in-flight and failed attempts.
+/// This is the stable summary shown in entry detail and used by free-text search.
+pub fn latest_completed_entry_summary(
+    conn: &Connection,
+    entry_id: i64,
+) -> Result<Option<EntrySummaryRecord>> {
+    conn.query_row(
+        &format!(
+            "{ENTRY_SUMMARY_COLS} WHERE s.entry_id = ?1 AND s.status = 'completed'
+             ORDER BY s.completed_at DESC, s.updated_at DESC, s.id DESC LIMIT 1"
+        ),
+        [entry_id],
+        map_entry_summary,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// The newest non-completed replacement attempt after the retained completed
+/// result. This includes failed rows so authenticated callers can show a recent
+/// failure beside readable content, but suppresses historical failures after a
+/// newer successful regeneration.
+pub fn latest_entry_summary_attempt(
+    conn: &Connection,
+    entry_id: i64,
+) -> Result<Option<EntrySummaryRecord>> {
+    conn.query_row(
+        &format!(
+            "{ENTRY_SUMMARY_COLS} WHERE s.entry_id = ?1 AND s.status != 'completed'
+               AND (
+                   NOT EXISTS (
+                       SELECT 1 FROM entry_summaries c
+                       WHERE c.entry_id = s.entry_id AND c.status = 'completed'
+                   )
+                   OR (s.updated_at, s.id) > (
+                       SELECT c.updated_at, c.id FROM entry_summaries c
+                       WHERE c.entry_id = s.entry_id AND c.status = 'completed'
+                       ORDER BY c.completed_at DESC, c.updated_at DESC, c.id DESC LIMIT 1
+                   )
+               )
+             ORDER BY s.updated_at DESC, s.id DESC LIMIT 1"
+        ),
+        [entry_id],
+        map_entry_summary,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 pub fn create_archive_run(
     conn: &Connection,
     created_by_user_id: i64,
@@ -1445,7 +1802,11 @@ pub fn finish_archive_run(conn: &Connection, run_id: i64) -> Result<()> {
         [run_id],
         |row| row.get(0),
     )?;
-    let status = if failed_count > 0 { "failed" } else { "completed" };
+    let status = if failed_count > 0 {
+        "failed"
+    } else {
+        "completed"
+    };
     conn.execute(
         "UPDATE archive_runs SET status = ?1, finished_at = ?2 WHERE id = ?3",
         params![status, now_timestamp(), run_id],
@@ -1681,9 +2042,8 @@ pub fn delete_entry(conn: &Connection, entry_uid: &str) -> Result<bool> {
     // (no grandchildren), so without `id = ?1` the set would be empty and
     // cascade_cached_bytes_after_subtree_delete would not recalculate shared-blob totals.
     let subtree_ids: Vec<i64> = {
-        let mut stmt = conn.prepare(
-            "SELECT id FROM archived_entries WHERE id = ?1 OR root_entry_id = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT id FROM archived_entries WHERE id = ?1 OR root_entry_id = ?1")?;
         stmt.query_map([entry_id], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?
     };
@@ -2334,7 +2694,6 @@ pub fn visibility_to_bits(visibility: &str) -> u32 {
     }
 }
 
-
 /// Returns the id of the '_default_' collection, creating it if absent.
 pub fn ensure_default_collection(conn: &Connection) -> Result<i64> {
     let now = now_timestamp();
@@ -2437,16 +2796,20 @@ pub fn get_collection_by_slug(conn: &Connection, slug: &str) -> Result<Option<Co
         "SELECT id, collection_uid, name, slug, default_visibility_bits, created_at, requires_auth \
          FROM collections WHERE slug = ?1",
         [slug],
-        |row| Ok(CollectionRecord {
-            id: row.get(0)?,
-            collection_uid: row.get(1)?,
-            name: row.get(2)?,
-            slug: row.get(3)?,
-            default_visibility_bits: row.get::<_, i64>(4)? as u32,
-            created_at: row.get(5)?,
-            requires_auth: row.get::<_, i64>(6)? != 0,
-        }),
-    ).optional().map_err(Into::into)
+        |row| {
+            Ok(CollectionRecord {
+                id: row.get(0)?,
+                collection_uid: row.get(1)?,
+                name: row.get(2)?,
+                slug: row.get(3)?,
+                default_visibility_bits: row.get::<_, i64>(4)? as u32,
+                created_at: row.get(5)?,
+                requires_auth: row.get::<_, i64>(6)? != 0,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 /// Adds an entry to a collection with given visibility_bits. Idempotent (INSERT OR IGNORE).
@@ -2505,7 +2868,12 @@ pub fn get_entry_collection_memberships(
          WHERE ce.entry_id = ?1",
     )?;
     stmt.query_map([entry_id], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, i64>(3)? as u32))
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get::<_, i64>(3)? as u32,
+        ))
     })?
     .collect::<Result<_, _>>()
     .map_err(Into::into)
@@ -3063,7 +3431,10 @@ mod tests {
                 |row| row.get::<_, i64>(0).map(|v| v as u32),
             )
             .unwrap();
-        assert_eq!(default_bits, 2, "default collection should start USER-visible");
+        assert_eq!(
+            default_bits, 2,
+            "default collection should start USER-visible"
+        );
 
         // Create an entry with visibility = "private" (what capture always passes).
         let entry = create_entry_fixture(&conn, "private", None, None);
@@ -3111,7 +3482,10 @@ mod tests {
                 |row| row.get::<_, i64>(0).map(|v| v as u32),
             )
             .unwrap();
-        assert_eq!(public_bits, 3, "collection default=public should produce bits=3");
+        assert_eq!(
+            public_bits, 3,
+            "collection default=public should produce bits=3"
+        );
 
         // Child entries must NOT use the collection default — they keep
         // visibility_to_bits(entry.visibility) so parent-child visibility
@@ -3124,7 +3498,10 @@ mod tests {
                 |row| row.get::<_, i64>(0).map(|v| v as u32),
             )
             .unwrap();
-        assert_eq!(child_bits, 0, "child entries must use visibility_to_bits, not collection default");
+        assert_eq!(
+            child_bits, 0,
+            "child entries must use visibility_to_bits, not collection default"
+        );
     }
 
     #[test]
@@ -4153,27 +4530,414 @@ mod tests {
 
         // Root item (parent_item_id IS NULL) — mirrors what record_container_entry does.
         let root_item = create_archive_run_item(
-            &c, run.id, None, 0, "https://example.com/pl", None, "youtube", "playlist",
-        ).unwrap();
+            &c,
+            run.id,
+            None,
+            0,
+            "https://example.com/pl",
+            None,
+            "youtube",
+            "playlist",
+        )
+        .unwrap();
         // Child item (parent_item_id IS NOT NULL).
         let child_item = create_archive_run_item(
-            &c, run.id, Some(root_item.id), 1, "https://example.com/v1", None, "youtube", "video",
-        ).unwrap();
+            &c,
+            run.id,
+            Some(root_item.id),
+            1,
+            "https://example.com/v1",
+            None,
+            "youtube",
+            "video",
+        )
+        .unwrap();
 
         // Complete both — marks archive_runs.completed_count = 2.
         c.execute(
             "UPDATE archive_run_items SET status = 'completed' WHERE id IN (?1, ?2)",
             rusqlite::params![root_item.id, child_item.id],
-        ).unwrap();
+        )
+        .unwrap();
         refresh_run_counters(&c, run.id).unwrap();
 
-        let total: i64 = c.query_row(
-            "SELECT completed_count FROM archive_runs WHERE id = ?1", [run.id], |r| r.get(0),
-        ).unwrap();
+        let total: i64 = c
+            .query_row(
+                "SELECT completed_count FROM archive_runs WHERE id = ?1",
+                [run.id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(total, 2, "both items completed: DB counter must be 2");
 
         let child_count = get_run_completed_child_count(&c, run.id).unwrap();
         assert_eq!(child_count, 1, "only the child item must be counted");
     }
 
+    // ── entry_summaries ────────────────────────────────────────────────────
+
+    #[test]
+    fn initialize_schema_is_idempotent_for_entry_summaries() {
+        // initialize_schema runs on *every* open_or_initialize, so re-running it
+        // against a populated DB must be a no-op, not an error.
+        let c = conn();
+        let entry = create_entry_fixture(&c, "private", None, None);
+        upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "abc").unwrap();
+
+        initialize_schema(&c).unwrap();
+        initialize_schema(&c).unwrap();
+
+        let exists: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entry_summaries'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
+        assert!(latest_entry_summary(&c, entry.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn initialize_schema_migrates_resolved_model_for_existing_summary_table() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE entry_summaries (
+                id INTEGER PRIMARY KEY,
+                summary_uid TEXT NOT NULL UNIQUE,
+                entry_id INTEGER NOT NULL,
+                provider_kind TEXT NOT NULL,
+                provider_model TEXT,
+                prompt_version TEXT NOT NULL,
+                input_sha256 TEXT NOT NULL,
+                status TEXT NOT NULL,
+                summary_text TEXT,
+                error_text TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                UNIQUE(entry_id, provider_kind, provider_model, prompt_version, input_sha256)
+            );",
+        )
+        .unwrap();
+
+        initialize_schema(&c).unwrap();
+
+        let has_resolved_model: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('entry_summaries') WHERE name = 'resolved_model'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_resolved_model, 1);
+    }
+
+    #[test]
+    fn entry_summary_lifecycle_pending_running_completed() {
+        let c = conn();
+        let entry = create_entry_fixture(&c, "private", None, None);
+        let uid =
+            upsert_pending_entry_summary(&c, entry.id, "anthropic_http", Some("m1"), "v1", "sha1")
+                .unwrap();
+        assert!(uid.starts_with("sum_"), "got {uid}");
+        assert_eq!(uid.len(), "sum_".len() + 10);
+
+        let rec = get_entry_summary_by_uid(&c, &uid).unwrap().unwrap();
+        assert_eq!(rec.status, "pending");
+        assert_eq!(rec.entry_uid, entry.entry_uid);
+        assert_eq!(rec.provider_model.as_deref(), Some("m1"));
+        assert!(rec.completed_at.is_none());
+
+        update_entry_summary_status(&c, &uid, "running", None, None).unwrap();
+        assert_eq!(
+            get_entry_summary_by_uid(&c, &uid).unwrap().unwrap().status,
+            "running"
+        );
+
+        update_entry_summary_status(&c, &uid, "completed", Some("{\"summary\":\"s\"}"), None)
+            .unwrap();
+        let rec = get_entry_summary_by_uid(&c, &uid).unwrap().unwrap();
+        assert_eq!(rec.status, "completed");
+        assert_eq!(rec.summary_text.as_deref(), Some("{\"summary\":\"s\"}"));
+        assert!(rec.completed_at.is_some(), "completed rows must be stamped");
+    }
+
+    #[test]
+    fn entry_summary_keeps_requested_model_for_cache_and_resolved_model_for_display() {
+        let c = conn();
+        let entry = create_entry_fixture(&c, "private", None, None);
+        let uid = upsert_pending_entry_summary(
+            &c,
+            entry.id,
+            "anthropic_http",
+            Some("claude-3-5-sonnet-latest"),
+            "v1",
+            "sha1",
+        )
+        .unwrap();
+
+        update_entry_summary_completed(&c, &uid, "summary", Some("claude-3-5-sonnet-20241022"))
+            .unwrap();
+        let rec = get_entry_summary_by_uid(&c, &uid).unwrap().unwrap();
+
+        assert_eq!(
+            rec.provider_model.as_deref(),
+            Some("claude-3-5-sonnet-latest")
+        );
+        assert_eq!(
+            rec.resolved_model.as_deref(),
+            Some("claude-3-5-sonnet-20241022")
+        );
+        assert_eq!(
+            find_entry_summary(
+                &c,
+                entry.id,
+                "anthropic_http",
+                Some("claude-3-5-sonnet-latest"),
+                "v1",
+                "sha1",
+            )
+            .unwrap()
+            .unwrap()
+            .summary_uid,
+            uid,
+        );
+    }
+
+    #[test]
+    fn entry_summary_failure_records_error_and_no_completed_at() {
+        let c = conn();
+        let entry = create_entry_fixture(&c, "private", None, None);
+        let uid = upsert_pending_entry_summary(&c, entry.id, "codex_cli", None, "v1", "s").unwrap();
+        update_entry_summary_status(&c, &uid, "failed", None, Some("boom")).unwrap();
+        let rec = get_entry_summary_by_uid(&c, &uid).unwrap().unwrap();
+        assert_eq!(rec.status, "failed");
+        assert_eq!(rec.error_text.as_deref(), Some("boom"));
+        assert!(rec.completed_at.is_none());
+    }
+
+    #[test]
+    fn regenerating_a_completed_summary_creates_a_new_attempt_and_preserves_completion() {
+        let c = conn();
+        let entry = create_entry_fixture(&c, "private", None, None);
+        let first =
+            upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "sha").unwrap();
+        update_entry_summary_status(&c, &first, "completed", Some("old"), None).unwrap();
+
+        // Regeneration must retain the finished result while a new attempt runs.
+        let second =
+            upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "sha").unwrap();
+        assert_ne!(first, second, "regeneration needs a distinct attempt uid");
+
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM entry_summaries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+
+        let completed = get_entry_summary_by_uid(&c, &first).unwrap().unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.summary_text.as_deref(), Some("old"));
+        let rec = get_entry_summary_by_uid(&c, &second).unwrap().unwrap();
+        assert_eq!(rec.status, "pending");
+        update_entry_summary_status(&c, &second, "failed", None, Some("boom")).unwrap();
+        assert_eq!(
+            latest_completed_entry_summary(&c, entry.id)
+                .unwrap()
+                .unwrap()
+                .summary_uid,
+            first,
+            "a failed regeneration must not replace the previous completed result"
+        );
+    }
+
+    #[test]
+    fn latest_summary_attempt_is_separate_from_the_retained_completed_summary() {
+        let c = conn();
+        let entry = create_entry_fixture(&c, "private", None, None);
+        let completed =
+            upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "old").unwrap();
+        update_entry_summary_status(&c, &completed, "completed", Some("previous"), None).unwrap();
+        let pending =
+            upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "new").unwrap();
+
+        assert_eq!(
+            latest_completed_entry_summary(&c, entry.id).unwrap().unwrap().summary_uid,
+            completed
+        );
+        assert_eq!(
+            latest_entry_summary_attempt(&c, entry.id).unwrap().unwrap().summary_uid,
+            pending
+        );
+
+        update_entry_summary_status(&c, &pending, "failed", None, Some("boom")).unwrap();
+        assert_eq!(
+            latest_completed_entry_summary(&c, entry.id).unwrap().unwrap().summary_text.as_deref(),
+            Some("previous")
+        );
+        assert_eq!(
+            latest_entry_summary_attempt(&c, entry.id).unwrap().unwrap().status,
+            "failed"
+        );
+
+        let successful_replacement =
+            upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "newer").unwrap();
+        update_entry_summary_status(
+            &c,
+            &successful_replacement,
+            "completed",
+            Some("replacement"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            latest_completed_entry_summary(&c, entry.id)
+                .unwrap()
+                .unwrap()
+                .summary_uid,
+            successful_replacement
+        );
+        assert!(
+            latest_entry_summary_attempt(&c, entry.id).unwrap().is_none(),
+            "a failed attempt predating a successful replacement must not remain visible"
+        );
+    }
+
+    #[test]
+    fn fail_stalled_entry_summaries_marks_pending_and_running_with_restart_message() {
+        let c = conn();
+        let entry = create_entry_fixture(&c, "private", None, None);
+        let pending =
+            upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "a").unwrap();
+        let running =
+            upsert_pending_entry_summary(&c, entry.id, "codex_cli", None, "v1", "b").unwrap();
+        let completed =
+            upsert_pending_entry_summary(&c, entry.id, "anthropic_http", None, "v1", "c").unwrap();
+        update_entry_summary_status(&c, &running, "running", None, None).unwrap();
+        update_entry_summary_status(&c, &completed, "completed", Some("done"), None).unwrap();
+
+        assert_eq!(fail_stalled_entry_summaries(&c).unwrap(), 2);
+        for uid in [&pending, &running] {
+            let row = get_entry_summary_by_uid(&c, uid).unwrap().unwrap();
+            assert_eq!(row.status, "failed");
+            assert_eq!(
+                row.error_text.as_deref(),
+                Some("Summary generation was interrupted by a server restart.")
+            );
+            assert!(!row.updated_at.is_empty());
+        }
+        assert_eq!(
+            get_entry_summary_by_uid(&c, &completed)
+                .unwrap()
+                .unwrap()
+                .status,
+            "completed"
+        );
+    }
+
+    #[test]
+    fn entry_summaries_with_no_model_preserve_none_across_attempts() {
+        // CLI providers have no explicit model, so the stored empty-string
+        // sentinel must always map back to None even when attempts accumulate.
+        let c = conn();
+        let entry = create_entry_fixture(&c, "private", None, None);
+        upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "sha").unwrap();
+        upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "sha").unwrap();
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM entry_summaries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+        // …and it reads back as None, not as an empty-string model.
+        let rec = latest_entry_summary(&c, entry.id).unwrap().unwrap();
+        assert_eq!(rec.provider_model, None);
+    }
+
+    #[test]
+    fn different_cache_keys_produce_separate_summaries() {
+        let c = conn();
+        let entry = create_entry_fixture(&c, "private", None, None);
+        upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "sha").unwrap();
+        upsert_pending_entry_summary(&c, entry.id, "codex_cli", None, "v1", "sha").unwrap();
+        upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v2", "sha").unwrap();
+        upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "other").unwrap();
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM entry_summaries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn find_entry_summary_matches_only_the_exact_cache_key() {
+        let c = conn();
+        let entry = create_entry_fixture(&c, "private", None, None);
+        let uid =
+            upsert_pending_entry_summary(&c, entry.id, "openai_compatible", Some("gpt"), "v1", "s")
+                .unwrap();
+        let hit = find_entry_summary(&c, entry.id, "openai_compatible", Some("gpt"), "v1", "s")
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.summary_uid, uid);
+        assert!(
+            find_entry_summary(
+                &c,
+                entry.id,
+                "openai_compatible",
+                Some("gpt"),
+                "v1",
+                "changed"
+            )
+            .unwrap()
+            .is_none(),
+            "a changed input digest must miss the cache"
+        );
+    }
+
+    #[test]
+    fn latest_entry_summary_returns_the_most_recently_updated_row() {
+        let c = conn();
+        let entry = create_entry_fixture(&c, "private", None, None);
+        let a = upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "a").unwrap();
+        let b = upsert_pending_entry_summary(&c, entry.id, "codex_cli", None, "v1", "b").unwrap();
+        update_entry_summary_status(&c, &a, "completed", Some("first"), None).unwrap();
+        update_entry_summary_status(&c, &b, "completed", Some("second"), None).unwrap();
+        // Same-timestamp ties break on id DESC, so the later insert wins either way.
+        assert_eq!(
+            latest_entry_summary(&c, entry.id)
+                .unwrap()
+                .unwrap()
+                .summary_uid,
+            b
+        );
+    }
+
+    #[test]
+    fn latest_entry_summary_is_none_for_an_unsummarized_entry() {
+        let c = conn();
+        let entry = create_entry_fixture(&c, "private", None, None);
+        assert!(latest_entry_summary(&c, entry.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn deleting_an_entry_cascades_to_its_summaries() {
+        let c = conn();
+        c.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let entry = create_entry_fixture(&c, "private", None, None);
+        upsert_pending_entry_summary(&c, entry.id, "claude_cli", None, "v1", "a").unwrap();
+        assert!(delete_entry(&c, &entry.entry_uid).unwrap());
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM entry_summaries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn entry_id_for_uid_resolves_and_misses() {
+        let c = conn();
+        let entry = create_entry_fixture(&c, "private", None, None);
+        assert_eq!(
+            entry_id_for_uid(&c, &entry.entry_uid).unwrap(),
+            Some(entry.id)
+        );
+        assert_eq!(entry_id_for_uid(&c, "ent_nope").unwrap(), None);
+    }
 }
