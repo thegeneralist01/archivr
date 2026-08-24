@@ -77,6 +77,12 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
   const summaryPollAbortRef = useRef(null)
   const summaryGenerateAbortRef = useRef(null)
   const summarySelectionRef = useRef(null)
+  // Update before effects run so a request settled during a new selection's
+  // render can never apply state or refresh the newly selected entry.
+  const summarySelectionKey = archiveId && detail?.summary?.entry_uid
+    ? `${archiveId}:${detail.summary.entry_uid}`
+    : null
+  summarySelectionRef.current = summarySelectionKey
 
   // ── Bulk-panel state ────────────────────────────────────────────────────
   const isBulk = selectedUids?.size >= 2
@@ -131,10 +137,6 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
   // Seed the summary from the entry detail payload and stop any poll left over
   // from the previously selected entry.
   useLayoutEffect(() => {
-    const selectionKey = archiveId && detail?.summary?.entry_uid
-      ? `${archiveId}:${detail.summary.entry_uid}`
-      : null
-    summarySelectionRef.current = selectionKey
     clearInterval(summaryPollRef.current)
     summaryPollRef.current = null
     summaryPollAbortRef.current?.abort()
