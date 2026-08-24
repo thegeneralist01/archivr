@@ -15,6 +15,9 @@ const SUMMARY_PROVIDERS = [
 const PROVIDER_LABEL = Object.fromEntries(SUMMARY_PROVIDERS.map(p => [p.value, p.label]))
 const SUMMARY_PROVIDER_KEY = 'archivr:summary:provider'
 const SUMMARY_POLL_MS = 1500
+const UNSUPPORTED_SUMMARY_CONTENT_HEADING = 'This entry can’t be summarized yet.'
+const UNSUPPORTED_SUMMARY_CONTENT_DETAIL = 'It doesn’t contain archived text that a summary provider can read. Summaries currently support text notes, web pages, X posts and threads, and X Articles. Video, audio, and image-only entries need a transcript or text source.'
+const UNSUPPORTED_SUMMARY_CONTENT_MESSAGE = `${UNSUPPORTED_SUMMARY_CONTENT_HEADING}\n\n${UNSUPPORTED_SUMMARY_CONTENT_DETAIL}`
 
 // Summaries are stored as the raw JSON string the model produced (normalized
 // server-side to {tldr, summary, tags}). Parsing can still fail for rows written
@@ -566,6 +569,9 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
               ? parseSummaryText(summary.summary_text)
               : null
             const running = summary?.status === 'pending' || summary?.status === 'running'
+            const unsupportedContent =
+              (summary?.status === 'failed' && summary.error_text === UNSUPPORTED_SUMMARY_CONTENT_MESSAGE) ||
+              summaryError === UNSUPPORTED_SUMMARY_CONTENT_MESSAGE
             if (isPublicSession && !parsed) return null
             return (
               <div className="rail-section rail-summary">
@@ -596,13 +602,19 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
                   </p>
                 )}
 
-                {summary?.status === 'failed' && summary.error_text && !isPublicSession && (
-                  <p className="form-msg form-msg--err" style={{ margin: '0 0 8px' }}>
+                {unsupportedContent && !isPublicSession && (
+                  <div className="rail-summary-info" role="status">
+                    <p className="rail-summary-info__heading">{UNSUPPORTED_SUMMARY_CONTENT_HEADING}</p>
+                    <p className="rail-summary-info__detail">{UNSUPPORTED_SUMMARY_CONTENT_DETAIL}</p>
+                  </div>
+                )}
+                {summary?.status === 'failed' && summary.error_text && !unsupportedContent && !isPublicSession && (
+                  <p className="form-msg form-msg--err rail-summary-error">
                     {summary.error_text}
                   </p>
                 )}
-                {summaryError && (
-                  <p className="form-msg form-msg--err" style={{ margin: '0 0 8px' }}>
+                {summaryError && !unsupportedContent && (
+                  <p className="form-msg form-msg--err rail-summary-error">
                     {summaryError}
                   </p>
                 )}
