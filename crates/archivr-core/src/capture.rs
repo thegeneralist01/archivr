@@ -1951,8 +1951,7 @@ pub fn perform_text_capture(
     }
 
     // Validate body
-    let body = body.trim();
-    if body.is_empty() {
+    if body.trim().is_empty() {
         anyhow::bail!("body must not be empty");
     }
     if body.len() > 2 * 1024 * 1024 {
@@ -2024,7 +2023,7 @@ pub fn perform_text_capture(
         source_kind,
         entity_kind,
         None,
-        Some(&canonical_locator),
+        None,
         &canonical_locator,
     )?;
 
@@ -2884,6 +2883,111 @@ mod tests {
         assert_eq!(entry.title, Some(title.to_string()));
 
         // Clean up
+        let _ = fs::remove_dir_all(&base_path);
+    }
+
+    #[test]
+    fn test_text_capture_preserves_intentional_whitespace_in_stored_artifact() {
+        let base_path = env::temp_dir().join(format!(
+            "archivr-text-whitespace-test-{}",
+            Local::now().format("%Y%m%d%H%M%S%3f")
+        ));
+        let _ = fs::remove_dir_all(&base_path);
+        fs::create_dir_all(&base_path).unwrap();
+
+        let store_path = base_path.join("store");
+        let archive_path = base_path.join(".archivr");
+        archive::initialize_store_directories(&store_path).unwrap();
+        fs::create_dir_all(&archive_path).unwrap();
+        fs::write(archive_path.join("name"), "test-archive").unwrap();
+        fs::write(archive_path.join("store_path"), store_path.to_str().unwrap()).unwrap();
+
+        let archive_paths = ArchivePaths {
+            archive_path: archive_path.clone(),
+            store_path: store_path.clone(),
+            name: "test-archive".to_string(),
+        };
+        let body = "  \n# Heading\n\nContent with a final newline\n\t ";
+
+        perform_text_capture(
+            &archive_paths,
+            "Whitespace Note",
+            body,
+            "text/markdown",
+            None,
+        )
+        .unwrap();
+
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let raw_relpath: String = conn
+            .query_row(
+                "SELECT b.raw_relpath
+                 FROM entry_artifacts ea
+                 JOIN blobs b ON b.id = ea.blob_id
+                 WHERE ea.artifact_role = 'primary_media'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fs::read(store_path.join(raw_relpath)).unwrap(), body.as_bytes());
+
+        let _ = fs::remove_dir_all(&base_path);
+    }
+
+    #[test]
+    fn test_text_capture_hides_synthetic_url_but_reuses_source_identity() {
+        let base_path = env::temp_dir().join(format!(
+            "archivr-text-identity-test-{}",
+            Local::now().format("%Y%m%d%H%M%S%3f")
+        ));
+        let _ = fs::remove_dir_all(&base_path);
+        fs::create_dir_all(&base_path).unwrap();
+
+        let store_path = base_path.join("store");
+        let archive_path = base_path.join(".archivr");
+        archive::initialize_store_directories(&store_path).unwrap();
+        fs::create_dir_all(&archive_path).unwrap();
+        fs::write(archive_path.join("name"), "test-archive").unwrap();
+        fs::write(archive_path.join("store_path"), store_path.to_str().unwrap()).unwrap();
+
+        let archive_paths = ArchivePaths {
+            archive_path: archive_path.clone(),
+            store_path,
+            name: "test-archive".to_string(),
+        };
+        let body = "Same body, same text identity.";
+
+        perform_text_capture(&archive_paths, "First title", body, "text/plain", None).unwrap();
+        perform_text_capture(&archive_paths, "Second title", body, "text/plain", None).unwrap();
+
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let default_coll_id = database::ensure_default_collection(&conn).unwrap();
+        let entries = archive::list_entries_for_collection(&conn, default_coll_id, 0xFFFFFFFF).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.original_url.is_none()));
+
+        let expected_locator = format!("text:{}", crate::hash::hash_bytes(body.as_bytes()));
+        let (canonical_url, normalized_locator): (Option<String>, String) = conn
+            .query_row(
+                "SELECT canonical_url, normalized_locator
+                 FROM source_identities
+                 WHERE source_kind = 'text' AND normalized_locator = ?1",
+                [&expected_locator],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(canonical_url, None);
+        assert_eq!(normalized_locator, expected_locator);
+
+        let source_identity_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_identities WHERE source_kind = 'text'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_identity_count, 1);
+
         let _ = fs::remove_dir_all(&base_path);
     }
 
