@@ -143,7 +143,8 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
     summaryPollAbortRef.current = null
     summaryGenerateAbortRef.current?.abort()
     summaryGenerateAbortRef.current = null
-    const detailMatchesSelection = detail?.summary?.entry_uid === selectedEntry?.entry_uid
+    const detailMatchesSelection = selectedEntry?.entry_uid != null &&
+      detail?.summary?.entry_uid === selectedEntry?.entry_uid
     setSummary(detailMatchesSelection ? detail.latest_summary ?? null : null)
     setSummaryAttempt(detailMatchesSelection ? detail.summary_attempt ?? null : null)
     setSummaryError('')
