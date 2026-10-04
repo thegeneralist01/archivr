@@ -123,6 +123,9 @@ export default function App() {
   const [collections, setCollections] = useState([])
   const [entries, setEntries] = useState([])
   const [deletedUids, setDeletedUids] = useState(() => new Set())
+  // Renames made in this session, keyed by entry_uid. Child rows live in each
+  // EntryRow's private state (not `entries`), so they read titles through this.
+  const [renamedTitles, setRenamedTitles] = useState(() => new Map())
   const [selectedEntryUid, setSelectedEntryUid] = useState(() => parseLocation().entry)
   const [selectedEntry, setSelectedEntry] = useState(null)
   const [selectedUids, setSelectedUids] = useState(() => {
@@ -427,6 +430,9 @@ export default function App() {
   }, [tagFilter]);
 
   const handleEntryTitleChange = useCallback((entryUid, newTitle) => {
+    setRenamedTitles(prev => new Map(prev).set(entryUid, newTitle))
+    const cached = entryCacheRef.current.get(entryUid)
+    if (cached) entryCacheRef.current.set(entryUid, { ...cached, title: newTitle })
     setEntries(prev => prev.map(e =>
       e.entry_uid === entryUid ? { ...e, title: newTitle } : e
     ))
@@ -637,6 +643,10 @@ export default function App() {
     setToasts(prev => prev.filter(t => t.id !== id))
   }, [])
 
+  const handleChildReorderError = useCallback((message) => {
+    handleToast(message, null, 'error', 'Reorder failed')
+  }, [handleToast])
+
   const handleIgnoreUblock = useCallback(() => {
     sessionStorage.setItem('ublockWarningIgnored', 'true')
     setUblockWarningIgnored(true)
@@ -752,7 +762,10 @@ export default function App() {
                 archiveId={archiveId}
                 pendingCaptures={pendingCaptures}
                 deletedUids={deletedUids}
+                renamedTitles={renamedTitles}
                 isPublicSession={!currentUser}
+                canReorder={!!currentUser?.can_reorder_children}
+                onChildReorderError={handleChildReorderError}
               />
             )}
             {view === 'runs' && <RunsView runs={runs} />}

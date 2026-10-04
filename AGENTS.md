@@ -16,7 +16,7 @@ Three crates with a strict ownership split — **core owns truth; CLI and server
 
 Capture flow: locator → `determine_source()` (`crates/archivr-core/src/capture.rs`) routes by platform/shorthand (`yt:`, `x:`, `tweet:` …) → platform downloader (`downloader/ytdlp.rs`, `tweets.rs`, `singlefile.rs`, `http.rs`, `local.rs`) stages into `temp/` → SHA3-256 dedup (`hash.rs`, `downloader/store.rs`) moves blobs to `raw/A/B/HASH.EXT` → rows written to `archivr.sqlite` (runs, entries, artifacts, blobs) → served via `/api/archives/:id/...`. `CaptureConfig` carries per-request toggles (uBlock, reader mode, Freedium mirror, etc.); when `via_freedium` is set, the fetch URL is rewritten through `freedium-mirror.cfd` while the canonical DB URL stays the original locator.
 
-YouTube playlists and channels produce a **parent container entry** with each video captured as a child entry. `downloader/ytdlp.rs` handles the playlist probe (fetching per-video quality metadata before archiving), the multi-video download loop, and sync mode (skipping already-archived videos when re-archiving a playlist or channel).
+YouTube playlists and channels produce a **parent container entry** with each video captured as a child entry. `downloader/ytdlp.rs` handles the flat-playlist probe (fetching per-video quality metadata before archiving); the multi-video download loop and sync mode (skipping already-archived videos when re-archiving a playlist or channel) live in `capture.rs`. Child order is persisted in `archived_entries.position` (append-only at insert in `database::create_archived_entry`; rewritten only by `database::reorder_child_entries` behind `PUT …/entries/:entry_uid/children/order` (allowed roles = `InstanceSettings::reorder_children_role_bits`, default ADMIN|OWNER, Owner-editable)).
 
 Pasted text takes a much shorter path: `perform_text_capture()` (`capture.rs`) skips source detection
 and every downloader shell-out — `downloader/text.rs` stages the body under `temp/`, hashes it, and the
@@ -43,7 +43,7 @@ remains synchronous: the server puts provider work in its blocking boundary rath
 Entry free-text search includes summary text (and generated JSON tags inside it) from the latest completed summary only.
 Pending and failed rows do not match, and a newer pending or failed request does not hide an older completed summary.
 
-Per-archive layout (created by `archivr init`): `.archivr/` (name, store_path, `archivr.sqlite`) + sibling `store/` (`raw/`, `raw_tweets/`, `structured/`, `temp/`). Server-level auth lives in a **separate** `archivr-auth.sqlite` (users, sessions, API tokens, role bits GUEST=1/USER=2/ADMIN=4/OWNER=8).
+Per-archive layout (created by `archivr init`): `.archivr/` (name, store_path, `archivr.sqlite`) + sibling `store/` (`raw/`, `raw_tweets/`, `structured/`, `temp/`). Server-level auth lives in a **separate** `archivr-auth.sqlite` (users, sessions, API tokens, role bits GUEST=1/USER=2/ADMIN=4/OWNER=8; per-action role masks (e.g. `reorder_children_role_bits`) live on its `instance_settings` row).
 
 The server mounts multiple archives from a TOML registry (`crates/archivr-server/src/registry.rs`); routes are parameterized by `:archive_id`.
 
@@ -75,7 +75,6 @@ cargo build --release -p archivr-server
 bun install
 bun run dev                        # Vite dev server
 bun run build                      # → ../crates/archivr-server/static (served by the server)
-bun run storybook                  # Storybook on :6006
 
 # Nix
 nix develop                        # devshell: yt-dlp, nushell, uv, twitter-api-client
@@ -144,5 +143,5 @@ No CI is configured; no rustfmt.toml/clippy.toml — default `cargo fmt`/`clippy
 ## Testing & QA
 
 - **Rust**: unit tests only, in `#[cfg(test)]` modules inside source files (e.g. `capture.rs`, `database.rs`, `registry.rs`, `routes.rs`, `hash.rs`, and newer: `summarizer.rs` — 23 tests over provider construction, CLI/env resolution, output extraction, HTML/text/JSON input reduction and tweet-thread joining; `downloader/ytdlp.rs` — 13 tests, several covering resolver priority and version tie-breaking). No `tests/` integration dir. Patterns: `tempfile` for scratch archives, config round-trip assertions, regex/parser validation. Run `cargo test` or `cargo test -p <crate>`.
-- **Frontend**: no test framework. Storybook (`bun run storybook`) is the component QA surface — stories are colocated `*.stories.jsx` files; add one when adding a nontrivial component.
+- **Frontend**: component render tests are colocated `*.test.jsx` files on `bun:test` (`bun test` from `frontend/`); there is no Storybook.
 - Manual smoke test for server changes: build frontend, `cargo run -p archivr-server -- <config.toml>`, exercise `/api/*`.

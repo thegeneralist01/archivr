@@ -42,5 +42,3 @@ frontend/result/**
 frontend/dist/
 frontend/dist/**
 .DS_Store
-frontend/storybook-static/
-frontend/storybook-static/**

@@ -11,13 +11,17 @@
 //                   POST /api/archives/:id/tags
 //                   POST/DELETE /api/archives/:id/entries/:uid/tags
 //                   PATCH /api/archives/:id/entries/:uid
-//   ADMIN       — requires ROLE_ADMIN: (future)
-//   OWNER       — requires ROLE_OWNER: (future)
+//   PERMISSION  — authenticated + caller role_bits ∩ instance-settings mask (else 403):
+//                   PUT /api/archives/:id/entries/:uid/children/order
+//                   (mask = reorder_children_role_bits, default ADMIN|OWNER)
+//   ADMIN       — requires ROLE_ADMIN: /api/admin/* (users, roles, cookie-rules)
+//   OWNER       — requires ROLE_OWNER:
+//                   changing reorder_children_role_bits via PATCH /api/admin/instance-settings
 //   AUTH_SELF   — own resources, require_auth() only:
 //                   GET/POST/DELETE /api/auth/tokens
 //                   POST /api/auth/logout, GET/PATCH /api/auth/me
-//   SETTINGS    — instance settings, require ROLE_ADMIN:
-//                   GET/PATCH /api/admin/instance-settings
+//   SETTINGS    — instance settings:
+//                   GET/PATCH /api/admin/instance-settings (ROLE_ADMIN; the reorder mask field is OWNER-only)
 // ────────────────────────────────────────────────────────────────────────────
 
 use parking_lot::Mutex;
@@ -36,7 +40,7 @@ use axum::{
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
 };
 use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
@@ -259,6 +263,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .route(
             "/api/archives/:archive_id/entries/:entry_uid/children",
             get(list_entry_children),
+        )
+        .route(
+            "/api/archives/:archive_id/entries/:entry_uid/children/order",
+            put(reorder_entry_children_handler),
         )
         .route(
             "/api/archives/:archive_id/entries/:entry_uid/artifacts/:artifact_index",
@@ -1114,6 +1122,44 @@ async fn delete_entry_handler(
     }
 }
 
+async fn reorder_entry_children_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((archive_id, entry_uid)): Path<(String, String)>,
+    Json(body): Json<ReorderChildrenBody>,
+) -> Result<StatusCode, ApiError> {
+    let (_, role_bits) = auth_user.require_auth()?; // guests → 401
+    let settings = database::get_instance_settings(&database::open_auth_db(&state.auth_db_path)?)?;
+    if !settings.can_reorder_children(role_bits) {
+        return Err(ApiError::forbidden(
+            "your role is not allowed to reorder child entries",
+        ));
+    }
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let mut conn = database::open_or_initialize(&mounted.archive_path)?;
+    // IMMEDIATE: take the write lock before the set check so a concurrent
+    // sync capture cannot add a sibling between validation and the writes.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // A role granted reorder must still be able to see the parent's children
+    // (same rule as the children GET); hidden parents are indistinguishable
+    // from missing ones.
+    if !database::caller_sees_all_children(&tx, &entry_uid, role_bits)? {
+        return Err(ApiError::not_found("entry not found"));
+    }
+    match database::reorder_child_entries(&tx, &entry_uid, &body.child_uids)? {
+        database::ReorderChildrenOutcome::Reordered => {
+            tx.commit()?;
+            Ok(StatusCode::NO_CONTENT)
+        }
+        database::ReorderChildrenOutcome::ParentNotFound => {
+            Err(ApiError::not_found("entry not found"))
+        }
+        database::ReorderChildrenOutcome::ChildSetMismatch => Err(ApiError::bad_request(
+            "child_uids must list every current child of the entry exactly once",
+        )),
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct CaptureBody {
     locator: String,
@@ -1172,6 +1218,12 @@ struct CreateTokenBody {
 #[derive(Debug, serde::Deserialize)]
 struct PatchEntryBody {
     title: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReorderChildrenBody {
+    /// Every current direct child UID of the parent, in the desired order.
+    child_uids: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1922,6 +1974,8 @@ async fn auth_login(
         return Err(ApiError::unauthorized("invalid_credentials"));
     }
     let role_bits = database::compute_role_bits(&conn, user.id)?;
+    let can_reorder_children =
+        database::get_instance_settings(&conn)?.can_reorder_children(role_bits);
     let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok());
     let session_uid = database::create_session(&conn, user.id, role_bits, user_agent)?;
 
@@ -1950,6 +2004,7 @@ async fn auth_login(
             "user_uid": user.user_uid,
             "username": user.username,
             "role_bits": role_bits,
+            "can_reorder_children": can_reorder_children,
         })),
     ))
 }
@@ -1986,11 +2041,13 @@ async fn auth_me(
         )
         .map_err(|e| ApiError::from(anyhow::anyhow!("db error: {e}")))?;
     let humanize_slugs = humanize_slugs_int != 0;
+    let settings = database::get_instance_settings(&conn)?;
     Ok(Json(serde_json::json!({
         "role_bits": role_bits,
         "username": username,
         "display_name": display_name,
         "humanize_slugs": humanize_slugs,
+        "can_reorder_children": settings.can_reorder_children(role_bits),
     })))
 }
 
@@ -2069,8 +2126,12 @@ async fn update_instance_settings_handler(
     Json(body): Json<UpdateInstanceSettingsBody>,
 ) -> Result<StatusCode, ApiError> {
     auth_user.require_role(ROLE_ADMIN)?;
-    let conn = database::open_auth_db(&state.auth_db_path)?;
-    let mut settings = database::get_instance_settings(&conn)?;
+    let mut conn = database::open_auth_db(&state.auth_db_path)?;
+    // IMMEDIATE: the read-merge-write below rewrites every column, so it must
+    // not interleave with another PATCH (an admin save could otherwise write a
+    // stale reorder mask over the owner's change).
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut settings = database::get_instance_settings(&tx)?;
     if let Some(v) = body.public_index_enabled {
         settings.public_index_enabled = v;
     }
@@ -2092,7 +2153,24 @@ async fn update_instance_settings_handler(
     if let Some(v) = body.modal_closer_enabled {
         settings.modal_closer_enabled = v;
     }
-    database::update_instance_settings(&conn, &settings)?;
+    if let Some(mask) = body.reorder_children_role_bits {
+        if mask != settings.reorder_children_role_bits {
+            if !auth_user.has_role(ROLE_OWNER) {
+                return Err(ApiError::forbidden(
+                    "only the owner can change who may reorder child entries",
+                ));
+            }
+            let grantable = database::grantable_role_bits(&tx)?;
+            if mask & !grantable != 0 {
+                return Err(ApiError::bad_request(
+                    "reorder_children_role_bits may only contain bits of existing non-guest roles",
+                ));
+            }
+            settings.reorder_children_role_bits = mask;
+        }
+    }
+    database::update_instance_settings(&tx, &settings)?;
+    tx.commit()?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2440,6 +2518,7 @@ struct UpdateInstanceSettingsBody {
     ublock_enabled: Option<bool>,
     cookie_ext_enabled: Option<bool>,
     modal_closer_enabled: Option<bool>,
+    reorder_children_role_bits: Option<u32>,
 }
 
 async fn admin_list_users(
@@ -3031,6 +3110,78 @@ mod tests {
         format!("session={}", sess_uid)
     }
 
+    /// Creates an active user holding `roles` (assign_role adds the cumulative ones:
+    /// user for any non-guest, admin for owner) and returns a session cookie.
+    fn make_role_session(auth_path: &std::path::Path, username: &str, roles: &[&str]) -> String {
+        let conn = archivr_core::database::open_auth_db(auth_path).unwrap();
+        let owner_id: i64 = conn
+            .query_row(
+                "SELECT id FROM users WHERE username = 'testowner'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let uid = database::create_user(&conn, username, None, "dummy", owner_id).unwrap();
+        let user_id = database::get_user_id_by_uid(&conn, &uid).unwrap().unwrap();
+        for role in roles {
+            database::assign_role(&conn, user_id, role, owner_id).unwrap();
+        }
+        // assign_role deletes sessions, so create the session afterwards.
+        let bits = database::compute_role_bits(&conn, user_id).unwrap();
+        format!(
+            "session={}",
+            database::create_session(&conn, user_id, bits, None).unwrap()
+        )
+    }
+
+    fn patch_settings_request(body: serde_json::Value, cookie: &str) -> Request<Body> {
+        Request::builder()
+            .method("PATCH")
+            .uri("/api/admin/instance-settings")
+            .header("content-type", "application/json")
+            .header("cookie", cookie)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn get_settings_json(
+        registry: ServerRegistry,
+        auth_path: std::path::PathBuf,
+        cookie: &str,
+    ) -> serde_json::Value {
+        let resp = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/instance-settings")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        body_json(resp).await
+    }
+
+    async fn me_json(
+        registry: ServerRegistry,
+        auth_path: std::path::PathBuf,
+        cookie: &str,
+    ) -> serde_json::Value {
+        let resp = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/me")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        body_json(resp).await
+    }
+
     fn make_test_entry(archive_path: &std::path::Path) -> archivr_core::database::ArchivedEntry {
         let conn = database::open_or_initialize(archive_path).unwrap();
         let user_id = database::ensure_default_user(&conn).unwrap();
@@ -3056,6 +3207,38 @@ mod tests {
                 source_kind: "web".to_string(),
                 entity_kind: "page".to_string(),
                 title: Some("Test Entry".to_string()),
+                visibility: "private".to_string(),
+                representation_kind: "html".to_string(),
+                source_metadata_json: "{}".to_string(),
+                display_metadata_json: None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn make_test_child(
+        archive_path: &std::path::Path,
+        parent_id: i64,
+        title: &str,
+        url: &str,
+    ) -> archivr_core::database::ArchivedEntry {
+        let conn = database::open_or_initialize(archive_path).unwrap();
+        let user_id = database::ensure_default_user(&conn).unwrap();
+        let run = database::create_archive_run(&conn, user_id, 1).unwrap();
+        let si = database::upsert_source_identity(&conn, "web", "page", None, Some(url), url)
+            .unwrap();
+        database::create_archived_entry(
+            &conn,
+            &database::NewEntry {
+                source_identity_id: si,
+                archive_run_id: run.id,
+                parent_entry_id: Some(parent_id),
+                root_entry_id: Some(parent_id),
+                created_by_user_id: user_id,
+                owned_by_user_id: user_id,
+                source_kind: "web".to_string(),
+                entity_kind: "page".to_string(),
+                title: Some(title.to_string()),
                 visibility: "private".to_string(),
                 representation_kind: "html".to_string(),
                 source_metadata_json: "{}".to_string(),
@@ -4221,6 +4404,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn login_response_includes_can_reorder_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.sqlite");
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            let hash = crate::auth::hash_password("pw").unwrap();
+            archivr_core::database::create_owner(&conn, "owner", &hash).unwrap();
+        }
+        let registry = ServerRegistry {
+            archives: vec![],
+            bind: None,
+            auth_db_path: None,
+        };
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"username":"owner","password":"pw"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["can_reorder_children"], true);
+    }
+
+    #[tokio::test]
     async fn create_token_requires_auth() {
         let (test_app, _dir) = make_test_app();
         let response = test_app
@@ -4841,6 +5053,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["public_index_enabled"], false);
         assert_eq!(json["open_registration_enabled"], false);
+        assert_eq!(json["reorder_children_role_bits"], 12);
     }
 
     #[tokio::test]
@@ -6166,6 +6379,328 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    fn reorder_request(parent_uid: &str, uids: &[&str], cookie: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("PUT")
+            .uri(format!("/api/archives/test/entries/{parent_uid}/children/order"))
+            .header("content-type", "application/json");
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        builder
+            .body(Body::from(serde_json::json!({ "child_uids": uids }).to_string()))
+            .unwrap()
+    }
+
+    async fn child_uids_via_api(
+        registry: ServerRegistry,
+        auth_path: std::path::PathBuf,
+        cookie: &str,
+        parent_uid: &str,
+    ) -> Vec<String> {
+        let resp = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/archives/test/entries/{parent_uid}/children"))
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        body_json(resp)
+            .await
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["entry_uid"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn reorder_entry_children_requires_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let parent = make_test_entry(&archive_path);
+        let a = make_test_child(&archive_path, parent.id, "A", "https://example.com/a");
+        let resp = app(registry, auth_path)
+            .oneshot(reorder_request(&parent.entry_uid, &[&a.entry_uid], None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // owner is allowed by the default mask
+    #[tokio::test]
+    async fn reorder_entry_children_persists_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let cookie = make_test_session(&auth_path);
+        let parent = make_test_entry(&archive_path);
+        let a = make_test_child(&archive_path, parent.id, "A", "https://example.com/a");
+        let b = make_test_child(&archive_path, parent.id, "B", "https://example.com/b");
+        let c = make_test_child(&archive_path, parent.id, "C", "https://example.com/c");
+        let order = [c.entry_uid.as_str(), a.entry_uid.as_str(), b.entry_uid.as_str()];
+        let resp = app(registry.clone(), auth_path.clone())
+            .oneshot(reorder_request(&parent.entry_uid, &order, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            child_uids_via_api(registry, auth_path, &cookie, &parent.entry_uid).await,
+            order
+        );
+    }
+
+    #[tokio::test]
+    async fn reorder_entry_children_rejects_mismatched_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let cookie = make_test_session(&auth_path);
+        let parent = make_test_entry(&archive_path);
+        let a = make_test_child(&archive_path, parent.id, "A", "https://example.com/a");
+        let b = make_test_child(&archive_path, parent.id, "B", "https://example.com/b");
+        let other = make_test_entry(&archive_path);
+        let (a_u, b_u) = (a.entry_uid.as_str(), b.entry_uid.as_str());
+        let bad: [&[&str]; 3] = [&[a_u], &[a_u, b_u, other.entry_uid.as_str()], &[a_u, a_u]];
+        for uids in bad {
+            let resp = app(registry.clone(), auth_path.clone())
+                .oneshot(reorder_request(&parent.entry_uid, uids, Some(&cookie)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uids:?}");
+        }
+        assert_eq!(
+            child_uids_via_api(registry, auth_path, &cookie, &parent.entry_uid).await,
+            [a_u, b_u]
+        );
+    }
+
+    #[tokio::test]
+    async fn reorder_entry_children_returns_404_for_unknown_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let cookie = make_test_session(&auth_path);
+        let resp = app(registry, auth_path)
+            .oneshot(reorder_request("no-such-uid", &[], Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn reorder_entry_children_denies_plain_user_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let owner = make_test_session(&auth_path);
+        let plain = make_role_session(&auth_path, "plain", &[]);
+        let parent = make_test_entry(&archive_path);
+        let a = make_test_child(&archive_path, parent.id, "A", "https://example.com/a");
+        let b = make_test_child(&archive_path, parent.id, "B", "https://example.com/b");
+        let (a_u, b_u) = (a.entry_uid.as_str(), b.entry_uid.as_str());
+        let resp = app(registry.clone(), auth_path.clone())
+            .oneshot(reorder_request(&parent.entry_uid, &[b_u, a_u], Some(&plain)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            child_uids_via_api(registry, auth_path, &owner, &parent.entry_uid).await,
+            [a_u, b_u]
+        );
+    }
+
+    #[tokio::test]
+    async fn reorder_entry_children_allows_admin_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let admin = make_role_session(&auth_path, "adm", &["admin"]);
+        let parent = make_test_entry(&archive_path);
+        let a = make_test_child(&archive_path, parent.id, "A", "https://example.com/a");
+        let b = make_test_child(&archive_path, parent.id, "B", "https://example.com/b");
+        let (a_u, b_u) = (a.entry_uid.as_str(), b.entry_uid.as_str());
+        let resp = app(registry.clone(), auth_path.clone())
+            .oneshot(reorder_request(&parent.entry_uid, &[b_u, a_u], Some(&admin)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            child_uids_via_api(registry, auth_path, &admin, &parent.entry_uid).await,
+            [b_u, a_u]
+        );
+    }
+
+    #[tokio::test]
+    async fn reorder_entry_children_allows_custom_role_after_owner_grants_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let owner = make_test_session(&auth_path);
+        {
+            let conn = archivr_core::database::open_auth_db(&auth_path).unwrap();
+            let role = database::create_custom_role(&conn, "editor", "Editor").unwrap();
+            assert_eq!(role.bit_position, 4);
+        }
+        let editor = make_role_session(&auth_path, "ed", &["editor"]);
+        let parent = make_test_entry(&archive_path);
+        let a = make_test_child(&archive_path, parent.id, "A", "https://example.com/a");
+        let b = make_test_child(&archive_path, parent.id, "B", "https://example.com/b");
+        let order = [b.entry_uid.as_str(), a.entry_uid.as_str()];
+        let resp = app(registry.clone(), auth_path.clone())
+            .oneshot(reorder_request(&parent.entry_uid, &order, Some(&editor)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = app(registry.clone(), auth_path.clone())
+            .oneshot(patch_settings_request(
+                serde_json::json!({ "reorder_children_role_bits": 4 | 8 | 16 }),
+                &owner,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let resp = app(registry, auth_path)
+            .oneshot(reorder_request(&parent.entry_uid, &order, Some(&editor)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn reorder_entry_children_hides_parent_invisible_to_granted_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let owner = make_test_session(&auth_path);
+        let user = make_role_session(&auth_path, "plain", &["user"]);
+        let parent = make_test_entry(&archive_path);
+        let a = make_test_child(&archive_path, parent.id, "A", "https://example.com/a");
+        let b = make_test_child(&archive_path, parent.id, "B", "https://example.com/b");
+        // Admin/owner-only membership: the USER role cannot see the parent or children.
+        database::open_or_initialize(&archive_path)
+            .unwrap()
+            .execute("UPDATE collection_entries SET visibility_bits = 12", [])
+            .unwrap();
+        let resp = app(registry.clone(), auth_path.clone())
+            .oneshot(patch_settings_request(
+                serde_json::json!({ "reorder_children_role_bits": 2 | 4 | 8 }),
+                &owner,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let order = [b.entry_uid.as_str(), a.entry_uid.as_str()];
+        let resp = app(registry.clone(), auth_path.clone())
+            .oneshot(reorder_request(&parent.entry_uid, &order, Some(&user)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "granted but cannot see the parent");
+        let resp = app(registry, auth_path)
+            .oneshot(reorder_request(&parent.entry_uid, &order, Some(&owner)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT, "owner sees every entry");
+    }
+
+    #[tokio::test]
+    async fn reorder_entry_children_empty_mask_denies_everyone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let owner = make_test_session(&auth_path);
+        let parent = make_test_entry(&archive_path);
+        let a = make_test_child(&archive_path, parent.id, "A", "https://example.com/a");
+        let resp = app(registry.clone(), auth_path.clone())
+            .oneshot(patch_settings_request(
+                serde_json::json!({ "reorder_children_role_bits": 0 }),
+                &owner,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let resp = app(registry, auth_path)
+            .oneshot(reorder_request(&parent.entry_uid, &[&a.entry_uid], Some(&owner)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn instance_settings_reorder_mask_requires_owner_to_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let owner = make_test_session(&auth_path);
+        let admin = make_role_session(&auth_path, "adm", &["admin"]);
+        let resp = app(registry.clone(), auth_path.clone())
+            .oneshot(patch_settings_request(
+                serde_json::json!({ "reorder_children_role_bits": 2 }),
+                &admin,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let json = get_settings_json(registry.clone(), auth_path.clone(), &admin).await;
+        assert_eq!(json["reorder_children_role_bits"], 12);
+        let resp = app(registry.clone(), auth_path.clone())
+            .oneshot(patch_settings_request(
+                serde_json::json!({ "reorder_children_role_bits": 12, "open_registration_enabled": true }),
+                &admin,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let json = get_settings_json(registry.clone(), auth_path.clone(), &admin).await;
+        assert_eq!(json["open_registration_enabled"], true);
+        let resp = app(registry.clone(), auth_path.clone())
+            .oneshot(patch_settings_request(
+                serde_json::json!({ "reorder_children_role_bits": 14 }),
+                &owner,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let json = get_settings_json(registry, auth_path, &owner).await;
+        assert_eq!(json["reorder_children_role_bits"], 14);
+    }
+
+    #[tokio::test]
+    async fn instance_settings_reorder_mask_rejects_invalid_bits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let owner = make_test_session(&auth_path);
+        for mask in [16u32, 13, 1u32 << 31] {
+            let resp = app(registry.clone(), auth_path.clone())
+                .oneshot(patch_settings_request(
+                    serde_json::json!({ "reorder_children_role_bits": mask }),
+                    &owner,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{mask}");
+        }
+        let json = get_settings_json(registry, auth_path, &owner).await;
+        assert_eq!(json["reorder_children_role_bits"], 12);
+    }
+
+    #[tokio::test]
+    async fn auth_me_reports_can_reorder_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let owner = make_test_session(&auth_path);
+        let plain = make_role_session(&auth_path, "plain", &[]);
+        let me = me_json(registry.clone(), auth_path.clone(), &owner).await;
+        assert_eq!(me["can_reorder_children"], true);
+        let me = me_json(registry.clone(), auth_path.clone(), &plain).await;
+        assert_eq!(me["can_reorder_children"], false);
+        let resp = app(registry.clone(), auth_path.clone())
+            .oneshot(patch_settings_request(
+                serde_json::json!({ "reorder_children_role_bits": 14 }),
+                &owner,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let me = me_json(registry, auth_path, &plain).await;
+        assert_eq!(me["can_reorder_children"], true);
+    }
+
     #[tokio::test]
     async fn auth_me_returns_humanize_slugs_false_by_default() {
         let dir = tempfile::tempdir().unwrap();
@@ -6950,24 +7485,7 @@ mod tests {
         // Create parent entry.
         let parent = make_test_entry(&archive_path);
         // Create child entry referencing parent.
-        let child = {
-            let conn = database::open_or_initialize(&archive_path).unwrap();
-            let user_id = database::ensure_default_user(&conn).unwrap();
-            let run = database::create_archive_run(&conn, user_id, 1).unwrap();
-            let si = database::upsert_source_identity(
-                &conn, "web", "page", None,
-                Some("https://example.com/child"), "https://example.com/child",
-            ).unwrap();
-            database::create_archived_entry(&conn, &database::NewEntry {
-                source_identity_id: si, archive_run_id: run.id,
-                parent_entry_id: Some(parent.id), root_entry_id: Some(parent.id),
-                created_by_user_id: user_id, owned_by_user_id: user_id,
-                source_kind: "web".to_string(), entity_kind: "page".to_string(),
-                title: Some("Child Entry".to_string()), visibility: "private".to_string(),
-                representation_kind: "html".to_string(),
-                source_metadata_json: "{}".to_string(), display_metadata_json: None,
-            }).unwrap()
-        };
+        let child = make_test_child(&archive_path, parent.id, "Child Entry", "https://example.com/child");
         // Put parent in a public collection with guest visibility.
         let coll = api_make_collection(
             registry.clone(), auth_path.clone(), &session, "PubParent", "pub-parent", 3, false,

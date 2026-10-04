@@ -510,9 +510,11 @@ pub fn list_entries_for_collection(
     Ok(entries)
 }
 
-/// Returns the direct children of the entry identified by `parent_entry_uid`,
-/// ordered ascending by `archived_at, id` (preserves playlist ordinal feel).
-/// Returns an empty vec if the parent has no children or does not exist.
+/// Returns the direct children of the entry identified by `parent_entry_uid`
+/// in persisted sibling order (`position`, set at insert time as append and
+/// rewritten by `database::reorder_child_entries`), tie-broken by
+/// `archived_at, id`. Returns an empty vec if the parent has no children or
+/// does not exist.
 pub fn list_child_entries(
     conn: &rusqlite::Connection,
     parent_entry_uid: &str,
@@ -535,7 +537,7 @@ pub fn list_child_entries(
              )\
          ) \
          GROUP BY e.id \
-         ORDER BY e.archived_at ASC, e.id ASC",
+         ORDER BY e.position ASC, e.archived_at ASC, e.id ASC",
         ENTRY_SELECT_COLS, ENTRY_FROM_JOINS,
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -2266,6 +2268,39 @@ mod tests {
         // GUEST caller (bits=1): parent collection has bits=2, so child must NOT be visible.
         let guest_children = list_child_entries(&conn, &container.entry_uid, 1).unwrap();
         assert!(guest_children.is_empty(), "guest must not see children of a USER-only collection");
+    }
+
+    #[test]
+    fn list_child_entries_orders_by_position_not_archived_at() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        let container = make_entry_in_db(&conn, user_id, run_id, None, None,
+            "Playlist", "https://example.com/pl");
+        let mk = |title: &str, url: &str| make_entry_in_db(&conn, user_id, run_id,
+            Some(container.id), Some(container.id), title, url);
+        let v1 = mk("V1", "https://example.com/pl/v1");
+        let v2 = mk("V2", "https://example.com/pl/v2");
+        let v3 = mk("V3", "https://example.com/pl/v3");
+        conn.execute(
+            "UPDATE archived_entries SET archived_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+            [v3.id],
+        ).unwrap();
+        let uids = || -> Vec<String> {
+            list_child_entries(&conn, &container.entry_uid, 12).unwrap()
+                .into_iter().map(|e| e.entry_uid).collect()
+        };
+        assert_eq!(uids(), vec![v1.entry_uid.clone(), v2.entry_uid.clone(), v3.entry_uid.clone()]);
+
+        let order = vec![v3.entry_uid.clone(), v1.entry_uid.clone(), v2.entry_uid.clone()];
+        assert_eq!(
+            database::reorder_child_entries(&conn, &container.entry_uid, &order).unwrap(),
+            database::ReorderChildrenOutcome::Reordered
+        );
+        assert_eq!(uids(), order);
+
+        let v4 = mk("V4", "https://example.com/pl/v4");
+        let mut expected = order.clone();
+        expected.push(v4.entry_uid.clone());
+        assert_eq!(uids(), expected);
     }
 
 }

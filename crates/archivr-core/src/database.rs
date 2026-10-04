@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -155,6 +156,9 @@ pub struct RoleRecord {
     pub is_builtin: bool,
 }
 
+/// Default reorder permission: ADMIN (bit 2) | OWNER (bit 3). Keep in sync with the SQL DEFAULT 12 in `initialize_auth_schema`.
+pub const DEFAULT_REORDER_CHILDREN_ROLE_BITS: u32 = 0b1100;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InstanceSettings {
     pub public_index_enabled: bool,
@@ -168,6 +172,16 @@ pub struct InstanceSettings {
     pub cookie_ext_enabled: bool,
     /// Global default for modal-closer browser-script behavior during WebPage captures.
     pub modal_closer_enabled: bool,
+    /// Role bits allowed to reorder child entries (`PUT …/children/order`).
+    /// A caller may reorder iff `role_bits & reorder_children_role_bits != 0`.
+    /// Only the Owner may change it. Never contains the Guest bit.
+    pub reorder_children_role_bits: u32,
+}
+
+impl InstanceSettings {
+    pub fn can_reorder_children(&self, role_bits: u32) -> bool {
+        role_bits & self.reorder_children_role_bits != 0
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -296,7 +310,8 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             representation_kind TEXT NOT NULL,
             source_metadata_json TEXT NOT NULL DEFAULT '{}',
             display_metadata_json TEXT,
-            cached_bytes INTEGER NOT NULL DEFAULT 0
+            cached_bytes INTEGER NOT NULL DEFAULT 0,
+            position INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS blobs (
@@ -493,6 +508,51 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         [],
     );
 
+    // Migration: persisted sibling order for child entries (`position`).
+    // NULL for roots; 0-based per parent for children. The backfill reproduces
+    // the previous implicit child order (archived_at ASC, id ASC) so existing
+    // archives render unchanged. New DBs get the column from the DDL above and
+    // skip this (they have no rows to backfill).
+    let has_position = |conn: &Connection| -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('archived_entries') WHERE name = 'position'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? > 0)
+    };
+    if !has_position(conn)? {
+        // IMMEDIATE + re-check under the write lock: two connections opening
+        // the same pre-migration DB at once must not both run the ALTER.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let migrated = (|| -> Result<()> {
+            if !has_position(conn)? {
+                conn.execute_batch(
+                    "ALTER TABLE archived_entries ADD COLUMN position INTEGER;
+                     UPDATE archived_entries
+                     SET position = (
+                         SELECT COUNT(*) FROM archived_entries s
+                         WHERE s.parent_entry_id = archived_entries.parent_entry_id
+                           AND (s.archived_at < archived_entries.archived_at
+                                OR (s.archived_at = archived_entries.archived_at
+                                    AND s.id < archived_entries.id))
+                     )
+                     WHERE parent_entry_id IS NOT NULL;",
+                )?;
+            }
+            Ok(())
+        })();
+        conn.execute_batch(if migrated.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+        migrated?;
+    }
+    // Sibling-order lookups: list_child_entries ORDER BY and the MAX(position)
+    // append in create_archived_entry. Created after the migration because the
+    // column may not exist yet when the main DDL batch runs.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_archived_entries_parent_position
+             ON archived_entries(parent_entry_id, position)",
+        [],
+    )?;
+
     // Summary attempts used to be unique by cache key, which meant forced
     // regeneration erased the last completed result. Rebuild that small table
     // without the cache-key constraint while retaining all existing rows.
@@ -605,7 +665,8 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
             default_entry_visibility           INTEGER NOT NULL DEFAULT 2,
             ublock_enabled                     INTEGER NOT NULL DEFAULT 1 CHECK (ublock_enabled IN (0, 1)),
             cookie_ext_enabled                 INTEGER NOT NULL DEFAULT 1 CHECK (cookie_ext_enabled IN (0, 1)),
-            modal_closer_enabled               INTEGER NOT NULL DEFAULT 1 CHECK (modal_closer_enabled IN (0, 1))
+            modal_closer_enabled               INTEGER NOT NULL DEFAULT 1 CHECK (modal_closer_enabled IN (0, 1)),
+            reorder_children_role_bits         INTEGER NOT NULL DEFAULT 12
         );
 
         INSERT OR IGNORE INTO instance_settings
@@ -658,6 +719,11 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
     // Add modal_closer_enabled column to instance_settings if not present (idempotent migration)
     let _ = conn.execute(
         "ALTER TABLE instance_settings ADD COLUMN modal_closer_enabled INTEGER NOT NULL DEFAULT 1",
+        [],
+    );
+    // Add reorder_children_role_bits (ADMIN|OWNER = 12 by default) if not present (idempotent migration)
+    let _ = conn.execute(
+        "ALTER TABLE instance_settings ADD COLUMN reorder_children_role_bits INTEGER NOT NULL DEFAULT 12",
         [],
     );
 
@@ -885,7 +951,8 @@ pub fn get_instance_settings(conn: &Connection) -> Result<InstanceSettings> {
                 public_archive_submission_enabled, default_entry_visibility,
                 COALESCE(ublock_enabled, 1),
                 COALESCE(cookie_ext_enabled, 1),
-                COALESCE(modal_closer_enabled, 1)
+                COALESCE(modal_closer_enabled, 1),
+                COALESCE(reorder_children_role_bits, 12)
          FROM instance_settings WHERE id = 1",
         [],
         |row| {
@@ -897,6 +964,7 @@ pub fn get_instance_settings(conn: &Connection) -> Result<InstanceSettings> {
                 ublock_enabled: row.get::<_, i64>(4)? != 0,
                 cookie_ext_enabled: row.get::<_, i64>(5)? != 0,
                 modal_closer_enabled: row.get::<_, i64>(6)? != 0,
+                reorder_children_role_bits: row.get::<_, i64>(7)? as u32,
             })
         },
     )
@@ -912,7 +980,8 @@ pub fn update_instance_settings(conn: &Connection, settings: &InstanceSettings) 
              default_entry_visibility = ?4,
              ublock_enabled = ?5,
              cookie_ext_enabled = ?6,
-             modal_closer_enabled = ?7
+             modal_closer_enabled = ?7,
+             reorder_children_role_bits = ?8
          WHERE id = 1",
         params![
             settings.public_index_enabled as i64,
@@ -922,6 +991,7 @@ pub fn update_instance_settings(conn: &Connection, settings: &InstanceSettings) 
             settings.ublock_enabled as i64,
             settings.cookie_ext_enabled as i64,
             settings.modal_closer_enabled as i64,
+            settings.reorder_children_role_bits as i64,
         ],
     )?;
     Ok(())
@@ -1049,6 +1119,78 @@ pub fn update_entry_title(conn: &Connection, entry_uid: &str, title: Option<&str
         params![title, entry_uid],
     )?;
     Ok(n > 0)
+}
+
+/// Outcome of [`reorder_child_entries`]; the server maps it to 204/404/400.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReorderChildrenOutcome {
+    Reordered,
+    ParentNotFound,
+    /// `ordered_child_uids` was not exactly the parent's current direct
+    /// children (missing, extra, foreign or duplicate UID).
+    ChildSetMismatch,
+}
+
+/// Replaces the sibling order of the direct children of `parent_entry_uid`.
+/// `ordered_child_uids` must be a permutation of the current children; child
+/// at index `i` gets `position = i`. Nothing is written on mismatch.
+/// Wrap in a transaction at the call site so the set check and the writes
+/// are atomic against concurrent child inserts (sync capture).
+pub fn reorder_child_entries(
+    conn: &Connection,
+    parent_entry_uid: &str,
+    ordered_child_uids: &[String],
+) -> Result<ReorderChildrenOutcome> {
+    let Some(parent_id) = entry_id_for_uid(conn, parent_entry_uid)? else {
+        return Ok(ReorderChildrenOutcome::ParentNotFound);
+    };
+    let current: HashSet<String> = {
+        let mut stmt =
+            conn.prepare("SELECT entry_uid FROM archived_entries WHERE parent_entry_id = ?1")?;
+        stmt.query_map([parent_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    let requested: HashSet<&str> = ordered_child_uids.iter().map(String::as_str).collect();
+    if requested.len() != ordered_child_uids.len()
+        || requested.len() != current.len()
+        || !requested.iter().all(|uid| current.contains(*uid))
+    {
+        return Ok(ReorderChildrenOutcome::ChildSetMismatch);
+    }
+    let mut update = conn.prepare(
+        "UPDATE archived_entries SET position = ?1
+         WHERE parent_entry_id = ?2 AND entry_uid = ?3",
+    )?;
+    for (index, uid) in ordered_child_uids.iter().enumerate() {
+        update.execute(params![index as i64, parent_id, uid])?;
+    }
+    Ok(ReorderChildrenOutcome::Reordered)
+}
+
+/// True when `caller_bits` can see every direct child of `parent_entry_uid`
+/// under the rule `archive::list_child_entries` applies: ADMIN/OWNER (bits 12)
+/// see everything, otherwise the parent must be in a collection whose
+/// `visibility_bits` overlap the caller's bits (children inherit it). A caller
+/// who sees only individually-shared children cannot submit a full order, so
+/// that case is false too. False for an unknown parent.
+pub fn caller_sees_all_children(
+    conn: &Connection,
+    parent_entry_uid: &str,
+    caller_bits: u32,
+) -> Result<bool> {
+    if caller_bits & 12 != 0 {
+        return Ok(entry_id_for_uid(conn, parent_entry_uid)?.is_some());
+    }
+    let visible: bool = conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM collection_entries ce
+             JOIN archived_entries p ON p.id = ce.entry_id
+             WHERE p.entry_uid = ?1 AND ce.visibility_bits & ?2 != 0
+         )",
+        params![parent_entry_uid, caller_bits as i64],
+        |row| row.get(0),
+    )?;
+    Ok(visible)
 }
 
 pub fn get_user_display_name(conn: &Connection, user_id: i64) -> Result<Option<String>> {
@@ -1292,6 +1434,17 @@ pub fn list_roles(conn: &Connection) -> Result<Vec<RoleRecord>> {
     })?
     .collect::<Result<_, _>>()
     .map_err(Into::into)
+}
+
+/// OR of `1 << bit_position` over every role except Guest (bit 0): the bits a
+/// role-permission mask may contain. Guest is excluded because every signed-in
+/// account carries it, so granting it would mean "everyone".
+pub fn grantable_role_bits(conn: &Connection) -> Result<u32> {
+    let mut stmt = conn.prepare("SELECT bit_position FROM roles WHERE bit_position > 0")?;
+    let bits = stmt
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .try_fold(0u32, |acc, b| b.map(|b| acc | (1u32 << b)))?;
+    Ok(bits)
 }
 
 /// Creates a new custom role (level=2, bit_position = max existing + 1, min 4).
@@ -2201,10 +2354,14 @@ pub fn create_archived_entry(conn: &Connection, entry: &NewEntry) -> Result<Arch
             entry_uid, source_identity_id, archive_run_id, parent_entry_id, root_entry_id,
             created_by_user_id, owned_by_user_id, source_kind, entity_kind, title, visibility,
             archived_at, original_published_at, structured_root_relpath, representation_kind,
-            source_metadata_json, display_metadata_json
+            source_metadata_json, display_metadata_json, position
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-            ?12, NULL, ?13, ?14, ?15, ?16
+            ?12, NULL, ?13, ?14, ?15, ?16,
+            CASE WHEN ?4 IS NULL THEN NULL ELSE (
+                SELECT COALESCE(MAX(position), -1) + 1
+                FROM archived_entries WHERE parent_entry_id = ?4
+            ) END
         )",
         params![
             entry_uid,
@@ -3798,6 +3955,60 @@ mod tests {
         assert_eq!(r2.bit_position, 5);
         assert_eq!(r2.level, 2);
     }
+
+    #[test]
+    fn instance_settings_reorder_mask_defaults_to_admin_owner() {
+        let conn = make_auth_conn_for_mgmt();
+        let s = get_instance_settings(&conn).unwrap();
+        assert_eq!(s.reorder_children_role_bits, 12);
+        assert_eq!(s.reorder_children_role_bits, DEFAULT_REORDER_CHILDREN_ROLE_BITS);
+    }
+
+    #[test]
+    fn instance_settings_reorder_mask_round_trips() {
+        let conn = make_auth_conn_for_mgmt();
+        let mut s = get_instance_settings(&conn).unwrap();
+        s.reorder_children_role_bits = 2 | 16;
+        update_instance_settings(&conn, &s).unwrap();
+        let s = get_instance_settings(&conn).unwrap();
+        assert_eq!(s.reorder_children_role_bits, 18);
+        assert!(s.ublock_enabled);
+    }
+
+    #[test]
+    fn instance_settings_reorder_mask_migrates_legacy_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE instance_settings (id INTEGER PRIMARY KEY CHECK (id = 1), public_index_enabled INTEGER NOT NULL DEFAULT 0, public_entry_content_enabled INTEGER NOT NULL DEFAULT 0, public_archive_submission_enabled INTEGER NOT NULL DEFAULT 0, default_entry_visibility INTEGER NOT NULL DEFAULT 2);
+             INSERT INTO instance_settings (id) VALUES (1);",
+        )
+        .unwrap();
+        initialize_auth_schema(&conn).unwrap();
+        initialize_auth_schema(&conn).unwrap();
+        let s = get_instance_settings(&conn).unwrap();
+        assert_eq!(s.reorder_children_role_bits, 12);
+        assert!(s.modal_closer_enabled);
+    }
+
+    #[test]
+    fn can_reorder_children_intersects_mask() {
+        let conn = make_auth_conn_for_mgmt();
+        let mut s = get_instance_settings(&conn).unwrap();
+        assert!(s.can_reorder_children(15));
+        assert!(s.can_reorder_children(7));
+        assert!(!s.can_reorder_children(3));
+        assert!(!s.can_reorder_children(1));
+        s.reorder_children_role_bits = 0;
+        assert!(!s.can_reorder_children(15));
+    }
+
+    #[test]
+    fn grantable_role_bits_excludes_guest_and_tracks_custom_roles() {
+        let conn = make_auth_conn_for_mgmt();
+        assert_eq!(grantable_role_bits(&conn).unwrap(), 0b1110);
+        create_custom_role(&conn, "editor", "Editor").unwrap();
+        assert_eq!(grantable_role_bits(&conn).unwrap(), 30);
+    }
     // ── rename_tag / delete_tag ────────────────────────────────────────────
 
     #[test]
@@ -4939,5 +5150,129 @@ mod tests {
             Some(entry.id)
         );
         assert_eq!(entry_id_for_uid(&c, "ent_nope").unwrap(), None);
+    }
+
+    fn position_of(c: &Connection, id: i64) -> Option<i64> {
+        c.query_row(
+            "SELECT position FROM archived_entries WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn child(c: &Connection, parent: &ArchivedEntry) -> ArchivedEntry {
+        create_entry_fixture(c, "private", Some(parent.id), Some(parent.id))
+    }
+
+    #[test]
+    fn create_archived_entry_assigns_child_positions_append_only() {
+        let c = conn();
+        let r = create_entry_fixture(&c, "private", None, None);
+        assert_eq!(position_of(&c, r.id), None);
+        let a = child(&c, &r);
+        let b = child(&c, &r);
+        let c3 = child(&c, &r);
+        assert_eq!(position_of(&c, a.id), Some(0));
+        assert_eq!(position_of(&c, b.id), Some(1));
+        assert_eq!(position_of(&c, c3.id), Some(2));
+        let r2 = create_entry_fixture(&c, "private", None, None);
+        let x = child(&c, &r2);
+        assert_eq!(position_of(&c, x.id), Some(0));
+        assert!(delete_entry(&c, &b.entry_uid).unwrap());
+        let d = child(&c, &r);
+        assert_eq!(position_of(&c, d.id), Some(3));
+    }
+
+    #[test]
+    fn reorder_child_entries_rewrites_positions() {
+        let c = conn();
+        let r = create_entry_fixture(&c, "private", None, None);
+        let a = child(&c, &r);
+        let b = child(&c, &r);
+        let c3 = child(&c, &r);
+        let order = vec![c3.entry_uid.clone(), a.entry_uid.clone(), b.entry_uid.clone()];
+        assert_eq!(
+            reorder_child_entries(&c, &r.entry_uid, &order).unwrap(),
+            ReorderChildrenOutcome::Reordered
+        );
+        assert_eq!(position_of(&c, c3.id), Some(0));
+        assert_eq!(position_of(&c, a.id), Some(1));
+        assert_eq!(position_of(&c, b.id), Some(2));
+        let d = child(&c, &r);
+        assert_eq!(position_of(&c, d.id), Some(3));
+    }
+
+    #[test]
+    fn reorder_child_entries_rejects_mismatched_sets() {
+        let c = conn();
+        let r = create_entry_fixture(&c, "private", None, None);
+        let a = child(&c, &r);
+        let b = child(&c, &r);
+        let r2 = create_entry_fixture(&c, "private", None, None);
+        let x = child(&c, &r2);
+        let (a_u, b_u) = (a.entry_uid.clone(), b.entry_uid.clone());
+        let cases: Vec<Vec<String>> = vec![
+            vec![a_u.clone()],
+            vec![a_u.clone(), b_u.clone(), x.entry_uid.clone()],
+            vec![a_u.clone(), b_u.clone(), r2.entry_uid.clone()],
+            vec![a_u.clone(), a_u.clone()],
+            vec![a_u.clone(), b_u.clone(), a_u.clone()],
+            vec![],
+        ];
+        for case in cases {
+            assert_eq!(
+                reorder_child_entries(&c, &r.entry_uid, &case).unwrap(),
+                ReorderChildrenOutcome::ChildSetMismatch,
+                "{case:?}"
+            );
+            assert_eq!(position_of(&c, a.id), Some(0));
+            assert_eq!(position_of(&c, b.id), Some(1));
+        }
+    }
+
+    #[test]
+    fn reorder_child_entries_unknown_parent() {
+        let c = conn();
+        assert_eq!(
+            reorder_child_entries(&c, "entry_nope", &[]).unwrap(),
+            ReorderChildrenOutcome::ParentNotFound
+        );
+    }
+
+    #[test]
+    fn initialize_schema_backfills_child_positions_once() {
+        let c = conn();
+        let r = create_entry_fixture(&c, "private", None, None);
+        let a = child(&c, &r);
+        let b = child(&c, &r);
+        let c3 = child(&c, &r);
+        c.execute(
+            "UPDATE archived_entries SET archived_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+            [b.id],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE archived_entries SET archived_at = '2026-01-02T00:00:00Z' WHERE id IN (?1, ?2)",
+            [a.id, c3.id],
+        )
+        .unwrap();
+        c.execute_batch(
+            "DROP INDEX idx_archived_entries_parent_position;
+             ALTER TABLE archived_entries DROP COLUMN position;",
+        )
+        .unwrap();
+        initialize_schema(&c).unwrap();
+        assert_eq!(position_of(&c, b.id), Some(0));
+        assert_eq!(position_of(&c, a.id), Some(1));
+        assert_eq!(position_of(&c, c3.id), Some(2));
+        assert_eq!(position_of(&c, r.id), None);
+
+        let order = vec![a.entry_uid.clone(), b.entry_uid.clone(), c3.entry_uid.clone()];
+        reorder_child_entries(&c, &r.entry_uid, &order).unwrap();
+        initialize_schema(&c).unwrap();
+        assert_eq!(position_of(&c, a.id), Some(0));
+        assert_eq!(position_of(&c, b.id), Some(1));
+        assert_eq!(position_of(&c, c3.id), Some(2));
     }
 }

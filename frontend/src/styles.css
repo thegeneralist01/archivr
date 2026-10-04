@@ -3062,6 +3062,56 @@ body.has-audio-bar { padding-bottom: 56px; }
 .child-entry-row .col-added { padding-left: 22px; }
 .child-entry-row > div:last-child { padding-right: 22px; }
 
+/* Child reorder: drag handle or move buttons inside .col-title, never both.
+   The arrows are the default (touch, no pointer, phone-sized ≤640px viewports,
+   and any browser that can't evaluate the query below). The one media query
+   switches a mouse/trackpad on a wider viewport to the drag handle, so the two
+   cases are exact complements without range syntax. Alt+↑/↓ on a focused row
+   works everywhere. */
+.child-reorder-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  transition: opacity 0.15s;
+}
+.child-drag-handle {
+  display: none;
+  cursor: grab;
+  padding: 0 3px;
+  font-size: 0.8em;
+  letter-spacing: -2px;
+  user-select: none;
+  color: var(--muted);
+}
+.child-drag-handle:active { cursor: grabbing; }
+.child-move-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  font-size: 0.9em;
+  line-height: 1;
+  cursor: pointer;
+}
+.child-move-btn:disabled { opacity: 0.3; cursor: default; }
+.child-move-btn:focus { outline: none; }
+.child-move-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: 2px; }
+@media (hover: hover) and (pointer: fine) and (min-width: 641px) {
+  /* Dimmed until the row is hovered/focused; there is hover to reveal it. */
+  .child-reorder-controls { gap: 1px; opacity: 0.3; }
+  .child-entry-row:hover .child-reorder-controls,
+  .child-entry-row:focus-within .child-reorder-controls { opacity: 1; }
+  .child-drag-handle { display: inline; }
+  .child-move-btn { display: none; }
+}
+.child-entry-row.is-dragging { opacity: 0.4; }
+.child-entry-row.is-drop-before { box-shadow: inset 0 2px 0 var(--accent); }
+.child-entry-row.is-drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
+.child-entries[aria-busy="true"] .child-entry-row { cursor: progress; }
+
 /* Expand chevron button */
 .entry-expand-btn {
   display: inline-flex;

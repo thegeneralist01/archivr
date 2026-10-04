@@ -46,7 +46,7 @@ Archivr is a self-hosted tool for capturing and preserving digital content — Y
 - **Deduplication** — SHA3-256 content-addressed blob store shared across all captures; identical files are stored once
 - **Tags and search** — hierarchical tag tree, full-text search (including the latest completed summary and its generated JSON tags), filterable entry list
 - **Multiple archives** — the server mounts any number of separate archives from a single TOML config
-- **Role-based auth** — Guest / User / Admin / Owner roles; session cookies and API tokens; Argon2 passwords
+- **Role-based auth** — Guest / User / Admin / Owner roles; session cookies and API tokens; Argon2 passwords; the Owner can choose which roles (including custom ones) may reorder child entries
 - **Quality selection** — choose video quality or audio-only per capture; a live metadata probe populates the selector before download
 - **LLM summaries** — regenerable per-entry summary via the Anthropic HTTP API, an OpenAI-compatible HTTP API, a local `claude` CLI, or a local `codex` CLI; triggered manually from the entry rail, never automatically on capture; text-only by default, with an explicit `Include attached images` option
 - **Text notes** — capture a plain-text or Markdown note with a title and no URL; the byte-preserving note is stored as a normal deduplicated blob and opens in the usual entry-rail preview
@@ -145,6 +145,8 @@ A separate auth database (`archivr-auth.sqlite`, path set in TOML) holds users, 
 Capturing a playlist or channel creates a **container entry** with each video archived as a child beneath it. Before downloading, the UI probes each video for available quality options — set quality per-video or apply one to the whole batch. Individual videos can be excluded with the remove button.
 
 **Sync mode:** when re-archiving a playlist or channel, enable sync mode in the capture dialog to skip videos that are already in the archive. Only new videos are downloaded; the existing container is reused.
+
+**Reordering:** if your role is allowed (by default Admin and Owner), expand a container on the main page and drag a video by its handle to change its position. On touch screens and phone-sized windows, where dragging isn't available, ↑/↓ buttons appear instead. Alt+↑/↓ on a selected row works everywhere. The order is saved to the archive. Videos added later by sync mode appear at the end. The Owner chooses which roles, including custom roles, may reorder under **Settings → Instance → Permissions**.
 
 ### Video quality and audio-only
 
@@ -429,7 +431,6 @@ cargo run -p archivr-server -- ./archivr-server.toml
 bun install
 bun run dev        # Vite dev server
 bun run build      # → crates/archivr-server/static/
-bun run storybook  # Component QA on :6006
 
 # Nix
 nix develop        # dev shell

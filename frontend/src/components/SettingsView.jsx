@@ -6,13 +6,16 @@ import {
   getInstanceSettings, updateInstanceSettings,
   scanOrphanBlobs, deleteOrphanBlobs,
   listCookieRules, createCookieRule, updateCookieRule, deleteCookieRule,
+  listRoles, fetchMe,
 } from '../api.js'
 
 const ROLE_ADMIN = 4
+const ROLE_OWNER = 8
 
 export default function SettingsView({ tab, onTabChange, archiveId }) {
   const { currentUser, setCurrentUser } = useContext(AuthContext) ?? {}
   const isAdmin = currentUser && ((currentUser.role_bits & ROLE_ADMIN) !== 0)
+  const isOwner = !!currentUser && (currentUser.role_bits & ROLE_OWNER) !== 0
 
   const tabs = ['profile', 'tokens', ...(isAdmin ? ['instance', 'cookies', 'extensions', 'storage'] : [])]
   const tabLabels = { profile: 'Profile', tokens: 'API Tokens', instance: 'Instance', cookies: 'Cookies', extensions: 'Extensions', storage: 'Storage' }
@@ -32,7 +35,7 @@ export default function SettingsView({ tab, onTabChange, archiveId }) {
 
       {tab === 'profile' && <ProfileTab currentUser={currentUser} setCurrentUser={setCurrentUser} />}
       {tab === 'tokens' && <TokensTab />}
-      {tab === 'instance' && isAdmin && <InstanceTab />}
+      {tab === 'instance' && isAdmin && <InstanceTab isOwner={isOwner} setCurrentUser={setCurrentUser} />}
       {tab === 'cookies' && isAdmin && <CookiesTab />}
       {tab === 'extensions' && isAdmin && <ExtensionsTab />}
       {tab === 'storage' && isAdmin && <StorageTab archiveId={archiveId} />}
@@ -239,26 +242,56 @@ function TokensTab() {
   )
 }
 
-function InstanceTab() {
+function InstanceTab({ isOwner, setCurrentUser }) {
   const [settings, setSettings] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [saving, setSaving] = useState(false)
   const [saveMsg, setSaveMsg] = useState(null)
+  const [roles, setRoles] = useState([])
+  const [reorderBits, setReorderBits] = useState(12)
+  const [permSaving, setPermSaving] = useState(false)
+  const [permMsg, setPermMsg] = useState(null)
 
   useEffect(() => {
     (async () => {
-      try { setSettings(await getInstanceSettings()) }
+      try {
+        const [s, r] = await Promise.all([getInstanceSettings(), listRoles()])
+        setSettings(s)
+        setRoles(r.filter(role => role.bit_position > 0))
+        setReorderBits(s.reorder_children_role_bits ?? 12)
+      }
       catch (e) { setError(e.message) }
       finally { setLoading(false) }
     })()
   }, [])
 
+  function toggleRole(bit, checked) {
+    setReorderBits(b => checked ? (b | bit) >>> 0 : (b & ~bit) >>> 0)
+  }
+
+  async function handleSavePermissions(e) {
+    e.preventDefault()
+    setPermSaving(true); setPermMsg(null)
+    try {
+      await updateInstanceSettings({ reorder_children_role_bits: reorderBits })
+      setSettings(s => ({ ...s, reorder_children_role_bits: reorderBits }))
+      const me = await fetchMe()
+      if (me) setCurrentUser?.(me) // owner's own can_reorder_children may change
+      setPermMsg({ ok: true, text: 'Saved.' })
+    } catch (err) {
+      setPermMsg({ ok: false, text: err.message })
+    } finally {
+      setPermSaving(false)
+    }
+  }
+
   async function handleSave(e) {
     e.preventDefault()
     setSaving(true); setSaveMsg(null)
     try {
-      await updateInstanceSettings(settings)
+      const { reorder_children_role_bits: _mask, ...rest } = settings
+      await updateInstanceSettings(rest)
       setSaveMsg({ ok: true, text: 'Saved.' })
     } catch (err) {
       setSaveMsg({ ok: false, text: err.message })
@@ -300,6 +333,31 @@ function InstanceTab() {
           <button className="btn-primary" type="submit" disabled={saving}>
             {saving ? 'Saving\u2026' : 'Save Settings'}
           </button>
+        </form>
+      </div>
+      <div className="form-section">
+        <h2>Permissions</h2>
+        <form onSubmit={handleSavePermissions}>
+          <label className="form-label">Reorder child entries</label>
+          {roles.map(role => {
+            const bit = (1 << role.bit_position) >>> 0
+            return (
+              <label key={role.role_uid} className="checkbox-row">
+                <input type="checkbox" disabled={!isOwner || permSaving}
+                  checked={(reorderBits & bit) !== 0}
+                  onChange={e => toggleRole(bit, e.target.checked)} />
+                {role.name}{!role.is_builtin && <span className="muted"> (custom)</span>}
+              </label>
+            )
+          })}
+          <p className="form-hint">Roles are cumulative: every signed-in account also has User, and owners also have Admin. Checking User lets every signed-in account reorder.</p>
+          {!isOwner && <p className="form-hint">Only the owner can change this.</p>}
+          {permMsg && <div className={`form-msg form-msg--${permMsg.ok ? 'ok' : 'err'}`}>{permMsg.text}</div>}
+          {isOwner && (
+            <button className="btn-primary" type="submit" disabled={permSaving}>
+              {permSaving ? 'Saving\u2026' : 'Save Permissions'}
+            </button>
+          )}
         </form>
       </div>
     </div>

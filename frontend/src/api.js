@@ -77,6 +77,26 @@ export async function fetchEntryChildren(archiveId, entryUid) {
   return getJson(`/api/archives/${archiveId}/entries/${entryUid}/children`);
 }
 
+// Persists a new sibling order for a parent's direct children. `childUids`
+// must be exactly the parent's current children; the server answers 400
+// when the set is stale (e.g. a sync added a video) — err.status carries it.
+export async function reorderEntryChildren(archiveId, parentEntryUid, childUids) {
+  const res = await fetch(
+    `/api/archives/${archiveId}/entries/${parentEntryUid}/children/order`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ child_uids: childUids }),
+    }
+  );
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    const err = new Error(body.error || `HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+}
+
 // Fetch multiple artifact JSON payloads for an entry in parallel.
 // Returns a Promise<Array> preserving index order.
 export function fetchEntryArtifacts(archiveId, entryUid, indices) {
@@ -359,7 +379,7 @@ export async function updateInstanceSettings(patch) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(patch),
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || `HTTP ${res.status}`); }
 }
 
 // ── Admin helpers ─────────────────────────────────────────────────────────────

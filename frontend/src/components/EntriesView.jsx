@@ -2,7 +2,7 @@ import SkeletonEntryRow from './SkeletonEntryRow';
 
 import EntryRow from './EntryRow';
 
-export default function EntriesView({ entries, selectedUids, onRowClick, archiveId, pendingCaptures = [], deletedUids, isPublicSession }) {
+export default function EntriesView({ entries, selectedUids, onRowClick, archiveId, pendingCaptures = [], deletedUids, renamedTitles, isPublicSession, canReorder = false, onChildReorderError }) {
   return (
     <section id="archive-view" className="view is-active">
       <div className="entry-table">
@@ -29,7 +29,10 @@ export default function EntriesView({ entries, selectedUids, onRowClick, archive
               onRowClick={onRowClick}
               selectedUids={selectedUids}
               deletedUids={deletedUids}
+              renamedTitles={renamedTitles}
               isPublicSession={isPublicSession}
+              canReorder={canReorder}
+              onReorderError={onChildReorderError}
             />
           ))}
         </div>

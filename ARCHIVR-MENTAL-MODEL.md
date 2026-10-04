@@ -72,8 +72,11 @@ Rules:
 - Maximum nesting depth is 2 (root → child). Children cannot have children.
 - The UI shows child entries collapsed under their parent, expandable with a chevron.
 - Container entries are created by playlist/channel captures. Single-video and all other source types produce a standalone root entry with no children.
+- Children have a persisted sibling order: `archived_entries.position` (0-based per parent, `NULL` for roots). `list_child_entries` orders by it (tie-break `archived_at, id`).
+- New children are always appended (`MAX(position)+1` in `create_archived_entry`): an initial playlist/channel capture keeps playlist enumeration order; sync appends newly found videos after the existing (possibly user-reordered) children.
+- Users whose roles are allowed by the instance setting `reorder_children_role_bits` (auth DB `instance_settings`; default ADMIN|OWNER = 12; editable only by the Owner in Settings → Instance → Permissions) reorder an expanded parent's children on the main page. Exactly one control is shown, selected purely in CSS: the ↑/↓ buttons are the default, and a single `(hover: hover) and (pointer: fine) and (min-width: 641px)` query swaps in the drag handle (HTML5 drag-and-drop). Touch, no-pointer, phone-width (≤ 640px) viewports, and browsers that can't evaluate the query keep the arrows, since HTML5 DnD is unreliable there and no feature test detects it. Alt+↑/↓ on a focused child row works on all inputs (advertised via `aria-keyshortcuts`). The UI sends the full child UID list to `PUT /api/archives/:archive_id/entries/:entry_uid/children/order` (401 guest, 403 role not in mask, 404 unknown parent or a parent the caller can't see under the `list_child_entries` rule (`database::caller_sees_all_children`), 400 unless the list is exactly the current children). `/api/auth/me` and login return `can_reorder_children`; the UI hides reorder controls when it is false.
 
-If a feature touches how entries are parented or how the UI groups them, start in `archivr-core` (`database.rs` for schema, `archive.rs` for listing, `capture.rs` for creation).
+If a feature touches how entries are parented or how the UI groups them, start in `archivr-core` (`database.rs` for schema, `archive.rs` for listing, `capture.rs` for creation). Child-order UI lives in `routes.rs` (`reorder_entry_children_handler`) and `frontend/src/components/EntryRow.jsx`.
 
 ## How To Run It
 
@@ -287,7 +290,7 @@ If a browser feature needs new data, the usual order is:
 
 The server both reads and writes archive data. Capture jobs are asynchronous: `POST /api/archives/:id/captures` inserts a job row, spawns a blocking task, and returns immediately; the frontend polls until the job completes or fails. Heavy work stays synchronous inside `archivr-core`.
 
-**Auth model.** A separate `archivr-auth.sqlite` (path derived from the server config directory) holds users, sessions, and API tokens. Role bits are `u32` flags (`GUEST`, `USER`, `ADMIN`, `OWNER`) so a single bitmask value covers assignment, checks, and visibility. The middleware stack is `setup_guard` → `login_rate_limit` → `security_headers`; route families are classified `READ / ADMIN / WRITE / STATIC` in `routes.rs`.
+**Auth model.** A separate `archivr-auth.sqlite` (path derived from the server config directory) holds users, sessions, and API tokens. Role bits are `u32` flags (`GUEST`, `USER`, `ADMIN`, `OWNER`) so a single bitmask value covers assignment, checks, and visibility. The middleware stack is `setup_guard` → `login_rate_limit` → `security_headers`; route families are classified `READ / ADMIN / WRITE / STATIC` in `routes.rs`. Configurable per-action permissions are `u32` role masks on the auth `instance_settings` singleton (currently `reorder_children_role_bits`). Handlers read them per request and allow when `caller_bits & mask != 0`, so changes take effect without re-login. Only the Owner may change them, and masks may contain only existing non-guest role bits (`database::grantable_role_bits`).
 
 **Search** is server-side free-text filtering over entry fields and the latest completed summary. The summary JSON is
 searched as text, so generated `tags` participate. Older completed summaries stay searchable while a newer request is
