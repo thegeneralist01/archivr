@@ -563,6 +563,12 @@ fn determine_source(path: &str) -> Source {
         }
 
         if path.starts_with("https://x.com/") {
+            // Status URLs (twitter.com/{user}/status/{id}) are tweets; everything
+            // else (home, search, profiles, etc.) goes through yt-dlp as Source::X.
+            let after_domain = &path["https://x.com/".len()..];
+            if after_domain.contains("/status/") {
+                return Source::Tweet;
+            }
             return Source::X;
         }
 
@@ -756,6 +762,17 @@ fn local_file_extension(path: &str) -> String {
 }
 
 fn tweet_id_from_archive_path(path: &str) -> Option<String> {
+    // Full x.com status URL: https://x.com/{user}/status/{id}[/...]
+    if let Some(after_domain) = path.strip_prefix("https://x.com/") {
+        if let Some(status_idx) = after_domain.find("/status/") {
+            let id = after_domain[status_idx + "/status/".len()..]
+                .split('/')
+                .next()
+                .unwrap_or("");
+            return parse_tweet_id(id);
+        }
+    }
+    // Shorthand: tweet:ID, x:tweet:ID, etc.
     path.split(':').next_back().and_then(parse_tweet_id)
 }
 
@@ -2692,9 +2709,19 @@ mod tests {
     #[test]
     fn test_x_sources() {
         let x_cases = [
+            // Non-status x.com URLs still go through yt-dlp
             TestCase {
                 url: "https://x.com/some_post",
                 expected: Source::X,
+            },
+            // Status URLs are tweets
+            TestCase {
+                url: "https://x.com/navyabijoy/status/2106754057834840266",
+                expected: Source::Tweet,
+            },
+            TestCase {
+                url: "https://x.com/i/status/1234567890",
+                expected: Source::Tweet,
             },
             TestCase {
                 url: "x:1234567890",
