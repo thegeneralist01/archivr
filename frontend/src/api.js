@@ -37,18 +37,31 @@ export async function fetchEntrySummary(archiveId, entryUid, { signal } = {}) {
   return getJson(`/api/archives/${archiveId}/entries/${entryUid}/summary`, { signal });
 }
 
+// Local transcription engines that are enabled and configured on this server
+// ([{ kind, label, english_only, languages }]); an empty list means the
+// feature is off. Logged-in users only; callers treat errors as [].
+export async function fetchTranscriptionEngines({ signal } = {}) {
+  return getJson('/api/summary/transcription-engines', { signal });
+}
+
 // Kicks off generation. Resolves to either an existing completed summary (200)
 // or a freshly claimed pending row (202) — both carry a summary_uid, so the
 // caller polls fetchEntrySummary either way.
 // The server returns 400 with the exact missing env var name when a provider is
 // unconfigured, so its body is surfaced verbatim rather than replaced.
-export async function requestEntrySummary(archiveId, entryUid, { provider, force = false, includeImages = false, signal } = {}) {
+// `transcribeEngine` (a kind from fetchTranscriptionEngines) is sent only when
+// non-empty; the server uses it only for YouTube videos without subtitles.
+export async function requestEntrySummary(archiveId, entryUid, { provider, force = false, includeImages = false, transcribeEngine, signal } = {}) {
+  const payload = { provider, force, include_images: includeImages };
+  if (typeof transcribeEngine === 'string' && transcribeEngine.trim()) {
+    payload.transcribe_engine = transcribeEngine.trim();
+  }
   const resp = await fetch(
     `/api/archives/${archiveId}/entries/${entryUid}/summary`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ provider, force, include_images: includeImages }),
+      body: JSON.stringify(payload),
       signal,
     }
   );
@@ -128,6 +141,28 @@ export async function updateEntryTitle(archiveId, entryUid, title) {
     body: JSON.stringify({ title: title ?? null }),
   });
   if (!res.ok) throw new Error(await res.text());
+}
+
+// Names an X thread with a cheap model on the server and saves it as the title.
+// Resolves to { entry_uid, title }; the server's { error } text is surfaced verbatim
+// (e.g. a missing API-key variable or the provider's failure).
+export async function generateThreadTitle(archiveId, entryUid, { provider }) {
+  const res = await fetch(`/api/archives/${archiveId}/entries/${entryUid}/thread-title`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider }),
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    let message = detail.trim();
+    try {
+      message = JSON.parse(detail).error || message;
+    } catch {
+      // non-JSON body
+    }
+    throw new Error(message || `Title generation failed (${res.status})`);
+  }
+  return res.json();
 }
 
 export async function fetchEntryTags(archiveId, entryUid) {
@@ -214,13 +249,14 @@ export async function fetchTags(archiveId) {
 export async function submitCapture(archiveId, locator, quality = null, extensions = null) {
   const payload = { locator }
   if (quality && quality !== 'best') payload.quality = quality
-  // extensions: { ublock_enabled?: bool, reader_mode?: bool, cookie_ext_enabled?: bool, modal_closer_enabled?: bool, via_freedium?: bool }
+  // extensions: { ublock_enabled?: bool, reader_mode?: bool, cookie_ext_enabled?: bool, modal_closer_enabled?: bool, via_freedium?: bool, download_subtitles?: bool }
   if (extensions) {
     if (typeof extensions.ublock_enabled === 'boolean') payload.ublock_enabled = extensions.ublock_enabled
     if (typeof extensions.reader_mode === 'boolean') payload.reader_mode = extensions.reader_mode
     if (typeof extensions.cookie_ext_enabled === 'boolean') payload.cookie_ext_enabled = extensions.cookie_ext_enabled
     if (typeof extensions.modal_closer_enabled === 'boolean') payload.modal_closer_enabled = extensions.modal_closer_enabled
     if (typeof extensions.via_freedium === 'boolean') payload.via_freedium = extensions.via_freedium
+    if (typeof extensions.download_subtitles === 'boolean') payload.download_subtitles = extensions.download_subtitles
     if (extensions.per_item_quality && typeof extensions.per_item_quality === 'object' && Object.keys(extensions.per_item_quality).length > 0) payload.per_item_quality = extensions.per_item_quality
     if (extensions.sync === true) payload.sync = true
   }
@@ -380,6 +416,23 @@ export async function updateInstanceSettings(patch) {
     body: JSON.stringify(patch),
   });
   if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || `HTTP ${res.status}`); }
+}
+
+export async function getYtDlpStatus({ signal } = {}) {
+  return getJson('/api/admin/yt-dlp', { signal });
+}
+
+// Runs the yt-dlp + Deno update server-side (same as `archivr yt-dlp update`); can take minutes.
+// err.status carries the HTTP status (409 = another update is running).
+export async function updateYtDlp() {
+  const res = await fetch('/api/admin/yt-dlp/update', { method: 'POST' });
+  if (!res.ok) {
+    const b = await res.json().catch(() => ({}));
+    const err = new Error(b.error || `HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
 }
 
 // ── Admin helpers ─────────────────────────────────────────────────────────────

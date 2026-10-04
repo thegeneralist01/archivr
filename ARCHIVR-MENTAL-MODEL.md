@@ -84,7 +84,7 @@ There are two user-facing binaries:
 
 | Binary | Purpose |
 |---|---|
-| `archivr` | CLI for initializing archives and capturing material into one archive (also `yt-dlp status\|update`) |
+| `archivr` | CLI for initializing archives and capturing material into one archive (also `yt-dlp status\|update`; the web UI equivalent is Settings › Instance › yt-dlp) |
 | `archivr-server` | Web server for browsing one or more existing archives |
 
 The CLI writes archive data:
@@ -130,6 +130,17 @@ sequenceDiagram
   Core->>DB: insert run, source identity, entry, artifacts
   CLI->>User: terminal result
 ```
+
+**YouTube subtitles are sidecar artifacts.** For `Source::YouTubeVideo` (single videos and YouTube playlist/channel
+children) with `CaptureConfig::download_subtitles` set (the default), the yt-dlp media call also writes up to two
+subtitle files (see [yt-dlp Lifecycle](#yt-dlp-lifecycle)). `subtitles::archive_staged_subtitles` moves them into
+`raw/` through `store::archive_staged_file` (same SHA3 dedup) before the temp dir is removed, and
+`subtitles::register_subtitle_artifacts` records each one as a `subtitle` artifact once the entry exists:
+`storage_area = "raw"`, MIME `text/vtt` or `application/x-subrip`, and `metadata_json`
+`{language, kind, format, original_language, origin}` with `kind` `manual`/`auto`/`unknown` and `origin` `capture` or
+`summary_fetch`. Registration runs in one `BEGIN IMMEDIATE` transaction and skips an existing
+(entry, `subtitle`, blob) row. Subtitle archive and register errors are warnings; the capture still succeeds. The CLI
+(`--no-subtitles`), the capture API (`download_subtitles: false`) and the capture dialog toggle all turn it off.
 
 **Pasted text short-circuits most of that.** `perform_text_capture` (`capture.rs`) is not a `Source`
 route: there is no locator to classify, no URL probe, and no downloader subprocess. It validates the
@@ -208,6 +219,10 @@ flowchart LR
   UI["ContextRail Summary"] -->|POST .../summary| Server
   Server --> Input["build_summary_input()"]
   Input --> Artifacts["entry artifacts on disk"]
+  Server -->|YouTube, no usable subtitles| Fetch["fetch_subtitles_for_entry (yt-dlp)"]
+  Fetch --> Artifacts
+  Fetch -->|still none + transcribe_engine| Transcribe["transcribe_entry (audio → ffmpeg → engine)"]
+  Transcribe --> Artifacts
   Server --> Row["entry_summaries: pending → running"]
   Server --> Provider["SummaryProvider (HTTP or CLI)"]
   Provider --> Row2["completed / failed"]
@@ -223,6 +238,55 @@ statuses from bleeding into one another. For an X Article, the reducer prefers a
 `plain_text`, then flattened ordered blocks, then `preview_text`, then `summary_text`; only then does it fall back to
 `full_text`/`text`/`content`/`body`. Any change to article reduction or thread status storage must be mirrored here.
 
+**Tweet entry titles.** When the status is an X Article, the title is `<article.title> — @handle`; otherwise the
+tweet-text excerpt (`caption_excerpt`). On server startup `capture::backfill_x_article_titles` retitles only rows whose title still
+byte-equals the legacy bare-link title recomputed from their raw JSON and whose raw JSON has an Article title. It is
+compare-and-set and idempotent. Titles carry no provenance flag, so exact equality is the guard: renamed titles are
+never touched, but a title renamed back to the exact legacy string is retitled. It runs only in `archivr-server`;
+CLI-only installs never backfill. Rearchive still does not change titles.
+
+**Thread titles** (`thread_title.rs`) are manual and synchronous: the rail's **Generate title** button on
+`tweet_thread` entries calls `POST .../entries/:entry_uid/thread-title` (user role, the same gate as rename). It reuses
+the selected provider's transport (`summarizer::complete_plain`) with a cheap title model — admin instance setting
+`instance_settings.title_model_<kind>`, else `ARCHIVR_*_TITLE_MODEL`, else a per-provider default, never the summary
+model; the server passes the instance value to core as an `Option<&str>` override (core never reads the auth DB) — and
+never touches `entry_summaries`. The model returns only the topic; the server sanitizes it and owns the
+`Thread about <topic> — @author` format, saved via `update_entry_title`. The bulk panel's **Generate titles** (≥2
+selected, ≥1 thread) loops the same endpoint client-side over the selected threads, 2 at a time, with the rail's
+provider; a selection change stops it from starting further entries.
+
+**YouTube videos are summarized from a `subtitle` artifact, never the mp4.** For `youtube`/`video` entries
+`build_summary_input` skips `primary_media` and reads the entry's `subtitle` artifacts (VTT/SRT by extension or MIME).
+`subtitles::subtitle_track_rank` orders them — 0 manual English, 1 manual original language, 2 other manual, 3
+transcribed (any language), 4 auto/unknown original language, 5 auto/unknown English, 6 the rest; ties go to the lowest
+artifact id — and the first
+track that reduces to a non-empty transcript wins. `subtitles::subtitle_to_transcript` drops header/`NOTE`/`STYLE`
+blocks, cue ids, timing lines, cue settings, inline tags and ASS overrides, decodes entities, and collapses rolling
+auto-caption repeats. Content is `Transcript ({language}, {kind} subtitles):` plus the transcript, truncated at
+48,000 chars like every input; the digest covers it, so adding or switching subtitles changes `input_sha256`.
+
+No usable track yields `NoSubtitlesAvailable` (`is_no_subtitles_error`, distinct from unsupported content). The server
+preflight then inserts a `pending` row whose `input_sha256` is the placeholder `SUBTITLE_FETCH_PENDING_INPUT_SHA256`
+(`"pending-subtitle-fetch"`, never a real digest), skips the cache lookup, and returns 202. Its blocking task loads
+cookie rules from the auth DB and calls `build_summary_input_with_subtitle_fetch`: `fetch_subtitles_for_entry` returns
+early for non-YouTube entries, non-`http(s)` canonical URLs, or an entry that already has a usable track; otherwise it
+runs `fetch_metadata`, `plan_subtitle_request` and a subtitles-only `download_subtitles`, and registers the results
+with origin `summary_fetch`. An unreachable video or any yt-dlp error counts as zero subtitles. Then the input is
+rebuilt. On success `update_entry_summary_input_sha256` writes the real hash and the provider runs. If there are still
+no subtitles and the request named a `transcribe_engine`, `transcriber::transcribe_entry` runs (step 3 of the fixed
+order archived → fetched → transcribed → error), then the input is rebuilt once more. Transcription never runs when
+either earlier step yields a usable track. Otherwise the row fails with `NO_SUBTITLES_SUMMARY_MESSAGE` (or a
+transcription-specific copy when an engine ran) and no provider is called. Entries that already have usable subtitles
+keep the synchronous preflight.
+
+**Local transcription** (`transcriber.rs`): engines `whisper` (whisper.cpp or a `script` wrapper), `parakeet` (script),
+`phonon2` (English only, `--json` stdout → VTT), configured only by env and gated by `ARCHIVR_TRANSCRIBE_ENGINES`
+(`GET /api/summary/transcription-engines` lists enabled ones). One job at a time per process; audio from the archived
+media or a yt-dlp audio download, ffmpeg to 16 kHz mono WAV, all within one `ARCHIVR_TRANSCRIBE_TIMEOUT` budget
+(ffmpeg and engines via `process::run_with_timeout`; the yt-dlp audio call via `ytdlp.rs`'s own runner). The result is a `subtitle` artifact with kind `transcribed`, origin `transcription`, plus
+`engine` and `model` metadata. Spec and deviations:
+`docs/superpowers/specs/2026-10-05-local-transcription-fallback.md`.
+
 ## yt-dlp Lifecycle
 
 There is no single yt-dlp. Up to three can exist on one machine:
@@ -235,8 +299,8 @@ There is no single yt-dlp. Up to three can exist on one machine:
    sentinel that lets repeat runs skip the download.
 3. **Whatever is on PATH** — the historical behaviour, and the last-resort fallback.
 
-`resolve_yt_dlp()` in `downloader/ytdlp.rs` picks between them once per process (cached in a
-`OnceLock`): `ARCHIVR_YT_DLP_FORCE` wins outright if it points at a real file; otherwise the pinned and
+`resolve_yt_dlp()` in `downloader/ytdlp.rs` picks between them and caches the result in an `RwLock` until
+`refresh_yt_dlp()`: `ARCHIVR_YT_DLP_FORCE` wins outright if it points at a real file; otherwise the pinned and
 state-dir candidates are probed with `--version` and the newest wins — yt-dlp versions are `YYYY.MM.DD`,
 so plain string ordering is chronological — with exact ties going to the state-dir copy the user
 deliberately installed. If neither exists, it falls back to bare `yt-dlp`. `archivr yt-dlp status`
@@ -245,7 +309,45 @@ forced candidate and selects it as the winner.
 
 Three ways to move the version forward: the weekly `.github/workflows/update-ytdlp.yml` cron (reads the
 current pin, queries the GitHub releases API, re-hashes with `nix hash file --sri`, rewrites the `ytDlp`
-block and opens a PR), `archivr yt-dlp update` for one machine, or editing `flake.nix` by hand.
+block and opens a PR), `archivr yt-dlp update` / Settings › Instance › yt-dlp for one machine, or editing `flake.nix` by
+hand.
+
+**The JS runtime has the same shape.** YouTube's player challenges are solved by yt-dlp's EJS solver, which needs
+Deno ≥ 2.3.0. Candidates: the Nix/Docker pin in `ARCHIVR_DENO`, `<state_dir>/deno/deno`, and `deno` on PATH.
+`resolve_js_runtime()` in `downloader/js_runtime.rs` (cached in an `RwLock` until `refresh_js_runtime()`, returns an owned clone, warnings printed once per resolution) returns a valid
+`ARCHIVR_JS_RUNTIME` force (`RUNTIME[:ABS_PATH]`, `deno|node|bun|quickjs`, invalid values warned and ignored)
+outright; otherwise it probes the pinned and state-dir Deno, drops anything below 2.3.0, compares real semver
+(`DenoVersion`, so 2.10.0 > 2.9.7) and keeps the newest, ties to the state dir; then PATH; else `None` plus a one-time
+warning. Only Deno is chosen automatically. Every yt-dlp process is built by `yt_dlp_command()` in `ytdlp.rs`, which
+appends `js_runtime_args()` (`--js-runtimes deno:<path>`; non-Deno forces get `--no-js-runtimes` first) — the
+`download` closure (incl. the media-only retry), `download_subtitles`, `fetch_metadata_with_timeout`,
+`fetch_playlist_info` and `probe_playlist_qualities`. The update also installs the latest Deno
+(`crates/archivr-core/src/downloader/deno_install.rs`): download, extract to `deno.new`, require `--version` to equal the release,
+then atomic rename. `status` adds a JS runtime table with rows `force (ARCHIVR_JS_RUNTIME)`, `env (ARCHIVR_DENO)`,
+`state-dir`, `path (deno)`; the star goes to the winning `JsRuntimeRole` from `resolve_js_runtime_with_role()`, not to
+every row whose path matches (the Nix wrappers' pinned Deno is also on PATH).
+
+**One updater, two front ends.** `downloader/ytdlp_tools.rs` owns `install_yt_dlp`, `update_tools` and the
+`tools_status()` model; the CLI renders it as text and `GET /api/admin/yt-dlp` / `POST /api/admin/yt-dlp/update`
+(admin, 409 while an update runs) serve it to Settings › Instance › yt-dlp. `update_tools` calls `refresh_yt_dlp()` /
+`refresh_js_runtime()` after each successful component, so a UI update takes effect without a restart; commands
+already built keep their old binary. A CLI update runs in another process, so a running server still needs a restart.
+
+**Subtitles ride on the media call.** When capture wants subtitles, `plan_subtitle_request` builds a bounded (≤ 2
+tracks) request from the `--dump-json` metadata capture already fetched. `download` then appends `--write-subs` and/or
+`--write-auto-subs` (only the kinds planned), `--sub-langs <codes>`, `--sub-format vtt/srt/best` and `--ignore-errors`.
+There is no `--convert-subs`, so ffmpeg is never needed for subtitles. yt-dlp treats `--sub-langs` entries as regexes,
+so planned codes are limited to `[A-Za-z0-9][A-Za-z0-9-]*`. Without metadata the request falls back to `en` and
+`.*-orig`. If the combined call exits non-zero without staging media and its stderr mentions subtitles, it is
+retried once with the exact legacy media-only arguments (`should_retry_media_only`), and subtitle files from the
+first attempt are still collected; other failures (private, deleted, geo-blocked) fail without a retry.
+`collect_staged_outputs` splits the staging dir into the
+media file and `<stem>.<lang>.<vtt|srt>` sidecars; other subtitle formats are dropped with a warning. Summary-time
+fetches use `download_subtitles` instead: `--skip-download --no-playlist --ignore-no-formats-error` plus the same
+subtitle args and `--ignore-errors`, staged under `temp/subs-<uuid>/`. A non-zero exit is tolerated if any subtitle
+file was written. The summary-time metadata probe and subtitle call are killed after `ARCHIVR_SUMMARY_CLI_TIMEOUT`
+(a timeout counts as "no subtitles"); capture-time calls stay unbounded. Blob cleanup refuses to run while such a
+fetch is in flight (`has_pending_subtitle_fetches`). Every one of these calls is built with `yt_dlp_command()`.
 
 ## Where To Edit
 
@@ -257,8 +359,19 @@ block and opens a PR), `archivr yt-dlp update` for one machine, or editing `flak
 | Download/save behavior | `crates/archivr-core/src/downloader/` |
 | YouTube playlist/channel download, playlist probe, sync mode | `crates/archivr-core/src/downloader/ytdlp.rs` and `capture.rs` |
 | Which yt-dlp binary runs (resolver, state dir, version probe) | `crates/archivr-core/src/downloader/ytdlp.rs` |
+| Which JS runtime yt-dlp gets (Deno resolver, `ARCHIVR_JS_RUNTIME`, `--js-runtimes` args) | `crates/archivr-core/src/downloader/js_runtime.rs` |
+| yt-dlp/Deno update orchestration and status model (CLI + admin API) | `crates/archivr-core/src/downloader/ytdlp_tools.rs` |
+| Deno installer (CLI and UI update) | `crates/archivr-core/src/downloader/deno_install.rs` |
+| Settings › Instance › yt-dlp section | `frontend/src/components/SettingsView.jsx` (`YtDlpSection`) |
+| YouTube subtitles (track planning, yt-dlp args, staging) | `crates/archivr-core/src/downloader/ytdlp.rs` |
+| Subtitle artifacts, transcript reduction, track ranking, summary-time fetch | `crates/archivr-core/src/subtitles.rs` |
 | Pasted-text capture (staging, hashing, MIME allowlist) | `crates/archivr-core/src/downloader/text.rs` and `capture.rs` |
 | LLM summary providers, prompt, `PROMPT_VERSION`, input building | `crates/archivr-core/src/summarizer.rs` |
+| Local transcription engines, audio, job slot, `transcribe_entry` | `crates/archivr-core/src/transcriber.rs` |
+| Subprocess timeout runner | `crates/archivr-core/src/process.rs` |
+| Shared `ARCHIVR_*` env helpers | `crates/archivr-core/src/env_config.rs` |
+| Thread-title generation, cheap title models | `crates/archivr-core/src/thread_title.rs` |
+| X Article titles + startup backfill | `crates/archivr-core/src/capture.rs` (`backfill_x_article_titles`), called from `archivr-server/src/main.rs` |
 | `entry_summaries` schema and summary CRUD | `crates/archivr-core/src/database.rs` |
 | CLI commands, argument parsing, terminal output | `crates/archivr-cli/src/main.rs` |
 | Server API routes | `crates/archivr-server/src/routes.rs` |
@@ -267,7 +380,7 @@ block and opens a PR), `archivr yt-dlp update` for one machine, or editing `flak
 | Frontend root state + routing | `frontend/src/App.jsx` |
 | Frontend API client | `frontend/src/api.js` |
 | Frontend components | `frontend/src/components/` |
-| Summary UI (provider selector, generate, polling) | `frontend/src/components/ContextRail.jsx` |
+| Summary UI (provider selector, transcription engine, generate, polling, thread Generate title) | `frontend/src/components/ContextRail.jsx` |
 | Text/Markdown entry preview | `frontend/src/components/TextPreview.jsx` |
 | "Add text" capture row | `frontend/src/components/CaptureDialog.jsx` |
 | Frontend styling | `frontend/src/styles.css` |

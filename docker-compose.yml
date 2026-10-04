@@ -11,6 +11,12 @@ services:
       # Uncomment and set this to enable Twitter/X archiving.
       # The file must be accessible inside the container (e.g. in the config volume).
       # ARCHIVR_TWITTER_CREDENTIALS_FILE: /config/twitter-cookies.txt
+      # Optional local transcription for YouTube summaries without subtitles.
+      # Engines are not bundled: install them in a derived image or mount them.
+      # ARCHIVR_TRANSCRIBE_ENGINES: "whisper,phonon2"
+      # ARCHIVR_WHISPER_CLI: /models/bin/whisper-cli
+      # ARCHIVR_WHISPER_MODEL: /models/ggml-large-v3-turbo.bin
+      # ARCHIVR_PHONON2_CLI: /opt/transcribe/bin/fermion
     volumes:
       # Mount a directory containing archivr-server.toml as read-only config.
       # Copy docker/config.example.toml to ./config/archivr-server.toml to start.
@@ -18,6 +24,8 @@ services:
       # Persistent volume for the auth database and archive directories.
       # The paths inside must match archive_path values in your TOML config.
       - archivr-data:/data
+      # Optional read-only model directory for local transcription engines.
+      # - ./models:/models:ro
 
 volumes:
   archivr-data:

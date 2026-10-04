@@ -1,4 +1,4 @@
-import { useState, useEffect, useContext, useCallback } from 'react'
+import { useState, useEffect, useContext, useCallback, useRef } from 'react'
 import { AuthContext } from '../App.jsx'
 import {
   updateProfile, changePassword, patchMe,
@@ -7,6 +7,7 @@ import {
   scanOrphanBlobs, deleteOrphanBlobs,
   listCookieRules, createCookieRule, updateCookieRule, deleteCookieRule,
   listRoles, fetchMe,
+  getYtDlpStatus, updateYtDlp,
 } from '../api.js'
 
 const ROLE_ADMIN = 4
@@ -35,7 +36,12 @@ export default function SettingsView({ tab, onTabChange, archiveId }) {
 
       {tab === 'profile' && <ProfileTab currentUser={currentUser} setCurrentUser={setCurrentUser} />}
       {tab === 'tokens' && <TokensTab />}
-      {tab === 'instance' && isAdmin && <InstanceTab isOwner={isOwner} setCurrentUser={setCurrentUser} />}
+      {tab === 'instance' && isAdmin && (
+        <>
+          <InstanceTab isOwner={isOwner} setCurrentUser={setCurrentUser} />
+          <YtDlpSection />
+        </>
+      )}
       {tab === 'cookies' && isAdmin && <CookiesTab />}
       {tab === 'extensions' && isAdmin && <ExtensionsTab />}
       {tab === 'storage' && isAdmin && <StorageTab archiveId={archiveId} />}
@@ -242,6 +248,13 @@ function TokensTab() {
   )
 }
 
+const TITLE_MODEL_PROVIDERS = [
+  ['anthropic_http', 'Anthropic API'],
+  ['openai_compatible', 'OpenAI-compatible API'],
+  ['claude_cli', 'Claude CLI'],
+  ['codex_cli', 'Codex CLI'],
+]
+
 function InstanceTab({ isOwner, setCurrentUser }) {
   const [settings, setSettings] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -290,8 +303,9 @@ function InstanceTab({ isOwner, setCurrentUser }) {
     e.preventDefault()
     setSaving(true); setSaveMsg(null)
     try {
-      const { reorder_children_role_bits: _mask, ...rest } = settings
+      const { reorder_children_role_bits: _mask, title_models: _models, ...rest } = settings
       await updateInstanceSettings(rest)
+      setSettings(await getInstanceSettings()) // server-trimmed models + effective sources
       setSaveMsg({ ok: true, text: 'Saved.' })
     } catch (err) {
       setSaveMsg({ ok: false, text: err.message })
@@ -328,6 +342,23 @@ function InstanceTab({ isOwner, setCurrentUser }) {
               <option value={2}>Unlisted</option>
               <option value={3}>Public</option>
             </select>
+          </div>
+          <div className="form-field" style={{ marginTop: 4 }}>
+            <label className="form-label">Thread title models</label>
+            {TITLE_MODEL_PROVIDERS.map(([kind, label]) => {
+              const key = `title_model_${kind}`
+              const info = settings.title_models?.[kind]
+              const placeholder = info ? `${info.fallback_model} (${info.fallback_source})` : ''
+              return (
+                <div key={kind} className="form-field">
+                  <label className="form-label" htmlFor={key}>{label}</label>
+                  <input id={key} className="field-input" type="text" maxLength={100}
+                    value={settings[key] ?? ''} placeholder={placeholder}
+                    onChange={e => setSettings(s => ({ ...s, [key]: e.target.value }))} />
+                </div>
+              )
+            })}
+            <p className="form-hint">Cheap model used for Generate title. Leave blank to use the default.</p>
           </div>
           {saveMsg && <div className={`form-msg form-msg--${saveMsg.ok ? 'ok' : 'err'}`}>{saveMsg.text}</div>}
           <button className="btn-primary" type="submit" disabled={saving}>
@@ -857,6 +888,214 @@ function ExtensionsTab() {
 
         {msg && <div className={`form-msg form-msg--${msg.ok ? 'ok' : 'err'}`}>{msg.text}</div>}
       </div>
+    </div>
+  )
+}
+
+const YT_DLP_SOURCE_LABELS = {
+  force: 'Forced (ARCHIVR_YT_DLP_FORCE)',
+  env: 'Pinned (ARCHIVR_YT_DLP)',
+  'state-dir': 'Managed install',
+  path: 'System PATH',
+}
+const JS_SOURCE_LABELS = {
+  force: 'Forced (ARCHIVR_JS_RUNTIME)',
+  env: 'Pinned (ARCHIVR_DENO)',
+  'state-dir': 'Managed install',
+  path: 'System PATH',
+}
+
+function sourceLabel(labels, row) {
+  return (row?.role && labels[row.role]) || row?.label || 'unknown source'
+}
+
+function YtDlpCandidateTable({ caption, rows, labels }) {
+  return (
+    <div className="form-field">
+      <div className="form-label">{caption}</div>
+      <div className="ytdlp-table-wrap">
+        <table className="admin-table ytdlp-table">
+          <thead>
+            <tr><th>Source</th><th>Path</th><th>Version</th><th></th></tr>
+          </thead>
+          <tbody>
+            {rows.map(row => (
+              <tr key={row.role} className={row.chosen ? 'ytdlp-row--chosen' : undefined}>
+                <td>{sourceLabel(labels, row)}</td>
+                <td className="ytdlp-path">
+                  {row.path ?? <span className="muted">not set</span>}
+                </td>
+                <td>
+                  {row.invalid
+                    ? <span className="form-msg--err">invalid: {row.invalid}</span>
+                    : (row.path ? (row.version ?? '\u2014') : '\u2014')}
+                </td>
+                <td>{row.chosen && <span className="ytdlp-badge">in use</span>}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+function YtDlpSection() {
+  const [status, setStatus] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+  const [updating, setUpdating] = useState(false)
+  const [result, setResult] = useState(null)
+  const [updateError, setUpdateError] = useState(null)
+
+  const loadCtrl = useRef(null)
+  const alive = useRef(true)
+
+  // Probing every candidate takes seconds, so this loads separately from the settings form.
+  // A newer load or unmounting aborts the previous request. Resolves to the status or null.
+  async function load() {
+    loadCtrl.current?.abort()
+    const ctrl = new AbortController()
+    loadCtrl.current = ctrl
+    setLoading(true)
+    setError(null)
+    try {
+      const s = await getYtDlpStatus({ signal: ctrl.signal })
+      if (!ctrl.signal.aborted) setStatus(s)
+      return s
+    } catch (e) {
+      if (!ctrl.signal.aborted) setError(e.message)
+      return null
+    } finally {
+      if (!ctrl.signal.aborted) setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    alive.current = true
+    load()
+    return () => {
+      alive.current = false
+      loadCtrl.current?.abort()
+    }
+  }, [])
+
+  async function handleUpdate() {
+    setUpdating(true)
+    setResult(null)
+    setUpdateError(null)
+    try {
+      const r = await updateYtDlp()
+      setResult(r)
+      setStatus(r.status)
+    } catch (err) {
+      // A proxy may time out (e.g. 504) while the update keeps running server-side.
+      const s = err.status !== 409 && alive.current ? await load() : null
+      setUpdateError(s?.update_running
+        ? 'Update still running on the server — refresh in a minute.'
+        : err.message)
+    } finally {
+      setUpdating(false)
+    }
+  }
+
+  const ytChosen = status?.yt_dlp_chosen
+  const ytChosenRow = (status?.yt_dlp ?? []).find(r => r.chosen)
+  const jsChosen = status?.js_runtime_chosen
+  const inUse = status?.js_runtime_in_use
+  const invalidRows = (status?.js_runtime ?? []).filter(r => r.invalid)
+
+  return (
+    <div className="form-section ytdlp-section">
+      <h2>yt-dlp</h2>
+      {loading && !status && <div className="muted">Loading{'\u2026'}</div>}
+      {error && <div className="form-msg form-msg--err">{error}</div>}
+
+      {status && (
+        <>
+          <dl className="ytdlp-summary">
+            <dt>yt-dlp</dt>
+            <dd>
+              {ytChosen?.version ?? 'unknown'}
+              <span className="muted"> · {ytChosen?.role ? YT_DLP_SOURCE_LABELS[ytChosen.role] : 'unlisted path'}</span>
+              {ytChosen?.path && <div className="ytdlp-path">{ytChosen.path}</div>}
+            </dd>
+            <dt>JS runtime</dt>
+            <dd>
+              {jsChosen ? (
+                <>
+                  {jsChosen.kind} {jsChosen.version ?? ''}
+                  <span className="muted"> · {JS_SOURCE_LABELS[jsChosen.role] ?? jsChosen.role}</span>
+                  {jsChosen.path && <div className="ytdlp-path">{jsChosen.path}</div>}
+                </>
+              ) : <span className="form-msg--err">none</span>}
+            </dd>
+            <dt>In use by this server</dt>
+            <dd>
+              {inUse ? (
+                <>
+                  {inUse.kind}{jsChosen && jsChosen.path === inUse.path && jsChosen.version ? ` ${jsChosen.version}` : ''}
+                  {inUse.path && <div className="ytdlp-path">{inUse.path}</div>}
+                </>
+              ) : <span className="muted">no JS runtime</span>}
+            </dd>
+          </dl>
+
+          {ytChosenRow?.invalid && (
+            <div className="form-msg form-msg--err">
+              The yt-dlp in use does not run: {ytChosenRow.invalid}
+            </div>
+          )}
+          {!jsChosen && (
+            <div className="form-msg form-msg--err">
+              No JS runtime resolved — YouTube downloads may fail with HTTP 403. Update below to install Deno.
+            </div>
+          )}
+          {invalidRows.map(r => (
+            <div key={r.role} className="form-msg form-msg--err">
+              ARCHIVR_JS_RUNTIME={r.path} is invalid ({r.invalid}) and is ignored.
+            </div>
+          ))}
+
+          {status.state_dir && <p className="form-hint">State directory: <span className="ytdlp-path">{status.state_dir}</span></p>}
+          {!status.yt_dlp_installed && status.yt_dlp_target && (
+            <p className="form-hint">No managed yt-dlp yet — the update installs it to {status.yt_dlp_target}.</p>
+          )}
+          {!status.deno_installed && status.deno_target && (
+            <p className="form-hint">No managed Deno yet — the update installs it to {status.deno_target}.</p>
+          )}
+
+          <YtDlpCandidateTable caption="yt-dlp candidates" rows={status.yt_dlp} labels={YT_DLP_SOURCE_LABELS} />
+          <YtDlpCandidateTable caption="JS runtime candidates" rows={status.js_runtime} labels={JS_SOURCE_LABELS} />
+        </>
+      )}
+
+      {(status || !loading) && (
+        <div className="ytdlp-actions">
+          <button className="btn-primary" type="button"
+            disabled={updating || status?.update_running} onClick={handleUpdate}>
+            {updating ? 'Updating\u2026 (can take a few minutes)' : 'Update yt-dlp & Deno'}
+          </button>
+          <button className="btn-ghost" type="button" disabled={updating || loading} onClick={load}>
+            Refresh
+          </button>
+          {status?.update_running && !updating && <span className="form-hint">An update is already running.</span>}
+        </div>
+      )}
+
+      {result && (
+        <>
+          {[['yt-dlp', result.yt_dlp], ['Deno', result.deno]].map(([name, o]) => (
+            <div key={name} className={`form-msg form-msg--${o.ok ? 'ok' : 'err'}`}>
+              {name}: {o.ok ? o.message : `failed — ${o.message}`}
+            </div>
+          ))}
+          {(result.yt_dlp.ok || result.deno.ok) && (
+            <p className="form-hint">New binaries are used for the next capture — no restart needed.</p>
+          )}
+        </>
+      )}
+      {updateError && <div className="form-msg form-msg--err">{updateError}</div>}
     </div>
   )
 }

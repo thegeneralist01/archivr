@@ -112,6 +112,25 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Repair legacy bare-link titles on X Article tweets (idempotent; no-op once fixed).
+    for archive in &registry.archives {
+        let Ok(paths) = archivr_core::archive::read_archive_paths(&archive.archive_path) else {
+            continue;
+        };
+        match archivr_core::capture::backfill_x_article_titles(&paths) {
+            Ok(0) => {}
+            Ok(n) => eprintln!(
+                "info: retitled {n} X Article entr{} in '{}'",
+                if n == 1 { "y" } else { "ies" },
+                archive.id
+            ),
+            Err(e) => eprintln!(
+                "warn: X Article title backfill failed for '{}': {e:#}",
+                archive.id
+            ),
+        }
+    }
+
     // Prune staged upload dirs older than 24 h.  cleanup_stale_sentinels=true
     // because no uploads are in flight before the server starts listening.
     let prune_cutoff = std::time::SystemTime::now()

@@ -17,15 +17,17 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use std::{
     env,
-    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::mpsc,
-    thread,
     time::Duration,
 };
 
-use crate::{archive::ArchivePaths, database, hash};
+use crate::{
+    archive::ArchivePaths,
+    database, hash,
+    subtitles::{self, SubtitleFormat},
+    transcriber,
+};
+use crate::env_config::{env_or, env_timeout, optional_env, required_env, resolve_cli};
 
 /// Bump whenever the prompt text below changes in a way that would produce a
 /// materially different summary. It is part of the `entry_summaries` cache key,
@@ -43,11 +45,21 @@ pub const MAX_SUMMARY_IMAGE_TOTAL_BYTES: u64 = 12 * 1024 * 1024;
 /// User-safe copy for entries whose archived artifacts do not contain
 /// summarizable text. Keep this separate from provider and archive failures.
 pub const UNSUPPORTED_SUMMARY_CONTENT_HEADING: &str = "This entry can’t be summarized yet.";
-pub const UNSUPPORTED_SUMMARY_CONTENT_DETAIL: &str = "It doesn’t contain archived text that a summary provider can read. Summaries currently support text notes, web pages, X posts and threads, and X Articles. Video, audio, and image-only entries need a transcript or text source.";
+pub const UNSUPPORTED_SUMMARY_CONTENT_DETAIL: &str = "It doesn’t contain archived text that a summary provider can read. Summaries currently support text notes, web pages, X posts and threads, X Articles, and YouTube videos with subtitles. Other video, audio, and image-only entries need a transcript or text source.";
 pub const UNSUPPORTED_SUMMARY_CONTENT_MESSAGE: &str = concat!(
     "This entry can’t be summarized yet.\n\n",
-    "It doesn’t contain archived text that a summary provider can read. Summaries currently support text notes, web pages, X posts and threads, and X Articles. Video, audio, and image-only entries need a transcript or text source."
+    "It doesn’t contain archived text that a summary provider can read. Summaries currently support text notes, web pages, X posts and threads, X Articles, and YouTube videos with subtitles. Other video, audio, and image-only entries need a transcript or text source."
 );
+
+/// User-safe copy for YouTube videos with no usable subtitle track, neither
+/// archived nor downloadable on demand.
+pub const NO_SUBTITLES_SUMMARY_MESSAGE: &str = "This video can’t be summarized because no subtitles are available. Archivr found no archived subtitles and couldn’t download any from the original video — it may have no captions, or it may be private, deleted, or unreachable.";
+/// Placeholder `input_sha256` for a pending summary row whose input cannot be
+/// digested until subtitles have been fetched in the background.
+pub const SUBTITLE_FETCH_PENDING_INPUT_SHA256: &str = "pending-subtitle-fetch";
+/// User-safe copy when local transcription ran but its transcript reduced to
+/// no text (silence or music).
+pub const NO_SUBTITLES_AFTER_TRANSCRIPTION_MESSAGE: &str = "This video can’t be summarized because no subtitles are available and local transcription found no speech in its audio.";
 
 /// Upper bound on characters fed to a model. Archived pages run to hundreds of
 /// kilobytes; past this point we are paying for tokens that do not change a
@@ -78,6 +90,28 @@ pub fn is_unsupported_summary_content_error(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.downcast_ref::<UnsupportedSummaryContent>().is_some())
+}
+
+#[derive(Debug)]
+struct NoSubtitlesAvailable;
+
+impl std::fmt::Display for NoSubtitlesAvailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no subtitles available")
+    }
+}
+
+impl std::error::Error for NoSubtitlesAvailable {}
+
+fn no_subtitles_error() -> anyhow::Error {
+    anyhow::Error::new(NoSubtitlesAvailable)
+}
+
+/// True when a YouTube video has no usable subtitle track to summarize.
+pub fn is_no_subtitles_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<NoSubtitlesAvailable>().is_some())
 }
 
 /// The instruction half of the prompt. JSON output is requested because parsing
@@ -193,60 +227,12 @@ pub fn provider_from_config(cfg: ProviderConfig) -> Box<dyn SummaryProvider> {
     }
 }
 
-/// Reads a required env var, failing with the *exact variable name* so the
-/// server can hand a caller an actionable 400 rather than "not configured".
-fn required_env(name: &str) -> Result<String> {
-    match env::var(name) {
-        Ok(v) if !v.trim().is_empty() => Ok(v),
-        _ => bail!("missing required environment variable: {name}"),
-    }
-}
-
-fn env_or(name: &str, default: &str) -> String {
-    env::var(name)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| default.to_string())
-}
-
-fn optional_env(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|v| !v.trim().is_empty())
-}
-
-fn env_timeout(name: &str, default: u64) -> u64 {
-    env::var(name)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(default)
-}
-
-/// Resolve a CLI executable path.
-///
-/// Priority: `env_name` override → first `well_known_absolute` path that
-/// exists → `HOME/.local/bin/<bare>` if it exists → bare name (relies on the
-/// server's PATH). The macOS defaults matter for `codex`, which the ChatGPT
-/// desktop app installs at `/Applications/ChatGPT.app/Contents/Resources/codex`
-/// and does not add to PATH.
-fn resolve_cli(env_name: &str, well_known_absolute: &[&str], bare: &str) -> PathBuf {
-    if let Some(explicit) = optional_env(env_name) {
-        return PathBuf::from(explicit);
-    }
-    for candidate in well_known_absolute {
-        let p = Path::new(candidate);
-        if p.is_file() {
-            return p.to_path_buf();
-        }
-    }
-    if let Some(home) = env::var_os("HOME") {
-        let mut p = PathBuf::from(home);
-        p.push(".local/bin");
-        p.push(bare);
-        if p.is_file() {
-            return p;
-        }
-    }
-    PathBuf::from(bare)
+/// Bound for summary-path subprocesses (`ARCHIVR_SUMMARY_CLI_TIMEOUT`).
+pub(crate) fn summary_cli_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(env_timeout(
+        "ARCHIVR_SUMMARY_CLI_TIMEOUT",
+        DEFAULT_CLI_TIMEOUT_SECS,
+    ))
 }
 
 /// Builds a provider configuration for `kind` purely from the environment.
@@ -408,6 +394,31 @@ pub fn openai_request_body(model: &str, request: &SummaryRequest) -> Result<serd
     }))
 }
 
+pub fn anthropic_plain_body(
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": [{ "role": "user", "content": user }],
+    })
+}
+
+/// No `max_tokens`: newer OpenAI models reject it (mirrors `openai_request_body`).
+pub fn openai_plain_body(model: &str, system: &str, user: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user },
+        ],
+    })
+}
+
 struct AnthropicHttpProvider(HttpProviderConfig);
 
 impl SummaryProvider for AnthropicHttpProvider {
@@ -418,25 +429,28 @@ impl SummaryProvider for AnthropicHttpProvider {
         Some(&self.0.model)
     }
     fn summarize(&self, request: &SummaryRequest) -> Result<SummaryOutput> {
-        let body = anthropic_request_body(&self.0.model, request)?;
-        let resp = http_client(self.0.timeout_secs)?
-            .post(&self.0.endpoint)
-            .header("x-api-key", &self.0.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .body(body.to_string())
-            .send()
-            .with_context(|| format!("request to {} failed", self.0.endpoint))?;
-        let status = resp.status();
-        let text = resp.text().unwrap_or_default();
-        if !status.is_success() {
-            bail!(
-                "anthropic API returned {status}: {}",
-                truncate_for_error(&text)
-            );
-        }
-        parse_anthropic_response(&text)
+        send_anthropic(&self.0, &anthropic_request_body(&self.0.model, request)?)
     }
+}
+
+fn send_anthropic(cfg: &HttpProviderConfig, body: &serde_json::Value) -> Result<SummaryOutput> {
+    let resp = http_client(cfg.timeout_secs)?
+        .post(&cfg.endpoint)
+        .header("x-api-key", &cfg.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .with_context(|| format!("request to {} failed", cfg.endpoint))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "anthropic API returned {status}: {}",
+            truncate_for_error(&text)
+        );
+    }
+    parse_anthropic_response(&text)
 }
 
 pub fn parse_anthropic_response(body: &str) -> Result<SummaryOutput> {
@@ -461,24 +475,27 @@ impl SummaryProvider for OpenAiCompatibleProvider {
         Some(&self.0.model)
     }
     fn summarize(&self, request: &SummaryRequest) -> Result<SummaryOutput> {
-        let body = openai_request_body(&self.0.model, request)?;
-        let resp = http_client(self.0.timeout_secs)?
-            .post(&self.0.endpoint)
-            .header("authorization", format!("Bearer {}", self.0.api_key))
-            .header("content-type", "application/json")
-            .body(body.to_string())
-            .send()
-            .with_context(|| format!("request to {} failed", self.0.endpoint))?;
-        let status = resp.status();
-        let text = resp.text().unwrap_or_default();
-        if !status.is_success() {
-            bail!(
-                "openai-compatible API returned {status}: {}",
-                truncate_for_error(&text)
-            );
-        }
-        parse_openai_response(&text)
+        send_openai(&self.0, &openai_request_body(&self.0.model, request)?)
     }
+}
+
+fn send_openai(cfg: &HttpProviderConfig, body: &serde_json::Value) -> Result<SummaryOutput> {
+    let resp = http_client(cfg.timeout_secs)?
+        .post(&cfg.endpoint)
+        .header("authorization", format!("Bearer {}", cfg.api_key))
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .with_context(|| format!("request to {} failed", cfg.endpoint))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "openai-compatible API returned {status}: {}",
+            truncate_for_error(&text)
+        );
+    }
+    parse_openai_response(&text)
 }
 
 pub fn parse_openai_response(body: &str) -> Result<SummaryOutput> {
@@ -505,73 +522,39 @@ fn truncate_for_error(s: &str) -> String {
 
 /// Runs `executable args…`, writes `prompt` to its stdin, and returns stdout.
 ///
-/// `archivr-core` deliberately has no async runtime and the tree carries no
-/// `wait_timeout` dependency, so the timeout is enforced by structure rather
-/// than by a library: stdout is drained on its own thread and handed back over
-/// a channel, which leaves the calling thread free to `recv_timeout` and kill
-/// the child if it overruns. stdin is written on a third thread because a
-/// 48 KB prompt can exceed the pipe buffer, and writing it inline would
-/// deadlock against a child that is waiting for us to read its output.
+/// A thin adapter over [`crate::process::run_with_timeout`], which drains
+/// stdout and stderr on their own threads, writes stdin on a third, and kills
+/// the child once `timeout_secs` pass.
 fn run_cli(executable: &Path, args: &[&str], prompt: &str, timeout_secs: u64) -> Result<String> {
-    let mut child = Command::new(executable)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to spawn {}", executable.display()))?;
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    crate::process::run_with_timeout(
+        executable,
+        &args,
+        Some(prompt),
+        Duration::from_secs(timeout_secs),
+    )
+    .map(|output| output.stdout)
+}
 
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("failed to open stdin for {}", executable.display()))?;
-    let prompt_owned = prompt.to_string();
-    thread::spawn(move || {
-        let _ = stdin.write_all(prompt_owned.as_bytes());
-        // Dropping stdin closes the pipe, which is what tells the CLI the
-        // prompt is complete.
-    });
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("failed to open stdout for {}", executable.display()))?;
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut buf = String::new();
-        use std::io::Read;
-        let mut stdout = stdout;
-        let res = stdout.read_to_string(&mut buf).map(|_| buf);
-        let _ = tx.send(res);
-    });
-
-    let collected = match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
-        Ok(res) => {
-            res.with_context(|| format!("failed to read stdout of {}", executable.display()))?
-        }
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("{} timed out after {timeout_secs}s", executable.display());
-        }
-    };
-
-    let status = child
-        .wait()
-        .with_context(|| format!("failed to wait for {}", executable.display()))?;
-    if !status.success() {
-        let mut stderr = String::new();
-        if let Some(mut e) = child.stderr.take() {
-            use std::io::Read;
-            let _ = e.read_to_string(&mut stderr);
-        }
-        bail!(
-            "{} exited with {status}: {}",
-            executable.display(),
-            truncate_for_error(&stderr)
-        );
+/// `claude -p --output-format text` is the documented one-shot ("print") mode
+/// of the Claude Code CLI: it reads the prompt from stdin, writes the answer
+/// to stdout, and exits.
+fn claude_cli_args(model: Option<&str>) -> Vec<&str> {
+    let mut args: Vec<&str> = vec!["-p", "--output-format", "text"];
+    if let Some(model) = model {
+        args.push("--model");
+        args.push(model);
     }
-    Ok(collected)
+    args
+}
+
+fn run_claude_cli(cfg: &CliProviderConfig, prompt: &str) -> Result<String> {
+    run_cli(
+        &cfg.executable,
+        &claude_cli_args(cfg.model.as_deref()),
+        prompt,
+        cfg.timeout_secs,
+    )
 }
 
 struct ClaudeCliProvider(CliProviderConfig);
@@ -587,22 +570,8 @@ impl SummaryProvider for ClaudeCliProvider {
         if !request.images.is_empty() {
             bail!("Claude CLI cannot attach local images; choose an HTTP provider or Codex CLI");
         }
-        // `claude -p --output-format text` is the documented one-shot
-        // ("print") mode of the Claude Code CLI: it reads the prompt from
-        // stdin, writes the answer to stdout, and exits.
-        let mut args: Vec<&str> = vec!["-p", "--output-format", "text"];
-        if let Some(model) = self.0.model.as_deref() {
-            args.push("--model");
-            args.push(model);
-        }
-        let out = run_cli(
-            &self.0.executable,
-            &args,
-            &build_combined_prompt(request),
-            self.0.timeout_secs,
-        )?;
         Ok(SummaryOutput {
-            text: out,
+            text: run_claude_cli(&self.0, &build_combined_prompt(request))?,
             model: self.0.model.clone(),
         })
     }
@@ -747,6 +716,33 @@ impl SummaryProvider for CodexCliProvider {
             text: out,
             model: self.0.model.clone(),
         })
+    }
+}
+
+/// One-shot plain-text completion over the same transports as `summarize`,
+/// for short non-summary prompts (thread titles). Never attaches images.
+pub fn complete_plain(
+    cfg: &ProviderConfig,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> Result<SummaryOutput> {
+    let combined = || format!("{system}\n\n---\n\n{user}");
+    match cfg {
+        ProviderConfig::AnthropicHttp(c) => {
+            send_anthropic(c, &anthropic_plain_body(&c.model, system, user, max_tokens))
+        }
+        ProviderConfig::OpenAiCompatible(c) => {
+            send_openai(c, &openai_plain_body(&c.model, system, user))
+        }
+        ProviderConfig::ClaudeCli(c) => Ok(SummaryOutput {
+            text: run_claude_cli(c, &combined())?,
+            model: c.model.clone(),
+        }),
+        ProviderConfig::CodexCli(c) => Ok(SummaryOutput {
+            text: codex::run(c, &combined(), &[])?,
+            model: c.model.clone(),
+        }),
     }
 }
 
@@ -909,29 +905,131 @@ fn extension_of(relpath: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Loads an entry's primary artifact and reduces it to plain text.
+/// Loads an entry's primary text artifacts and reduces them to plain text.
 ///
-/// Returns a descriptive error rather than a summary for artifact kinds v1 does
-/// not handle (video, audio, images): the caller surfaces it to the UI, and a
-/// clear "unsupported" beats an empty or hallucinated summary.
-fn load_summary_artifacts(
+/// Returns the unsupported-content error rather than a summary for artifact
+/// kinds without text (video, audio, images): a clear "unsupported" beats an
+/// empty or hallucinated summary.
+pub(crate) fn artifact_text_content(
     conn: &rusqlite::Connection,
+    store_path: &Path,
     entry_id: i64,
-    artifact_role: &str,
-) -> Result<Vec<(String, Option<String>)>> {
-    let mut stmt = conn.prepare(
-        "SELECT ea.relpath, b.mime_type
-         FROM entry_artifacts ea
-         LEFT JOIN blobs b ON b.id = ea.blob_id
-         WHERE ea.entry_id = ?1 AND ea.artifact_role = ?2
-         ORDER BY ea.id ASC",
-    )?;
-    let rows = stmt
-        .query_map(rusqlite::params![entry_id, artifact_role], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    entity_kind: &str,
+) -> Result<String> {
+    // Tweets and tweet threads use `raw_tweet_json` rather than `primary_media`,
+    // and a THREAD is materialized as N separate JSON files (one per status).
+    // Load every matching artifact in insertion order so a thread summarizes
+    // as the whole conversation, not just its first status.
+    let is_tweetish = matches!(entity_kind, "tweet" | "tweet_thread");
+    let primary_role = if is_tweetish {
+        "raw_tweet_json"
+    } else {
+        "primary_media"
+    };
+    let mut artifacts = database::list_entry_artifacts_by_role(conn, entry_id, primary_role)?;
+    if artifacts.is_empty() && is_tweetish {
+        // Older archives may have stored tweet payloads under `primary_media`.
+        artifacts = database::list_entry_artifacts_by_role(conn, entry_id, "primary_media")?;
+    }
+    if artifacts.is_empty() {
+        return Err(unsupported_summary_content_error());
+    }
+
+    let mut pieces: Vec<String> = Vec::with_capacity(artifacts.len());
+    for artifact in &artifacts {
+        let abs = store_path.join(&artifact.relpath);
+        let ext = extension_of(&artifact.relpath);
+        let mime = artifact.mime_type.as_deref().unwrap_or_default();
+
+        let piece = if ext == "md"
+            || ext == "markdown"
+            || ext == "txt"
+            || mime.starts_with("text/markdown")
+            || mime == "text/plain"
+        {
+            std::fs::read_to_string(&abs)
+                .with_context(|| format!("failed to read {}", abs.display()))?
+        } else if ext == "html" || ext == "htm" || mime.starts_with("text/html") {
+            let raw = std::fs::read_to_string(&abs)
+                .with_context(|| format!("failed to read {}", abs.display()))?;
+            strip_html(&raw)
+        } else if ext == "json" || mime == "application/json" {
+            let raw = std::fs::read_to_string(&abs)
+                .with_context(|| format!("failed to read {}", abs.display()))?;
+            let parsed: serde_json::Value = serde_json::from_str(&raw)
+                .with_context(|| format!("{} is not valid JSON", abs.display()))?;
+            extract_tweet_text(&parsed).unwrap_or_default()
+        } else {
+            return Err(unsupported_summary_content_error());
+        };
+        if !piece.trim().is_empty() {
+            pieces.push(piece);
+        }
+    }
+    // Thread joiner: `---` on its own line reads as a paragraph break to both
+    // humans and models. Single-piece entries never render the separator.
+    let content = pieces.join("\n\n---\n\n").trim().to_string();
+    if content.is_empty() {
+        return Err(unsupported_summary_content_error());
+    }
+    Ok(content)
+}
+
+/// Picks the single best usable `subtitle` track of a YouTube video and
+/// reduces it to a labelled transcript. Tracks are ordered by
+/// [`subtitles::subtitle_track_rank`], ties broken by artifact id, so the
+/// choice (and therefore the digest) is deterministic.
+fn youtube_transcript_content(
+    conn: &rusqlite::Connection,
+    store_path: &Path,
+    entry_id: i64,
+) -> Result<String> {
+    let mut tracks: Vec<(u8, i64, subtitles::SubtitleTrackMeta, String)> =
+        database::list_entry_artifacts_by_role(conn, entry_id, subtitles::SUBTITLE_ARTIFACT_ROLE)?
+            .into_iter()
+            .filter(|artifact| {
+                SubtitleFormat::detect(
+                    &extension_of(&artifact.relpath),
+                    artifact.mime_type.as_deref().unwrap_or_default(),
+                )
+                .is_some()
+            })
+            .map(|artifact| {
+                let meta = subtitles::parse_subtitle_metadata(artifact.metadata_json.as_deref());
+                (
+                    subtitles::subtitle_track_rank(&meta),
+                    artifact.id,
+                    meta,
+                    artifact.relpath,
+                )
+            })
+            .collect();
+    tracks.sort_by_key(|(rank, id, _, _)| (*rank, *id));
+
+    for (_, _, meta, relpath) in tracks {
+        let raw = match std::fs::read_to_string(store_path.join(&relpath)) {
+            Ok(raw) => raw,
+            Err(e) => {
+                eprintln!("warn: summary subtitle {relpath}: {e:#}");
+                continue;
+            }
+        };
+        let transcript = subtitles::subtitle_to_transcript(&raw);
+        if transcript.trim().is_empty() {
+            continue;
+        }
+        let language = if meta.language.is_empty() {
+            "unknown language"
+        } else {
+            meta.language.as_str()
+        };
+        return Ok(format!(
+            "Transcript ({language}, {} subtitles):\n{}",
+            meta.kind.as_str(),
+            transcript.trim()
+        ));
+    }
+    Err(no_subtitles_error())
 }
 
 fn matching_image_mime(extension: &str, mime_type: &str) -> bool {
@@ -1052,62 +1150,11 @@ pub fn build_summary_input(
         )
         .map_err(|_| anyhow!("entry not found: {entry_uid}"))?;
 
-    // Tweets and tweet threads use `raw_tweet_json` rather than `primary_media`,
-    // and a THREAD is materialized as N separate JSON files (one per status).
-    // Load every matching artifact in insertion order so a thread summarizes
-    // as the whole conversation, not just its first status.
-    let is_tweetish = matches!(entity_kind.as_str(), "tweet" | "tweet_thread");
-    let primary_role = if is_tweetish {
-        "raw_tweet_json"
+    let content = if source_kind == "youtube" && entity_kind == "video" {
+        youtube_transcript_content(&conn, &paths.store_path, entry_id)?
     } else {
-        "primary_media"
+        artifact_text_content(&conn, &paths.store_path, entry_id, &entity_kind)?
     };
-    let mut artifacts = load_summary_artifacts(&conn, entry_id, primary_role)?;
-    if artifacts.is_empty() && is_tweetish {
-        // Older archives may have stored tweet payloads under `primary_media`.
-        artifacts = load_summary_artifacts(&conn, entry_id, "primary_media")?;
-    }
-    if artifacts.is_empty() {
-        return Err(unsupported_summary_content_error());
-    }
-
-    let mut pieces: Vec<String> = Vec::with_capacity(artifacts.len());
-    for (relpath, mime_opt) in &artifacts {
-        let abs = paths.store_path.join(relpath);
-        let ext = extension_of(relpath);
-        let mime = mime_opt.clone().unwrap_or_default();
-
-        let piece = if ext == "md"
-            || ext == "markdown"
-            || ext == "txt"
-            || mime.starts_with("text/markdown")
-            || mime == "text/plain"
-        {
-            std::fs::read_to_string(&abs)
-                .with_context(|| format!("failed to read {}", abs.display()))?
-        } else if ext == "html" || ext == "htm" || mime.starts_with("text/html") {
-            let raw = std::fs::read_to_string(&abs)
-                .with_context(|| format!("failed to read {}", abs.display()))?;
-            strip_html(&raw)
-        } else if ext == "json" || mime == "application/json" {
-            let raw = std::fs::read_to_string(&abs)
-                .with_context(|| format!("failed to read {}", abs.display()))?;
-            let parsed: serde_json::Value = serde_json::from_str(&raw)
-                .with_context(|| format!("{} is not valid JSON", abs.display()))?;
-            extract_tweet_text(&parsed).unwrap_or_default()
-        } else {
-            return Err(unsupported_summary_content_error());
-        };
-        if !piece.trim().is_empty() {
-            pieces.push(piece);
-        }
-    }
-    // Thread joiner: `---` on its own line reads as a paragraph break to both
-    // humans and models. Single-piece entries never render the separator.
-    let content = pieces.join("\n\n---\n\n").trim().to_string();
-    if content.is_empty() {
-        return Err(unsupported_summary_content_error());
-    }
     // Truncate on a char boundary, then hash: the digest must describe the
     // bytes actually sent, or the cache would key on content the model never saw.
     let content: String = if content.chars().count() > MAX_INPUT_CHARS {
@@ -1133,6 +1180,51 @@ pub fn build_summary_input(
         },
         input_sha256,
     })
+}
+
+/// Builds the summary input for a YouTube video that had no usable subtitles
+/// at preflight, in this order: subtitles fetched from the original video
+/// (a no-op for other entries or when a usable track is already archived),
+/// then — only if that still leaves none and `transcription` is given — a
+/// local transcription of the audio.
+///
+/// Without `transcription` this still returns the no-subtitles error when
+/// nothing usable could be fetched. With it, failures carry a
+/// [`transcriber::TranscriptionUserMessage`].
+pub fn build_summary_input_with_subtitle_fetch(
+    paths: &ArchivePaths,
+    entry_uid: &str,
+    options: SummaryBuildOptions,
+    cookie_rules: &[database::CookieRule],
+    transcription: Option<&transcriber::TranscriptionRequest>,
+) -> Result<SummaryInput> {
+    let outcome = subtitles::fetch_subtitles_for_entry(paths, entry_uid, cookie_rules)?;
+    eprintln!(
+        "info: summary {entry_uid}: subtitle fetch added {} artifact(s)",
+        outcome.added
+    );
+    let request = match build_summary_input(paths, entry_uid, options) {
+        Ok(input) => return Ok(input),
+        Err(e) if is_no_subtitles_error(&e) => match transcription {
+            Some(request) => request,
+            None => return Err(e),
+        },
+        Err(e) => return Err(e),
+    };
+
+    transcriber::transcribe_entry(
+        paths,
+        entry_uid,
+        request,
+        outcome.original_language.as_deref(),
+        cookie_rules,
+    )?;
+    match build_summary_input(paths, entry_uid, options) {
+        Err(e) if is_no_subtitles_error(&e) => Err(e.context(transcriber::TranscriptionUserMessage(
+            NO_SUBTITLES_AFTER_TRANSCRIPTION_MESSAGE.to_string(),
+        ))),
+        other => other,
+    }
 }
 
 // ── Orchestration ──────────────────────────────────────────────────────────
@@ -1899,7 +1991,7 @@ mod tests {
         assert!(!is_unsupported_summary_content_error(&read_error));
         assert_eq!(
             UNSUPPORTED_SUMMARY_CONTENT_MESSAGE,
-            "This entry can’t be summarized yet.\n\nIt doesn’t contain archived text that a summary provider can read. Summaries currently support text notes, web pages, X posts and threads, and X Articles. Video, audio, and image-only entries need a transcript or text source."
+            "This entry can’t be summarized yet.\n\nIt doesn’t contain archived text that a summary provider can read. Summaries currently support text notes, web pages, X posts and threads, X Articles, and YouTube videos with subtitles. Other video, audio, and image-only entries need a transcript or text source."
         );
 
         assert!(!is_unsupported_summary_content_error(&anyhow!(
@@ -1909,6 +2001,195 @@ mod tests {
             "entry not found: {}",
             entry.entry_uid
         )));
+    }
+
+    fn video_summary_fixture(
+        source_kind: &str,
+    ) -> (tempfile::TempDir, ArchivePaths, String, i64) {
+        video_summary_fixture_with_url(
+            source_kind,
+            &format!("https://{source_kind}.example/watch?v=abc123"),
+        )
+    }
+
+    fn video_summary_fixture_with_url(
+        source_kind: &str,
+        url: &str,
+    ) -> (tempfile::TempDir, ArchivePaths, String, i64) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = crate::archive::initialize_archive(
+            temp.path(),
+            &temp.path().join("store"),
+            "Test archive",
+            false,
+        )
+        .unwrap();
+        let conn = database::open_or_initialize(&paths.archive_path).unwrap();
+        let user_id = database::ensure_default_user(&conn).unwrap();
+        let run = database::create_archive_run(&conn, user_id, 1).unwrap();
+        let source_id = database::upsert_source_identity(
+            &conn,
+            source_kind,
+            "video",
+            Some("abc123"),
+            Some(url),
+            &format!("{source_kind}:abc123"),
+        )
+        .unwrap();
+        let entry = database::create_archived_entry(
+            &conn,
+            &database::NewEntry {
+                source_identity_id: source_id,
+                archive_run_id: run.id,
+                parent_entry_id: None,
+                root_entry_id: None,
+                created_by_user_id: user_id,
+                owned_by_user_id: user_id,
+                source_kind: source_kind.to_string(),
+                entity_kind: "video".to_string(),
+                title: Some("A video".to_string()),
+                visibility: "private".to_string(),
+                representation_kind: "video".to_string(),
+                source_metadata_json: "{}".to_string(),
+                display_metadata_json: None,
+            },
+        )
+        .unwrap();
+        drop(conn);
+        add_summary_image_artifact(&paths, entry.id, 0, "primary_media", "mp4", "video/mp4", 1);
+        (temp, paths, entry.entry_uid, entry.id)
+    }
+
+    fn youtube_summary_fixture() -> (tempfile::TempDir, ArchivePaths, String, i64) {
+        video_summary_fixture("youtube")
+    }
+
+    /// YouTube video whose canonical URL is not http(s), so the on-demand
+    /// subtitle fetch returns without spawning yt-dlp.
+    fn youtube_offline_summary_fixture() -> (tempfile::TempDir, ArchivePaths, String, i64) {
+        video_summary_fixture_with_url("youtube", "youtube-test:offline")
+    }
+
+    fn add_subtitle_artifact(
+        paths: &ArchivePaths,
+        entry_id: i64,
+        name: &str,
+        body: &str,
+        language: &str,
+        kind: &str,
+    ) {
+        let relpath = format!("raw/{name}");
+        std::fs::write(paths.store_path.join(&relpath), body).unwrap();
+        let format = if name.ends_with(".srt") { "srt" } else { "vtt" };
+        let conn = database::open_or_initialize(&paths.archive_path).unwrap();
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id,
+                artifact_role: subtitles::SUBTITLE_ARTIFACT_ROLE.to_string(),
+                storage_area: "raw".to_string(),
+                relpath,
+                blob_id: None,
+                logical_path: None,
+                metadata_json: Some(
+                    serde_json::json!({
+                        "language": language,
+                        "kind": kind,
+                        "format": format,
+                        "original_language": "en",
+                        "origin": "capture",
+                    })
+                    .to_string(),
+                ),
+            },
+        )
+        .unwrap();
+    }
+
+    const AUTO_EN_VTT: &str = "WEBVTT\nKind: captions\nLanguage: en\n\n00:00:00.000 --> 00:00:02.000 align:start position:0%\nauto caption words\n \n\n00:00:02.000 --> 00:00:04.000\nmore auto words\n";
+    const MANUAL_EN_SRT: &str =
+        "1\n00:00:00,000 --> 00:00:02,000\nManual line one.\n\n2\n00:00:02,000 --> 00:00:04,000\nManual line two.\n";
+
+    #[test]
+    fn youtube_summary_uses_best_subtitle_track_transcript() {
+        let (_temp, paths, entry_uid, entry_id) = youtube_summary_fixture();
+        add_subtitle_artifact(&paths, entry_id, "auto.en.vtt", AUTO_EN_VTT, "en", "auto");
+        add_subtitle_artifact(&paths, entry_id, "manual.en.srt", MANUAL_EN_SRT, "en", "manual");
+
+        let input =
+            build_summary_input(&paths, &entry_uid, SummaryBuildOptions::default()).unwrap();
+        let content = &input.request.content;
+        assert!(
+            content.starts_with("Transcript (en, manual subtitles):"),
+            "got: {content}"
+        );
+        assert!(content.contains("Manual line one."));
+        assert!(content.contains("Manual line two."));
+        assert!(!content.contains("auto caption"));
+        assert!(!content.contains("-->"));
+    }
+
+    #[test]
+    fn youtube_summary_skips_unusable_tracks_and_labels_unknown_language() {
+        let (_temp, paths, entry_uid, entry_id) = youtube_summary_fixture();
+        // Better-ranked but empty manual track must be skipped.
+        add_subtitle_artifact(&paths, entry_id, "empty.en.srt", "", "en", "manual");
+        add_subtitle_artifact(&paths, entry_id, "auto.vtt", AUTO_EN_VTT, "", "auto");
+
+        let input =
+            build_summary_input(&paths, &entry_uid, SummaryBuildOptions::default()).unwrap();
+        assert!(
+            input
+                .request
+                .content
+                .starts_with("Transcript (unknown language, auto subtitles):\nauto caption words")
+        );
+    }
+
+    #[test]
+    fn youtube_summary_digest_changes_when_subtitles_added() {
+        let (_temp, paths, entry_uid, entry_id) = youtube_summary_fixture();
+        add_subtitle_artifact(&paths, entry_id, "auto.en.vtt", AUTO_EN_VTT, "en", "auto");
+        let sha1 = build_summary_input(&paths, &entry_uid, SummaryBuildOptions::default())
+            .unwrap()
+            .input_sha256;
+        add_subtitle_artifact(&paths, entry_id, "manual.en.srt", MANUAL_EN_SRT, "en", "manual");
+        let sha2 = build_summary_input(&paths, &entry_uid, SummaryBuildOptions::default())
+            .unwrap()
+            .input_sha256;
+        assert_ne!(sha1, sha2);
+    }
+
+    #[test]
+    fn youtube_summary_without_subtitles_is_no_subtitles_error() {
+        let (_temp, paths, entry_uid, _entry_id) = youtube_summary_fixture();
+        let err = build_summary_input(&paths, &entry_uid, SummaryBuildOptions::default())
+            .unwrap_err();
+        assert!(is_no_subtitles_error(&err));
+        assert!(!is_unsupported_summary_content_error(&err));
+    }
+
+    #[test]
+    fn non_youtube_video_still_unsupported() {
+        let (_temp, paths, entry_uid, entry_id) = video_summary_fixture("tiktok");
+        // Subtitle artifacts are ignored outside YouTube videos.
+        add_subtitle_artifact(&paths, entry_id, "manual.en.srt", MANUAL_EN_SRT, "en", "manual");
+        let err = build_summary_input(&paths, &entry_uid, SummaryBuildOptions::default())
+            .unwrap_err();
+        assert!(is_unsupported_summary_content_error(&err));
+        assert!(!is_no_subtitles_error(&err));
+    }
+
+    #[test]
+    fn no_subtitles_error_classification() {
+        assert!(is_no_subtitles_error(&no_subtitles_error()));
+        assert!(is_no_subtitles_error(
+            &no_subtitles_error().context("while building summary input")
+        ));
+        assert_eq!(no_subtitles_error().to_string(), "no subtitles available");
+        assert!(!is_no_subtitles_error(&unsupported_summary_content_error()));
+        assert!(!is_no_subtitles_error(&anyhow!("provider timeout")));
+        assert!(!is_unsupported_summary_content_error(&no_subtitles_error()));
     }
 
     fn add_summary_image_artifact(
@@ -2173,5 +2454,309 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("exited with"), "got: {err}");
+    }
+
+    #[test]
+    fn anthropic_plain_body_uses_system_field_and_max_tokens() {
+        let body = anthropic_plain_body("claude-haiku-4-5", "sys prompt", "user text", 64);
+        assert_eq!(body["model"], "claude-haiku-4-5");
+        assert_eq!(body["system"], "sys prompt");
+        assert_eq!(body["max_tokens"], 64);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "user text");
+        assert!(!body.to_string().contains(SYSTEM_PROMPT.trim()));
+    }
+
+    #[test]
+    fn openai_plain_body_has_system_then_user() {
+        let body = openai_plain_body("gpt-4o-mini", "sys prompt", "user text");
+        assert_eq!(body["model"], "gpt-4o-mini");
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "sys prompt");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "user text");
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn claude_cli_args_append_model_only_when_set() {
+        assert_eq!(claude_cli_args(None), vec!["-p", "--output-format", "text"]);
+        assert_eq!(
+            claude_cli_args(Some("haiku")),
+            vec!["-p", "--output-format", "text", "--model", "haiku"]
+        );
+    }
+
+    // ── Local transcription fallback ───────────────────────────────────────
+
+    /// In-process engine: writes `vtt` as the transcript and counts calls.
+    struct FakeTranscriber {
+        kind: &'static str,
+        label: &'static str,
+        vtt: &'static str,
+        languages: Option<Vec<String>>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl transcriber::Transcriber for FakeTranscriber {
+        fn kind(&self) -> &'static str {
+            self.kind
+        }
+        fn label(&self) -> &'static str {
+            self.label
+        }
+        fn model(&self) -> &str {
+            "fake-model"
+        }
+        fn timeout_secs(&self) -> u64 {
+            30
+        }
+        fn supports_language(&self, original_language: Option<&str>) -> bool {
+            match (&self.languages, original_language) {
+                (Some(allowed), Some(lang)) => {
+                    allowed.contains(&crate::downloader::ytdlp::language_base(lang))
+                }
+                _ => true,
+            }
+        }
+        fn supported_languages(&self) -> Option<&[String]> {
+            self.languages.as_deref()
+        }
+        fn transcribe(
+            &self,
+            _audio_wav: &Path,
+            _lang_hint: Option<&str>,
+            out_dir: &Path,
+            _deadline: std::time::Instant,
+        ) -> Result<transcriber::TranscriptOutput> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let vtt_path = out_dir.join("transcript.vtt");
+            std::fs::write(&vtt_path, self.vtt)?;
+            Ok(transcriber::TranscriptOutput {
+                vtt_path,
+                language: Some("en".to_string()),
+            })
+        }
+    }
+
+    const FAKE_TRANSCRIPT_VTT: &str =
+        "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nlocally transcribed words\n";
+
+    fn fake_transcription(
+        bin_dir: &Path,
+        kind: &'static str,
+        label: &'static str,
+        languages: Option<Vec<String>>,
+    ) -> (
+        transcriber::TranscriptionRequest,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ffmpeg = transcriber::test_support::write_stub_script(
+            bin_dir,
+            "ffmpeg",
+            transcriber::test_support::STUB_FFMPEG,
+        );
+        let request = transcriber::TranscriptionRequest {
+            transcriber: Box::new(FakeTranscriber {
+                kind,
+                label,
+                vtt: FAKE_TRANSCRIPT_VTT,
+                languages,
+                calls: calls.clone(),
+            }),
+            settings: transcriber::TranscriptionSettings { ffmpeg },
+        };
+        (request, calls)
+    }
+
+    fn transcription_lock() -> std::sync::MutexGuard<'static, ()> {
+        transcriber::TRANSCRIBE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subtitle_fetch_with_transcriber_uses_transcribed_track() {
+        let _lock = transcription_lock();
+        let (temp, paths, entry_uid, _entry_id) = youtube_offline_summary_fixture();
+        let (request, calls) = fake_transcription(temp.path(), "whisper", "Whisper", None);
+        let input = build_summary_input_with_subtitle_fetch(
+            &paths,
+            &entry_uid,
+            SummaryBuildOptions::default(),
+            &[],
+            Some(&request),
+        )
+        .unwrap();
+        let content = &input.request.content;
+        assert!(
+            content.starts_with("Transcript (en, transcribed subtitles):"),
+            "got: {content}"
+        );
+        assert!(content.contains("locally transcribed words"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_ne!(input.input_sha256, SUBTITLE_FETCH_PENDING_INPUT_SHA256);
+    }
+
+    #[test]
+    fn subtitle_fetch_without_transcriber_keeps_no_subtitles_error() {
+        let (_temp, paths, entry_uid, _entry_id) = youtube_offline_summary_fixture();
+        let err = build_summary_input_with_subtitle_fetch(
+            &paths,
+            &entry_uid,
+            SummaryBuildOptions::default(),
+            &[],
+            None,
+        )
+        .unwrap_err();
+        assert!(is_no_subtitles_error(&err));
+        assert_eq!(transcriber::transcription_user_message(&err), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcriber_not_called_when_usable_subtitles_exist() {
+        let _lock = transcription_lock();
+        let (temp, paths, entry_uid, entry_id) = youtube_offline_summary_fixture();
+        add_subtitle_artifact(&paths, entry_id, "auto.en.vtt", AUTO_EN_VTT, "en", "auto");
+        let (request, calls) = fake_transcription(temp.path(), "whisper", "Whisper", None);
+        let input = build_summary_input_with_subtitle_fetch(
+            &paths,
+            &entry_uid,
+            SummaryBuildOptions::default(),
+            &[],
+            Some(&request),
+        )
+        .unwrap();
+        assert!(input.request.content.starts_with("Transcript (en, auto subtitles):"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn youtube_summary_digest_changes_when_transcript_added() {
+        let _lock = transcription_lock();
+        let (temp, paths, entry_uid, entry_id) = youtube_offline_summary_fixture();
+        let (request, _calls) = fake_transcription(temp.path(), "whisper", "Whisper", None);
+        let transcribed = build_summary_input_with_subtitle_fetch(
+            &paths,
+            &entry_uid,
+            SummaryBuildOptions::default(),
+            &[],
+            Some(&request),
+        )
+        .unwrap();
+        // A rebuild reuses the stored transcript: same digest, no second run.
+        let rebuilt =
+            build_summary_input(&paths, &entry_uid, SummaryBuildOptions::default()).unwrap();
+        assert_eq!(transcribed.input_sha256, rebuilt.input_sha256);
+        // A better-ranked manual track replaces it and changes the digest.
+        add_subtitle_artifact(&paths, entry_id, "manual.en.srt", MANUAL_EN_SRT, "en", "manual");
+        let manual =
+            build_summary_input(&paths, &entry_uid, SummaryBuildOptions::default()).unwrap();
+        assert_ne!(transcribed.input_sha256, manual.input_sha256);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn phonon2_non_english_original_language_fails_before_audio_work() {
+        let _lock = transcription_lock();
+        let (temp, paths, entry_uid, entry_id) = youtube_offline_summary_fixture();
+        // An unusable (empty) track whose metadata records the original language.
+        std::fs::write(paths.store_path.join("raw/empty.de.vtt"), "WEBVTT\n").unwrap();
+        let conn = database::open_or_initialize(&paths.archive_path).unwrap();
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id,
+                artifact_role: subtitles::SUBTITLE_ARTIFACT_ROLE.to_string(),
+                storage_area: "raw".to_string(),
+                relpath: "raw/empty.de.vtt".to_string(),
+                blob_id: None,
+                logical_path: None,
+                metadata_json: Some(
+                    serde_json::json!({
+                        "language": "de",
+                        "kind": "auto",
+                        "format": "vtt",
+                        "original_language": "de",
+                        "origin": "capture",
+                    })
+                    .to_string(),
+                ),
+            },
+        )
+        .unwrap();
+        drop(conn);
+        let (request, calls) = fake_transcription(
+            temp.path(),
+            "phonon2",
+            "Phonon-2",
+            Some(vec!["en".to_string()]),
+        );
+        let err = build_summary_input_with_subtitle_fetch(
+            &paths,
+            &entry_uid,
+            SummaryBuildOptions::default(),
+            &[],
+            Some(&request),
+        )
+        .unwrap_err();
+        let msg = transcriber::transcription_user_message(&err).unwrap();
+        assert_eq!(
+            msg,
+            transcriber::transcription_language_unsupported_message(
+                "Phonon-2",
+                "de",
+                &["en".to_string()]
+            )
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let temp_dir = paths.store_path.join("temp");
+        assert!(std::fs::read_dir(&temp_dir).map_or(true, |rd| rd
+            .flatten()
+            .all(|e| !e.file_name().to_string_lossy().starts_with("transcribe-"))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_transcript_after_transcription_is_no_speech_copy() {
+        let _lock = transcription_lock();
+        let (temp, paths, entry_uid, _entry_id) = youtube_offline_summary_fixture();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ffmpeg = transcriber::test_support::write_stub_script(
+            temp.path(),
+            "ffmpeg",
+            transcriber::test_support::STUB_FFMPEG,
+        );
+        let request = transcriber::TranscriptionRequest {
+            transcriber: Box::new(FakeTranscriber {
+                kind: "whisper",
+                label: "Whisper",
+                vtt: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n \n",
+                languages: None,
+                calls: calls.clone(),
+            }),
+            settings: transcriber::TranscriptionSettings { ffmpeg },
+        };
+        let err = build_summary_input_with_subtitle_fetch(
+            &paths,
+            &entry_uid,
+            SummaryBuildOptions::default(),
+            &[],
+            Some(&request),
+        )
+        .unwrap_err();
+        assert_eq!(
+            transcriber::transcription_user_message(&err).as_deref(),
+            Some(NO_SUBTITLES_AFTER_TRANSCRIPTION_MESSAGE)
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

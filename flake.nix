@@ -225,6 +225,7 @@
               ytDlp
               pkgs.single-file-cli
               tweetPython
+              pkgs.deno
             ] ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.chromium ];
             phases = [ "installPhase" ];
             installPhase = ''
@@ -232,8 +233,12 @@
               cp ${archivr_cli_unwrapped}/bin/archivr $out/libexec/archivr/archivr
               cp ${./vendor/twitter/scrape_user_tweet_contents.py} $out/libexec/archivr/scrape_user_tweet_contents.py
               chmod +x $out/libexec/archivr/scrape_user_tweet_contents.py
+              # Pinned Deno is the fallback JS runtime for yt-dlp's YouTube challenge
+              # solver; a newer state-dir copy from `archivr yt-dlp update` takes precedence.
               makeWrapper $out/libexec/archivr/archivr $out/bin/archivr \
                 --set ARCHIVR_YT_DLP ${ytDlp}/bin/yt-dlp \
+                --set ARCHIVR_DENO ${pkgs.deno}/bin/deno \
+                --set ARCHIVR_FFMPEG ${pkgs.ffmpeg}/bin/ffmpeg \
                 --set ARCHIVR_SINGLE_FILE ${pkgs.single-file-cli}/bin/single-file \
                 ${lib.optionalString pkgs.stdenv.isLinux "--set ARCHIVR_CHROME ${pkgs.chromium}/bin/chromium"} \
                 --set ARCHIVR_TWEET_PYTHON ${tweetPython}/bin/python3 \
@@ -245,6 +250,7 @@
                     ytDlp
                     pkgs.single-file-cli
                     tweetPython
+                    pkgs.deno
                   ] ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.chromium ])
                 }
             '';
@@ -253,7 +259,7 @@
             pname = "archivr-server-wrapped";
             inherit version;
             nativeBuildInputs = [ pkgs.makeWrapper ];
-            buildInputs = [ ytDlp tweetPython pkgs.single-file-cli ] ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.chromium ];
+            buildInputs = [ ytDlp tweetPython pkgs.single-file-cli pkgs.deno ] ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.chromium ];
             phases = [ "installPhase" ];
             installPhase = ''
               mkdir -p $out/bin $out/libexec/archivr-server $out/share/archivr-server/static
@@ -261,16 +267,20 @@
               cp ${./vendor/twitter/scrape_user_tweet_contents.py} $out/libexec/archivr-server/scrape_user_tweet_contents.py
               chmod +x $out/libexec/archivr-server/scrape_user_tweet_contents.py
               cp -r ${frontendStatic}/* $out/share/archivr-server/static/
+              # Pinned Deno is the fallback JS runtime for yt-dlp's YouTube challenge
+              # solver; a newer state-dir copy from `archivr yt-dlp update` takes precedence.
               makeWrapper $out/libexec/archivr-server/archivr-server $out/bin/archivr-server \
                 --set ARCHIVR_STATIC_DIR $out/share/archivr-server/static \
                 --set ARCHIVR_YT_DLP ${ytDlp}/bin/yt-dlp \
+                --set ARCHIVR_DENO ${pkgs.deno}/bin/deno \
+                --set ARCHIVR_FFMPEG ${pkgs.ffmpeg}/bin/ffmpeg \
                 --set ARCHIVR_SINGLE_FILE ${pkgs.single-file-cli}/bin/single-file \
                 ${lib.optionalString pkgs.stdenv.isLinux "--set ARCHIVR_CHROME ${pkgs.chromium}/bin/chromium"} \
                 --set ARCHIVR_TWEET_PYTHON ${tweetPython}/bin/python3 \
                 --set ARCHIVR_TWEET_SCRAPER $out/libexec/archivr-server/scrape_user_tweet_contents.py \
                 --set ARCHIVR_UBLOCK_EXT ${ublockLite} \
                 --set ARCHIVR_COOKIE_EXT ${isdcac} \
-                --prefix PATH : ${lib.makeBinPath ([ ytDlp pkgs.single-file-cli tweetPython ] ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.chromium ])}
+                --prefix PATH : ${lib.makeBinPath ([ ytDlp pkgs.single-file-cli tweetPython pkgs.deno ] ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.chromium ])}
             '';
           };
           archivr-all = pkgs.symlinkJoin {
@@ -339,11 +349,13 @@
               pkgs.yt-dlp
               pkgs.nushell
               pkgs.uv
+              pkgs.deno
+              pkgs.ffmpeg
               tweetPython
             ];
             shellHook = ''
               export SHELL=${pkgs.nushell}/bin/nu
-              echo "nushell dev shell active – yt-dlp, uv, and tweet scraper Python on PATH"
+              echo "nushell dev shell active – yt-dlp, deno, uv, and tweet scraper Python on PATH"
               nu
             '';
           };

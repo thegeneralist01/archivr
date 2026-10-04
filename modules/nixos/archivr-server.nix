@@ -128,6 +128,33 @@ in
         non-loopback address.
       '';
     };
+
+    environment = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      default = { };
+      example = lib.literalExpression ''
+        {
+          ARCHIVR_TRANSCRIBE_ENGINES = "whisper";
+          ARCHIVR_WHISPER_CLI = "''${pkgs.whisper-cpp}/bin/whisper-cli";
+          ARCHIVR_WHISPER_MODEL = "/var/lib/archivr-server/models/ggml-large-v3-turbo.bin";
+        }
+      '';
+      description = ''
+        Extra environment variables (e.g. ARCHIVR_TRANSCRIBE_ENGINES,
+        ARCHIVR_PHONON2_CLI, LLM provider settings). Merged over defaults that
+        point HOME, XDG_CACHE_HOME and HF_HOME into the state directory, so
+        Python transcription engines can cache downloaded weights.
+      '';
+    };
+
+    environmentFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = ''
+        Optional systemd EnvironmentFile (KEY=value lines) for settings that
+        should stay out of the Nix store, such as LLM API keys.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -152,10 +179,17 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
 
+      environment = {
+        HOME = lib.mkDefault "/var/lib/archivr-server";
+        XDG_CACHE_HOME = lib.mkDefault "/var/lib/archivr-server/.cache";
+        HF_HOME = lib.mkDefault "/var/lib/archivr-server/.cache/huggingface";
+      } // cfg.environment;
+
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/archivr-server ${configFile}";
         User = cfg.user;
         Group = cfg.group;
+        EnvironmentFile = lib.mkIf (cfg.environmentFile != null) cfg.environmentFile;
 
         # State directory — auth SQLite lives here across upgrades/restarts.
         StateDirectory = "archivr-server";
@@ -169,6 +203,8 @@ in
         # Each archive_path is an .archivr dir; its sibling store/ dir (where
         # capture artifacts are written) lives at the same level. Whitelisting
         # the parent covers both without over-permissioning.
+        # GPU transcription engines (CUDA) need /dev/nvidia*; adding
+        # PrivateDevices or DeviceAllow here would break them.
         NoNewPrivileges = true;
         PrivateTmp = true;
         ProtectSystem = "strict";

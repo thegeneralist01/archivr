@@ -22,6 +22,7 @@
 //                   POST /api/auth/logout, GET/PATCH /api/auth/me
 //   SETTINGS    — instance settings:
 //                   GET/PATCH /api/admin/instance-settings (ROLE_ADMIN; the reorder mask field is OWNER-only)
+//                   GET /api/admin/yt-dlp, POST /api/admin/yt-dlp/update (ROLE_ADMIN; 409 while an update runs)
 // ────────────────────────────────────────────────────────────────────────────
 
 use parking_lot::Mutex;
@@ -33,7 +34,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use archivr_core::{archive, capture, database, downloader, summarizer};
+use archivr_core::{archive, capture, database, downloader, summarizer, thread_title};
 use axum::{
     Json, Router,
     extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, Request, State},
@@ -281,8 +282,16 @@ pub fn app_with_state(state: AppState) -> Router {
             post(rearchive_handler),
         )
         .route(
+            "/api/archives/:archive_id/entries/:entry_uid/thread-title",
+            post(generate_thread_title_handler),
+        )
+        .route(
             "/api/archives/:archive_id/entries/:entry_uid/summary",
             get(entry_summary_handler).post(request_entry_summary_handler),
+        )
+        .route(
+            "/api/summary/transcription-engines",
+            get(transcription_engines_handler),
         )
         .route(
             "/api/archives/:archive_id/entries/:entry_uid/favicon",
@@ -373,6 +382,8 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/admin/instance-settings",
             get(get_instance_settings_handler).patch(update_instance_settings_handler),
         )
+        .route("/api/admin/yt-dlp", get(get_yt_dlp_status_handler))
+        .route("/api/admin/yt-dlp/update", post(update_yt_dlp_handler))
         .route(
             "/api/admin/cookie-rules",
             get(list_cookie_rules_handler).post(create_cookie_rule_handler),
@@ -547,6 +558,10 @@ struct SummaryRequestBody {
     force: bool,
     #[serde(default)]
     include_images: bool,
+    /// Local transcription engine to use only if a YouTube video has no
+    /// subtitles; empty or absent means none.
+    #[serde(default)]
+    transcribe_engine: Option<String>,
 }
 
 /// `GET /api/archives/:id/entries/:uid/summary`
@@ -587,15 +602,22 @@ async fn entry_summary_handler(
 /// `POST /api/archives/:id/entries/:uid/summary`
 ///
 /// Manual-only summary generation. Body: `{ "provider": "...", "force": false,
-/// "include_images": false }`.
+/// "include_images": false, "transcribe_engine": "whisper" }`; the optional
+/// `transcribe_engine` is used only for YouTube videos that end up without
+/// subtitles, and the transcription runs in the background.
 ///
-/// Provider configuration and content extraction are both resolved *before*
-/// spawning, so a missing env var or an unsummarizable artifact comes back as a
-/// synchronous 400 naming the exact problem rather than as a background job the
-/// caller has to poll only to learn about a config typo.
+/// Provider and transcription-engine configuration and content extraction are
+/// all resolved *before* spawning, so a missing env var or an unsummarizable
+/// artifact comes back as a synchronous 400 naming the exact problem rather
+/// than as a background job the caller has to poll only to learn about a
+/// config typo.
 ///
 /// Returns 200 with the existing row when an identical cache key already
 /// completed and `force` is false; otherwise 202 with a pending row.
+///
+/// YouTube videos without archived subtitles also return 202: the pending row
+/// carries a placeholder input digest while subtitles are fetched in the
+/// background, and a failed fetch fails the row with a safe explanation.
 async fn request_entry_summary_handler(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -616,6 +638,18 @@ async fn request_entry_summary_handler(
             "Claude CLI cannot attach local images; choose an HTTP provider or Codex CLI",
         ));
     }
+    let transcription = match body
+        .transcribe_engine
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    {
+        Some(kind) => Some(
+            archivr_core::transcriber::request_from_env(kind)
+                .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?,
+        ),
+        None => None,
+    };
     let provider = summarizer::provider_from_config(provider_cfg);
     let summary_options = summarizer::SummaryBuildOptions {
         include_images: body.include_images,
@@ -632,6 +666,7 @@ async fn request_entry_summary_handler(
     enum PreflightOutcome {
         Cached(database::EntrySummaryRecord),
         Pending { input: summarizer::SummaryInput, summary_uid: String },
+        FetchSubtitles { summary_uid: String },
     }
     let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<PreflightOutcome> {
         let conn = database::open_or_initialize(&preflight_paths.archive_path)?;
@@ -639,7 +674,19 @@ async fn request_entry_summary_handler(
             .ok_or_else(|| anyhow::anyhow!("entry not found"))?;
         // Preserve the route's historical 404 before attempting content
         // extraction, whose own missing-entry error includes the uid.
-        let input = summarizer::build_summary_input(&preflight_paths, &preflight_uid, summary_options)?;
+        let input = match summarizer::build_summary_input(&preflight_paths, &preflight_uid, summary_options) {
+            Ok(input) => input,
+            Err(e) if summarizer::is_no_subtitles_error(&e) => {
+                // The real digest is unknown until subtitles are fetched, so
+                // there is no cache key to look up yet.
+                let summary_uid = database::upsert_pending_entry_summary(
+                    &conn, entry_id, &provider_kind, provider_model.as_deref(),
+                    summarizer::PROMPT_VERSION, summarizer::SUBTITLE_FETCH_PENDING_INPUT_SHA256,
+                )?;
+                return Ok(PreflightOutcome::FetchSubtitles { summary_uid });
+            }
+            Err(e) => return Err(e),
+        };
         if !force {
             if let Some(existing) = database::find_entry_summary(
                 &conn, entry_id, &provider_kind, provider_model.as_deref(),
@@ -673,22 +720,51 @@ async fn request_entry_summary_handler(
             serde_json::to_value(&existing).map(Json)
                 .map_err(|e| ApiError::internal(&e.to_string()))?,
         )),
-        PreflightOutcome::Pending { input, summary_uid } => (input, summary_uid),
+        PreflightOutcome::Pending { input, summary_uid } => (Some(input), summary_uid),
+        PreflightOutcome::FetchSubtitles { summary_uid } => (None, summary_uid),
     };
 
     let archive_path = mounted.archive_path.clone();
+    let auth_db_path = state.auth_db_path.clone();
+    let entry_uid_bg = entry_uid.clone();
     let summary_uid_bg = summary_uid.clone();
     tokio::task::spawn_blocking(move || {
-        // The input and attempt were claimed during blocking preflight, so no
-        // row is reset and no archive content is read twice.
-        if let Err(e) =
+        // A prebuilt input was claimed during blocking preflight, so no row is
+        // reset and no archive content is read twice. Without one, subtitles
+        // are fetched first and the row gets its real input digest.
+        let run = || -> anyhow::Result<()> {
+            let input = match input {
+                Some(input) => input,
+                None => {
+                    let cookie_rules = match database::open_auth_db(&auth_db_path) {
+                        Ok(conn) => database::list_cookie_rules(&conn).unwrap_or_default(),
+                        Err(_) => vec![],
+                    };
+                    let input = summarizer::build_summary_input_with_subtitle_fetch(
+                        &archive_paths,
+                        &entry_uid_bg,
+                        summary_options,
+                        &cookie_rules,
+                        transcription.as_ref(),
+                    )?;
+                    let conn = database::open_or_initialize(&archive_path)?;
+                    database::update_entry_summary_input_sha256(
+                        &conn,
+                        &summary_uid_bg,
+                        &input.input_sha256,
+                    )?;
+                    input
+                }
+            };
             summarizer::summarize_prebuilt_entry(
                 &archive_paths,
                 input,
                 &summary_uid_bg,
                 provider.as_ref(),
             )
-        {
+            .map(|_| ())
+        };
+        if let Err(e) = run() {
             eprintln!("warn: summary {summary_uid_bg}: {e:#}");
             record_background_summary_failure(&archive_path, &summary_uid_bg, &e);
         }
@@ -705,11 +781,26 @@ async fn request_entry_summary_handler(
 }
 
 fn summary_failure_error_text(error: &anyhow::Error) -> String {
-    if summarizer::is_unsupported_summary_content_error(error) {
+    if let Some(copy) = archivr_core::transcriber::transcription_user_message(error) {
+        copy
+    } else if summarizer::is_no_subtitles_error(error) {
+        summarizer::NO_SUBTITLES_SUMMARY_MESSAGE.to_string()
+    } else if summarizer::is_unsupported_summary_content_error(error) {
         summarizer::UNSUPPORTED_SUMMARY_CONTENT_MESSAGE.to_string()
     } else {
         format!("{error:#}")
     }
+}
+
+/// `GET /api/summary/transcription-engines`
+///
+/// Local transcription engines that are enabled (`ARCHIVR_TRANSCRIBE_ENGINES`)
+/// and fully configured. Reads env only; an empty array means the feature is off.
+async fn transcription_engines_handler(
+    auth_user: AuthUser,
+) -> Result<Json<Vec<archivr_core::transcriber::TranscriberInfo>>, ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    Ok(Json(archivr_core::transcriber::available_transcribers()))
 }
 
 fn record_background_summary_failure(
@@ -1122,6 +1213,66 @@ async fn delete_entry_handler(
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct ThreadTitleBody {
+    provider: String,
+}
+
+/// `POST /api/archives/:id/entries/:uid/thread-title` — names an X thread with a
+/// cheap model (`thread_title`) and saves it as the entry title. Same role gate as
+/// title PATCH. Synchronous: load, provider call and save run in one blocking task.
+async fn generate_thread_title_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((archive_id, entry_uid)): Path<(String, String)>,
+    Json(body): Json<ThreadTitleBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let paths = archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;
+    let settings = database::get_instance_settings(&database::open_auth_db(&state.auth_db_path)?)?;
+    let cfg = thread_title::title_provider_from_env(
+        &body.provider,
+        settings.title_model_override(&body.provider),
+    )
+    .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+    let uid = entry_uid.clone();
+    let title = tokio::task::spawn_blocking(move || -> Result<String, ApiError> {
+        let input = thread_title::load_thread_title_input(&paths, &uid)
+            .map_err(|e| thread_title_load_error(&uid, e))?
+            .ok_or_else(|| ApiError::not_found("entry not found"))?;
+        let title = thread_title::generate_thread_title(&cfg, &input).map_err(|e| {
+            eprintln!("warn: thread title {uid}: {e:#}");
+            ApiError {
+                status: StatusCode::BAD_GATEWAY,
+                message: format!("{e:#}"),
+            }
+        })?;
+        let conn = database::open_or_initialize(&paths.archive_path)?;
+        if !database::update_entry_title(&conn, &uid, Some(&title))? {
+            return Err(ApiError::not_found("entry not found"));
+        }
+        eprintln!("info: thread title {uid}: {title}");
+        Ok(title)
+    })
+    .await
+    .map_err(|e| ApiError::internal(&format!("thread title task failed: {e}")))??;
+    Ok(Json(serde_json::json!({ "entry_uid": entry_uid, "title": title })))
+}
+
+/// Expected load failures (not a thread, no archived text) are 400 with their
+/// message; anything else (DB/IO) is logged and returned as a generic 500 so
+/// absolute store paths never reach the client.
+fn thread_title_load_error(uid: &str, error: anyhow::Error) -> ApiError {
+    match thread_title::thread_title_user_message(&error) {
+        Some(message) => ApiError::bad_request(&message),
+        None => {
+            eprintln!("error: thread title {uid}: {error:#}");
+            ApiError::internal("failed to load thread for title generation")
+        }
+    }
+}
+
 async fn reorder_entry_children_handler(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -1171,6 +1322,8 @@ struct CaptureBody {
     modal_closer_enabled: Option<bool>,
     /// Route through Freedium mirror for WebPage captures. Absent = true (on by default).
     via_freedium: Option<bool>,
+    /// Download YouTube subtitles. Absent = true.
+    download_subtitles: Option<bool>,
     /// Per-video quality overrides for playlist captures.
     /// Keys are yt-dlp video IDs; values are quality strings ("best", "1080p", "audio", etc.).
     #[serde(default)]
@@ -1342,6 +1495,7 @@ async fn capture_handler(
         modal_closer_enabled: Some(effective_modal_closer),
         reader_mode: body.reader_mode.unwrap_or(false),
         via_freedium: body.via_freedium.unwrap_or(true),
+        download_subtitles: body.download_subtitles.unwrap_or(true),
         per_item_quality: body.per_item_quality.clone(),
         sync: body.sync,
     };
@@ -1756,6 +1910,7 @@ async fn rearchive_handler(
         modal_closer_enabled: None,
         reader_mode: false,
         via_freedium: false,
+        download_subtitles: true,
         per_item_quality: std::collections::HashMap::new(),
         sync: false,
     };
@@ -2116,6 +2271,26 @@ async fn get_instance_settings_handler(
             "cookie_ext_available".into(),
             serde_json::Value::Bool(cookie_ext_available),
         );
+        let title_models: serde_json::Map<String, serde_json::Value> = summarizer::PROVIDER_KINDS
+            .iter()
+            .filter_map(|kind| {
+                let instance = settings.title_model_override(kind);
+                let (model, source) = thread_title::resolve_title_model(kind, instance)?;
+                // Fallback = what applies if the instance value is cleared (placeholder).
+                let (fallback, fallback_source) = thread_title::resolve_title_model(kind, None)?;
+                Some((
+                    kind.to_string(),
+                    serde_json::json!({
+                        "model": model,
+                        "source": source.as_str(),
+                        "fallback_model": fallback,
+                        "fallback_source": fallback_source.as_str(),
+                        "env_var": thread_title::title_model_env(kind),
+                    }),
+                ))
+            })
+            .collect();
+        obj.insert("title_models".into(), serde_json::Value::Object(title_models));
     }
     Ok(Json(val))
 }
@@ -2169,9 +2344,153 @@ async fn update_instance_settings_handler(
             settings.reorder_children_role_bits = mask;
         }
     }
+    for (kind, value) in [
+        ("anthropic_http", body.title_model_anthropic_http),
+        ("openai_compatible", body.title_model_openai_compatible),
+        ("claude_cli", body.title_model_claude_cli),
+        ("codex_cli", body.title_model_codex_cli),
+    ] {
+        if let Some(raw) = value {
+            let model = validate_title_model(kind, &raw)?;
+            if let Some(slot) = settings.title_model_slot_mut(kind) {
+                *slot = model;
+            }
+        }
+    }
     database::update_instance_settings(&tx, &settings)?;
     tx.commit()?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+const MAX_TITLE_MODEL_CHARS: usize = 100;
+
+/// Trims an admin-supplied title model; empty clears it (`None`). Rejects
+/// overlong values and any whitespace/control characters inside.
+fn validate_title_model(kind: &str, raw: &str) -> Result<Option<String>, ApiError> {
+    let model = raw.trim();
+    if model.is_empty() {
+        return Ok(None);
+    }
+    if model.chars().count() > MAX_TITLE_MODEL_CHARS {
+        return Err(ApiError::bad_request(&format!(
+            "title_model_{kind} must be at most {MAX_TITLE_MODEL_CHARS} characters"
+        )));
+    }
+    if model.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(ApiError::bad_request(&format!(
+            "title_model_{kind} must not contain spaces or control characters"
+        )));
+    }
+    Ok(Some(model.to_string()))
+}
+
+// ── yt-dlp tools ──────────────────────────────────────────────────────────────
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Process-wide: the state dir the update writes into is process-global too.
+static YT_DLP_UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Holds the update slot; released on drop (including on panic in the blocking task).
+struct YtDlpUpdateGuard;
+
+impl YtDlpUpdateGuard {
+    fn try_acquire() -> Option<Self> {
+        YT_DLP_UPDATE_RUNNING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for YtDlpUpdateGuard {
+    fn drop(&mut self) {
+        YT_DLP_UPDATE_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+/// `ToolsStatus` plus this server's live state: whether an update is running and the
+/// cached JS runtime that new yt-dlp processes actually get.
+fn tools_status_json(
+    status: downloader::ytdlp_tools::ToolsStatus,
+    in_use: Option<downloader::js_runtime::JsRuntime>,
+) -> serde_json::Value {
+    let mut val = serde_json::to_value(&status).unwrap_or_default();
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert(
+            "update_running".into(),
+            serde_json::Value::Bool(YT_DLP_UPDATE_RUNNING.load(Ordering::Acquire)),
+        );
+        obj.insert(
+            "js_runtime_in_use".into(),
+            in_use.map_or(serde_json::Value::Null, |rt| {
+                serde_json::json!({
+                    "kind": rt.kind.as_str(),
+                    "path": rt.path.map(|p| p.display().to_string()),
+                })
+            }),
+        );
+    }
+    val
+}
+
+fn component_outcome(r: &anyhow::Result<String>) -> serde_json::Value {
+    match r {
+        Ok(m) => serde_json::json!({ "ok": true, "message": m }),
+        Err(e) => serde_json::json!({ "ok": false, "message": format!("{e:#}") }),
+    }
+}
+
+async fn get_yt_dlp_status_handler(
+    auth_user: AuthUser,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    auth_user.require_role(ROLE_ADMIN)?;
+    // Both probe binaries (the first resolve_js_runtime() call may too): keep them off
+    // the async workers.
+    let (status, in_use) = tokio::task::spawn_blocking(|| {
+        (
+            downloader::ytdlp_tools::tools_status(),
+            downloader::js_runtime::resolve_js_runtime(),
+        )
+    })
+    .await
+    .map_err(|e| ApiError::internal(&format!("yt-dlp status task failed: {e}")))?;
+    Ok(Json(tools_status_json(status, in_use)))
+}
+
+async fn update_yt_dlp_handler(
+    auth_user: AuthUser,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    auth_user.require_role(ROLE_ADMIN)?;
+    let guard = YtDlpUpdateGuard::try_acquire()
+        .ok_or_else(|| ApiError::conflict("a yt-dlp update is already running"))?;
+    // The guard moves into the blocking task, so a client disconnecting mid-update
+    // can't release it before the install finishes.
+    let (report, status, in_use) = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        let report = downloader::ytdlp_tools::update_tools(
+            None,
+            concat!("archivr-server/", env!("CARGO_PKG_VERSION")),
+            true,
+            &mut |l| eprintln!("info: yt-dlp update: {l}"),
+        )?;
+        for (component, result) in [("yt-dlp", &report.yt_dlp), ("deno", &report.deno)] {
+            if let Err(e) = result {
+                eprintln!("warn: yt-dlp update: {component} failed: {e:#}");
+            }
+        }
+        let status = downloader::ytdlp_tools::tools_status();
+        let in_use = downloader::js_runtime::resolve_js_runtime();
+        anyhow::Ok((report, status, in_use))
+    })
+    .await
+    .map_err(|e| ApiError::internal(&format!("yt-dlp update task failed: {e}")))?
+    .map_err(|e| ApiError::internal(&format!("{e:#}")))?;
+    Ok(Json(serde_json::json!({
+        "yt_dlp": component_outcome(&report.yt_dlp),
+        "deno": component_outcome(&report.deno),
+        "status": tools_status_json(status, in_use),
+    })))
 }
 
 // ── Cookie rules ──────────────────────────────────────────────────────────────
@@ -2312,6 +2631,11 @@ async fn blob_cleanup_scan_handler(
             "captures are in progress; wait for them to finish before scanning",
         ));
     }
+    if database::has_pending_subtitle_fetches(&conn)? {
+        return Err(ApiError::conflict(
+            "subtitle fetches are in progress; wait for summaries to finish before scanning",
+        ));
+    }
 
     let referenced = database::all_referenced_file_relpaths(&conn)?;
     let orphaned_blob_rows = database::list_orphaned_blob_rows(&conn)?.len();
@@ -2345,6 +2669,11 @@ async fn blob_cleanup_delete_handler(
             "captures are in progress; wait for them to finish before cleaning up",
         ));
     }
+    if database::has_pending_subtitle_fetches(&conn)? {
+        return Err(ApiError::conflict(
+            "subtitle fetches are in progress; wait for summaries to finish before cleaning up",
+        ));
+    }
 
     // Collect the set of protected relpaths and the files to delete BEFORE mutating the DB.
     // This ensures the referenced set is consistent with the rows we're about to remove.
@@ -2358,6 +2687,11 @@ async fn blob_cleanup_delete_handler(
     if database::has_active_capture_jobs(&conn)? {
         return Err(ApiError::conflict(
             "a capture started during the scan; retry after all captures finish",
+        ));
+    }
+    if database::has_pending_subtitle_fetches(&conn)? {
+        return Err(ApiError::conflict(
+            "a subtitle fetch started during the scan; retry after summaries finish",
         ));
     }
 
@@ -2519,6 +2853,10 @@ struct UpdateInstanceSettingsBody {
     cookie_ext_enabled: Option<bool>,
     modal_closer_enabled: Option<bool>,
     reorder_children_role_bits: Option<u32>,
+    title_model_anthropic_http: Option<String>,
+    title_model_openai_compatible: Option<String>,
+    title_model_claude_cli: Option<String>,
+    title_model_codex_cli: Option<String>,
 }
 
 async fn admin_list_users(
@@ -3216,6 +3554,43 @@ mod tests {
         .unwrap()
     }
 
+    fn make_test_youtube_entry(
+        archive_path: &std::path::Path,
+        canonical_url: &str,
+    ) -> archivr_core::database::ArchivedEntry {
+        let conn = database::open_or_initialize(archive_path).unwrap();
+        let user_id = database::ensure_default_user(&conn).unwrap();
+        let run = database::create_archive_run(&conn, user_id, 1).unwrap();
+        let si = database::upsert_source_identity(
+            &conn,
+            "youtube",
+            "video",
+            None,
+            Some(canonical_url),
+            canonical_url,
+        )
+        .unwrap();
+        database::create_archived_entry(
+            &conn,
+            &database::NewEntry {
+                source_identity_id: si,
+                archive_run_id: run.id,
+                parent_entry_id: None,
+                root_entry_id: None,
+                created_by_user_id: user_id,
+                owned_by_user_id: user_id,
+                source_kind: "youtube".to_string(),
+                entity_kind: "video".to_string(),
+                title: Some("Test Video".to_string()),
+                visibility: "private".to_string(),
+                representation_kind: "video".to_string(),
+                source_metadata_json: "{}".to_string(),
+                display_metadata_json: None,
+            },
+        )
+        .unwrap()
+    }
+
     fn make_test_child(
         archive_path: &std::path::Path,
         parent_id: i64,
@@ -3531,6 +3906,142 @@ mod tests {
             summary_failure_error_text(&provider),
             "provider response was malformed"
         );
+    }
+
+    async fn post_codex_summary(
+        registry: ServerRegistry,
+        auth_path: std::path::PathBuf,
+        entry_uid: &str,
+    ) -> axum::response::Response {
+        let session_cookie = make_test_session(&auth_path);
+        let previous_codex_cli = std::env::var_os("ARCHIVR_CODEX_CLI");
+        unsafe { std::env::set_var("ARCHIVR_CODEX_CLI", "/usr/bin/false") };
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/archives/test/entries/{entry_uid}/summary"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({ "provider": "codex_cli" })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        match previous_codex_cli {
+            Some(value) => unsafe { std::env::set_var("ARCHIVR_CODEX_CLI", value) },
+            None => unsafe { std::env::remove_var("ARCHIVR_CODEX_CLI") },
+        }
+        response
+    }
+
+    #[tokio::test]
+    async fn youtube_summary_without_subtitles_fails_row_with_clear_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        // Non-HTTP canonical URL: the subtitle fetch never spawns yt-dlp.
+        let entry = make_test_youtube_entry(&archive_path, "youtube-test:offline");
+        add_summary_test_artifact(
+            &archive_path,
+            entry.id,
+            "raw/youtube-video.mp4",
+            "primary_media",
+            "video/mp4",
+            b"video fixture",
+        );
+
+        let response = post_codex_summary(registry, auth_path, &entry.entry_uid).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = body_json(response).await;
+        assert_eq!(body["status"], "pending");
+        let summary_uid = body["summary_uid"].as_str().unwrap().to_string();
+
+        let mut stored = None;
+        for _ in 0..100 {
+            let conn = database::open_or_initialize(&archive_path).unwrap();
+            let row = database::get_entry_summary_by_uid(&conn, &summary_uid)
+                .unwrap()
+                .unwrap();
+            if row.status == "failed" {
+                stored = Some(row);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let stored = stored.expect("summary row should fail");
+        // `/usr/bin/false` would yield a different error, so this also proves
+        // the provider never ran.
+        assert_eq!(
+            stored.error_text.as_deref(),
+            Some(summarizer::NO_SUBTITLES_SUMMARY_MESSAGE)
+        );
+        assert_eq!(stored.input_sha256, summarizer::SUBTITLE_FETCH_PENDING_INPUT_SHA256);
+    }
+
+    #[tokio::test]
+    async fn youtube_summary_with_subtitle_artifact_preflights_synchronously() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_youtube_entry(&archive_path, "youtube-test:offline");
+        add_summary_test_artifact(
+            &archive_path,
+            entry.id,
+            "raw/youtube-video.mp4",
+            "primary_media",
+            "video/mp4",
+            b"video fixture",
+        );
+        add_summary_test_artifact(
+            &archive_path,
+            entry.id,
+            "raw/youtube-video.en.vtt",
+            "subtitle",
+            "text/vtt",
+            b"WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nHello from the transcript\n",
+        );
+
+        let response = post_codex_summary(registry, auth_path, &entry.entry_uid).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let summary_uid = body_json(response).await["summary_uid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let stored = database::get_entry_summary_by_uid(&conn, &summary_uid)
+            .unwrap()
+            .unwrap();
+        assert_ne!(stored.input_sha256, summarizer::SUBTITLE_FETCH_PENDING_INPUT_SHA256);
+    }
+
+    #[test]
+    fn background_summary_failure_maps_no_subtitles_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_registry, archive_path, _auth_path) = make_test_registry(&dir);
+        let entry = make_test_youtube_entry(&archive_path, "youtube-test:offline");
+        let no_subtitles = summarizer::build_summary_input(
+            &archive::read_archive_paths(&archive_path).unwrap(),
+            &entry.entry_uid,
+            summarizer::SummaryBuildOptions::default(),
+        )
+        .unwrap_err();
+        assert!(summarizer::is_no_subtitles_error(&no_subtitles));
+        assert_eq!(
+            summary_failure_error_text(&no_subtitles),
+            summarizer::NO_SUBTITLES_SUMMARY_MESSAGE
+        );
+    }
+
+    #[test]
+    fn capture_body_download_subtitles_defaults_to_none() {
+        let absent: CaptureBody =
+            serde_json::from_value(serde_json::json!({ "locator": "x" })).unwrap();
+        assert_eq!(absent.download_subtitles, None);
+        assert!(absent.download_subtitles.unwrap_or(true));
+        let disabled: CaptureBody = serde_json::from_value(
+            serde_json::json!({ "locator": "x", "download_subtitles": false }),
+        )
+        .unwrap();
+        assert_eq!(disabled.download_subtitles, Some(false));
     }
 
     #[tokio::test]
@@ -5075,6 +5586,98 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
+
+    #[tokio::test]
+    async fn yt_dlp_status_requires_admin() {
+        let (test_app, _dir) = make_test_app();
+        let response = test_app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/yt-dlp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let plain = make_role_session(&auth_path, "plain", &["user"]);
+        let app = app(registry, auth_path);
+        for (method, uri) in [("GET", "/api/admin/yt-dlp"), ("POST", "/api/admin/yt-dlp/update")] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("cookie", &plain)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn yt_dlp_status_returns_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/yt-dlp")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        let yt_dlp = json["yt_dlp"].as_array().expect("yt_dlp array");
+        assert_eq!(yt_dlp.len(), 4);
+        for row in yt_dlp {
+            assert!(row["role"].is_string() && row["label"].is_string(), "{row}");
+            assert!(row["chosen"].is_boolean(), "{row}");
+        }
+        assert_eq!(json["js_runtime"].as_array().map(Vec::len), Some(4));
+        assert!(json["yt_dlp_chosen"]["path"].is_string());
+        // Value not asserted: the concurrent-run test may hold the guard right now.
+        assert!(json["update_running"].is_boolean());
+        let in_use = json.get("js_runtime_in_use").expect("js_runtime_in_use key");
+        assert!(in_use.is_null() || in_use["kind"].is_string(), "{in_use}");
+    }
+
+    #[tokio::test]
+    async fn yt_dlp_update_rejects_concurrent_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let guard = YtDlpUpdateGuard::try_acquire().expect("no other update running");
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/yt-dlp/update")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let json = body_json(response).await;
+        assert!(
+            json["error"].as_str().is_some_and(|e| e.contains("already running")),
+            "{json}"
+        );
+        drop(guard);
+    }
     #[tokio::test]
     async fn cookie_rules_require_admin() {
         // Non-admin (no session) should get 401.
@@ -6379,6 +6982,256 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    fn make_test_thread_entry(archive_path: &std::path::Path) -> archivr_core::database::ArchivedEntry {
+        let conn = database::open_or_initialize(archive_path).unwrap();
+        let user_id = database::ensure_default_user(&conn).unwrap();
+        let run = database::create_archive_run(&conn, user_id, 1).unwrap();
+        let si = database::upsert_source_identity(
+            &conn,
+            "x",
+            "tweet_thread",
+            Some("9001"),
+            Some("https://x.com/alice/status/9001"),
+            "x:thread:9001",
+        )
+        .unwrap();
+        let entry = database::create_archived_entry(
+            &conn,
+            &database::NewEntry {
+                source_identity_id: si,
+                archive_run_id: run.id,
+                parent_entry_id: None,
+                root_entry_id: None,
+                created_by_user_id: user_id,
+                owned_by_user_id: user_id,
+                source_kind: "x".to_string(),
+                entity_kind: "tweet_thread".to_string(),
+                title: Some("Thread by @alice".to_string()),
+                visibility: "private".to_string(),
+                representation_kind: "tweet_thread".to_string(),
+                source_metadata_json: r#"{"tweet_id":"9001"}"#.to_string(),
+                display_metadata_json: None,
+            },
+        )
+        .unwrap();
+        add_summary_test_artifact(
+            archive_path,
+            entry.id,
+            "raw_tweets/tweet-9001.json",
+            "raw_tweet_json",
+            "application/json",
+            br#"{"full_text":"1/ Comparing Rust async runtimes.","author":{"screen_name":"alice"}}"#,
+        );
+        add_summary_test_artifact(
+            archive_path,
+            entry.id,
+            "raw_tweets/tweet-9002.json",
+            "raw_tweet_json",
+            "application/json",
+            br#"{"full_text":"2/ Tokio wins on ecosystem.","author":{"screen_name":"alice"}}"#,
+        );
+        entry
+    }
+
+    fn thread_title_request(entry_uid: &str, provider: &str, cookie: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(format!("/api/archives/test/entries/{entry_uid}/thread-title"))
+            .header("content-type", "application/json");
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        builder
+            .body(json_body(&serde_json::json!({ "provider": provider })))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn thread_title_requires_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_thread_entry(&archive_path);
+        let response = app(registry, auth_path)
+            .oneshot(thread_title_request(&entry.entry_uid, "claude_cli", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn thread_title_unknown_entry_returns_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let response = app(registry, auth_path)
+            .oneshot(thread_title_request("no-such-uid", "claude_cli", Some(&session_cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["error"], "entry not found");
+    }
+
+    #[tokio::test]
+    async fn thread_title_rejects_non_thread_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let entry = make_test_entry(&archive_path);
+        let response = app(registry, auth_path)
+            .oneshot(thread_title_request(&entry.entry_uid, "claude_cli", Some(&session_cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = body_json(response).await["error"].as_str().unwrap().to_string();
+        assert!(error.contains("not an X thread"), "{error}");
+    }
+
+    #[test]
+    fn thread_title_load_error_maps_user_errors_to_400_and_others_to_500() {
+        let user = anyhow::Error::new(thread_title::ThreadTitleUserError("not a thread".into()));
+        let e = thread_title_load_error("uid", user);
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+        assert_eq!(e.message, "not a thread");
+
+        let io = anyhow::anyhow!("disk gone").context("failed to read /abs/store/x.json");
+        let e = thread_title_load_error("uid", io);
+        assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!e.message.contains("/abs"), "{}", e.message);
+    }
+
+    #[tokio::test]
+    async fn thread_title_unknown_provider_returns_400() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let entry = make_test_thread_entry(&archive_path);
+        let response = app(registry, auth_path)
+            .oneshot(thread_title_request(&entry.entry_uid, "gemini", Some(&session_cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = body_json(response).await["error"].as_str().unwrap().to_string();
+        assert!(error.contains("unknown summary provider"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn thread_title_generates_and_persists() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let entry = make_test_thread_entry(&archive_path);
+        let script = dir.path().join("fake-claude");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat >/dev/null\ncase \" $* \" in *\" --model haiku \"*) printf '%s\\n' '\"Rust async runtimes compared.\"';; *\" --model custom-title-1 \"*) printf '%s\\n' 'Instance model topic';; *) echo \"bad args: $*\" >&2; exit 3;; esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let previous_cli = std::env::var_os("ARCHIVR_CLAUDE_CLI");
+        let previous_model = std::env::var_os("ARCHIVR_CLAUDE_TITLE_MODEL");
+        unsafe {
+            std::env::set_var("ARCHIVR_CLAUDE_CLI", &script);
+            std::env::remove_var("ARCHIVR_CLAUDE_TITLE_MODEL");
+        }
+        // Parallel tests forking while the script fd was open can briefly make
+        // exec fail with ETXTBSY (rust-lang/rust#114554); retry that case only.
+        let run = || async {
+            let mut attempt = 0;
+            loop {
+                let response = app(registry.clone(), auth_path.clone())
+                    .oneshot(thread_title_request(&entry.entry_uid, "claude_cli", Some(&session_cookie)))
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = body_json(response).await;
+                let busy = body["error"].as_str().is_some_and(|e| e.contains("Text file busy"));
+                if busy && attempt < 20 {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+                break (status, body);
+            }
+        };
+        let stored_title = || -> Option<String> {
+            database::open_or_initialize(&archive_path)
+                .unwrap()
+                .query_row(
+                    "SELECT title FROM archived_entries WHERE entry_uid = ?1",
+                    [&entry.entry_uid],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let (status, body) = run().await;
+        let first_stored = stored_title();
+        // Instance setting beats env/default: the fake CLI sees --model custom-title-1.
+        let patch = app(registry.clone(), auth_path.clone())
+            .oneshot(patch_settings_request(
+                serde_json::json!({ "title_model_claude_cli": " custom-title-1 " }),
+                &session_cookie,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(patch.status(), StatusCode::NO_CONTENT);
+        let (instance_status, instance_body) = run().await;
+        unsafe {
+            match previous_cli {
+                Some(value) => std::env::set_var("ARCHIVR_CLAUDE_CLI", value),
+                None => std::env::remove_var("ARCHIVR_CLAUDE_CLI"),
+            }
+            if let Some(value) = previous_model {
+                std::env::set_var("ARCHIVR_CLAUDE_TITLE_MODEL", value);
+            }
+        }
+
+        let expected = "Thread about Rust async runtimes compared — @alice";
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["entry_uid"], entry.entry_uid.as_str());
+        assert_eq!(body["title"], expected);
+        assert_eq!(first_stored.as_deref(), Some(expected));
+        let instance_expected = "Thread about Instance model topic — @alice";
+        assert_eq!(instance_status, StatusCode::OK, "{instance_body}");
+        assert_eq!(instance_body["title"], instance_expected);
+        assert_eq!(stored_title().as_deref(), Some(instance_expected));
+    }
+
+    #[tokio::test]
+    async fn instance_settings_title_models_validate_and_report_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let owner = make_test_session(&auth_path);
+        let patch = |body: serde_json::Value| {
+            app(registry.clone(), auth_path.clone()).oneshot(patch_settings_request(body, &owner))
+        };
+        let long = "m".repeat(101);
+        for bad in ["has space", "tab\there", "ctl\u{7}x", long.as_str()] {
+            let resp = patch(serde_json::json!({ "title_model_codex_cli": bad })).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+        let resp = patch(serde_json::json!({ "title_model_anthropic_http": "  claude-x-1  " }))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let json = get_settings_json(registry.clone(), auth_path.clone(), &owner).await;
+        assert_eq!(json["title_model_anthropic_http"], "claude-x-1");
+        assert!(json["title_model_codex_cli"].is_null());
+        let anthropic = &json["title_models"]["anthropic_http"];
+        assert_eq!(anthropic["model"], "claude-x-1");
+        assert_eq!(anthropic["source"], "instance");
+        assert_ne!(anthropic["fallback_source"], "instance");
+        assert_eq!(anthropic["env_var"], "ARCHIVR_ANTHROPIC_TITLE_MODEL");
+        // Empty clears back to NULL.
+        let resp = patch(serde_json::json!({ "title_model_anthropic_http": "   " })).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let json = get_settings_json(registry, auth_path, &owner).await;
+        assert!(json["title_model_anthropic_http"].is_null());
+        assert_ne!(json["title_models"]["anthropic_http"]["source"], "instance");
+    }
+
     fn reorder_request(parent_uid: &str, uids: &[&str], cookie: Option<&str>) -> Request<Body> {
         let mut builder = Request::builder()
             .method("PUT")
@@ -7586,5 +8439,298 @@ mod tests {
             "auth-required collection name must not be returned to guests; got {:?}", names);
         assert!(names.contains(&"PublicColl"),
             "public collection must be returned to guests; got {:?}", names);
+    }
+
+    // ── Local transcription fallback ───────────────────────────────────────
+
+    /// Serializes tests that set transcription env vars (std Mutex: the
+    /// workspace tokio features don't include `sync`).
+    static TRANSCRIBE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const TRANSCRIBE_ENV_VARS: [&str; 13] = [
+        "ARCHIVR_TRANSCRIBE_ENGINES",
+        "ARCHIVR_WHISPER_CLI",
+        "ARCHIVR_WHISPER_MODEL",
+        "ARCHIVR_WHISPER_BACKEND",
+        "ARCHIVR_WHISPER_LANGUAGES",
+        "ARCHIVR_PARAKEET_CLI",
+        "ARCHIVR_PARAKEET_MODEL",
+        "ARCHIVR_PARAKEET_LANGUAGES",
+        "ARCHIVR_PHONON2_CLI",
+        "ARCHIVR_PHONON2_MODEL",
+        "ARCHIVR_TRANSCRIBE_TIMEOUT",
+        "ARCHIVR_FFMPEG",
+        "ARCHIVR_CODEX_CLI",
+    ];
+
+    /// Holds the lock, clears every transcription var, sets `vars`, and
+    /// restores the previous values on drop.
+    struct TranscribeEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for TranscribeEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(v) => unsafe { std::env::set_var(key, v) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+        }
+    }
+
+    fn transcribe_env(vars: &[(&str, &str)]) -> TranscribeEnv {
+        let guard = TRANSCRIBE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = TRANSCRIBE_ENV_VARS
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect();
+        for k in TRANSCRIBE_ENV_VARS {
+            unsafe { std::env::remove_var(k) };
+        }
+        for (k, v) in vars {
+            unsafe { std::env::set_var(k, v) };
+        }
+        TranscribeEnv {
+            saved,
+            _guard: guard,
+        }
+    }
+
+    /// Writes an executable `#!/bin/sh` stub, then waits until it can be exec'd
+    /// (same ETXTBSY retry as core's `downloader::write_script`: a child forked by
+    /// a parallel test may still hold our write fd, rust-lang/rust#114554). A guard
+    /// line after the shebang makes the `--version` probe a no-op so stub bodies
+    /// don't write files during it.
+    #[cfg(unix)]
+    fn write_transcribe_stub(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        let (shebang, rest) = body.split_once('\n').unwrap_or((body, ""));
+        std::fs::write(&path, format!("{shebang}\n[ \"$1\" = --version ] && exit 0\n{rest}")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for _ in 0..200 {
+            match std::process::Command::new(&path).arg("--version").output() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                _ => return path,
+            }
+        }
+        panic!("{} stayed busy (ETXTBSY)", path.display());
+    }
+
+    async fn post_summary_body(
+        registry: ServerRegistry,
+        auth_path: std::path::PathBuf,
+        entry_uid: &str,
+        payload: serde_json::Value,
+    ) -> axum::response::Response {
+        let session_cookie = make_test_session(&auth_path);
+        app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/archives/test/entries/{entry_uid}/summary"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn transcription_engines_endpoint_requires_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _archive_path, auth_path) = make_test_registry(&dir);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/summary/transcription-engines")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn transcription_engines_endpoint_lists_enabled_engines() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _archive_path, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let _env = transcribe_env(&[
+            ("ARCHIVR_TRANSCRIBE_ENGINES", "phonon2"),
+            ("ARCHIVR_PHONON2_CLI", "/usr/bin/false"),
+        ]);
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/summary/transcription-engines")
+                    .header("cookie", &session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(
+            body,
+            serde_json::json!([{
+                "kind": "phonon2",
+                "label": "Phonon-2",
+                "english_only": true,
+                "languages": ["en"],
+            }])
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn summary_post_rejects_unconfigured_transcribe_engine_with_400() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_youtube_entry(&archive_path, "youtube-test:offline");
+        let _env = transcribe_env(&[
+            ("ARCHIVR_TRANSCRIBE_ENGINES", "whisper"),
+            ("ARCHIVR_CODEX_CLI", "/usr/bin/false"),
+        ]);
+        let response = post_summary_body(
+            registry,
+            auth_path,
+            &entry.entry_uid,
+            serde_json::json!({ "provider": "codex_cli", "transcribe_engine": "whisper" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await.to_string();
+        assert!(body.contains("ARCHIVR_WHISPER_MODEL"), "{body}");
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        assert!(database::latest_entry_summary_attempt(&conn, entry.id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn summary_post_rejects_engine_not_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_youtube_entry(&archive_path, "youtube-test:offline");
+        let _env = transcribe_env(&[
+            ("ARCHIVR_PHONON2_CLI", "/usr/bin/false"),
+            ("ARCHIVR_CODEX_CLI", "/usr/bin/false"),
+        ]);
+        let response = post_summary_body(
+            registry,
+            auth_path,
+            &entry.entry_uid,
+            serde_json::json!({ "provider": "codex_cli", "transcribe_engine": "phonon2" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await.to_string();
+        assert!(body.contains("ARCHIVR_TRANSCRIBE_ENGINES"), "{body}");
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        assert!(database::latest_entry_summary_attempt(&conn, entry.id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn youtube_summary_with_stub_transcription_reaches_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        // Non-HTTP canonical URL: the subtitle fetch never spawns yt-dlp.
+        let entry = make_test_youtube_entry(&archive_path, "youtube-test:offline");
+        add_summary_test_artifact(
+            &archive_path,
+            entry.id,
+            "raw/youtube-video.mp4",
+            "primary_media",
+            "video/mp4",
+            b"video fixture",
+        );
+        let bin = tempfile::tempdir().unwrap();
+        let ffmpeg = write_transcribe_stub(
+            bin.path(),
+            "ffmpeg",
+            "#!/bin/sh\nfor a; do last=\"$a\"; done\nhead -c 3244 /dev/zero > \"$last\"\n",
+        );
+        let whisper = write_transcribe_stub(
+            bin.path(),
+            "whisper-cli",
+            "#!/bin/sh\nprefix=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-of\" ]; then prefix=\"$2\"; shift; fi\n  shift\ndone\nprintf 'WEBVTT\\n\\n00:00:00.000 --> 00:00:02.000\\nhello from the stub transcript\\n' > \"$prefix.vtt\"\nprintf '{\"result\":{\"language\":\"en\"}}' > \"$prefix.json\"\n",
+        );
+        let _env = transcribe_env(&[
+            ("ARCHIVR_TRANSCRIBE_ENGINES", "whisper"),
+            ("ARCHIVR_WHISPER_CLI", whisper.to_str().unwrap()),
+            ("ARCHIVR_WHISPER_MODEL", "/tmp/x/ggml-tiny.bin"),
+            ("ARCHIVR_FFMPEG", ffmpeg.to_str().unwrap()),
+            ("ARCHIVR_CODEX_CLI", "/usr/bin/false"),
+        ]);
+
+        let response = post_summary_body(
+            registry,
+            auth_path,
+            &entry.entry_uid,
+            serde_json::json!({ "provider": "codex_cli", "transcribe_engine": "whisper" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let summary_uid = body_json(response).await["summary_uid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let mut stored = None;
+        for _ in 0..200 {
+            let conn = database::open_or_initialize(&archive_path).unwrap();
+            let row = database::get_entry_summary_by_uid(&conn, &summary_uid)
+                .unwrap()
+                .unwrap();
+            if row.status == "failed" {
+                stored = Some(row);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let stored = stored.expect("summary row should fail at the /usr/bin/false provider");
+        let error_text = stored.error_text.unwrap_or_default();
+        // Neither the no-subtitles copy nor a transcription copy: transcription
+        // succeeded and the (failing) provider ran.
+        assert_ne!(error_text, summarizer::NO_SUBTITLES_SUMMARY_MESSAGE);
+        assert_ne!(error_text, summarizer::NO_SUBTITLES_AFTER_TRANSCRIPTION_MESSAGE);
+        assert!(!error_text.starts_with("Local transcription"), "{error_text}");
+        assert!(!error_text.contains("can’t be transcribed"), "{error_text}");
+        assert_ne!(stored.input_sha256, summarizer::SUBTITLE_FETCH_PENDING_INPUT_SHA256);
+
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let subtitles = database::list_entry_artifacts_by_role(&conn, entry.id, "subtitle").unwrap();
+        assert_eq!(subtitles.len(), 1);
+        let meta: serde_json::Value =
+            serde_json::from_str(subtitles[0].metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(meta["kind"], "transcribed");
+        assert_eq!(meta["origin"], "transcription");
+        assert_eq!(meta["engine"], "whisper");
+        assert_eq!(meta["model"], "ggml-tiny.bin");
+    }
+
+    #[test]
+    fn summary_failure_error_text_prefers_transcription_copy() {
+        let copy = "Local transcription with Whisper failed: the transcription engine exited with an error. Check the server log for details.";
+        let error = anyhow::anyhow!("whisper-cli exited with 1: /secret/path")
+            .context(archivr_core::transcriber::TranscriptionUserMessage(copy.to_string()))
+            .context("outer");
+        assert_eq!(summary_failure_error_text(&error), copy);
     }
 }

@@ -1,6 +1,6 @@
 use crate::{
     archive::{self, ArchivePaths},
-    database, downloader,
+    database, downloader, subtitles,
     twitter::parse_tweet_id,
 };
 use anyhow::{Context, Result};
@@ -83,7 +83,7 @@ impl PlatformMetadata {
 
 /// Configuration passed to `perform_capture` to supply per-instance settings
 /// that live outside the archive (e.g. cookies stored in the auth DB).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CaptureConfig {
     pub cookie_rules: Vec<database::CookieRule>,
     /// Override for uBlock Origin Lite during WebPage captures.
@@ -108,6 +108,38 @@ pub struct CaptureConfig {
     /// When true, skip playlist items whose URL is already archived as a child
     /// of any container entry with the same canonical playlist URL.
     pub sync: bool,
+    /// Download subtitles for YouTube videos (manual preferred, auto fallback). Default true.
+    pub download_subtitles: bool,
+}
+
+impl Default for CaptureConfig {
+    fn default() -> Self {
+        Self {
+            cookie_rules: Vec::new(),
+            ublock_enabled: None,
+            cookie_ext_enabled: None,
+            reader_mode: false,
+            modal_closer_enabled: None,
+            via_freedium: false,
+            per_item_quality: HashMap::new(),
+            sync: false,
+            download_subtitles: true,
+        }
+    }
+}
+
+/// Plan a subtitle request from the yt-dlp metadata probe. Only YouTube videos
+/// (not YouTube Music / audio) get subtitles, and only when enabled.
+fn subtitle_request_for(
+    source: Source,
+    config: &CaptureConfig,
+    metadata_json: Option<&str>,
+) -> Option<downloader::ytdlp::SubtitleRequest> {
+    if config.download_subtitles && source == Source::YouTubeVideo {
+        downloader::ytdlp::plan_subtitle_request(metadata_json)
+    } else {
+        None
+    }
 }
 
 /// Resolves which cookies apply to `url` by evaluating all rules in ordinal order.
@@ -238,12 +270,17 @@ fn generate_entry_title(source: Source, meta: &PlatformMetadata) -> String {
             .unwrap_or_else(|| "Spotify Content".to_string()),
         Source::X => format!("X Media by {}", meta.author.as_deref().unwrap_or("unknown")),
         Source::Tweet => {
-            let excerpt = meta
-                .caption_excerpt()
+            let headline = meta
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .or_else(|| meta.caption_excerpt())
                 .unwrap_or_else(|| "Tweet".to_string());
             format!(
                 "{} \u{2014} @{}",
-                excerpt,
+                headline,
                 meta.author.as_deref().unwrap_or("unknown")
             )
         }
@@ -911,6 +948,7 @@ fn record_container_entry(
 }
 
 /// Extracts PlatformMetadata from a tweet JSON string.
+/// `title` is the X Article title when the status is an Article.
 /// Returns Default on any parse failure.
 fn tweet_metadata_from_json(json_str: &str) -> PlatformMetadata {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) else {
@@ -930,8 +968,16 @@ fn tweet_metadata_from_json(json_str: &str) -> PlatformMetadata {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
+    let article_title = v
+        .get("article")
+        .and_then(|a| a.get("title"))
+        .and_then(|t| t.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     PlatformMetadata {
         author: screen_name,
+        title: article_title,
         caption: full_text,
         ..Default::default()
     }
@@ -1048,6 +1094,69 @@ fn record_tweet_entry(
 
     database::complete_archive_run_item(conn, item.id, entry.id)?;
     Ok(entry)
+}
+
+/// Rewrites legacy bare-link titles of X Article tweet entries to
+/// "<article title> — @handle". Idempotent and safe to run on every start:
+/// a row is only rewritten while its title still byte-equals the legacy title
+/// recomputed from its raw JSON (so user renames are never touched), and the
+/// write is compare-and-set. Rows with missing/unreadable raw JSON are skipped
+/// with a `warn:` line and retried next run. Returns the number of rows changed.
+pub fn backfill_x_article_titles(paths: &archive::ArchivePaths) -> Result<usize> {
+    let conn = database::open_or_initialize(&paths.archive_path)?;
+    let mut count = 0;
+    for c in database::list_bare_link_tweet_titles(&conn)? {
+        let Ok(source_meta) = serde_json::from_str::<serde_json::Value>(&c.source_metadata_json)
+        else {
+            continue;
+        };
+        let Some(tweet_id) = source_meta.get("tweet_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if tweet_id.is_empty() || !tweet_id.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let json_path = paths
+            .store_path
+            .join("raw_tweets")
+            .join(format!("tweet-{tweet_id}.json"));
+        let json = match fs::read_to_string(&json_path) {
+            Ok(json) => json,
+            Err(e) => {
+                eprintln!("warn: X Article title backfill: skipping entry {}: {e}", c.id);
+                continue;
+            }
+        };
+        let meta = tweet_metadata_from_json(&json);
+        if meta.title.is_none() {
+            continue;
+        }
+        let bare_link = meta.caption.as_deref().map(str::trim).is_some_and(|t| {
+            !t.chars().any(char::is_whitespace)
+                && (t.starts_with("https://") || t.starts_with("http://"))
+        });
+        if !bare_link {
+            continue;
+        }
+        let legacy = generate_entry_title(
+            Source::Tweet,
+            &PlatformMetadata {
+                title: None,
+                ..meta.clone()
+            },
+        );
+        if c.title != legacy {
+            continue;
+        }
+        let new_title = generate_entry_title(Source::Tweet, &meta);
+        if new_title == legacy {
+            continue;
+        }
+        if database::replace_entry_title_if_unchanged(&conn, c.id, &legacy, &new_title)? {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 /// Trusted image MIME types emitted by the X downloader's media paths.
@@ -1375,15 +1484,26 @@ pub fn perform_capture(
                     .or(child_quality)
             };
 
+            let child_source = match source {
+                Source::SpotifyAlbum | Source::SpotifyPlaylist => Source::SpotifyTrack,
+                _ if is_audio => Source::YouTubeMusicTrack,
+                _ => Source::YouTubeVideo,
+            };
+            let child_subtitle_request =
+                subtitle_request_for(child_source, config, child_meta_json.as_deref());
+
             // Download the media.
             match downloader::ytdlp::download(
                 playlist_item.url.clone(),
                 store_path,
                 &child_timestamp,
                 effective_child_quality,
+                child_subtitle_request.as_ref(),
                 &cookies,
             ) {
-                Ok((hash, file_extension)) => {
+                Ok(dl) => {
+                    let hash = dl.hash;
+                    let file_extension = dl.extension;
                     let temp_file = store_path
                         .join("temp")
                         .join(&child_timestamp)
@@ -1411,13 +1531,10 @@ pub fn perform_capture(
                             continue;
                         }
                     }
+                    let archived_subtitles =
+                        subtitles::archive_staged_subtitles(store_path, dl.subtitles);
                     let _ = fs::remove_dir_all(store_path.join("temp").join(&child_timestamp));
 
-                    let child_source = match source {
-                        Source::SpotifyAlbum | Source::SpotifyPlaylist => Source::SpotifyTrack,
-                        _ if is_audio => Source::YouTubeMusicTrack,
-                        _ => Source::YouTubeVideo,
-                    };
                     match record_media_entry(
                         &conn,
                         store_path,
@@ -1435,6 +1552,18 @@ pub fn perform_capture(
                         Some(container_id),
                     ) {
                         Ok(child_entry) => {
+                            if let Err(e) = subtitles::register_subtitle_artifacts(
+                                &conn,
+                                store_path,
+                                child_entry.id,
+                                &archived_subtitles,
+                                subtitles::SUBTITLE_ORIGIN_CAPTURE,
+                            ) {
+                                eprintln!(
+                                    "warn: register subtitles for {}: {e:#}",
+                                    playlist_item.url
+                                );
+                            }
                             let _ = database::refresh_entry_cached_bytes(&conn, child_entry.id);
                         }
                         Err(e) => {
@@ -1829,7 +1958,9 @@ pub fn perform_capture(
         _ => None,
     };
 
-    let (hash, file_extension) = match source {
+    let subtitle_request = subtitle_request_for(source, config, ytdlp_metadata_json.as_deref());
+
+    let (hash, file_extension, staged_subtitles) = match source {
         Source::YouTubeVideo
         | Source::X
         | Source::Instagram
@@ -1842,10 +1973,12 @@ pub fn perform_capture(
                 store_path,
                 &timestamp,
                 quality,
+                subtitle_request.as_ref(),
                 &cookies,
             ) {
-                Ok(result) => result,
+                Ok(d) => (d.hash, d.extension, d.subtitles),
                 Err(e) => {
+                    let _ = fs::remove_dir_all(store_path.join("temp").join(&timestamp));
                     return Err(fail_run(
                         &conn,
                         &run,
@@ -1862,10 +1995,12 @@ pub fn perform_capture(
                 store_path,
                 &timestamp,
                 Some("audio"),
+                None,
                 &cookies,
             ) {
-                Ok(result) => result,
+                Ok(d) => (d.hash, d.extension, d.subtitles),
                 Err(e) => {
+                    let _ = fs::remove_dir_all(store_path.join("temp").join(&timestamp));
                     return Err(fail_run(
                         &conn,
                         &run,
@@ -1876,7 +2011,7 @@ pub fn perform_capture(
             }
         }
         Source::Local => match downloader::local::save(path.clone(), store_path, &timestamp) {
-            Ok(h) => (h, local_file_extension(&path)),
+            Ok(h) => (h, local_file_extension(&path), Vec::new()),
             Err(e) => {
                 return Err(fail_run(
                     &conn,
@@ -1893,9 +2028,17 @@ pub fn perform_capture(
         .join("temp")
         .join(&timestamp)
         .join(format!("{timestamp}{file_extension}"));
-    let byte_size = fs::metadata(&temp_file)
-        .with_context(|| format!("failed to stat staged file {}", temp_file.display()))?
-        .len() as i64;
+    let byte_size = match fs::metadata(&temp_file) {
+        Ok(meta) => meta.len() as i64,
+        Err(e) => {
+            let _ = fs::remove_dir_all(store_path.join("temp").join(&timestamp));
+            return Err(anyhow::Error::new(e)
+                .context(format!("failed to stat staged file {}", temp_file.display())));
+        }
+    };
+
+    // Archive subtitle sidecars before the temp dir is removed below.
+    let archived_subtitles = subtitles::archive_staged_subtitles(store_path, staged_subtitles);
 
     let hash_exists = hash_exists(&hash, &file_extension, store_path)?;
 
@@ -1942,6 +2085,15 @@ pub fn perform_capture(
         None,
         None,
     )?;
+    if let Err(e) = subtitles::register_subtitle_artifacts(
+        &conn,
+        store_path,
+        media_entry.id,
+        &archived_subtitles,
+        subtitles::SUBTITLE_ORIGIN_CAPTURE,
+    ) {
+        eprintln!("warn: register subtitles for {path}: {e:#}");
+    }
     database::refresh_entry_cached_bytes(&conn, media_entry.id)?;
     database::finish_archive_run(&conn, run.id)?;
 
@@ -3452,6 +3604,163 @@ mod tests {
                 meta.caption,
                 Some("Hello Rust world, this is a test tweet".to_string())
             );
+            assert_eq!(meta.title, None);
+        }
+
+        #[test]
+        fn tweet_prefers_article_title() {
+            let m = meta(
+                Some("undefinedKi"),
+                Some("Why Boring Wins"),
+                Some("https://t.co/sDrzjUhCzy"),
+                None,
+                None,
+            );
+            assert_eq!(
+                generate_entry_title(Source::Tweet, &m),
+                "Why Boring Wins \u{2014} @undefinedKi"
+            );
+        }
+
+        #[test]
+        fn tweet_blank_article_title_falls_back_to_caption() {
+            let m = meta(Some("alice"), Some("   "), Some("Hello"), None, None);
+            assert_eq!(
+                generate_entry_title(Source::Tweet, &m),
+                "Hello \u{2014} @alice"
+            );
+        }
+
+        #[test]
+        fn tweet_title_extracted_from_x_article_json() {
+            let json = r#"{"full_text":"https://t.co/sDrzjUhCzy","author":{"screen_name":"undefinedKi"},"is_article":true,"article":{"title":"  Why Boring Wins ","plain_text":"body"}}"#;
+            let meta = tweet_metadata_from_json(json);
+            assert_eq!(meta.title.as_deref(), Some("Why Boring Wins"));
+            assert_eq!(meta.caption.as_deref(), Some("https://t.co/sDrzjUhCzy"));
+            assert_eq!(
+                generate_entry_title(Source::Tweet, &meta),
+                "Why Boring Wins \u{2014} @undefinedKi"
+            );
+        }
+    }
+
+    mod x_article_backfill_tests {
+        use super::*;
+
+        const ARTICLE_JSON: &str = r#"{"full_text":"https://t.co/sDrzjUhCzy","author":{"screen_name":"undefinedKi"},"is_article":true,"article":{"title":"Why Boring Wins","plain_text":"body"}}"#;
+        const PLAIN_LINK_JSON: &str =
+            r#"{"full_text":"https://t.co/sDrzjUhCzy","author":{"screen_name":"undefinedKi"}}"#;
+        const LEGACY: &str = "https://t.co/sDrzjUhCzy \u{2014} @undefinedKi";
+
+        struct Fixture {
+            _temp: tempfile::TempDir,
+            paths: archive::ArchivePaths,
+            conn: rusqlite::Connection,
+            entry: database::ArchivedEntry,
+        }
+
+        fn fixture(tweet_json: &str) -> Fixture {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = archive::initialize_archive(
+                temp.path(),
+                &temp.path().join("store"),
+                "X Article backfill test",
+                false,
+            )
+            .unwrap();
+            fs::write(
+                paths.store_path.join("raw_tweets").join("tweet-555.json"),
+                tweet_json,
+            )
+            .unwrap();
+            let conn = database::open_or_initialize(&paths.archive_path).unwrap();
+            let user_id = database::ensure_default_user(&conn).unwrap();
+            let run = database::create_archive_run(&conn, user_id, 1).unwrap();
+            let item = database::create_archive_run_item(
+                &conn, run.id, None, 0, "tweet:555", None, "x", "tweet",
+            )
+            .unwrap();
+            let entry = record_tweet_entry(
+                &conn,
+                &paths.store_path,
+                user_id,
+                &run,
+                &item,
+                "tweet:555",
+                Source::Tweet,
+                "555",
+                &["raw_tweets/tweet-555.json".to_string()],
+            )
+            .unwrap();
+            Fixture {
+                _temp: temp,
+                paths,
+                conn,
+                entry,
+            }
+        }
+
+        impl Fixture {
+            fn set_title(&self, title: &str) {
+                database::update_entry_title(&self.conn, &self.entry.entry_uid, Some(title))
+                    .unwrap();
+            }
+
+            fn title(&self) -> String {
+                self.conn
+                    .query_row(
+                        "SELECT title FROM archived_entries WHERE id = ?1",
+                        [self.entry.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap()
+            }
+        }
+
+        #[test]
+        fn new_capture_of_article_uses_article_title() {
+            let f = fixture(ARTICLE_JSON);
+            assert_eq!(f.title(), "Why Boring Wins \u{2014} @undefinedKi");
+        }
+
+        #[test]
+        fn backfill_retitles_legacy_bare_link_article_and_is_idempotent() {
+            let f = fixture(ARTICLE_JSON);
+            f.set_title(LEGACY);
+            assert_eq!(backfill_x_article_titles(&f.paths).unwrap(), 1);
+            assert_eq!(f.title(), "Why Boring Wins \u{2014} @undefinedKi");
+            assert_eq!(backfill_x_article_titles(&f.paths).unwrap(), 0);
+            assert_eq!(f.title(), "Why Boring Wins \u{2014} @undefinedKi");
+        }
+
+        #[test]
+        fn backfill_preserves_user_edited_title() {
+            let f = fixture(ARTICLE_JSON);
+            f.set_title("My notes");
+            assert_eq!(backfill_x_article_titles(&f.paths).unwrap(), 0);
+            assert_eq!(f.title(), "My notes");
+
+            f.set_title("https://t.co/sDrzjUhCzy \u{2014} my pick");
+            assert_eq!(backfill_x_article_titles(&f.paths).unwrap(), 0);
+            assert_eq!(f.title(), "https://t.co/sDrzjUhCzy \u{2014} my pick");
+        }
+
+        #[test]
+        fn backfill_ignores_bare_link_tweet_without_article() {
+            let f = fixture(PLAIN_LINK_JSON);
+            assert_eq!(f.title(), LEGACY);
+            assert_eq!(backfill_x_article_titles(&f.paths).unwrap(), 0);
+            assert_eq!(f.title(), LEGACY);
+        }
+
+        #[test]
+        fn backfill_skips_missing_raw_json() {
+            let f = fixture(ARTICLE_JSON);
+            fs::remove_file(f.paths.store_path.join("raw_tweets").join("tweet-555.json"))
+                .unwrap();
+            f.set_title(LEGACY);
+            assert_eq!(backfill_x_article_titles(&f.paths).unwrap(), 0);
+            assert_eq!(f.title(), LEGACY);
         }
     }
 
@@ -3606,6 +3915,38 @@ mod tests {
         fn lookalike_subdomain_rejected() {
             // "notmedium.com" should not match due to the dot-prefix check
             assert!(!is_freedium_supported_url("https://notmedium.com/article"));
+        }
+    }
+
+    #[test]
+    fn capture_config_default_downloads_subtitles() {
+        let config = CaptureConfig::default();
+        assert!(config.download_subtitles);
+        assert!(config.cookie_rules.is_empty());
+        assert!(!config.reader_mode);
+        assert!(!config.via_freedium);
+        assert!(!config.sync);
+        assert!(config.per_item_quality.is_empty());
+        assert_eq!(config.ublock_enabled, None);
+        assert_eq!(config.cookie_ext_enabled, None);
+        assert_eq!(config.modal_closer_enabled, None);
+    }
+
+    #[test]
+    fn subtitle_request_only_for_youtube_video_when_enabled() {
+        let meta = r#"{"language":"en","subtitles":{"en":[{"ext":"vtt"}]},"automatic_captions":{}}"#;
+        let enabled = CaptureConfig::default();
+        let disabled = CaptureConfig {
+            download_subtitles: false,
+            ..CaptureConfig::default()
+        };
+        assert!(subtitle_request_for(Source::YouTubeVideo, &enabled, Some(meta)).is_some());
+        assert!(subtitle_request_for(Source::YouTubeVideo, &disabled, Some(meta)).is_none());
+        for source in [Source::TikTok, Source::YouTubeMusicTrack, Source::X] {
+            assert!(
+                subtitle_request_for(source, &enabled, Some(meta)).is_none(),
+                "{source:?} must not request subtitles"
+            );
         }
     }
 }
