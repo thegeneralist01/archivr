@@ -430,7 +430,7 @@ cargo run -p archivr-server -- ./archivr-server.toml
 # Frontend (from frontend/)
 bun install
 bun run dev        # Vite dev server
-bun run build      # → crates/archivr-server/static/
+bun run build      # → crates/archivr-server/static/ (gitignored; nix build does this automatically)
 
 # Nix
 nix develop        # dev shell

@@ -11,6 +11,11 @@
 !docs/branding/**
 !crates
 !crates/**
+# Static assets are built by Nix (frontendStatic derivation in flake.nix).
+# Do not commit them; `nix build` produces them from frontend/src/.
+crates/archivr-server/static/
+crates/archivr-server/static/**
+
 
 !vendor
 !vendor/**

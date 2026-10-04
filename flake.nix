@@ -121,6 +121,60 @@
                 --prefix PATH : ${lib.makeBinPath [ pkgs.python312 pkgs.ffmpeg ]}
             '';
           };
+          # Frontend: per-system hash for the node_modules FOD.
+          # bun installs platform-specific native binaries (esbuild, rollup),
+          # so the hash differs between systems.
+          # To compute the hash for a new system, set its entry to
+          # "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" and run:
+          #   nix build .#archivr-server 2>&1 | grep "got:"
+          # then paste the reported hash here.
+          frontendDepsHash =
+            {
+              "aarch64-darwin" = "sha256-QYmiCaORbrWPVaM9xXViCZChSxwObRCjlrM03zukjQ0=";
+              "x86_64-linux" = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+              "aarch64-linux" = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+            }
+            .${system} or "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+          # FOD: fetch npm deps via bun.  Network is allowed; output is hashed.
+          frontendDeps = pkgs.stdenv.mkDerivation {
+            pname = "archivr-frontend-deps";
+            version = "0.1.0";
+            src = ./frontend;
+            nativeBuildInputs = [ pkgs.bun ];
+            buildPhase = ''
+              export HOME=$TMPDIR
+              bun install --frozen-lockfile
+            '';
+            installPhase = ''
+              cp -r node_modules $out
+            '';
+            outputHash = frontendDepsHash;
+            outputHashAlgo = "sha256";
+            outputHashMode = "recursive";
+          };
+
+          # Build the Vite bundle using the pre-fetched node_modules.
+          # Source files in frontend/src/ are jj-tracked and flow through automatically;
+          # only the deps hash (above) needs updating when bun.lock/package.json changes.
+          frontendStatic = pkgs.stdenv.mkDerivation {
+            pname = "archivr-frontend-static";
+            version = "0.1.0";
+            src = ./frontend;
+            nativeBuildInputs = [ pkgs.nodejs ];
+            buildPhase = ''
+              export HOME=$TMPDIR
+              export BABEL_CACHE_PATH=$TMPDIR/babel-cache
+              cp -r ${frontendDeps} node_modules
+              chmod -R u+w node_modules
+              node node_modules/vite/bin/vite.js build --outDir dist
+            '';
+            installPhase = ''
+              cp -r dist $out
+            '';
+            dontFixup = true;
+          };
+
           version = "0.1.0";
           src = pkgs.lib.cleanSource ./.;
           cargoLock = {
@@ -206,7 +260,7 @@
               cp ${archivr_server_unwrapped}/bin/archivr-server $out/libexec/archivr-server/archivr-server
               cp ${./vendor/twitter/scrape_user_tweet_contents.py} $out/libexec/archivr-server/scrape_user_tweet_contents.py
               chmod +x $out/libexec/archivr-server/scrape_user_tweet_contents.py
-              cp -r ${./crates/archivr-server/static}/* $out/share/archivr-server/static/
+              cp -r ${frontendStatic}/* $out/share/archivr-server/static/
               makeWrapper $out/libexec/archivr-server/archivr-server $out/bin/archivr-server \
                 --set ARCHIVR_STATIC_DIR $out/share/archivr-server/static \
                 --set ARCHIVR_YT_DLP ${ytDlp}/bin/yt-dlp \
