@@ -73,8 +73,8 @@ RUN npm install -g single-file-cli
 # conflicts with Debian's system Python packages.
 RUN python3 -m venv /opt/archivr-venv \
     && /opt/archivr-venv/bin/pip install --no-cache-dir \
-        yt-dlp \
-        twitter-api-client
+        "yt-dlp==2026.8.19" \
+        "twitter-api-client==0.10.22"
 
 # Download Chromium extensions used during headless captures.
 # uBlock Origin Lite (MV3) — ad/tracker blocking.

@@ -319,6 +319,15 @@ nix build .#archivr-server
 git commit -am "chore(nix): yt-dlp OLD → $NEW"
 ```
 
+**4. Docker:** yt-dlp is pinned to a specific version in the `Dockerfile` (`pip install "yt-dlp==<version>"`), matching the Nix pin. To update, bump the version string in the `Dockerfile` venv install step to match the new Nix version, then rebuild:
+
+```sh
+docker build -t archivr-server .
+docker compose up -d
+```
+
+There is no in-container self-update path — `archivr yt-dlp update` writes to a host state directory that does not survive container restarts. Rebuild the image when captures start returning HTTP 403.
+
 ## Deployment
 
 ### Security
