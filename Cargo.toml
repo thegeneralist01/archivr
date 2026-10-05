@@ -33,3 +33,5 @@ argon2 = { version = "0.5", features = ["std"] }
 rand = { version = "0.8", features = ["std"] }
 axum-extra = { version = "0.9", features = ["cookie"] }
 parking_lot = "0.12"
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+libc = "0.2"

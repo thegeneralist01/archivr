@@ -279,6 +279,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   const [cookieExtEnabled, setCookieExtEnabled] = useState(true)
   const [modalCloserEnabled, setModalCloserEnabled] = useState(true)
   const [freediumEnabled, setFreediumEnabled] = useState(true)
+  const [downloadSubtitles, setDownloadSubtitles] = useState(true)
 
   // Load global settings from server once on mount
   useEffect(() => {
@@ -485,6 +486,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
       cookie_ext_enabled: cookieExtEnabled,
       modal_closer_enabled: modalCloserEnabled,
       via_freedium: freediumEnabled,
+      download_subtitles: downloadSubtitles,
       ...extraExtensions,
     }
     try {
@@ -953,6 +955,22 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
                   className={`ext-toggle ext-toggle--sm${freediumEnabled ? ' ext-toggle--on' : ''}`}
                   onClick={() => setFreediumEnabled(v => !v)}
                   aria-label="Toggle Freedium mirror for this capture"
+                >
+                  <span className="ext-toggle-knob" />
+                </button>
+              </label>
+              <label className="capture-ext-row" style={{ marginTop: 8 }}>
+                <span className="capture-ext-label">
+                  <span className="capture-ext-name">Download subtitles</span>
+                  <span className="capture-ext-desc">Save YouTube subtitles (manual preferred, auto-generated fallback) so videos can be summarized</span>
+                </span>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={downloadSubtitles}
+                  className={`ext-toggle ext-toggle--sm${downloadSubtitles ? ' ext-toggle--on' : ''}`}
+                  onClick={() => setDownloadSubtitles(v => !v)}
+                  aria-label="Toggle subtitle download for this capture"
                 >
                   <span className="ext-toggle-knob" />
                 </button>

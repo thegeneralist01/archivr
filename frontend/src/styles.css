@@ -638,6 +638,9 @@ select {
 }
 .bulk-coll-select:focus { border-color: var(--accent); }
 .tag-add-btn:disabled { opacity: 0.45; cursor: default; }
+.bulk-title-note { font-size: 12px; color: var(--muted); margin: 6px 0 0; }
+.bulk-title-note.form-msg--ok { color: var(--link); }
+.bulk-title-note.form-msg--err { color: var(--accent); }
 
 /* ── Rail delete zone ───────────────────────────────────────────────────── */
 .rail-delete-zone {
@@ -2097,6 +2100,16 @@ select {
 }
 .admin-table td:first-child { padding-left: 16px; }
 .admin-table tr:hover td { background: var(--paper-2); }
+/* ── Settings › yt-dlp ── */
+.ytdlp-section { max-width: 760px; }
+.ytdlp-summary { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0 0 12px; font-size: 14px; }
+.ytdlp-summary dt { font-weight: 700; color: var(--muted); }
+.ytdlp-summary dd { margin: 0; }
+.ytdlp-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-all; }
+.ytdlp-table-wrap { overflow-x: auto; margin: 6px 0 14px; border: 1px solid var(--line-soft); }
+.ytdlp-row--chosen td { background: var(--paper-2); }
+.ytdlp-badge { font-size: 11px; font-weight: 700; color: var(--paper); background: var(--link); border-radius: 3px; padding: 1px 6px; white-space: nowrap; }
+.ytdlp-actions { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
 .admin-row-disabled td { opacity: 0.45; }
 .admin-section { margin-bottom: 36px; max-width: 860px; }
 .admin-section h2 {
@@ -3383,6 +3396,12 @@ body.has-audio-bar { padding-bottom: 56px; }
   margin: 5px 0 0;
   font-size: 11px;
   line-height: 1.4;
+}
+.rail-summary-transcribe-note {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--muted);
 }
 .rail-summary-image-option--disabled {
   color: var(--muted-2);

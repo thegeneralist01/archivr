@@ -42,6 +42,8 @@ RUN touch \
 ###############################################################################
 FROM debian:bookworm-slim
 
+ARG TARGETARCH
+
 # Runtime dependencies:
 #   chromium              used by single-file-cli for full-page archiving
 #   nodejs (20+)          runtime for single-file-cli (requires Node >=20; Debian
@@ -51,6 +53,10 @@ FROM debian:bookworm-slim
 #   python3 + pip + venv  twitter scraper
 #   ca-certificates       outbound HTTPS from the server and NodeSource HTTPS
 #   libssl3               OpenSSL linked by the Rust binary
+#   unzip                 unpacks the Chromium extensions and the Deno release zip
+#   deno (pinned, below)  JS runtime for yt-dlp's YouTube challenge solver. Node 20
+#                         is not usable: yt-dlp needs Node >= 22 and enables only
+#                         Deno by default.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
@@ -71,10 +77,36 @@ RUN npm install -g single-file-cli
 
 # Install yt-dlp and twitter-api-client into an isolated venv to avoid
 # conflicts with Debian's system Python packages.
+# The [default] extra pulls in yt-dlp-ejs (the EJS challenge-solver library);
+# without it Deno alone cannot solve YouTube challenges.
 RUN python3 -m venv /opt/archivr-venv \
     && /opt/archivr-venv/bin/pip install --no-cache-dir \
-        "yt-dlp==2026.8.19" \
+        "yt-dlp[default]==2026.8.19" \
         "twitter-api-client==0.10.22"
+
+# Pinned Deno — fallback JS runtime for yt-dlp's YouTube challenge solver.
+# A newer copy installed by `archivr yt-dlp update` into ARCHIVR_STATE_DIR
+# takes precedence. No auto-bump workflow exists: bump DENO_VERSION and BOTH
+# sha256 values together. Adds roughly 80 MB to the image.
+RUN set -eu; \
+    DENO_VERSION=2.9.7; \
+    DENO_SHA256_AMD64=c6527f24f4b16031d3ae4fa9f658d5f11534c8d84ce7dc8502420280919c3490; \
+    DENO_SHA256_ARM64=c832298b1ad4422481334855f6003e0f54145762c5a134f20a489511d2f65bbf; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "$arch" in \
+        amd64) triple=x86_64-unknown-linux-gnu; sha="$DENO_SHA256_AMD64" ;; \
+        arm64) triple=aarch64-unknown-linux-gnu; sha="$DENO_SHA256_ARM64" ;; \
+        *) echo "ERROR: unsupported architecture for Deno: $arch"; exit 1 ;; \
+    esac; \
+    command -v unzip >/dev/null; \
+    curl -fsSL "https://github.com/denoland/deno/releases/download/v${DENO_VERSION}/deno-${triple}.zip" \
+        -o /tmp/deno.zip; \
+    echo "${sha}  /tmp/deno.zip" | sha256sum -c -; \
+    mkdir -p /usr/local/lib/archivr/deno; \
+    unzip -q -o /tmp/deno.zip deno -d /usr/local/lib/archivr/deno; \
+    rm /tmp/deno.zip; \
+    chmod 0755 /usr/local/lib/archivr/deno/deno; \
+    /usr/local/lib/archivr/deno/deno --version
 
 # Download Chromium extensions used during headless captures.
 # uBlock Origin Lite (MV3) — ad/tracker blocking.
@@ -117,6 +149,9 @@ ENV ARCHIVR_STATIC_DIR=/usr/share/archivr-server/static \
     ARCHIVR_TWEET_PYTHON=/opt/archivr-venv/bin/python3 \
     ARCHIVR_TWEET_SCRAPER=/usr/local/lib/archivr/scrape_user_tweet_contents.py \
     ARCHIVR_YT_DLP=/opt/archivr-venv/bin/yt-dlp \
+    ARCHIVR_DENO=/usr/local/lib/archivr/deno/deno \
+    ARCHIVR_FFMPEG=/usr/bin/ffmpeg \
+    ARCHIVR_STATE_DIR=/data/archivr-state \
     ARCHIVR_UBLOCK_EXT=/usr/local/lib/archivr/extensions/ublock-origin-lite \
     ARCHIVR_COOKIE_EXT=/usr/local/lib/archivr/extensions/istilldontcareaboutcookies \
     ARCHIVR_CHROME_ARGS=--no-sandbox

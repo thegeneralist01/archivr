@@ -176,11 +176,46 @@ pub struct InstanceSettings {
     /// A caller may reorder iff `role_bits & reorder_children_role_bits != 0`.
     /// Only the Owner may change it. Never contains the Guest bit.
     pub reorder_children_role_bits: u32,
+    /// Admin overrides for the thread-title model per summary provider kind.
+    /// `None` = fall back to `ARCHIVR_*_TITLE_MODEL` env, then built-in default.
+    pub title_model_anthropic_http: Option<String>,
+    pub title_model_openai_compatible: Option<String>,
+    pub title_model_claude_cli: Option<String>,
+    pub title_model_codex_cli: Option<String>,
 }
 
 impl InstanceSettings {
     pub fn can_reorder_children(&self, role_bits: u32) -> bool {
         role_bits & self.reorder_children_role_bits != 0
+    }
+
+    /// Instance title-model override for a provider kind (trimmed, non-empty).
+    pub fn title_model_override(&self, kind: &str) -> Option<&str> {
+        self.title_model_slot(kind)?
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+    }
+
+    /// Mutable column for a provider kind's title model; `None` for unknown kinds.
+    pub fn title_model_slot_mut(&mut self, kind: &str) -> Option<&mut Option<String>> {
+        match kind {
+            "anthropic_http" => Some(&mut self.title_model_anthropic_http),
+            "openai_compatible" => Some(&mut self.title_model_openai_compatible),
+            "claude_cli" => Some(&mut self.title_model_claude_cli),
+            "codex_cli" => Some(&mut self.title_model_codex_cli),
+            _ => None,
+        }
+    }
+
+    fn title_model_slot(&self, kind: &str) -> Option<&Option<String>> {
+        match kind {
+            "anthropic_http" => Some(&self.title_model_anthropic_http),
+            "openai_compatible" => Some(&self.title_model_openai_compatible),
+            "claude_cli" => Some(&self.title_model_claude_cli),
+            "codex_cli" => Some(&self.title_model_codex_cli),
+            _ => None,
+        }
     }
 }
 
@@ -666,7 +701,11 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
             ublock_enabled                     INTEGER NOT NULL DEFAULT 1 CHECK (ublock_enabled IN (0, 1)),
             cookie_ext_enabled                 INTEGER NOT NULL DEFAULT 1 CHECK (cookie_ext_enabled IN (0, 1)),
             modal_closer_enabled               INTEGER NOT NULL DEFAULT 1 CHECK (modal_closer_enabled IN (0, 1)),
-            reorder_children_role_bits         INTEGER NOT NULL DEFAULT 12
+            reorder_children_role_bits         INTEGER NOT NULL DEFAULT 12,
+            title_model_anthropic_http         TEXT,
+            title_model_openai_compatible      TEXT,
+            title_model_claude_cli             TEXT,
+            title_model_codex_cli              TEXT
         );
 
         INSERT OR IGNORE INTO instance_settings
@@ -726,6 +765,18 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
         "ALTER TABLE instance_settings ADD COLUMN reorder_children_role_bits INTEGER NOT NULL DEFAULT 12",
         [],
     );
+    // Add nullable per-provider thread-title model overrides (idempotent migration)
+    for column in [
+        "title_model_anthropic_http",
+        "title_model_openai_compatible",
+        "title_model_claude_cli",
+        "title_model_codex_cli",
+    ] {
+        let _ = conn.execute(
+            &format!("ALTER TABLE instance_settings ADD COLUMN {column} TEXT"),
+            [],
+        );
+    }
 
     Ok(())
 }
@@ -952,7 +1003,9 @@ pub fn get_instance_settings(conn: &Connection) -> Result<InstanceSettings> {
                 COALESCE(ublock_enabled, 1),
                 COALESCE(cookie_ext_enabled, 1),
                 COALESCE(modal_closer_enabled, 1),
-                COALESCE(reorder_children_role_bits, 12)
+                COALESCE(reorder_children_role_bits, 12),
+                title_model_anthropic_http, title_model_openai_compatible,
+                title_model_claude_cli, title_model_codex_cli
          FROM instance_settings WHERE id = 1",
         [],
         |row| {
@@ -965,6 +1018,10 @@ pub fn get_instance_settings(conn: &Connection) -> Result<InstanceSettings> {
                 cookie_ext_enabled: row.get::<_, i64>(5)? != 0,
                 modal_closer_enabled: row.get::<_, i64>(6)? != 0,
                 reorder_children_role_bits: row.get::<_, i64>(7)? as u32,
+                title_model_anthropic_http: row.get(8)?,
+                title_model_openai_compatible: row.get(9)?,
+                title_model_claude_cli: row.get(10)?,
+                title_model_codex_cli: row.get(11)?,
             })
         },
     )
@@ -981,7 +1038,11 @@ pub fn update_instance_settings(conn: &Connection, settings: &InstanceSettings) 
              ublock_enabled = ?5,
              cookie_ext_enabled = ?6,
              modal_closer_enabled = ?7,
-             reorder_children_role_bits = ?8
+             reorder_children_role_bits = ?8,
+             title_model_anthropic_http = ?9,
+             title_model_openai_compatible = ?10,
+             title_model_claude_cli = ?11,
+             title_model_codex_cli = ?12
          WHERE id = 1",
         params![
             settings.public_index_enabled as i64,
@@ -992,6 +1053,10 @@ pub fn update_instance_settings(conn: &Connection, settings: &InstanceSettings) 
             settings.cookie_ext_enabled as i64,
             settings.modal_closer_enabled as i64,
             settings.reorder_children_role_bits as i64,
+            settings.title_model_anthropic_http,
+            settings.title_model_openai_compatible,
+            settings.title_model_claude_cli,
+            settings.title_model_codex_cli,
         ],
     )?;
     Ok(())
@@ -1119,6 +1184,46 @@ pub fn update_entry_title(conn: &Connection, entry_uid: &str, title: Option<&str
         params![title, entry_uid],
     )?;
     Ok(n > 0)
+}
+
+/// An `x`/`tweet` entry whose title may be a legacy bare-link auto title.
+#[derive(Debug, Clone)]
+pub struct TweetTitleCandidate {
+    pub id: i64,
+    pub title: String,
+    pub source_metadata_json: String,
+}
+
+/// Root or child `x`/`tweet` entries whose title starts with "http" (bare-link auto titles).
+pub fn list_bare_link_tweet_titles(conn: &Connection) -> Result<Vec<TweetTitleCandidate>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, source_metadata_json FROM archived_entries
+         WHERE source_kind = 'x' AND entity_kind = 'tweet' AND title LIKE 'http%'
+         ORDER BY id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(TweetTitleCandidate {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            source_metadata_json: row.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Compare-and-set title update: only writes when the stored title still equals
+/// `expected`, so a concurrent rename always wins. `Ok(true)` iff one row changed.
+pub fn replace_entry_title_if_unchanged(
+    conn: &Connection,
+    entry_id: i64,
+    expected: &str,
+    new_title: &str,
+) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE archived_entries SET title = ?1 WHERE id = ?2 AND title = ?3",
+        params![new_title, entry_id, expected],
+    )?;
+    Ok(n == 1)
 }
 
 /// Outcome of [`reorder_child_entries`]; the server maps it to 204/404/400.
@@ -1667,6 +1772,36 @@ pub fn entry_id_for_uid(conn: &Connection, entry_uid: &str) -> Result<Option<i64
     .map_err(Into::into)
 }
 
+/// An entry's id plus the source identity fields needed to re-fetch it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntrySourceInfo {
+    pub entry_id: i64,
+    pub source_kind: String,
+    pub entity_kind: String,
+    pub canonical_url: Option<String>,
+}
+
+/// Looks up `entry_uid` with its source identity's canonical URL. `Ok(None)` if absent.
+pub fn entry_source_info(conn: &Connection, entry_uid: &str) -> Result<Option<EntrySourceInfo>> {
+    conn.query_row(
+        "SELECT e.id, e.source_kind, e.entity_kind, si.canonical_url
+         FROM archived_entries e
+         JOIN source_identities si ON si.id = e.source_identity_id
+         WHERE e.entry_uid = ?1",
+        [entry_uid],
+        |row| {
+            Ok(EntrySourceInfo {
+                entry_id: row.get(0)?,
+                source_kind: row.get(1)?,
+                entity_kind: row.get(2)?,
+                canonical_url: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 /// Creates a fresh pending summary attempt for one cache key.
 ///
 /// Attempts are intentionally not unique by cache key: a forced regeneration
@@ -1747,6 +1882,20 @@ pub fn update_entry_summary_status(
             now,
             summary_uid
         ],
+    )?;
+    Ok(())
+}
+
+/// Replaces a summary row's input digest (used once a deferred input is built).
+/// Also bumps `updated_at`.
+pub fn update_entry_summary_input_sha256(
+    conn: &Connection,
+    summary_uid: &str,
+    input_sha256: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE entry_summaries SET input_sha256 = ?1, updated_at = ?2 WHERE summary_uid = ?3",
+        params![input_sha256, now_timestamp(), summary_uid],
     )?;
     Ok(())
 }
@@ -2284,6 +2433,19 @@ pub fn has_active_capture_jobs(conn: &Connection) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// Returns `true` while a summary-time subtitle fetch is in flight (a
+/// `pending`/`running` summary row still carrying the placeholder digest).
+/// Like a capture, the fetch moves files into `raw/` before writing DB rows.
+pub fn has_pending_subtitle_fetches(conn: &Connection) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM entry_summaries
+         WHERE status IN ('pending', 'running') AND input_sha256 = ?1",
+        [crate::summarizer::SUBTITLE_FETCH_PENDING_INPUT_SHA256],
+        |row| row.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 /// Returns `(id, raw_relpath, byte_size)` for every blob row not referenced by any
 /// `entry_artifacts.blob_id`.  These DB rows are safe to delete regardless of whether
 /// a disk file still exists at their `raw_relpath`.
@@ -2434,6 +2596,60 @@ pub fn add_entry_artifact(conn: &Connection, artifact: &NewArtifact) -> Result<i
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// One artifact of a given role, with its blob MIME type when it has a blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleArtifact {
+    pub id: i64,
+    pub relpath: String,
+    pub mime_type: Option<String>,
+    pub metadata_json: Option<String>,
+}
+
+/// Lists an entry's artifacts with `role`, in insertion (id) order.
+pub fn list_entry_artifacts_by_role(
+    conn: &Connection,
+    entry_id: i64,
+    role: &str,
+) -> Result<Vec<RoleArtifact>> {
+    let mut stmt = conn.prepare(
+        "SELECT ea.id, ea.relpath, b.mime_type, ea.metadata_json
+         FROM entry_artifacts ea
+         LEFT JOIN blobs b ON b.id = ea.blob_id
+         WHERE ea.entry_id = ?1 AND ea.artifact_role = ?2
+         ORDER BY ea.id ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![entry_id, role], |row| {
+            Ok(RoleArtifact {
+                id: row.get(0)?,
+                relpath: row.get(1)?,
+                mime_type: row.get(2)?,
+                metadata_json: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// True if the entry already has an artifact with `role` pointing at `blob_id`.
+/// `entry_artifacts` has no uniqueness constraint, so callers dedupe with this.
+pub fn entry_has_artifact_blob(
+    conn: &Connection,
+    entry_id: i64,
+    role: &str,
+    blob_id: i64,
+) -> Result<bool> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM entry_artifacts
+             WHERE entry_id = ?1 AND artifact_role = ?2 AND blob_id = ?3
+         )",
+        params![entry_id, role, blob_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
 }
 
 pub fn remove_entry_tag_assignment(conn: &Connection, entry_id: i64, tag_id: i64) -> Result<()> {
@@ -3302,6 +3518,26 @@ mod tests {
     }
 
     #[test]
+    fn replace_entry_title_if_unchanged_is_compare_and_set() {
+        let conn = conn();
+        let entry = create_entry_fixture(&conn, "private", None, None);
+        update_entry_title(&conn, &entry.entry_uid, Some("a")).unwrap();
+        let title = |conn: &Connection| -> String {
+            conn.query_row(
+                "SELECT title FROM archived_entries WHERE id = ?1",
+                [entry.id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert!(!replace_entry_title_if_unchanged(&conn, entry.id, "b", "c").unwrap());
+        assert_eq!(title(&conn), "a");
+        assert!(replace_entry_title_if_unchanged(&conn, entry.id, "a", "c").unwrap());
+        assert_eq!(title(&conn), "c");
+    }
+
+    #[test]
     fn schema_defaults_public_settings_to_private() {
         let conn = conn();
         let defaults: (i64, i64, i64) = conn
@@ -3988,6 +4224,29 @@ mod tests {
         let s = get_instance_settings(&conn).unwrap();
         assert_eq!(s.reorder_children_role_bits, 12);
         assert!(s.modal_closer_enabled);
+    }
+
+    #[test]
+    fn instance_settings_title_models_migrate_and_round_trip() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE instance_settings (id INTEGER PRIMARY KEY CHECK (id = 1), public_index_enabled INTEGER NOT NULL DEFAULT 0, public_entry_content_enabled INTEGER NOT NULL DEFAULT 0, public_archive_submission_enabled INTEGER NOT NULL DEFAULT 0, default_entry_visibility INTEGER NOT NULL DEFAULT 2);
+             INSERT INTO instance_settings (id) VALUES (1);",
+        )
+        .unwrap();
+        initialize_auth_schema(&conn).unwrap();
+        initialize_auth_schema(&conn).unwrap();
+        let mut s = get_instance_settings(&conn).unwrap();
+        assert_eq!(s.title_model_claude_cli, None);
+        assert_eq!(s.title_model_override("claude_cli"), None);
+        *s.title_model_slot_mut("claude_cli").unwrap() = Some("sonnet".into());
+        s.title_model_codex_cli = Some("   ".into());
+        update_instance_settings(&conn, &s).unwrap();
+        let s = get_instance_settings(&conn).unwrap();
+        assert_eq!(s.title_model_override("claude_cli"), Some("sonnet"));
+        assert_eq!(s.title_model_override("codex_cli"), None);
+        assert_eq!(s.title_model_override("gemini"), None);
+        assert_eq!(s.title_model_anthropic_http, None);
     }
 
     #[test]
@@ -4929,6 +5188,22 @@ mod tests {
     }
 
     #[test]
+    fn has_pending_subtitle_fetches_tracks_placeholder_rows() {
+        let c = conn();
+        let entry = create_entry_fixture(&c, "private", None, None);
+        let placeholder = crate::summarizer::SUBTITLE_FETCH_PENDING_INPUT_SHA256;
+        upsert_pending_entry_summary(&c, entry.id, "codex_cli", None, "v1", "real").unwrap();
+        assert!(!has_pending_subtitle_fetches(&c).unwrap());
+        let uid =
+            upsert_pending_entry_summary(&c, entry.id, "codex_cli", None, "v1", placeholder).unwrap();
+        assert!(has_pending_subtitle_fetches(&c).unwrap());
+        update_entry_summary_status(&c, &uid, "running", None, None).unwrap();
+        assert!(has_pending_subtitle_fetches(&c).unwrap());
+        update_entry_summary_status(&c, &uid, "failed", None, Some("x")).unwrap();
+        assert!(!has_pending_subtitle_fetches(&c).unwrap());
+    }
+
+    #[test]
     fn regenerating_a_completed_summary_creates_a_new_attempt_and_preserves_completion() {
         let c = conn();
         let entry = create_entry_fixture(&c, "private", None, None);
@@ -5274,5 +5549,120 @@ mod tests {
         assert_eq!(position_of(&c, a.id), Some(0));
         assert_eq!(position_of(&c, b.id), Some(1));
         assert_eq!(position_of(&c, c3.id), Some(2));
+    }
+
+    fn test_blob(conn: &Connection, sha: &str, mime: &str) -> i64 {
+        upsert_blob(
+            conn,
+            &BlobRecord {
+                sha256: sha.to_string(),
+                byte_size: 10,
+                mime_type: Some(mime.to_string()),
+                extension: None,
+                raw_relpath: format!("raw/{sha}"),
+            },
+        )
+        .unwrap()
+    }
+
+    fn test_artifact(conn: &Connection, entry_id: i64, role: &str, blob_id: Option<i64>, relpath: &str) -> i64 {
+        add_entry_artifact(
+            conn,
+            &NewArtifact {
+                entry_id,
+                artifact_role: role.to_string(),
+                storage_area: "raw".to_string(),
+                relpath: relpath.to_string(),
+                blob_id,
+                logical_path: None,
+                metadata_json: Some(format!("{{\"r\":\"{relpath}\"}}")),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn entry_source_info_joins_canonical_url() {
+        let conn = conn();
+        let entry = create_entry_fixture(&conn, "private", None, None);
+        let info = entry_source_info(&conn, &entry.entry_uid).unwrap().unwrap();
+        assert_eq!(
+            info,
+            EntrySourceInfo {
+                entry_id: entry.id,
+                source_kind: "youtube".to_string(),
+                entity_kind: "video".to_string(),
+                canonical_url: Some("https://youtube.com/watch?v=video-1".to_string()),
+            }
+        );
+        assert!(entry_source_info(&conn, "entry_missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn list_entry_artifacts_by_role_orders_by_id() {
+        let conn = conn();
+        let entry = create_entry_fixture(&conn, "private", None, None);
+        let vtt = test_blob(&conn, "aa11", "text/vtt");
+        let first = test_artifact(&conn, entry.id, "subtitle", Some(vtt), "raw/a/a/aa11.vtt");
+        let _media = test_artifact(&conn, entry.id, "primary_media", None, "raw/m.mp4");
+        let second = test_artifact(&conn, entry.id, "subtitle", None, "raw/b.srt");
+
+        let rows = list_entry_artifacts_by_role(&conn, entry.id, "subtitle").unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                RoleArtifact {
+                    id: first,
+                    relpath: "raw/a/a/aa11.vtt".to_string(),
+                    mime_type: Some("text/vtt".to_string()),
+                    metadata_json: Some("{\"r\":\"raw/a/a/aa11.vtt\"}".to_string()),
+                },
+                RoleArtifact {
+                    id: second,
+                    relpath: "raw/b.srt".to_string(),
+                    mime_type: None,
+                    metadata_json: Some("{\"r\":\"raw/b.srt\"}".to_string()),
+                },
+            ]
+        );
+        assert!(list_entry_artifacts_by_role(&conn, entry.id, "favicon").unwrap().is_empty());
+    }
+
+    #[test]
+    fn entry_has_artifact_blob_matches_role_and_blob() {
+        let conn = conn();
+        let entry = create_entry_fixture(&conn, "private", None, None);
+        let other = create_entry_fixture(&conn, "private", None, None);
+        let blob = test_blob(&conn, "bb22", "text/vtt");
+        let unrelated = test_blob(&conn, "cc33", "text/vtt");
+        test_artifact(&conn, entry.id, "subtitle", Some(blob), "raw/bb22.vtt");
+
+        assert!(entry_has_artifact_blob(&conn, entry.id, "subtitle", blob).unwrap());
+        assert!(!entry_has_artifact_blob(&conn, entry.id, "primary_media", blob).unwrap());
+        assert!(!entry_has_artifact_blob(&conn, entry.id, "subtitle", unrelated).unwrap());
+        assert!(!entry_has_artifact_blob(&conn, other.id, "subtitle", blob).unwrap());
+    }
+
+    #[test]
+    fn update_entry_summary_input_sha256_updates_row() {
+        let conn = conn();
+        let entry = create_entry_fixture(&conn, "private", None, None);
+        let uid = upsert_pending_entry_summary(
+            &conn,
+            entry.id,
+            "codex_cli",
+            None,
+            "v1",
+            "pending-subtitle-fetch",
+        )
+        .unwrap();
+        let before = get_entry_summary_by_uid(&conn, &uid).unwrap().unwrap();
+
+        let digest = "ab".repeat(32);
+        update_entry_summary_input_sha256(&conn, &uid, &digest).unwrap();
+        let after = get_entry_summary_by_uid(&conn, &uid).unwrap().unwrap();
+        assert_eq!(after.input_sha256, digest);
+        assert_eq!(after.status, "pending");
+        assert!(after.updated_at >= before.updated_at);
     }
 }

@@ -25,12 +25,15 @@ Archivr is a self-hosted tool for capturing and preserving digital content — Y
 - [Supported Inputs](#supported-inputs)
   - [YouTube playlists and channels](#youtube-playlists-and-channels)
   - [Video quality and audio-only](#video-quality-and-audio-only)
+  - [YouTube subtitles](#youtube-subtitles)
   - [Text notes](#text-notes)
 - [Configuration](#configuration)
   - [TOML config file](#toml-config-file)
   - [Environment variables](#environment-variables)
     - [LLM providers](#llm-providers)
-- [Keeping yt-dlp fresh](#keeping-yt-dlp-fresh)
+- [Keeping yt-dlp and its JS runtime fresh](#keeping-yt-dlp-and-its-js-runtime-fresh)
+  - [JavaScript runtime (Deno)](#javascript-runtime-deno)
+  - [Troubleshooting](#troubleshooting)
 - [Deployment](#deployment)
   - [Security](#security)
   - [NixOS](#hosting-on-nixos)
@@ -40,7 +43,7 @@ Archivr is a self-hosted tool for capturing and preserving digital content — Y
 
 ## Features
 
-- **Social media** — YouTube (videos, shorts, playlists, channels with sync mode), X/Twitter (tweet and thread JSON + media downloads), Instagram, TikTok, Facebook, Reddit, Snapchat via yt-dlp
+- **Social media** — YouTube (videos, shorts, playlists, channels with sync mode; subtitles saved with each video by default), X/Twitter (tweet and thread JSON + media downloads), Instagram, TikTok, Facebook, Reddit, Snapchat via yt-dlp
 - **Web pages** — full self-contained HTML snapshots via SingleFile + Chromium; optional Freedium mirror for paywalled articles; reader mode
 - **Local files** — import any file from disk by `file://` path
 - **Deduplication** — SHA3-256 content-addressed blob store shared across all captures; identical files are stored once
@@ -48,7 +51,7 @@ Archivr is a self-hosted tool for capturing and preserving digital content — Y
 - **Multiple archives** — the server mounts any number of separate archives from a single TOML config
 - **Role-based auth** — Guest / User / Admin / Owner roles; session cookies and API tokens; Argon2 passwords; the Owner can choose which roles (including custom ones) may reorder child entries
 - **Quality selection** — choose video quality or audio-only per capture; a live metadata probe populates the selector before download
-- **LLM summaries** — regenerable per-entry summary via the Anthropic HTTP API, an OpenAI-compatible HTTP API, a local `claude` CLI, or a local `codex` CLI; triggered manually from the entry rail, never automatically on capture; text-only by default, with an explicit `Include attached images` option
+- **LLM summaries** — regenerable per-entry summary via the Anthropic HTTP API, an OpenAI-compatible HTTP API, a local `claude` CLI, or a local `codex` CLI; triggered manually from the entry rail, never automatically on capture; text-only by default, with an explicit `Include attached images` option; YouTube videos are summarized from their subtitles
 - **Text notes** — capture a plain-text or Markdown note with a title and no URL; the byte-preserving note is stored as a normal deduplicated blob and opens in the usual entry-rail preview
 - **In-progress capture indicator** — running captures appear as a compact spinner row in the entries list until they finish, replacing the earlier grey skeleton block
 
@@ -140,6 +143,20 @@ A separate auth database (`archivr-auth.sqlite`, path set in TOML) holds users, 
 | Snapchat | Direct URL · `snapchat:ID` |
 | Arbitrary URL / web page | Any `https://` URL |
 
+X Articles are titled `<article title> — @handle` from the article's own title instead of the tweet text (usually a
+bare `t.co` link). Article entries archived before this change are retitled on the next `archivr-server` start, but only
+while their title still equals the old auto-generated bare-link title; a renamed entry is left alone. Titles have no
+"edited" flag, so an entry you renamed back to exactly that old title is retitled too. CLI-only installs never run this
+pass — it runs at server startup only.
+
+X threads keep `Thread by @handle` at capture. **Generate title** in the entry rail (thread entries, user role and up)
+asks the selected Summary provider's cheap title model for a short topic and saves `Thread about <topic> — @handle` as
+the entry title (`POST /api/archives/:id/entries/:uid/thread-title`, body `{"provider": "<kind>"}`); rename it like any
+title. With ≥2 entries selected and at least one X thread, the bulk panel's **Generate titles** does the same for each
+selected thread (non-threads skipped; uses the Summary provider selected in the rail), two at a time, with progress and
+an `X updated, Y failed` summary; changing the selection stops it picking up further entries. Models are listed under
+[LLM providers](#llm-providers).
+
 ### YouTube playlists and channels
 
 Capturing a playlist or channel creates a **container entry** with each video archived as a child beneath it. Before downloading, the UI probes each video for available quality options — set quality per-video or apply one to the whole batch. Individual videos can be excluded with the remove button.
@@ -168,6 +185,93 @@ The `POST /api/archives/:id/captures` endpoint accepts an optional `quality` fie
 ```
 
 `"audio"` selects the most efficient native audio track without re-encoding (Opus/WebM preferred, then AAC/M4A). Omitting `quality` or passing `"best"` downloads at the highest available quality.
+
+### YouTube subtitles
+
+YouTube video captures save subtitles next to the video by default: single videos, shorts, and every video archived
+from a YouTube playlist or channel, at any quality including audio-only. Subtitles apply to YouTube videos only —
+YouTube Music, Spotify, X, TikTok, and the other yt-dlp sources are downloaded without them.
+
+At most two tracks are saved, chosen from the metadata yt-dlp already fetches for the capture:
+
+- English, plus the video's original language when that isn't English.
+- Manual (uploader-provided) tracks are preferred. If the original language has no manual track, its auto-generated
+  track is used; auto-generated English is used only when nothing else was found.
+- If the metadata probe fails, yt-dlp is asked for `en` and any `-orig` (original-language) track instead.
+
+Tracks are requested as VTT, with SRT accepted; nothing is converted, and other subtitle formats are dropped. Each file
+goes through the usual SHA3-256 dedup into `store/raw/` and is recorded as a `subtitle` artifact of the entry, along
+with its language, whether it was manual or auto-generated, and its format.
+
+Subtitle failures never fail a capture. Subtitles are requested in the same yt-dlp call as the media with
+`--ignore-errors`, so a missing track or a rate-limited caption request only logs a warning. If that call still fails,
+the media is retried once without subtitles.
+
+Subtitles are on unless you turn them off for a capture:
+
+- **Web UI:** the **Download subtitles** toggle in the capture dialog.
+- **API:** `"download_subtitles": false` in the `POST /api/archives/:id/captures` body. Omitting the field means `true`.
+- **CLI:** `archivr archive --no-subtitles <url>`.
+
+Videos captured without subtitles can still be summarized; see [LLM providers](#llm-providers) and
+[Local transcription](#local-transcription-optional).
+
+#### Local transcription (optional)
+
+When a YouTube video has no subtitles at summary time, Archivr can transcribe its audio on the server. The order is
+fixed and transcription never runs if an earlier step yields usable subtitles:
+
+1. archived subtitles;
+2. subtitles fetched from the original video (subtitles only, no media);
+3. local transcription with the engine chosen in the Summary panel;
+4. the no-subtitles error (or a transcription-specific error if step 3 ran and failed).
+
+The feature is off until `ARCHIVR_TRANSCRIBE_ENGINES` lists at least one configured engine (env vars in
+[Local transcription env](#local-transcription)). Then the Summary panel shows a second selector on YouTube videos —
+**No local transcription** (default) or an enabled engine — remembered for the browser session. The API field is
+`"transcribe_engine": "<kind>"` in the summary POST body; an unknown or unconfigured engine is a 400. Enabled engines
+are listed by `GET /api/summary/transcription-engines`.
+
+| Engine (`kind`) | Languages | Runs on | Install |
+|---|---|---|---|
+| Whisper (`whisper`) | ~99 (`*.en` models English only) | CPU, Metal, CUDA/Vulkan | whisper.cpp `whisper-cli` + a ggml model (default backend), or a faster-whisper wrapper (`script` backend) |
+| NVIDIA Parakeet (`parakeet`) | v2 English; v3 25 European | NVIDIA GPU (NeMo), Apple silicon (parakeet-mlx), CPU (ONNX) | your own wrapper script; weights CC-BY-4.0 |
+| Fermion Phonon-2 (`phonon2`) | **English only** (hard-coded) | Apple silicon (MLX), x86-64/Arm CPU, CUDA | `pip install fermion-research` + platform runtime; weights CC-BY-4.0, CLI licence unknown |
+
+Setup examples:
+
+```sh
+# whisper.cpp
+nix shell nixpkgs#whisper-cpp
+curl -LO https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin
+export ARCHIVR_TRANSCRIBE_ENGINES=whisper ARCHIVR_WHISPER_MODEL=$PWD/ggml-large-v3-turbo.bin
+
+# Parakeet via parakeet-mlx (Apple silicon), wrapper from spec Appendix A.3
+export ARCHIVR_TRANSCRIBE_ENGINES=parakeet ARCHIVR_PARAKEET_CLI=/opt/transcribe/parakeet.py
+
+# Phonon-2 (vendor package; Apple silicon shown)
+python3 -m venv /opt/transcribe && /opt/transcribe/bin/pip install fermion-research mlx mlx-audio mlx-lm soundfile scipy zstandard
+export ARCHIVR_TRANSCRIBE_ENGINES=phonon2 ARCHIVR_PHONON2_CLI=/opt/transcribe/bin/fermion
+```
+
+**Script contract** (Whisper `script` backend and Parakeet). Archivr runs
+`<script> --input <job>/audio.wav --output <job>/transcript.vtt --model <model> [--language <xx>]`. The script exits 0
+only after writing WebVTT to `--output`, may write a detected language code to `<output>.lang`, treats `--language` as
+a hint, writes nothing outside the output directory except model caches, and must tolerate SIGKILL on timeout. The
+audio is already 16 kHz mono PCM WAV. Reference wrappers are in the spec's Appendix A.
+
+Notes:
+
+- One transcription job runs at a time per server; others wait inside their own timeout budget.
+- Audio comes from the archived media or a yt-dlp audio download, converted by ffmpeg to a temp WAV (~115 MB per hour
+  of audio) that is deleted afterwards.
+- `ARCHIVR_TRANSCRIBE_TIMEOUT` (default 3600 s) bounds the whole job: audio, ffmpeg and the engine.
+- The transcript is stored as a `subtitle` artifact with metadata `kind: "transcribed"`, `origin: "transcription"`,
+  `engine` and `model` (a model path is reduced to its file name). It ranks below manual subtitles and above
+  auto-generated ones, and later summaries reuse it without transcribing again.
+- Python engines download weights on first use, so the server user needs a writable `HOME`/cache directory.
+
+Design and deviations: [`superpowers/specs/2026-10-05-local-transcription-fallback.md`](superpowers/specs/2026-10-05-local-transcription-fallback.md).
 
 ### Text notes
 
@@ -213,6 +317,9 @@ See `docker/config.example.toml` for a complete annotated example.
 | `ARCHIVR_STATIC_DIR` | `crates/archivr-server/static` | Pre-built frontend asset directory |
 | `ARCHIVR_YT_DLP` | `yt-dlp` | yt-dlp binary used for video and social downloads; the Nix wrappers point this at the pinned release |
 | `ARCHIVR_YT_DLP_FORCE` | — | Absolute path to a yt-dlp binary that MUST be used, bypassing the resolver. Prefer `ARCHIVR_YT_DLP` unless you are overriding for a specific run |
+| `ARCHIVR_DENO` | — | Pinned Deno binary offered to the JS runtime resolver; the Nix wrappers and Docker image set it |
+| `ARCHIVR_JS_RUNTIME` | — | `RUNTIME[:ABS_PATH]` with `RUNTIME` one of `deno`, `node`, `bun`, `quickjs`. Forces the runtime passed to yt-dlp, bypassing resolution and version checks. Invalid values are warned about and ignored. Node needs ≥ 22; Bun needs ≥ 1.2.11 and is deprecated in yt-dlp |
+| `ARCHIVR_STATE_DIR` | platform state dir | Where `archivr yt-dlp update` and Settings › Instance › yt-dlp install yt-dlp and Deno. Docker sets `/data/archivr-state` |
 | `ARCHIVR_SINGLE_FILE` | `single-file` | single-file-cli binary for web page archiving |
 | `ARCHIVR_CHROME` | `chromium` | Chromium executable passed to single-file |
 | `ARCHIVR_CHROME_ARGS` | — | Extra space-separated Chromium flags (Docker sets `--no-sandbox`) |
@@ -220,7 +327,8 @@ See `docker/config.example.toml` for a complete annotated example.
 | `ARCHIVR_TWEET_SCRAPER` | `vendor/twitter/scrape_user_tweet_contents.py` | Tweet scraper script path |
 | `ARCHIVR_TWEET_PYTHON` | `python3` | Python executable for the tweet scraper |
 
-The Nix wrapper and Docker image set `ARCHIVR_STATIC_DIR`, `ARCHIVR_SINGLE_FILE`, and `ARCHIVR_CHROME` automatically.
+The Nix wrapper and Docker image set `ARCHIVR_STATIC_DIR`, `ARCHIVR_SINGLE_FILE`, `ARCHIVR_CHROME`, `ARCHIVR_DENO`, and
+`ARCHIVR_FFMPEG` automatically.
 
 #### LLM providers
 
@@ -237,6 +345,24 @@ explicitly sends eligible archived image data to the chosen provider; it is neve
 
 Image inclusion considers only `media` artifacts with `jpg`, `jpeg`, `png`, `webp`, `gif`, or `avif` files. At most four
 images are sent, each no larger than 5 MiB and no more than 12 MiB in total.
+
+**YouTube videos** are summarized from one archived subtitle track, never from the video file. The track is picked in
+this order: manual English, manual original language, other manual, auto-generated original language, auto-generated
+English. It is reduced to plain text: timestamps, cue settings, and markup are removed, and the repeated lines of
+rolling auto-captions are collapsed. Like every summary input, the transcript is cut at 48,000 characters, so the end of
+a long video is not summarized. Adding or replacing subtitles changes the input hash, so a cached summary built from
+different subtitles is not reused. Other video and audio entries still can't be summarized.
+
+If the entry has no usable subtitles (for example, it was captured with subtitles turned off, or by an older Archivr),
+requesting a summary first downloads them from the original URL — subtitles only, no media — while the attempt shows as
+pending. Fetched tracks are archived to the entry like captured ones. If none can be fetched, the attempt fails without
+calling the provider and the Summary panel shows:
+
+> This video can’t be summarized because no subtitles are available. Archivr found no archived subtitles and couldn’t
+> download any from the original video — it may have no captions, or it may be private, deleted, or unreachable.
+
+If a transcription engine was selected, Archivr transcribes the audio before giving up; see
+[Local transcription](#local-transcription-optional).
 
 Free-text entry search also matches the latest completed summary text and its generated JSON tags. Entries with no
 summary, or only a pending or failed summary, get no summary-derived match.
@@ -262,7 +388,18 @@ replacement succeeds, and public readers receive completed content only—never 
 | `ARCHIVR_CODEX_CLI` | *(auto-discovered)* | Path to a local `codex` binary |
 | `ARCHIVR_CODEX_MODEL` | *(the CLI's own default)* | Optional model override for the local Codex CLI |
 | `ARCHIVR_SUMMARY_HTTP_TIMEOUT` | `120` | Seconds before an HTTP-provider summary is killed |
-| `ARCHIVR_SUMMARY_CLI_TIMEOUT` | `300` | Seconds before a CLI-provider summary is killed |
+| `ARCHIVR_SUMMARY_CLI_TIMEOUT` | `300` | Seconds before a CLI-provider summary is killed; also bounds each summary-time yt-dlp subtitle fetch call |
+
+Thread-title generation uses the same provider but never its summary model (`ARCHIVR_*_MODEL`); it uses a cheap title
+model instead. Admins can set a per-provider title model in **Settings › Instance › Thread title models**. Precedence:
+that instance setting (blank = unset) > the env var below > the built-in default.
+
+| Variable | Default | Description |
+|---|---|---|
+| `ARCHIVR_ANTHROPIC_TITLE_MODEL` | `claude-haiku-4-5` | Model used only for thread-title generation |
+| `ARCHIVR_OPENAI_TITLE_MODEL` | `gpt-4o-mini` | Model used only for thread-title generation |
+| `ARCHIVR_CLAUDE_TITLE_MODEL` | `haiku` | Model used only for thread-title generation |
+| `ARCHIVR_CODEX_TITLE_MODEL` | `gpt-6-luna` | Model used only for thread-title generation; set this if your Codex account lacks that model |
 
 When `ARCHIVR_CLAUDE_CLI` / `ARCHIVR_CODEX_CLI` is unset the binary is auto-discovered, in this order: the well-known
 absolute paths, then `$HOME/.local/bin/<name>`, then the bare name resolved through `PATH`. Note that `PATH` is
@@ -271,7 +408,29 @@ the variable explicitly when you have both. The well-known paths are `/opt/homeb
 `/usr/local/bin/claude` for Claude, and `/Applications/ChatGPT.app/Contents/Resources/codex`,
 `/opt/homebrew/bin/codex`, and `/usr/local/bin/codex` for Codex.
 
-## Keeping yt-dlp fresh
+#### Local transcription
+
+Only read when a summary request names an engine. See [Local transcription](#local-transcription-optional).
+
+| Variable | Default | Description |
+|---|---|---|
+| `ARCHIVR_TRANSCRIBE_ENGINES` | *(unset: feature off)* | Comma-separated enabled engines: `whisper`, `parakeet`, `phonon2`. Unknown names are warned about and ignored |
+| `ARCHIVR_WHISPER_BACKEND` | `whisper_cpp` | `whisper_cpp` or `script` |
+| `ARCHIVR_WHISPER_CLI` | auto-discovered `whisper-cli` | whisper.cpp binary; **required** with the `script` backend (the wrapper script) |
+| `ARCHIVR_WHISPER_MODEL` | *(required for `whisper`)* | whisper.cpp: ggml model file; script: passed as `--model` |
+| `ARCHIVR_WHISPER_LANGUAGES` | *(any)* | Optional allowlist of base language codes, e.g. `en` for a `*.en` model |
+| `ARCHIVR_PARAKEET_CLI` | *(required for `parakeet`)* | Wrapper script following the script contract |
+| `ARCHIVR_PARAKEET_MODEL` | `nvidia/parakeet-tdt-0.6b-v3` | Passed as `--model` |
+| `ARCHIVR_PARAKEET_LANGUAGES` | *(any)* | Optional allowlist; use `en` for v2 |
+| `ARCHIVR_PHONON2_CLI` | auto-discovered `fermion` | The `fermion` CLI |
+| `ARCHIVR_PHONON2_MODEL` | `phonon-2` | Model passed to `fermion transcribe` |
+| `ARCHIVR_TRANSCRIBE_TIMEOUT` | `3600` | Seconds for one whole transcription job |
+| `ARCHIVR_FFMPEG` | `ffmpeg` | ffmpeg used to extract 16 kHz mono WAV; Nix wrappers and Docker set it |
+
+`whisper-cli` and `fermion` are auto-discovered like the Claude/Codex CLIs: `/opt/homebrew/bin/<name>`,
+`/usr/local/bin/<name>`, `$HOME/.local/bin/<name>`, then `PATH`.
+
+## Keeping yt-dlp and its JS runtime fresh
 
 yt-dlp is the download engine behind every video and social capture. YouTube rotates its player-signature and API
 surfaces on a days-to-weeks cadence, so a binary that worked last month starts returning HTTP 403 on downloads. Keeping
@@ -285,21 +444,31 @@ not from nixpkgs — that channel usually lags months behind. The `archivr-serve
 `ARCHIVR_YT_DLP` and any user-installed binary at `<state_dir>/yt-dlp/yt-dlp` — and runs the newest. An exact version
 tie resolves in favour of your own install. Setting `ARCHIVR_YT_DLP_FORCE=/path/to/yt-dlp` bypasses the comparison
 entirely. The state dir is `~/Library/Application Support/archivr` on macOS, and `$XDG_STATE_HOME/archivr` (default
-`~/.local/state/archivr`) elsewhere.
+`~/.local/state/archivr`) elsewhere; `ARCHIVR_STATE_DIR` overrides it.
 
-There are three ways to get a fresh version, cheapest first.
+There are three ways to get a fresh version, cheapest first. From the web UI, **Settings › Instance › yt-dlp** (admins
+only) shows every yt-dlp and JS runtime candidate with its version and the winner, and **Update yt-dlp & Deno** runs
+the same update as the CLI. The server picks up the new binaries immediately — no restart; captures already running keep the binary
+they started with. Admin API: `GET /api/admin/yt-dlp` (status) and `POST /api/admin/yt-dlp/update` (no body; per
+component outcome plus fresh status; 409 while an update is running).
 
 **1. Self-update — no rebuild required.**
 
 ```sh
 archivr yt-dlp status                        # every candidate, its version, and which one wins
-archivr yt-dlp update                        # download the latest zipapp into the state dir
+archivr yt-dlp update                        # download the latest zipapp and the latest Deno into the state dir
 archivr yt-dlp update --version 2026.09.15   # pin a specific release tag
 ```
 
 When `ARCHIVR_YT_DLP_FORCE` applies, `status` shows that forced candidate and selects it as the winner.
 
-The released artifact is a Python zipapp, so this path needs `python3` on `PATH` at run time.
+`update` installs yt-dlp and Deno independently and reports each (`yt-dlp: …`, `deno: …`); it exits non-zero if
+either failed. `--version` applies to yt-dlp only — Deno always tracks the latest release. The CLI runs in its own
+process, so restart a running server after a CLI update; an update from the web UI needs no restart.
+
+The released artifact is a Python zipapp, so this path needs Python ≥ 3.10 on `PATH` as `python3` at run time. The web
+UI update runs the installed yt-dlp once and reports it as failed, with the error, if it does not start (e.g. macOS's
+system Python 3.9); `status` shows a candidate that exists but does not run as `invalid: <last error line>`.
 
 **2. Automatic weekly bump.** `.github/workflows/update-ytdlp.yml` runs every Monday at 06:00 UTC, queries GitHub for
 the latest release, and opens a PR bumping `version` and `hash` in `flake.nix` via `peter-evans/create-pull-request`.
@@ -321,14 +490,85 @@ nix build .#archivr-server
 git commit -am "chore(nix): yt-dlp OLD → $NEW"
 ```
 
-**4. Docker:** yt-dlp is pinned to a specific version in the `Dockerfile` (`pip install "yt-dlp==<version>"`), matching the Nix pin. To update, bump the version string in the `Dockerfile` venv install step to match the new Nix version, then rebuild:
+**4. Docker:** yt-dlp is pinned to a specific version in the `Dockerfile` (`pip install "yt-dlp[default]==<version>"`, which also pulls the `yt-dlp-ejs` challenge solver), matching the Nix pin. To update the baked-in copy, bump the version string in the `Dockerfile` venv install step to match the new Nix version, then rebuild:
 
 ```sh
 docker build -t archivr-server .
 docker compose up -d
 ```
 
-There is no in-container self-update path — `archivr yt-dlp update` writes to a host state directory that does not survive container restarts. Rebuild the image when captures start returning HTTP 403.
+Self-update also works in the container: the image sets `ARCHIVR_STATE_DIR=/data/archivr-state` on the persistent
+`archivr-data` volume, so the update survives restarts. Use Settings › Instance › yt-dlp (no restart), or the CLI and
+then restart so the server re-resolves:
+
+```sh
+docker compose exec archivr archivr yt-dlp update
+docker compose restart archivr
+```
+
+Deno is pinned in the `Dockerfile` (2.9.7, sha256 per arch). Nothing bumps it automatically: change the version and
+both sha256 values together. It adds roughly 80 MB to the image.
+
+### JavaScript runtime (Deno)
+
+YouTube now serves player challenges that yt-dlp solves with its EJS solver, which needs a JavaScript runtime —
+Deno ≥ 2.3.0 by default. Without one, downloads fail with HTTP 403.
+
+**How the resolver picks.** `ARCHIVR_JS_RUNTIME` wins outright when valid. Otherwise archivr probes `deno --version`
+on the pinned `ARCHIVR_DENO` and on `<state_dir>/deno/deno`, skips anything below 2.3.0, and uses the newest (exact
+ties go to the state-dir copy). If neither qualifies it falls back to `deno` on `PATH`; if that fails too, it prints a
+one-time `warn: no JavaScript runtime for yt-dlp …` and runs yt-dlp without one. Only Deno is chosen automatically;
+Node, Bun and QuickJS are used only when forced. Every yt-dlp call gets the result as `--js-runtimes deno:<path>`
+(non-Deno runtimes also get `--no-js-runtimes` first so a stray Deno cannot outrank them).
+
+`archivr yt-dlp status` prints a second table after the yt-dlp one. Columns are tab-separated; locations are absolute
+(the state dir is `$XDG_STATE_HOME/archivr`, default `~/.local/state/archivr`, on Linux and
+`~/Library/Application Support/archivr` on macOS). Exactly one row — the role the resolver picked — is starred, even
+when two roles point at the same binary. On Linux after `archivr yt-dlp update`, with an older Deno on `PATH`:
+
+```text
+JS runtime (passed to yt-dlp as --js-runtimes)
+role	path	version	chosen
+force (ARCHIVR_JS_RUNTIME)	—	—	
+env (ARCHIVR_DENO)	—	—	
+state-dir	/home/alice/.local/state/archivr/deno/deno	2.9.7	*
+path (deno)	/usr/bin/deno	2.4.0	
+```
+
+Under the Nix wrappers the pinned Deno is also on `PATH`, so two rows show the same binary but only the pin is chosen:
+
+```text
+JS runtime (passed to yt-dlp as --js-runtimes)
+role	path	version	chosen
+force (ARCHIVR_JS_RUNTIME)	—	—	
+env (ARCHIVR_DENO)	/nix/store/…-deno-2.9.4/bin/deno	2.9.4	*
+state-dir	—	—	
+path (deno)	/nix/store/…-deno-2.9.4/bin/deno	2.9.4	
+```
+
+An invalid `ARCHIVR_JS_RUNTIME` shows as `invalid: <reason>` in the force row.
+
+### Troubleshooting
+
+**`WARNING: [youtube] No supported JavaScript runtime could be found…` followed by `HTTP Error 403: Forbidden`.**
+yt-dlp ran without a JS runtime.
+
+1. Run `archivr yt-dlp status` (or open Settings › Instance › yt-dlp) and check the JS runtime table has a chosen row.
+2. If not, run `archivr yt-dlp update` or **Update yt-dlp & Deno** in the UI (installs Deno into the state dir), or set
+   `ARCHIVR_JS_RUNTIME=node:/abs/node` (Node ≥ 22).
+3. After a CLI update, restart `archivr-server`; a UI update re-resolves automatically. An env-var change always
+   needs a restart.
+4. Verify by hand: `yt-dlp -v --js-runtimes deno:<path> --simulate <url>` should print `JS runtimes: deno-…`.
+
+**`no such option: --js-runtimes`.** A yt-dlp older than 2025.11 (only reachable through the bare `PATH` fallback)
+does not know the flag. Run `archivr yt-dlp update`.
+
+**Deno runs but the solver still fails.** yt-dlp treats any Deno stderr output as a solver error. Deno writes its
+cache to `DENO_DIR` (default `$HOME/.cache/deno`); with a read-only `HOME`, point `DENO_DIR` at a writable directory.
+
+**NixOS: `update` says the prebuilt Deno cannot execute.** Upstream Deno binaries are dynamically linked and need a
+standard loader. Enable `programs.nix-ld`, or rely on the pinned `ARCHIVR_DENO` from the flake — `update` then skips
+Deno and exits 0 (the UI shows the Deno outcome as `skipped: …`).
 
 ## Deployment
 
@@ -372,6 +612,29 @@ Set `openFirewall = true` with a non-loopback `listenAddress` only when LAN or r
 
 Archive directories must be owned by the `archivr` user. Initialise them with `archivr init` first, then `chown -R archivr:archivr /srv/archivr`.
 
+The wrappers ship nixpkgs' Deno as `ARCHIVR_DENO`, so YouTube works out of the box. `archivr yt-dlp update` downloads
+the upstream (dynamically linked) Deno, which only runs on NixOS with `programs.nix-ld.enable = true`; without it,
+`update` skips Deno, keeps the pinned one, and exits 0. Run `update` as the service user so it lands in
+`/var/lib/archivr-server`, then restart the unit — or use Settings › Instance › yt-dlp, which runs as the service user
+and needs no restart.
+
+Extra environment (LLM providers, local transcription) goes through two options:
+
+```nix
+services.archivr-server = {
+  environment = {
+    ARCHIVR_TRANSCRIBE_ENGINES = "whisper";
+    ARCHIVR_WHISPER_CLI = "${pkgs.whisper-cpp}/bin/whisper-cli";
+    ARCHIVR_WHISPER_MODEL = "/var/lib/archivr-server/models/ggml-large-v3-turbo.bin";
+  };
+  environmentFile = "/run/secrets/archivr.env";   # KEY=value lines, e.g. API keys; kept out of the Nix store
+};
+```
+
+`environment` is merged over defaults (`lib.mkDefault`) that put `HOME`, `XDG_CACHE_HOME` and `HF_HOME` under
+`/var/lib/archivr-server`, so Python engines can cache weights. The unit sets no `PrivateDevices`/`DeviceAllow`;
+adding them would break CUDA engines.
+
 ### Hosting with Docker
 
 ```sh
@@ -403,6 +666,21 @@ environment:
   ARCHIVR_TWITTER_CREDENTIALS_FILE: /config/twitter-cookies.txt
 ```
 
+**Local transcription:** the image ships no engines (it sets `ARCHIVR_FFMPEG=/usr/bin/ffmpeg`). `docker-compose.yml`
+has commented `ARCHIVR_TRANSCRIBE_ENGINES`/`ARCHIVR_WHISPER_*`/`ARCHIVR_PHONON2_CLI` examples and a read-only
+`./models:/models:ro` mount. For Phonon-2 on CPU, build a derived image:
+
+```dockerfile
+FROM archivr:latest
+RUN python3 -m venv /opt/transcribe && \
+    /opt/transcribe/bin/pip install --no-deps torch --index-url https://download.pytorch.org/whl/cpu && \
+    /opt/transcribe/bin/pip install fermion-research torch safetensors soundfile scipy zstandard
+ENV ARCHIVR_TRANSCRIBE_ENGINES=phonon2 ARCHIVR_PHONON2_CLI=/opt/transcribe/bin/fermion
+```
+
+Mount a cache volume at the server user's `~/.cache` so downloaded weights survive container recreation. GPU
+containers need the NVIDIA container toolkit and a CUDA base image.
+
 **Building locally:**
 
 ```sh
@@ -413,7 +691,7 @@ The image compiles the Rust binary in a separate build stage; only runtime depen
 
 ## Development
 
-Runtime dependencies beyond Rust and Node: `yt-dlp`, Chromium, `single-file` (Node), Python 3 with `twitter-api-client`, `ffmpeg`. `nix develop` provides the dev subset.
+Runtime dependencies beyond Rust and Node: `yt-dlp`, Deno (≥ 2.3.0, for YouTube), Chromium, `single-file` (Node), Python 3 with `twitter-api-client`, `ffmpeg`. `nix develop` provides the dev subset.
 
 Entry summaries are served by one of four interchangeable providers — `anthropic_http`, `openai_compatible`,
 `claude_cli`, or `codex_cli` — each configured entirely through the environment; see

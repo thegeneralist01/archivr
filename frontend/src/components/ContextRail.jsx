@@ -1,5 +1,5 @@
 import { useState, useEffect, useLayoutEffect, useRef } from 'react'
-import { fetchEntryTags, assignTag, removeTag, listEntryCollections, listCollections, addEntryToCollection, updateEntryTitle, deleteEntry, rearchiveEntry, pollCaptureJob, fetchEntrySummary, requestEntrySummary } from '../api'
+import { fetchEntryTags, assignTag, removeTag, listEntryCollections, listCollections, addEntryToCollection, updateEntryTitle, generateThreadTitle, deleteEntry, rearchiveEntry, pollCaptureJob, fetchEntrySummary, requestEntrySummary, fetchTranscriptionEngines } from '../api'
 import { formatTimestamp, formatBytes, valueText, sourceIconSvg, displayPath } from '../utils'
 
 const VIS_LABEL = { 0: 'Private', 1: 'Public', 2: 'Users only', 3: 'Public' }
@@ -14,9 +14,10 @@ const SUMMARY_PROVIDERS = [
 ]
 const PROVIDER_LABEL = Object.fromEntries(SUMMARY_PROVIDERS.map(p => [p.value, p.label]))
 const SUMMARY_PROVIDER_KEY = 'archivr:summary:provider'
+const SUMMARY_TRANSCRIBE_ENGINE_KEY = 'archivr:summary:transcribe-engine'
 const SUMMARY_POLL_MS = 1500
 const UNSUPPORTED_SUMMARY_CONTENT_HEADING = 'This entry can’t be summarized yet.'
-const UNSUPPORTED_SUMMARY_CONTENT_DETAIL = 'It doesn’t contain archived text that a summary provider can read. Summaries currently support text notes, web pages, X posts and threads, and X Articles. Video, audio, and image-only entries need a transcript or text source.'
+const UNSUPPORTED_SUMMARY_CONTENT_DETAIL = 'It doesn’t contain archived text that a summary provider can read. Summaries currently support text notes, web pages, X posts and threads, X Articles, and YouTube videos with subtitles. Other video, audio, and image-only entries need a transcript or text source.'
 const UNSUPPORTED_SUMMARY_CONTENT_MESSAGE = `${UNSUPPORTED_SUMMARY_CONTENT_HEADING}\n\n${UNSUPPORTED_SUMMARY_CONTENT_DETAIL}`
 
 // Summaries are stored as the raw JSON string the model produced (normalized
@@ -57,6 +58,8 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
   const [rearchiveState, setRearchiveState] = useState('idle') // 'idle' | 'running' | 'done' | 'error'
   const [rearchiveError, setRearchiveError] = useState('')
   const rearchivePollRef = useRef(null)
+  const [titleGenState, setTitleGenState] = useState('idle') // 'idle' | 'running' | 'done' | 'error'
+  const [titleGenError, setTitleGenError] = useState('')
   const [fontsOpen, setFontsOpen] = useState(false)
   useEffect(() => { setFontsOpen(false) }, [detail?.summary?.entry_uid])
 
@@ -73,6 +76,14 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
     } catch { return SUMMARY_PROVIDERS[0].value }
   })
   const [includeSummaryImages, setIncludeSummaryImages] = useState(false)
+  // Local transcription engines offered by the server ([] = feature off) and
+  // the one picked for YouTube videos without subtitles ('' = none).
+  const [transcriptionEngines, setTranscriptionEngines] = useState([])
+  const [transcribeEngine, setTranscribeEngine] = useState(() => {
+    try {
+      return sessionStorage.getItem(SUMMARY_TRANSCRIBE_ENGINE_KEY) || ''
+    } catch { return '' }
+  })
   const summaryPollRef = useRef(null)
   const summaryPollAbortRef = useRef(null)
   const summaryGenerateAbortRef = useRef(null)
@@ -97,6 +108,21 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
   const [singleCollUid, setSingleCollUid] = useState('')
   const [singleCollState, setSingleCollState] = useState('idle')
   const [singleCollError, setSingleCollError] = useState('')
+  // Batch thread-title generation; the seq ref invalidates a run whenever the
+  // selection (as a set of uids) or archive changes.
+  const [bulkTitleState, setBulkTitleState] = useState('idle') // 'idle'|'running'|'done'
+  const [bulkTitleProgress, setBulkTitleProgress] = useState({ done: 0, total: 0 })
+  const [bulkTitleSummary, setBulkTitleSummary] = useState({ updated: 0, failed: 0, firstError: '' })
+  const bulkTitleSeqRef = useRef(0)
+  const bulkThreads = (selectedEntries || []).filter(e => e.entity_kind === 'tweet_thread')
+  const bulkSkipped = (selectedUids?.size || 0) - bulkThreads.length
+  const bulkSelectionKey = selectedUids ? [...selectedUids].sort().join(',') : ''
+  useEffect(() => {
+    bulkTitleSeqRef.current++
+    setBulkTitleState('idle')
+    setBulkTitleProgress({ done: 0, total: 0 })
+    setBulkTitleSummary({ updated: 0, failed: 0, firstError: '' })
+  }, [bulkSelectionKey, archiveId])
 
   useEffect(() => {
     const seq = ++selectSeqRef.current
@@ -127,6 +153,17 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
       setEntryCollections(ecs)
     }).catch(() => {})
   }, [selectedEntry, archiveId, isPublicSession])
+
+  // F4 state is keyed on entry identity, not the entry object: a successful
+  // title generation replaces `selectedEntry` (new title) and must not reset
+  // its own "Title updated." confirmation.
+  const titleGenSeqRef = useRef(0)
+  const selectedEntryUid = selectedEntry?.entry_uid
+  useEffect(() => {
+    titleGenSeqRef.current++
+    setTitleGenState('idle')
+    setTitleGenError('')
+  }, [selectedEntryUid, archiveId])
 
   useEffect(() => {
     return () => {
@@ -201,6 +238,33 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
     summaryGenerateAbortRef.current?.abort()
   }, [])
 
+  useEffect(() => {
+    if (isPublicSession) {
+      setTranscriptionEngines([])
+      return
+    }
+    const controller = new AbortController()
+    fetchTranscriptionEngines({ signal: controller.signal }).then(list => {
+      if (controller.signal.aborted) return
+      const engines = Array.isArray(list) ? list : []
+      setTranscriptionEngines(engines)
+      setTranscribeEngine(current => {
+        if (!current || engines.some(t => t.kind === current)) return current
+        try { sessionStorage.removeItem(SUMMARY_TRANSCRIBE_ENGINE_KEY) } catch { /* private mode */ }
+        return ''
+      })
+    }).catch(() => {
+      if (!controller.signal.aborted) setTranscriptionEngines([])
+    })
+    return () => controller.abort()
+  }, [isPublicSession])
+
+  // The engine is only offered (and sent) for YouTube videos, so a stale
+  // session choice never reaches the server for other entries.
+  const transcribeAvailable = transcriptionEngines.length > 0 &&
+    detail?.summary?.source_kind === 'youtube' &&
+    detail?.summary?.entity_kind === 'video'
+
   async function handleGenerateSummary(force = false) {
     if (!archiveId || !detail?.summary?.entry_uid || summaryBusy) return
     const entryUid = detail.summary.entry_uid
@@ -216,6 +280,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
         provider: summaryProvider,
         force,
         includeImages: includeSummaryImages,
+        transcribeEngine: transcribeAvailable ? transcribeEngine : '',
         signal: controller.signal,
       })
       if (controller.signal.aborted || summarySelectionRef.current !== selectionKey) return
@@ -243,6 +308,11 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
     setSummaryProvider(value)
     if (value === 'claude_cli') setIncludeSummaryImages(false)
     try { sessionStorage.setItem(SUMMARY_PROVIDER_KEY, value) } catch { /* private mode */ }
+  }
+
+  function handleTranscribeEngineChange(value) {
+    setTranscribeEngine(value)
+    try { sessionStorage.setItem(SUMMARY_TRANSCRIBE_ENGINE_KEY, value) } catch { /* private mode */ }
   }
 
   // Fetch available collections whenever archiveId is available
@@ -436,6 +506,58 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
     }
   }
 
+  async function handleGenerateThreadTitle() {
+    if (!selectedEntry || !archiveId || titleGenState === 'running') return
+    const startSeq = titleGenSeqRef.current
+    const entryUid = selectedEntry.entry_uid
+    setTitleGenState('running')
+    setTitleGenError('')
+    try {
+      const { title } = await generateThreadTitle(archiveId, entryUid, { provider: summaryProvider })
+      // Saved server-side regardless of selection; App's caches are keyed by uid.
+      // Done state first (if still on the same entry), then notify App.
+      if (titleGenSeqRef.current === startSeq) setTitleGenState('done')
+      onEntryTitleChange?.(entryUid, title)
+    } catch (e) {
+      if (titleGenSeqRef.current !== startSeq) return
+      setTitleGenState('error')
+      setTitleGenError(e.message || 'Title generation failed.')
+    }
+  }
+
+  async function handleBulkGenerateTitles() {
+    if (!archiveId || bulkTitleState === 'running' || bulkThreads.length === 0) return
+    const startSeq = ++bulkTitleSeqRef.current
+    const uids = bulkThreads.map(e => e.entry_uid)
+    const provider = summaryProvider
+    let done = 0, updated = 0, failed = 0, firstError = ''
+    setBulkTitleState('running')
+    setBulkTitleProgress({ done: 0, total: uids.length })
+    setBulkTitleSummary({ updated: 0, failed: 0, firstError: '' })
+    let next = 0
+    async function worker() {
+      while (next < uids.length) {
+        if (bulkTitleSeqRef.current !== startSeq) return
+        const uid = uids[next++]
+        try {
+          const { title } = await generateThreadTitle(archiveId, uid, { provider })
+          updated++
+          // Saved server-side; App's caches are keyed by uid, so always propagate.
+          onEntryTitleChange?.(uid, title)
+        } catch (e) {
+          failed++
+          if (!firstError) firstError = e.message || 'Title generation failed.'
+        }
+        done++
+        if (bulkTitleSeqRef.current === startSeq) setBulkTitleProgress({ done, total: uids.length })
+      }
+    }
+    await Promise.all([worker(), worker()])
+    if (bulkTitleSeqRef.current !== startSeq) return
+    setBulkTitleState('done')
+    setBulkTitleSummary({ updated, failed, firstError })
+  }
+
   const metaRows = detail ? [
     ['Added',      formatTimestamp(detail.summary.archived_at)],
     ['Source',     detail.summary.source_kind],
@@ -525,6 +647,32 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
               </div>
               {bulkCollError && (
                 <p className="form-msg form-msg--err" style={{ margin: '6px 0 0' }}>{bulkCollError}</p>
+              )}
+            </div>
+          )}
+
+          {bulkThreads.length > 0 && (
+            <div className="rail-section">
+              <div className="rail-section-heading">Thread titles</div>
+              <button
+                className="rail-rearchive-btn"
+                onClick={handleBulkGenerateTitles}
+                disabled={bulkTitleState === 'running'}
+                title={`Names each thread with a small model via ${PROVIDER_LABEL[summaryProvider] || summaryProvider} (the Summary provider)`}
+              >
+                {bulkTitleState === 'running'
+                  ? `Generating titles\u2026 ${bulkTitleProgress.done}/${bulkTitleProgress.total}`
+                  : `Generate titles for ${bulkThreads.length} thread${bulkThreads.length === 1 ? '' : 's'}`}
+              </button>
+              {bulkSkipped > 0 && (
+                <p className="bulk-title-note">
+                  {`${bulkSkipped} non-thread entr${bulkSkipped === 1 ? 'y' : 'ies'} will be skipped.`}
+                </p>
+              )}
+              {bulkTitleState === 'done' && (
+                <p className={`form-msg ${bulkTitleSummary.failed ? 'form-msg--err' : 'form-msg--ok'} bulk-title-note`} role="status">
+                  {`${bulkTitleSummary.updated} updated${bulkTitleSummary.failed ? `, ${bulkTitleSummary.failed} failed: ${bulkTitleSummary.firstError}` : ''}`}
+                </p>
               )}
             </div>
           )}
@@ -676,6 +824,22 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
                         <option key={p.value} value={p.value}>{p.label}</option>
                       ))}
                     </select>
+                    {transcribeAvailable && (
+                      <>
+                        <select
+                          className="rail-summary-select"
+                          value={transcribeEngine}
+                          onChange={e => handleTranscribeEngineChange(e.target.value)}
+                          aria-label="Local transcription if no subtitles"
+                        >
+                          <option value="">No local transcription</option>
+                          {transcriptionEngines.map(t => (
+                            <option key={t.kind} value={t.kind}>{t.label}{t.english_only ? ' (English only)' : ''}</option>
+                          ))}
+                        </select>
+                        <p className="rail-summary-transcribe-note">Used only if this video has no subtitles. Transcription runs on this server and can take several minutes.</p>
+                      </>
+                    )}
                     <div className={`rail-summary-image-option${summaryProvider === 'claude_cli' ? ' rail-summary-image-option--disabled' : ''}`}>
                       <label className="rail-summary-image-option__label">
                         <input
@@ -864,6 +1028,25 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
               )}
               {rearchiveState === 'error' && (
                 <p className="form-msg form-msg--err" style={{ marginTop: '6px' }}>{rearchiveError}</p>
+              )}
+              {detail.summary.entity_kind === 'tweet_thread' && (
+                <>
+                  <button
+                    className="rail-rearchive-btn"
+                    style={{ marginTop: '8px' }}
+                    onClick={handleGenerateThreadTitle}
+                    disabled={titleGenState === 'running'}
+                    title={`Names this thread with a small model via ${PROVIDER_LABEL[summaryProvider] || summaryProvider} (the Summary provider)`}
+                  >
+                    {titleGenState === 'running' ? 'Generating title\u2026' : 'Generate title'}
+                  </button>
+                  {titleGenState === 'done' && (
+                    <p className="form-msg form-msg--ok" style={{ marginTop: '6px' }}>Title updated.</p>
+                  )}
+                  {titleGenState === 'error' && (
+                    <p className="form-msg form-msg--err" style={{ marginTop: '6px' }}>{titleGenError}</p>
+                  )}
+                </>
               )}
             </div>
           )}

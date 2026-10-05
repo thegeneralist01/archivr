@@ -9,6 +9,10 @@
 !docs/README*
 !docs/branding/
 !docs/branding/**
+# Dated design specs are tracked; docs/superpowers/plans/ stays ignored.
+!docs/superpowers/
+!docs/superpowers/specs/
+!docs/superpowers/specs/**
 !crates
 !crates/**
 # Static assets are built by Nix (frontendStatic derivation in flake.nix).
