@@ -81,7 +81,9 @@ impl FromRequestParts<AppState> for AuthUser {
                 if let Some(raw_token) = header_str.strip_prefix("Bearer ") {
                     let token_hash = hash_token(raw_token);
                     if let Ok(conn) = database::open_auth_db(auth_db_path) {
-                        if let Ok(Some(user_id)) = database::get_user_for_token(&conn, &token_hash) {
+                        if let Ok(Some((user_id, _token_uid))) =
+                            database::get_user_for_token(&conn, &token_hash)
+                        {
                             if let Ok(role_bits) = database::compute_role_bits(&conn, user_id) {
                                 return Ok(AuthUser::Authenticated { user_id, role_bits });
                             }

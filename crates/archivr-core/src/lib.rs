@@ -1,5 +1,8 @@
 pub mod capture;
 pub mod archive;
+pub mod auth_credentials;
+pub mod auth_users;
+pub mod capture_jobs;
 pub mod database;
 pub mod downloader;
 pub mod hash;

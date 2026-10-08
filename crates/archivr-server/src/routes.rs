@@ -70,7 +70,7 @@ pub(crate) struct MediaToken {
 
 #[derive(Clone)]
 pub struct AppState {
-    registry: Arc<ServerRegistry>,
+    pub(crate) registry: Arc<ServerRegistry>,
     pub auth_db_path: Arc<std::path::PathBuf>,
     pub login_attempts: Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
     pub media_tokens: Arc<Mutex<HashMap<String, MediaToken>>>,
@@ -425,6 +425,14 @@ pub fn app_with_state(state: AppState) -> Router {
             get(blob_cleanup_scan_handler).delete(blob_cleanup_delete_handler),
         )
         .route("/api/util/resolve-tco", post(resolve_tco_handler))
+        // Workstream routers (admin_users, credentials, jobs, effective_config).
+        // Axum 0.7 merges different methods on an existing path but panics on a
+        // duplicate path+method, so streams extending an existing path edit the
+        // existing handler in place (see the contract spec).
+        .merge(crate::admin_users::routes())
+        .merge(crate::credentials::routes())
+        .merge(crate::jobs::routes())
+        .merge(crate::effective_config::routes())
         .fallback_service(ServeDir::new(&static_dir).not_found_service(ServeFile::new(static_dir.join("index.html"))))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -2901,7 +2909,7 @@ async fn create_token(
     let raw_token = auth::generate_token();
     let token_hash = auth::hash_token(&raw_token);
     let conn = database::open_auth_db(&state.auth_db_path)?;
-    let token_uid = database::create_api_token(&conn, user_id, &token_hash, &body.name)?;
+    let token_uid = database::create_api_token(&conn, user_id, &token_hash, &body.name, None, "full")?;
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -3088,14 +3096,14 @@ async fn admin_create_role(
     Ok((StatusCode::CREATED, Json(role)))
 }
 
-fn auth_to_caller_bits(auth: &AuthUser) -> u32 {
+pub(crate) fn auth_to_caller_bits(auth: &AuthUser) -> u32 {
     match auth {
         AuthUser::Authenticated { role_bits, .. } => *role_bits,
         AuthUser::Guest => ROLE_GUEST,
     }
 }
 
-fn mounted_archive<'a>(
+pub(crate) fn mounted_archive<'a>(
     state: &'a AppState,
     archive_id: &str,
 ) -> Result<&'a MountedArchive, ApiError> {
@@ -3109,26 +3117,26 @@ fn mounted_archive<'a>(
 
 #[derive(Debug)]
 pub struct ApiError {
-    status: StatusCode,
-    message: String,
+    pub(crate) status: StatusCode,
+    pub(crate) message: String,
 }
 
 impl ApiError {
-    fn not_found(message: &str) -> Self {
+    pub(crate) fn not_found(message: &str) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.to_string(),
         }
     }
 
-    fn bad_request(message: &str) -> Self {
+    pub(crate) fn bad_request(message: &str) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.to_string(),
         }
     }
 
-    fn internal(message: &str) -> Self {
+    pub(crate) fn internal(message: &str) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.to_string(),
@@ -3149,7 +3157,7 @@ impl ApiError {
         }
     }
 
-    fn conflict(message: &str) -> Self {
+    pub(crate) fn conflict(message: &str) -> Self {
         Self {
             status: StatusCode::CONFLICT,
             message: message.to_string(),
@@ -3535,8 +3543,15 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        database::create_api_token(&conn, uid, &auth::hash_token("capture-token"), "Extension")
-            .unwrap();
+        database::create_api_token(
+            &conn,
+            uid,
+            &auth::hash_token("capture-token"),
+            "Extension",
+            None,
+            "full",
+        )
+        .unwrap();
         let mut settings = database::get_instance_settings(&conn).unwrap();
         settings.ublock_enabled = false;
         settings.cookie_ext_enabled = false;
@@ -3854,6 +3869,8 @@ mod tests {
             uid,
             &auth::hash_token("text-title-token"),
             "Extension",
+            None,
+            "full",
         )
         .unwrap();
         let mut settings = database::get_instance_settings(&conn).unwrap();

@@ -97,6 +97,9 @@ pub struct ApiTokenRecord {
     pub name: String,
     pub created_at: String,
     pub last_used_at: Option<String>,
+    pub expires_at: Option<String>,
+    /// `full` or `read`; read-scope tokens may only issue GET/HEAD requests.
+    pub scope: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -394,7 +397,8 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             error_text  TEXT,
             notes_json  TEXT,
             created_at  TEXT NOT NULL,
-            updated_at  TEXT NOT NULL
+            updated_at  TEXT NOT NULL,
+            created_by  TEXT
         );
         CREATE TABLE IF NOT EXISTS entry_summaries (
             id INTEGER PRIMARY KEY,
@@ -530,6 +534,13 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     // Migration: add notes_json column to existing capture_jobs tables.
     // Silently ignored when the column already exists (idempotent).
     let _ = conn.execute("ALTER TABLE capture_jobs ADD COLUMN notes_json TEXT", []);
+    // Migration: add created_by (auth-DB `user_uid` of the submitter; NULL for
+    // pre-migration and CLI rows). The index follows the ALTER so legacy tables
+    // have the column by the time it is created.
+    let _ = conn.execute("ALTER TABLE capture_jobs ADD COLUMN created_by TEXT", []);
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_capture_jobs_created_by ON capture_jobs(created_by);",
+    )?;
     // Provider responses may resolve a requested alias to a concrete model.
     // Keep that display-only value outside the cache key.
     let _ = conn.execute(
@@ -688,7 +699,8 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
             name         TEXT NOT NULL,
             created_at   TEXT NOT NULL,
             last_used_at TEXT,
-            expires_at   TEXT
+            expires_at   TEXT,
+            scope        TEXT NOT NULL DEFAULT 'full'
         );
         CREATE INDEX IF NOT EXISTS idx_api_tokens_user_id ON api_tokens(user_id);
 
@@ -742,6 +754,12 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
     // Add humanize_slugs column to users if not present (idempotent migration)
     let _ = conn.execute(
         "ALTER TABLE users ADD COLUMN humanize_slugs INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+
+    // Add scope column to api_tokens if not present ('full' | 'read'; idempotent migration)
+    let _ = conn.execute(
+        "ALTER TABLE api_tokens ADD COLUMN scope TEXT NOT NULL DEFAULT 'full'",
         [],
     );
 
@@ -930,32 +948,40 @@ pub fn delete_expired_sessions(conn: &Connection) -> Result<usize> {
 }
 
 /// Creates an API token. `token_hash` is SHA3-256 hex of the raw token.
+/// `expires_at` is an RFC 3339 timestamp (None = never expires); `scope` is
+/// `full` or `read`.
 pub fn create_api_token(
     conn: &Connection,
     user_id: i64,
     token_hash: &str,
     name: &str,
+    expires_at: Option<&str>,
+    scope: &str,
 ) -> Result<String> {
     let token_uid = public_id("tok");
     conn.execute(
-        "INSERT INTO api_tokens (token_uid, user_id, token_hash, name, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![token_uid, user_id, token_hash, name, now_timestamp()],
+        "INSERT INTO api_tokens (token_uid, user_id, token_hash, name, created_at, expires_at, scope)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![token_uid, user_id, token_hash, name, now_timestamp(), expires_at, scope],
     )?;
     Ok(token_uid)
 }
 
-/// Returns the user_id for a given token hash, if the token is valid and user is active.
-pub fn get_user_for_token(conn: &Connection, token_hash: &str) -> Result<Option<i64>> {
+/// Returns `(user_id, token_uid)` for a given token hash, if the token is valid
+/// (unexpired) and its user is active.
+pub fn get_user_for_token(
+    conn: &Connection,
+    token_hash: &str,
+) -> Result<Option<(i64, String)>> {
     let now = now_timestamp();
     conn.query_row(
-        "SELECT t.user_id FROM api_tokens t
+        "SELECT t.user_id, t.token_uid FROM api_tokens t
          JOIN users u ON u.id = t.user_id
          WHERE t.token_hash = ?1
            AND u.status = 'active'
            AND (t.expires_at IS NULL OR t.expires_at > ?2)",
         params![token_hash, now],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )
     .optional()
     .map_err(Into::into)
@@ -980,7 +1006,7 @@ pub fn delete_api_token(conn: &Connection, token_uid: &str, user_id: i64) -> Res
 
 pub fn list_user_tokens(conn: &Connection, user_id: i64) -> Result<Vec<ApiTokenRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT token_uid, name, created_at, last_used_at
+        "SELECT token_uid, name, created_at, last_used_at, expires_at, scope
          FROM api_tokens WHERE user_id = ?1 ORDER BY created_at DESC",
     )?;
     let records = stmt
@@ -990,6 +1016,8 @@ pub fn list_user_tokens(conn: &Connection, user_id: i64) -> Result<Vec<ApiTokenR
                 name: row.get(1)?,
                 created_at: row.get(2)?,
                 last_used_at: row.get(3)?,
+                expires_at: row.get(4)?,
+                scope: row.get(5)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -1314,6 +1342,17 @@ pub fn invalidate_user_sessions(conn: &Connection, user_id: i64) -> Result<usize
     Ok(n)
 }
 
+/// Returns the `user_uid` for an integer user id, or None if not found.
+pub fn get_user_uid(conn: &Connection, user_id: i64) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT user_uid FROM users WHERE id = ?1",
+        [user_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 /// Returns the integer id for a user_uid, or None if not found.
 pub fn get_user_id_by_uid(conn: &Connection, user_uid: &str) -> Result<Option<i64>> {
     conn.query_row(
@@ -1613,12 +1652,22 @@ pub fn ensure_default_user(conn: &Connection) -> Result<i64> {
 
 /// Creates a pending capture job. Returns the new `job_uid`.
 pub fn create_capture_job(conn: &Connection, archive_id: &str) -> Result<String> {
+    create_capture_job_as(conn, archive_id, None)
+}
+
+/// Creates a pending capture job attributed to `created_by` (the submitter's
+/// auth-DB `user_uid`; None for CLI/legacy callers). Returns the new `job_uid`.
+pub fn create_capture_job_as(
+    conn: &Connection,
+    archive_id: &str,
+    created_by: Option<&str>,
+) -> Result<String> {
     let job_uid = public_id("job");
     let now = now_timestamp();
     conn.execute(
-        "INSERT INTO capture_jobs (job_uid, archive_id, run_uid, status, error_text, created_at, updated_at)
-         VALUES (?1, ?2, NULL, 'pending', NULL, ?3, ?3)",
-        rusqlite::params![job_uid, archive_id, now],
+        "INSERT INTO capture_jobs (job_uid, archive_id, run_uid, status, error_text, created_at, updated_at, created_by)
+         VALUES (?1, ?2, NULL, 'pending', NULL, ?3, ?3, ?4)",
+        rusqlite::params![job_uid, archive_id, now, created_by],
     )?;
     Ok(job_uid)
 }
@@ -4036,9 +4085,78 @@ mod tests {
     fn token_hash_round_trips() {
         let conn = make_auth_conn();
         let user_id = create_owner(&conn, "alice", "pw").unwrap();
-        create_api_token(&conn, user_id, "hash_abc", "My Token").unwrap();
-        let found_id = get_user_for_token(&conn, "hash_abc").unwrap();
-        assert_eq!(found_id, Some(user_id));
+        let token_uid =
+            create_api_token(&conn, user_id, "hash_abc", "My Token", None, "full").unwrap();
+        let found = get_user_for_token(&conn, "hash_abc").unwrap();
+        assert_eq!(found, Some((user_id, token_uid)));
+    }
+
+    #[test]
+    fn token_expiry_and_scope_round_trip() {
+        let conn = make_auth_conn();
+        let user_id = create_owner(&conn, "alice", "pw").unwrap();
+        let past = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        create_api_token(&conn, user_id, "h_expired", "old", Some(&past), "full").unwrap();
+        create_api_token(&conn, user_id, "h_live", "new", Some(&future), "read").unwrap();
+        assert!(get_user_for_token(&conn, "h_expired").unwrap().is_none());
+        assert!(get_user_for_token(&conn, "h_live").unwrap().is_some());
+        let tokens = list_user_tokens(&conn, user_id).unwrap();
+        let live = tokens.iter().find(|t| t.name == "new").unwrap();
+        assert_eq!(live.scope, "read");
+        assert_eq!(live.expires_at.as_deref(), Some(future.as_str()));
+        let old = tokens.iter().find(|t| t.name == "old").unwrap();
+        assert_eq!(old.scope, "full");
+    }
+
+    #[test]
+    fn get_user_uid_round_trips_and_misses() {
+        let conn = make_auth_conn();
+        let user_id = create_owner(&conn, "alice", "pw").unwrap();
+        let uid = get_user_uid(&conn, user_id).unwrap().unwrap();
+        assert_eq!(get_user_id_by_uid(&conn, &uid).unwrap(), Some(user_id));
+        assert!(get_user_uid(&conn, user_id + 1000).unwrap().is_none());
+    }
+
+    #[test]
+    fn initialize_auth_schema_migrates_scope_for_existing_api_tokens() {
+        let c = Connection::open_in_memory().unwrap();
+        // Legacy tables: api_tokens without scope (users/roles arrive via the init).
+        c.execute_batch(
+            "CREATE TABLE api_tokens (
+                id           INTEGER PRIMARY KEY,
+                token_uid    TEXT NOT NULL UNIQUE,
+                user_id      INTEGER NOT NULL,
+                token_hash   TEXT NOT NULL UNIQUE,
+                name         TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                last_used_at TEXT,
+                expires_at   TEXT
+            );
+            INSERT INTO api_tokens (token_uid, user_id, token_hash, name, created_at)
+                VALUES ('tok-legacy', 1, 'h', 'legacy', 't');",
+        )
+        .unwrap();
+
+        initialize_auth_schema(&c).unwrap();
+        initialize_auth_schema(&c).unwrap();
+
+        let has_column: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('api_tokens') WHERE name = 'scope'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_column, 1);
+        let scope: String = c
+            .query_row(
+                "SELECT scope FROM api_tokens WHERE token_uid = 'tok-legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(scope, "full", "legacy tokens keep full access");
     }
 
     #[test]
@@ -5101,6 +5219,72 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_resolved_model, 1);
+    }
+
+    #[test]
+    fn initialize_schema_migrates_created_by_for_existing_capture_jobs() {
+        let c = Connection::open_in_memory().unwrap();
+        // Legacy table: no created_by, no notes_json.
+        c.execute_batch(
+            "CREATE TABLE capture_jobs (
+                id          INTEGER PRIMARY KEY,
+                job_uid     TEXT NOT NULL UNIQUE,
+                archive_id  TEXT NOT NULL,
+                run_uid     TEXT,
+                status      TEXT NOT NULL CHECK (status IN ('pending','running','completed','failed')) DEFAULT 'pending',
+                error_text  TEXT,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+            INSERT INTO capture_jobs (job_uid, archive_id, status, created_at, updated_at)
+                VALUES ('job-legacy', 'a', 'completed', 't', 't');",
+        )
+        .unwrap();
+
+        initialize_schema(&c).unwrap();
+        initialize_schema(&c).unwrap();
+
+        let has_column: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('capture_jobs') WHERE name = 'created_by'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_column, 1);
+        let has_index: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_capture_jobs_created_by'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_index, 1);
+        let legacy_owner: Option<String> = c
+            .query_row(
+                "SELECT created_by FROM capture_jobs WHERE job_uid = 'job-legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(legacy_owner.is_none(), "pre-migration rows stay NULL-owned");
+    }
+
+    #[test]
+    fn create_capture_job_as_records_submitter() {
+        let c = conn();
+        let owned = create_capture_job_as(&c, "a", Some("usr-1")).unwrap();
+        let anon = create_capture_job(&c, "a").unwrap();
+        let by = |uid: &str| -> Option<String> {
+            c.query_row(
+                "SELECT created_by FROM capture_jobs WHERE job_uid = ?1",
+                [uid],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(by(&owned).as_deref(), Some("usr-1"));
+        assert_eq!(by(&anon), None);
     }
 
     #[test]
