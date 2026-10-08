@@ -112,6 +112,8 @@ pub struct CaptureJobRecord {
     pub notes_json: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Auth-DB `user_uid` of the submitter; None for CLI/legacy jobs.
+    pub created_by: Option<String>,
 }
 
 /// One row of `entry_summaries` — a regenerable LLM summary of an entry.
@@ -1694,7 +1696,7 @@ pub fn update_capture_job_status(
 /// Returns a capture job by uid.
 pub fn get_capture_job(conn: &Connection, job_uid: &str) -> Result<Option<CaptureJobRecord>> {
     conn.query_row(
-        "SELECT job_uid, archive_id, run_uid, status, error_text, notes_json, created_at, updated_at
+        "SELECT job_uid, archive_id, run_uid, status, error_text, notes_json, created_at, updated_at, created_by
          FROM capture_jobs WHERE job_uid = ?1",
         [job_uid],
         |row| {
@@ -1707,6 +1709,7 @@ pub fn get_capture_job(conn: &Connection, job_uid: &str) -> Result<Option<Captur
                 notes_json: row.get(5)?,
                 created_at: row.get(6)?,
                 updated_at: row.get(7)?,
+                created_by: row.get(8)?,
             })
         },
     )

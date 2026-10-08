@@ -90,6 +90,8 @@ pub struct CaptureJobSummary {
     pub notes_json: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Submitter's auth-DB `user_uid`; null for CLI/legacy jobs.
+    pub created_by: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -371,6 +373,20 @@ pub fn get_entry_detail(
     }))
 }
 
+fn run_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunSummary> {
+    Ok(RunSummary {
+        run_uid: row.get(0)?,
+        started_at: row.get(1)?,
+        finished_at: row.get(2)?,
+        status: row.get(3)?,
+        requested_count: row.get(4)?,
+        discovered_count: row.get(5)?,
+        completed_count: row.get(6)?,
+        failed_count: row.get(7)?,
+        error_summary: row.get(8)?,
+    })
+}
+
 pub fn list_runs(conn: &rusqlite::Connection) -> Result<Vec<RunSummary>> {
     let mut stmt = conn.prepare(
         "SELECT run_uid, started_at, finished_at, status, requested_count,
@@ -379,21 +395,61 @@ pub fn list_runs(conn: &rusqlite::Connection) -> Result<Vec<RunSummary>> {
          ORDER BY started_at DESC, id DESC",
     )?;
     let runs = stmt
-        .query_map([], |row| {
-            Ok(RunSummary {
-                run_uid: row.get(0)?,
-                started_at: row.get(1)?,
-                finished_at: row.get(2)?,
-                status: row.get(3)?,
-                requested_count: row.get(4)?,
-                discovered_count: row.get(5)?,
-                completed_count: row.get(6)?,
-                failed_count: row.get(7)?,
-                error_summary: row.get(8)?,
-            })
-        })?
+        .query_map([], run_summary_from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
+    Ok(runs)
+}
+
+/// Runs the caller may see, newest first. A run is visible when the caller holds
+/// ADMIN/OWNER (bits 12), or created the capture job that owns the run
+/// (`capture_jobs.run_uid`, `created_by == caller_user_uid`), or can see at least one
+/// entry the run produced. Entry visibility is the rule `list_entries_for_collection` /
+/// `list_child_entries` apply: a `collection_entries` row of the entry (or, for a child
+/// entry, of its parent) whose `visibility_bits` overlap `caller_bits`.
+/// `limit = None` returns everything after `offset`.
+pub fn list_runs_for_caller(
+    conn: &rusqlite::Connection,
+    caller_bits: u32,
+    caller_user_uid: Option<&str>,
+    limit: Option<i64>,
+    offset: i64,
+) -> Result<Vec<RunSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.run_uid, r.started_at, r.finished_at, r.status, r.requested_count,
+                r.discovered_count, r.completed_count, r.failed_count, r.error_summary
+         FROM archive_runs r
+         WHERE CAST(?1 AS INTEGER) & 12 != 0
+            OR EXISTS (
+                SELECT 1 FROM capture_jobs j
+                WHERE j.run_uid = r.run_uid AND j.created_by = ?2
+            )
+            OR EXISTS (
+                SELECT 1 FROM archive_run_items i
+                JOIN archived_entries e ON e.id = i.produced_entry_id
+                WHERE i.run_id = r.id
+                  AND (
+                      EXISTS (
+                          SELECT 1 FROM collection_entries ce
+                          WHERE ce.entry_id = e.id
+                            AND ce.visibility_bits & CAST(?1 AS INTEGER) != 0
+                      )
+                      OR EXISTS (
+                          SELECT 1 FROM collection_entries ce_p
+                          WHERE ce_p.entry_id = e.parent_entry_id
+                            AND ce_p.visibility_bits & CAST(?1 AS INTEGER) != 0
+                      )
+                  )
+            )
+         ORDER BY r.started_at DESC, r.id DESC
+         LIMIT ?3 OFFSET ?4",
+    )?;
+    let runs = stmt
+        .query_map(
+            rusqlite::params![caller_bits as i64, caller_user_uid, limit.unwrap_or(-1), offset],
+            run_summary_from_row,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(runs)
 }
 
@@ -411,6 +467,7 @@ pub fn get_capture_job(
             notes_json: r.notes_json,
             created_at: r.created_at,
             updated_at: r.updated_at,
+            created_by: r.created_by,
         }),
     )
 }

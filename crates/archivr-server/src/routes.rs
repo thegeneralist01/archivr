@@ -51,6 +51,7 @@ pub use crate::auth::{AuthUser, ROLE_ADMIN, ROLE_GUEST, ROLE_OWNER, ROLE_USER};
 use crate::registry::{MountedArchive, ServerRegistry};
 use axum_extra::extract::CookieJar;
 use rusqlite::OptionalExtension;
+use crate::jobs;
 
 const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
 const LOGIN_MAX_ATTEMPTS: usize = 5;
@@ -463,8 +464,30 @@ fn static_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static"))
 }
 
-async fn list_archives(State(state): State<AppState>) -> Json<Vec<MountedArchive>> {
-    Json(state.registry.archives.clone())
+/// `GET /api/archives` item. `archive_path` (a server filesystem path) is only
+/// included for ADMIN callers.
+#[derive(serde::Serialize)]
+struct ArchiveListItem {
+    id: String,
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archive_path: Option<PathBuf>,
+}
+
+async fn list_archives(State(state): State<AppState>, auth: AuthUser) -> Json<Vec<ArchiveListItem>> {
+    let is_admin = auth.has_role(ROLE_ADMIN);
+    Json(
+        state
+            .registry
+            .archives
+            .iter()
+            .map(|a| ArchiveListItem {
+                id: a.id.clone(),
+                label: a.label.clone(),
+                archive_path: is_admin.then(|| a.archive_path.clone()),
+            })
+            .collect(),
+    )
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -842,11 +865,31 @@ async fn list_runs(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path(archive_id): Path<String>,
+    Query(page): Query<RunsPageQuery>,
 ) -> Result<Json<Vec<archive::RunSummary>>, ApiError> {
-    auth_user.require_auth()?;
+    let (_, role_bits) = auth_user.require_auth()?;
+    let limit = jobs::parse_int_param("limit", page.limit.as_deref())?.map(|n| n.max(0));
+    let offset = jobs::parse_int_param("offset", page.offset.as_deref())?
+        .unwrap_or(0)
+        .max(0);
     let mounted = mounted_archive(&state, &archive_id)?;
+    let caller_uid = jobs::caller_user_uid(&state, &auth_user)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
-    Ok(Json(archive::list_runs(&conn)?))
+    // Visibility follows access: admins see all runs; others see runs whose capture job
+    // they created or that produced at least one entry they can see.
+    Ok(Json(archive::list_runs_for_caller(
+        &conn,
+        role_bits,
+        caller_uid.as_deref(),
+        limit,
+        offset,
+    )?))
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct RunsPageQuery {
+    limit: Option<String>,
+    offset: Option<String>,
 }
 const MEDIA_TOKEN_TTL: Duration = Duration::from_secs(2 * 60 * 60); // 2 h
 
@@ -1593,9 +1636,36 @@ async fn capture_handler(
     let archive_paths =
         archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;
 
+    let locator = body.locator.trim().to_string();
+    // A file:// locator is accepted only for a file staged by upload_handler under
+    // temp/uploads/ (it is also tracked for cleanup). Anything else would let an API
+    // caller capture and read back arbitrary server files, e.g. file:///etc/passwd.
+    // Canonicalize both sides to prevent path-traversal via `..` components in the locator.
+    // Same pattern as artifact serving. The staged file must already exist on disk
+    // (it was written by upload_handler), so canonicalize() will resolve symlinks correctly.
+    let staged_upload_path: Option<std::path::PathBuf> = if locator.starts_with("file://") {
+        let file_path = std::path::PathBuf::from(locator.trim_start_matches("file://"));
+        let staging_dir = archive_paths.store_path.join("temp").join("uploads");
+        match (file_path.canonicalize(), staging_dir.canonicalize()) {
+            (Ok(canonical_file), Ok(canonical_staging))
+                if canonical_file.starts_with(&canonical_staging) =>
+            {
+                Some(canonical_file)
+            }
+            _ => {
+                return Err(ApiError::bad_request(
+                    "file:// locators must reference a staged upload",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
     // Create job record in the archive DB.
     let conn = database::open_or_initialize(&mounted.archive_path)?;
-    let job_uid = database::create_capture_job(&conn, &archive_id)?;
+    let created_by = jobs::caller_user_uid(&state, &auth_user)?;
+    let job_uid = database::create_capture_job_as(&conn, &archive_id, created_by.as_deref())?;
     drop(conn);
     // Load cookie rules and global uBlock / cookie-ext settings from the auth DB.
     let (cookie_rules, global_ublock, global_cookie_ext, global_modal_closer) = {
@@ -1632,25 +1702,6 @@ async fn capture_handler(
     };
 
     // Spawn background capture.
-    let locator = body.locator.trim().to_string();
-    // If the locator is a file:// path staged under temp/uploads/, track it for cleanup.
-    // Canonicalize both sides to prevent path-traversal via `..` components in the locator.
-    // Same pattern as artifact serving (line ~631). The staged file must already exist on disk
-    // (it was written by upload_handler), so canonicalize() will resolve symlinks correctly.
-    let staged_upload_path: Option<std::path::PathBuf> = if locator.starts_with("file://") {
-        let file_path = std::path::PathBuf::from(locator.trim_start_matches("file://"));
-        let staging_dir = archive_paths.store_path.join("temp").join("uploads");
-        match (file_path.canonicalize(), staging_dir.canonicalize()) {
-            (Ok(canonical_file), Ok(canonical_staging))
-                if canonical_file.starts_with(&canonical_staging) =>
-            {
-                Some(canonical_file)
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
     let quality = body.quality.clone();
     let archive_path = mounted.archive_path.clone();
     let job_uid_bg = job_uid.clone();
@@ -1779,7 +1830,8 @@ async fn capture_text_handler(
 
     // Create job record in the archive DB.
     let conn = database::open_or_initialize(&mounted.archive_path)?;
-    let job_uid = database::create_capture_job(&conn, &archive_id)?;
+    let created_by = jobs::caller_user_uid(&state, &auth_user)?;
+    let job_uid = database::create_capture_job_as(&conn, &archive_id, created_by.as_deref())?;
     drop(conn);
 
     // Spawn background text capture.
@@ -1996,13 +2048,10 @@ async fn get_capture_job_handler(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path((archive_id, job_uid)): Path<(String, String)>,
-) -> Result<Json<archive::CaptureJobSummary>, ApiError> {
+) -> Result<Json<jobs::CaptureJobDetail>, ApiError> {
     auth_user.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
-    let conn = database::open_or_initialize(&mounted.archive_path)?;
-    archive::get_capture_job(&conn, &job_uid)?
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found("capture job not found"))
+    jobs::get_job_detail(&state, &auth_user, &mounted.archive_path, &job_uid).map(Json)
 }
 
 /// POST /api/archives/:archive_id/entries/:entry_uid/rearchive
@@ -2026,7 +2075,8 @@ async fn rearchive_handler(
 
     // Create a capture job record so the client can poll for completion.
     let conn = database::open_or_initialize(&mounted.archive_path)?;
-    let job_uid = database::create_capture_job(&conn, &archive_id)?;
+    let created_by = jobs::caller_user_uid(&state, &auth_user)?;
+    let job_uid = database::create_capture_job_as(&conn, &archive_id, created_by.as_deref())?;
     drop(conn);
 
     // Load cookie rules from the auth DB (needed for Twitter credentials resolution).
