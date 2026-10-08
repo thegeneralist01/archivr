@@ -1229,7 +1229,7 @@ async fn delete_entry_handler(
 
 /// Inspect the already-resolved CLI path without invoking a provider. Bare
 /// names use PATH, while explicit paths must themselves be executable files.
-fn cli_executable_available(
+pub(crate) fn cli_executable_available(
     executable: &std::path::Path,
     search_path: Option<&std::ffi::OsStr>,
 ) -> bool {
