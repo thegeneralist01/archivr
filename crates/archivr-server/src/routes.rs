@@ -3083,12 +3083,22 @@ async fn admin_set_user_status(
     Json(body): Json<AdminSetStatusBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     auth_user.require_role(ROLE_ADMIN)?;
+    let (caller_id, caller_bits) = auth_user.require_auth()?;
     if body.status != "active" && body.status != "disabled" {
         return Err(ApiError::bad_request(
             "status must be 'active' or 'disabled'",
         ));
     }
     let conn = database::open_auth_db(&state.auth_db_path)?;
+    let target_id = database::get_user_id_by_uid(&conn, &uid)?
+        .ok_or_else(|| ApiError::not_found("user not found"))?;
+    if body.status == "disabled" {
+        crate::guards::ensure_not_self(caller_id, target_id)?;
+    }
+    crate::guards::ensure_can_manage(caller_bits, database::compute_role_bits(&conn, target_id)?)?;
+    if body.status == "disabled" {
+        crate::guards::ensure_not_last_owner(&conn, target_id)?;
+    }
     if !database::set_user_status(&conn, &uid, &body.status)? {
         return Err(ApiError::not_found("user not found"));
     }
@@ -3104,10 +3114,18 @@ async fn admin_assign_role(
     Json(body): Json<AdminAssignRoleBody>,
 ) -> Result<StatusCode, ApiError> {
     auth_user.require_role(ROLE_ADMIN)?;
-    let (caller_id, _) = auth_user.require_auth()?;
+    let (caller_id, caller_bits) = auth_user.require_auth()?;
     let conn = database::open_auth_db(&state.auth_db_path)?;
     let target_id = database::get_user_id_by_uid(&conn, &uid)?
         .ok_or_else(|| ApiError::not_found("user not found"))?;
+    crate::guards::ensure_can_manage(caller_bits, database::compute_role_bits(&conn, target_id)?)?;
+    archivr_core::auth_users::get_role_by_slug(&conn, &body.role_slug)?
+        .ok_or_else(|| ApiError::not_found("role not found"))?;
+    if matches!(body.role_slug.as_str(), "owner" | "admin") && caller_bits & ROLE_OWNER == 0 {
+        return Err(ApiError::forbidden(
+            "only an owner can grant the owner or admin role",
+        ));
+    }
     database::assign_role(&conn, target_id, &body.role_slug, caller_id)?;
     Ok(StatusCode::OK)
 }
@@ -3118,10 +3136,29 @@ async fn admin_remove_role(
     Path((uid, role_slug)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     auth_user.require_role(ROLE_ADMIN)?;
+    let (_, caller_bits) = auth_user.require_auth()?;
     let conn = database::open_auth_db(&state.auth_db_path)?;
     let target_id = database::get_user_id_by_uid(&conn, &uid)?
         .ok_or_else(|| ApiError::not_found("user not found"))?;
-    database::remove_role(&conn, target_id, &role_slug)?;
+    crate::guards::ensure_can_manage(caller_bits, database::compute_role_bits(&conn, target_id)?)?;
+    archivr_core::auth_users::get_role_by_slug(&conn, &role_slug)?
+        .ok_or_else(|| ApiError::not_found("role not found"))?;
+    if matches!(role_slug.as_str(), "owner" | "admin") && caller_bits & ROLE_OWNER == 0 {
+        return Err(ApiError::forbidden(
+            "only an owner can remove the owner or admin role",
+        ));
+    }
+    // Removing a role the user does not hold is a no-op.
+    if archivr_core::auth_users::user_has_role(&conn, target_id, &role_slug)? {
+        if role_slug == "owner" {
+            crate::guards::ensure_not_last_owner(&conn, target_id)?;
+            // `remove_role` also refuses to drop the sole owner row (even a disabled one).
+            if archivr_core::auth_users::count_role_holders(&conn, "owner")? <= 1 {
+                return Err(ApiError::conflict("cannot remove the last owner"));
+            }
+        }
+        database::remove_role(&conn, target_id, &role_slug)?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

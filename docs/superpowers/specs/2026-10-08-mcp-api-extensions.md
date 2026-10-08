@@ -69,7 +69,7 @@ Errors: `400` (`new_password` shorter than 8, or blank), 401/403/404/409 (self: 
 ```
 Errors: `400` blank name or a built-in role (`guest/user/admin/owner`), 401/403/404 (unknown slug).
 
-**R2.** No body. Custom roles only (`400` for built-ins, `404` unknown). One transaction: delete the role's `user_roles` rows, delete the sessions of every holder (their cached `role_bits` are stale), clear the role's bit from `instance_settings.reorder_children_role_bits`, delete the role. Response `204`.
+**R2.** No body. Custom roles only (`400` for built-ins, `404` unknown). One transaction: delete the role's `user_roles` rows, delete the sessions of every holder (their cached `role_bits` are stale), clear the role's bit from `instance_settings.reorder_children_role_bits`, delete the role. Response `200` `{"slug": string, "users_affected": <integer>, "reorder_mask_cleared": <boolean>}`.
 
 ### 1.3 Own sessions - R2
 
