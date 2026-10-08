@@ -437,6 +437,10 @@ pub fn app_with_state(state: AppState) -> Router {
         .fallback_service(ServeDir::new(&static_dir).not_found_service(ServeFile::new(static_dir.join("index.html"))))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            crate::token_scope::enforce_read_scope,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             setup_guard,
         ))
         .layer(axum::middleware::from_fn_with_state(
@@ -1540,6 +1544,10 @@ struct SetupBody {
 #[derive(Debug, serde::Deserialize)]
 struct CreateTokenBody {
     name: String,
+    /// 1..=3650; absent/null = never expires.
+    expires_in_days: Option<i64>,
+    /// `full` (default) or `read`.
+    scope: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2378,7 +2386,11 @@ async fn auth_me(
         .map_err(|e| ApiError::from(anyhow::anyhow!("db error: {e}")))?;
     let humanize_slugs = humanize_slugs_int != 0;
     let settings = database::get_instance_settings(&conn)?;
+    let user_uid = database::get_user_uid(&conn, user_id)?;
+    let roles = archivr_core::auth_credentials::list_user_role_slugs(&conn, user_id)?;
     Ok(Json(serde_json::json!({
+        "user_uid": user_uid,
+        "roles": roles,
         "role_bits": role_bits,
         "username": username,
         "display_name": display_name,
@@ -2390,6 +2402,7 @@ async fn auth_me(
 async fn patch_me(
     State(state): State<AppState>,
     auth_user: AuthUser,
+    jar: CookieJar,
     Json(body): Json<UpdateProfileBody>,
 ) -> Result<StatusCode, ApiError> {
     let (user_id, _) = auth_user.require_auth()?;
@@ -2405,8 +2418,19 @@ async fn patch_me(
         if !auth::verify_password(current_pw, &hash).map_err(ApiError::from)? {
             return Err(ApiError::unauthorized("current password is incorrect"));
         }
+        if new_pw.chars().count() < 8 {
+            return Err(ApiError::bad_request(
+                "new_password must be at least 8 characters",
+            ));
+        }
         let new_hash = auth::hash_password(new_pw).map_err(ApiError::from)?;
         database::update_user_password(&conn, user_id, &new_hash)?;
+        // Every other session is stale now; the caller's own cookie session survives.
+        archivr_core::auth_credentials::delete_other_sessions(
+            &conn,
+            user_id,
+            jar.get("session").map(|c| c.value()),
+        )?;
     }
 
     if let Some(ref dn) = body.display_name {
@@ -2956,16 +2980,40 @@ async fn create_token(
     if body.name.trim().is_empty() {
         return Err(ApiError::bad_request("token name is required"));
     }
+    let scope = body.scope.as_deref().unwrap_or("full");
+    if scope != "full" && scope != "read" {
+        return Err(ApiError::bad_request("scope must be 'full' or 'read'"));
+    }
+    let expires_at = match body.expires_in_days {
+        None => None,
+        Some(days) if (1..=3650).contains(&days) => Some(
+            (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339(),
+        ),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "expires_in_days must be between 1 and 3650",
+            ));
+        }
+    };
     let raw_token = auth::generate_token();
     let token_hash = auth::hash_token(&raw_token);
     let conn = database::open_auth_db(&state.auth_db_path)?;
-    let token_uid = database::create_api_token(&conn, user_id, &token_hash, &body.name, None, "full")?;
+    let token_uid = database::create_api_token(
+        &conn,
+        user_id,
+        &token_hash,
+        &body.name,
+        expires_at.as_deref(),
+        scope,
+    )?;
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({
             "token_uid": token_uid,
             "raw_token": raw_token,
             "name": body.name,
+            "expires_at": expires_at,
+            "scope": scope,
         })),
     ))
 }
