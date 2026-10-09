@@ -437,6 +437,105 @@ async fn a_plain_user_cannot_hide_an_entry_from_all_of_their_own_roles() {
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
+/// alice builds a collection holding `open` at her own role and drops the default-collection
+/// membership to admin-only, so the custom collection is the only thing letting her see it.
+/// Returns the custom collection's uid.
+async fn alice_collection_is_only_access(w: &World) -> String {
+    let (status, coll) = send_json(
+        &w.f.router,
+        "POST",
+        "/api/archives/test/collections",
+        Some(&w.alice),
+        Some(&json!({"name": "Private", "slug": "private"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{coll}");
+    let coll_uid = coll["collection_uid"].as_str().unwrap().to_string();
+    let (status, _) = send_json(
+        &w.f.router,
+        "POST",
+        &format!("/api/archives/test/collections/{coll_uid}/entries"),
+        Some(&w.alice),
+        Some(&json!({"entry_uid": w.open, "visibility_bits": 2})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    {
+        let conn = database::open_or_initialize(&w.f.archive_path).unwrap();
+        conn.execute(
+            "UPDATE collection_entries SET visibility_bits = 4 \
+             WHERE entry_id = (SELECT id FROM archived_entries WHERE entry_uid = ?1) \
+               AND collection_id = (SELECT id FROM collections WHERE slug = '_default_')",
+            [&w.open],
+        )
+        .unwrap();
+    }
+    coll_uid
+}
+
+#[tokio::test]
+async fn a_plain_user_cannot_delete_the_collection_that_is_their_only_access_to_an_entry() {
+    let w = world().await;
+    let coll_uid = alice_collection_is_only_access(&w).await;
+    let coll_uri = format!("/api/archives/test/collections/{coll_uid}");
+    let (status, _) = send_json(&w.f.router, "GET", &entry_path(&w.open, ""), Some(&w.alice), None).await;
+    assert_eq!(status, StatusCode::OK, "alice can see the entry before the delete");
+
+    let (status, body) = send_json(&w.f.router, "DELETE", &coll_uri, Some(&w.alice), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("hide the entry from all of your own roles"), "{body}");
+    let (status, _) = send_json(&w.f.router, "GET", &coll_uri, Some(&w.admin), None).await;
+    assert_eq!(status, StatusCode::OK, "the rejected delete must be rolled back");
+    let (status, _) = send_json(&w.f.router, "GET", &entry_path(&w.open, ""), Some(&w.alice), None).await;
+    assert_eq!(status, StatusCode::OK, "the entry must stay visible to alice");
+
+    // An admin may still delete it, and then the entry really is gone from alice's view.
+    let (status, _) = send_json(&w.f.router, "DELETE", &coll_uri, Some(&w.admin), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send_json(&w.f.router, "GET", &entry_path(&w.open, ""), Some(&w.alice), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_plain_user_can_delete_a_collection_whose_entries_stay_visible_elsewhere() {
+    let w = world().await;
+    let (status, coll) = send_json(
+        &w.f.router,
+        "POST",
+        "/api/archives/test/collections",
+        Some(&w.alice),
+        Some(&json!({"name": "Reading", "slug": "reading"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{coll}");
+    let coll_uri = format!("/api/archives/test/collections/{}", coll["collection_uid"].as_str().unwrap());
+    // `open` stays in the default collection at bits 2 (alice's role), so nothing is lost.
+    let (status, _) = send_json(
+        &w.f.router,
+        "POST",
+        &format!("{coll_uri}/entries"),
+        Some(&w.alice),
+        Some(&json!({"entry_uid": w.open, "visibility_bits": 2})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = send_json(&w.f.router, "DELETE", &coll_uri, Some(&w.alice), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, _) = send_json(&w.f.router, "GET", &entry_path(&w.open, ""), Some(&w.alice), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send_json(
+        &w.f.router,
+        "DELETE",
+        "/api/archives/test/collections/no_such_collection",
+        Some(&w.alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn a_role_created_after_deleting_one_never_inherits_its_hidden_entries() {
     let w = world().await;

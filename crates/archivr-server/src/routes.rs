@@ -3313,14 +3313,14 @@ pub(crate) fn ensure_entry_visible(
     Ok(())
 }
 
-/// Runs `change` (a mutation of the entry's collection memberships or their visibility) and, for
-/// callers who are not admins, rolls it back with a 400 when it would leave the entry hidden from
-/// the caller's own roles. Without this a plain user could hide an entry from every role they hold
-/// and could never reach it again to undo it (only an admin could).
+/// Runs `change` (a mutation of collection memberships or their visibility touching `entry_uids`)
+/// and, for callers who are not admins, rolls it back with a 400 when it would leave any of those
+/// entries hidden from the caller's own roles. Without this a plain user could hide an entry from
+/// every role they hold and could never reach it again to undo it (only an admin could).
 fn apply_without_self_lockout<T>(
     conn: &rusqlite::Connection,
     auth: &AuthUser,
-    entry_uid: &str,
+    entry_uids: &[String],
     change: impl FnOnce() -> Result<T, ApiError>,
 ) -> Result<T, ApiError> {
     let AuthUser::Authenticated { role_bits, .. } = auth else {
@@ -3329,12 +3329,33 @@ fn apply_without_self_lockout<T>(
     if role_bits & (ROLE_ADMIN | ROLE_OWNER) != 0 {
         return change();
     }
+    // Only entries the caller can see now can be locked out by the change; entries they could
+    // not see before are not theirs to lose.
+    let mut visible_before = Vec::new();
+    for uid in entry_uids {
+        if database::caller_can_access_entry(conn, uid, *role_bits)? {
+            visible_before.push(uid);
+        }
+    }
     let tx = conn.unchecked_transaction()?;
     let out = change()?;
-    if !database::caller_can_access_entry(conn, entry_uid, *role_bits)? {
-        return Err(ApiError::bad_request(
-            "this change would hide the entry from all of your own roles; ask an admin to do it",
-        ));
+    let mut hidden = 0usize;
+    for uid in &visible_before {
+        if !database::caller_can_access_entry(conn, uid, *role_bits)? {
+            hidden += 1;
+        }
+    }
+    if hidden > 0 {
+        // Returning before `commit` drops `tx`, which rolls the change back.
+        let message = if hidden == 1 {
+            "this change would hide the entry from all of your own roles; ask an admin to do it"
+                .to_string()
+        } else {
+            format!(
+                "this change would hide {hidden} entries from all of your own roles; ask an admin to do it"
+            )
+        };
+        return Err(ApiError::bad_request(&message));
     }
     tx.commit()?;
     Ok(out)
@@ -3587,7 +3608,7 @@ async fn remove_entry_from_collection_handler(
         )
         .optional()?
         .ok_or(ApiError::not_found("entry not found"))?;
-    let removed = apply_without_self_lockout(&conn, &auth, &entry_uid, || {
+    let removed = apply_without_self_lockout(&conn, &auth, std::slice::from_ref(&entry_uid), || {
         Ok(database::remove_entry_from_collection(&conn, coll.id, entry_id)?)
     })?;
     if removed {
@@ -3617,7 +3638,7 @@ async fn update_entry_visibility_handler(
         )
         .optional()?
         .ok_or(ApiError::not_found("entry not found"))?;
-    let updated = apply_without_self_lockout(&conn, &auth, &entry_uid, || {
+    let updated = apply_without_self_lockout(&conn, &auth, std::slice::from_ref(&entry_uid), || {
         Ok(database::update_collection_entry_visibility(
             &conn,
             coll.id,
@@ -3683,7 +3704,15 @@ async fn delete_collection_handler(
             "cannot delete the default collection",
         ));
     }
-    let deleted = database::delete_collection(&conn, &coll_uid)?;
+    // Deleting a collection drops its memberships. Refuse (like the other membership changes) when
+    // that would hide an entry from a non-admin caller's own roles.
+    let Some(coll) = database::get_collection_by_uid(&conn, &coll_uid)? else {
+        return Err(ApiError::not_found("collection not found"));
+    };
+    let member_uids = database::collection_entry_uids(&conn, coll.id)?;
+    let deleted = apply_without_self_lockout(&conn, &auth, &member_uids, || {
+        Ok(database::delete_collection(&conn, &coll_uid)?)
+    })?;
     if deleted {
         Ok(StatusCode::NO_CONTENT)
     } else {

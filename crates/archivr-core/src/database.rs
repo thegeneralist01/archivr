@@ -3459,6 +3459,20 @@ pub fn update_collection(
     Ok(true)
 }
 
+/// Returns the entry_uid of every entry that is a member of the collection.
+pub fn collection_entry_uids(conn: &Connection, collection_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.entry_uid FROM collection_entries ce \
+         JOIN archived_entries e ON e.id = ce.entry_id \
+         WHERE ce.collection_id = ?1 \
+         ORDER BY e.id",
+    )?;
+    let uids = stmt
+        .query_map([collection_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(uids)
+}
+
 /// Deletes a collection and cascades to collection_entries.
 /// Returns true if deleted, false if not found.
 /// Refuses to delete the '_default_' collection.
@@ -3921,6 +3935,27 @@ mod tests {
 
         set_public_settings(&conn, true, true, false).unwrap();
         assert_eq!(public_index_entry_count(&conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn collection_entry_uids_lists_members_only() {
+        let conn = conn();
+        let a = create_entry_fixture(&conn, "private", None, None);
+        let b = create_entry_fixture(&conn, "private", None, None);
+        let outside = create_entry_fixture(&conn, "private", None, None);
+        let coll = create_collection(&conn, "Mine", "mine", 2, false).unwrap();
+        add_entry_to_collection(&conn, coll.id, a.id, 2).unwrap();
+        add_entry_to_collection(&conn, coll.id, b.id, 4).unwrap();
+
+        let mut uids = collection_entry_uids(&conn, coll.id).unwrap();
+        uids.sort();
+        let mut expected = vec![a.entry_uid.clone(), b.entry_uid.clone()];
+        expected.sort();
+        assert_eq!(uids, expected);
+        assert!(!uids.contains(&outside.entry_uid));
+
+        let empty = create_collection(&conn, "Empty", "empty", 2, false).unwrap();
+        assert!(collection_entry_uids(&conn, empty.id).unwrap().is_empty());
     }
 
     #[test]
