@@ -17,6 +17,7 @@ import AudioBar from './components/AudioBar'
 import PreviewPage from './components/PreviewPage'
 import { displayPath } from './utils'
 import ToastStack from './components/ToastStack'
+import { parseCaptureLink, resolveCaptureLink, makeCaptureLinkRequest } from './captureRequests'
 
 export const AuthContext = createContext(null);
 
@@ -63,6 +64,8 @@ export default function App() {
       if (needsSetup) { setAuthState('setup'); return; }
       const user = await fetchMe();
       if (!user) {
+        // Captures need a signed-in session even when the archive can be read publicly.
+        if (parseCaptureLink(window.location.search)) { setAuthState('login'); return; }
         // Before showing login: check whether the active collection is publicly accessible.
         // fetchArchives is unauthenticated. ?archive=<id> pins the archive for multi-archive
         // setups; without it we try archives[0] (works for the common single-archive case).
@@ -75,6 +78,7 @@ export default function App() {
           if (aid) {
             await fetchEntries(aid, collection); // 401 if collection requires auth
             setArchives(archiveList);
+            setArchivesLoaded(true);
             setArchiveId(aid);
             setSelectedCollectionUid(collection);
             setAuthState('authenticated');
@@ -104,6 +108,7 @@ export default function App() {
   useEffect(() => {
     const handler = () => {
       const { view, settingsTab, q, tag, entry, collection } = parseLocation()
+      setPendingCaptureLink(parseCaptureLink(window.location.search))
       setView(view)
       setSettingsTab(settingsTab)
       setSearchQuery(q)
@@ -118,6 +123,7 @@ export default function App() {
   }, [])
 
   const [archives, setArchives] = useState([])
+  const [archivesLoaded, setArchivesLoaded] = useState(false)
   const [archiveId, setArchiveId] = useState(null)
   const [selectedCollectionUid, setSelectedCollectionUid] = useState(() => parseLocation().collection)
   const [collections, setCollections] = useState([])
@@ -144,6 +150,8 @@ export default function App() {
     const saved = sessionStorage.getItem('captureDialogOpen')
     return saved === 'true'
   })
+  const [pendingCaptureLink, setPendingCaptureLink] = useState(() => parseCaptureLink(window.location.search))
+  const [captureRequest, setCaptureRequest] = useState(null)
 
   const [toasts, setToasts] = useState([])
   const toastIdRef = useRef(0)
@@ -231,10 +239,12 @@ export default function App() {
     if (archiveId) return // already set (public-session path set it synchronously)
     fetchArchives().then(list => {
       setArchives(list)
+      setArchivesLoaded(true)
       if (list.length > 0) {
         const { archive: archiveParam } = parseLocation()
         const preferred = archiveParam ? list.find(a => a.id === archiveParam) : null
-        setArchiveId(preferred?.id ?? list[0].id)
+        // An invalid capture target is resolved below with a visible error.
+        setArchiveId(preferred?.id ?? (parseCaptureLink(window.location.search) ? null : list[0].id))
       }
     })
   }, [authState, archiveId])
@@ -511,15 +521,21 @@ export default function App() {
   // multi-archive public links (?archive=other) survive navigation to the default collection.
   useEffect(() => {
     if (PREVIEW_ROUTE) return
-    const existingArchive = new URLSearchParams(window.location.search).get('archive')
+    const existingParams = new URLSearchParams(window.location.search)
+    const existingArchive = existingParams.get('archive')
     const params = new URLSearchParams()
+    // Keep a pending capture intact through login and archive bootstrap.
+    if (existingParams.has('capture')) {
+      params.set('capture', existingParams.get('capture'))
+      if (existingArchive) params.set('archive', existingArchive)
+    }
     if (searchQuery) params.set('q', searchQuery)
     if (view === 'archive' && tagFilter) params.set('tag', tagFilter)
     if (view === 'archive' && selectedEntryUid) params.set('entry', selectedEntryUid)
     if (view === 'archive' && selectedCollectionUid) {
       params.set('collection', selectedCollectionUid)
-      if (archiveId) params.set('archive', archiveId)
-    } else if (existingArchive && archiveId) {
+      if (archiveId && !existingParams.has('capture')) params.set('archive', archiveId)
+    } else if (existingArchive && archiveId && !existingParams.has('capture')) {
       // Preserve ?archive when already in the URL (e.g. default collection public link)
       params.set('archive', archiveId)
     }
@@ -616,6 +632,7 @@ export default function App() {
   }, [view])
 
   const handleCaptureClick = useCallback(() => {
+    setCaptureRequest(prev => prev ? { ...prev, open: false } : null)
     setCaptureDialogOpen(true)
   }, [])
 
@@ -638,6 +655,26 @@ export default function App() {
     const id = ++toastIdRef.current
     setToasts(prev => [...prev, { id, text, locator, type, headline }])
   }, [ublockWarningIgnored])
+
+  useEffect(() => {
+    if (!pendingCaptureLink || PREVIEW_ROUTE || authState !== 'authenticated') return
+    if (!currentUser) { setAuthState('login'); return }
+    if (!archivesLoaded) return
+    const resolved = resolveCaptureLink(pendingCaptureLink, archives)
+    // Consume only after auth and archive lookup; replaceState also prevents
+    // Back/Forward from reopening the same processed request.
+    const url = new URL(window.location.href)
+    url.searchParams.delete('capture')
+    history.replaceState(null, '', url.pathname + url.search + url.hash)
+    setPendingCaptureLink(null)
+    if (resolved.error) {
+      handleToast(resolved.error, null, 'error', 'Capture link could not be opened')
+      return
+    }
+    setArchiveId(resolved.archiveId)
+    setCaptureDialogOpen(false)
+    setCaptureRequest(makeCaptureLinkRequest(resolved))
+  }, [pendingCaptureLink, archivesLoaded, archives, authState, currentUser, handleToast])
 
   const handleDismissToast = useCallback((id) => {
     setToasts(prev => prev.filter(t => t.id !== id))
@@ -682,7 +719,7 @@ export default function App() {
   useEffect(() => {
     const handler = (e) => {
       if (e.key !== 'Escape') return
-      if (captureDialogOpen || previewEntryUid) return
+      if (captureDialogOpen || captureRequest?.open || previewEntryUid) return
       const tag = document.activeElement?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
       if (selectedUids.size > 0) {
@@ -693,7 +730,7 @@ export default function App() {
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [captureDialogOpen, previewEntryUid, selectedUids])
+  }, [captureDialogOpen, captureRequest?.open, previewEntryUid, selectedUids])
 
   // Toggle body class so fixed AudioBar doesn't obscure scrollable content
   useEffect(() => {
@@ -835,6 +872,18 @@ export default function App() {
           onJobStarted={handleJobStarted}
           onJobSettled={handleJobSettled}
         />
+        {captureRequest && <CaptureDialog
+          open={captureRequest.open}
+          archiveId={captureRequest.archiveId}
+          initialItems={captureRequest.initialItems}
+          persistenceKey="captureItems:deeplink"
+          requestKey={captureRequest.requestKey}
+          onClose={() => setCaptureRequest(prev => prev ? { ...prev, open: false } : null)}
+          onCaptured={handleCaptured}
+          onToast={handleToast}
+          onJobStarted={handleJobStarted}
+          onJobSettled={handleJobSettled}
+        />}
         <ToastStack toasts={toasts} onDismiss={handleDismissToast} onIgnoreUblock={handleIgnoreUblock} />
       </>
     </AuthContext.Provider>

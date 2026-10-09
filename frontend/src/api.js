@@ -292,6 +292,25 @@ export async function submitTextCapture(archiveId, {title, body, mime = 'text/ma
   return res.json(); // { job_uid, status: "pending" }
 }
 
+export async function getCaptureOptions() {
+  return getJson('/api/captures/options');
+}
+
+export async function generateTextTitle(archiveId, { body, provider }) {
+  const res = await fetch(`/api/archives/${encodeURIComponent(archiveId)}/captures/text/title`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ body, provider }),
+  });
+  const result = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const error = new Error(result.error || `HTTP ${res.status}`);
+    error.status = res.status;
+    throw error;
+  }
+  return result;
+}
+
 // Returns { has_video: bool, qualities: string[] } e.g. { has_video: true, qualities: ["1080p","720p","480p"] }
 // Throws on network error; returns { has_video: false, qualities: [] } on non-video locators.
 export async function probeCapture(archiveId, locator) {

@@ -719,3 +719,13 @@ nix build .#archivr-server
 
 MIT — see [LICENSE](../LICENSE.md).
 \n
+
+## Chrome extension
+
+The companion `archivr-extension` checkout builds an unpacked Chrome Manifest V3 extension (Chrome 123+). Keep it next to this checkout, rebuild the current Archivr server/frontend, then run `bun install` and `bun run zip` from the extension checkout. Load its `dist` directory through Chrome’s Developer mode.
+
+Connect by entering your server origin (localhost or a Tailscale address are supported), then log in in the server tab. The extension creates a named, revocable API token using that login and lets you choose a mounted archive. Captures remain reviewable in the shared Capture dialog. Selected text has editable title/body and optional manual title generation. Playlists/channels open this app’s prefilled capture dialog.
+
+Capture deep links use `/?archive=<id>&capture=<encoded-locator>`. They wait for login, require a valid mounted archive, open once, and never submit automatically. The `capture` parameter is removed after opening.
+
+Capture users can read safe defaults and configured-provider availability through `GET /api/captures/options`. `POST /api/archives/:archive_id/captures/text/title` accepts `{body, provider}` and returns `{title}` without creating or modifying archive entries. Both endpoints require the capture role; administrator settings remain administrator-only.

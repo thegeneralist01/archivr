@@ -34,7 +34,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use archivr_core::{archive, capture, database, downloader, summarizer, thread_title};
+use archivr_core::{archive, capture, database, downloader, summarizer, text_title, thread_title};
 use axum::{
     Json, Router,
     extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, Request, State},
@@ -299,7 +299,13 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route("/api/archives/:archive_id/blobs/:sha256", get(serve_blob))
         .route("/api/archives/:archive_id/runs", get(list_runs))
+        .route("/api/captures/options", get(capture_options_handler))
         .route("/api/archives/:archive_id/captures", post(capture_handler))
+        .route(
+            "/api/archives/:archive_id/captures/text/title",
+            post(generate_text_title_handler)
+                .layer(DefaultBodyLimit::max(MAX_TEXT_CAPTURE_REQUEST_BYTES)),
+        )
         .route(
             "/api/archives/:archive_id/captures/text",
             post(capture_text_handler)
@@ -1211,6 +1217,123 @@ async fn delete_entry_handler(
     } else {
         Err(ApiError::not_found("entry not found"))
     }
+}
+
+/// Inspect the already-resolved CLI path without invoking a provider. Bare
+/// names use PATH, while explicit paths must themselves be executable files.
+fn cli_executable_available(
+    executable: &std::path::Path,
+    search_path: Option<&std::ffi::OsStr>,
+) -> bool {
+    let is_executable = |path: &std::path::Path| {
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return false;
+        };
+        if !metadata.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    };
+    if executable.is_absolute() || executable.components().count() > 1 {
+        return is_executable(executable);
+    }
+    search_path.is_some_and(|path| {
+        std::env::split_paths(path).any(|directory| is_executable(&directory.join(executable)))
+    })
+}
+
+/// Safe capture defaults for all users who can submit a capture.
+async fn capture_options_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    let settings = database::get_instance_settings(&conn)?;
+    let extension_available = |var: &str| {
+        std::env::var(var)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .is_some_and(|path| std::path::Path::new(&path).is_dir())
+    };
+    let providers: Vec<_> = [
+        ("anthropic_http", "Anthropic"),
+        ("openai_compatible", "OpenAI-compatible"),
+        ("claude_cli", "Claude CLI"),
+        ("codex_cli", "Codex CLI"),
+    ]
+    .into_iter()
+    .filter(|(kind, _)| {
+        summarizer::provider_from_env(kind).is_ok_and(|config| match config {
+            summarizer::ProviderConfig::AnthropicHttp(_)
+            | summarizer::ProviderConfig::OpenAiCompatible(_) => true,
+            summarizer::ProviderConfig::ClaudeCli(config)
+            | summarizer::ProviderConfig::CodexCli(config) => {
+                cli_executable_available(&config.executable, std::env::var_os("PATH").as_deref())
+            }
+        })
+    })
+    .map(|(kind, label)| serde_json::json!({"kind": kind, "label": label}))
+    .collect();
+    Ok(Json(serde_json::json!({
+        "ublock_enabled": settings.ublock_enabled,
+        "cookie_ext_enabled": settings.cookie_ext_enabled,
+        "modal_closer_enabled": settings.modal_closer_enabled,
+        "ublock_ext_available": extension_available("ARCHIVR_UBLOCK_EXT"),
+        "cookie_ext_available": extension_available("ARCHIVR_COOKIE_EXT"),
+        "reader_mode": false,
+        "via_freedium": true,
+        "download_subtitles": true,
+        "title_providers": providers,
+    })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TextTitleBody {
+    body: String,
+    provider: String,
+}
+
+async fn generate_text_title_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(archive_id): Path<String>,
+    Json(body): Json<TextTitleBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    if body.body.trim().is_empty() {
+        return Err(ApiError::bad_request("body must not be empty"));
+    }
+    if body.body.len() > MAX_TEXT_CAPTURE_BODY_BYTES {
+        return Err(ApiError::bad_request("body must not exceed 2 MiB"));
+    }
+    mounted_archive(&state, &archive_id)?;
+    let settings = database::get_instance_settings(&database::open_auth_db(&state.auth_db_path)?)?;
+    let cfg = thread_title::title_provider_from_env(
+        &body.provider,
+        settings.title_model_override(&body.provider),
+    )
+    .map_err(|error| ApiError::bad_request(&format!("{error:#}")))?;
+    let title = tokio::task::spawn_blocking(move || {
+        text_title::generate_text_title(&cfg, &body.body).map_err(|error| {
+            eprintln!("warn: text title: {error:#}");
+            ApiError {
+                status: StatusCode::BAD_GATEWAY,
+                message: format!("{error:#}"),
+            }
+        })
+    })
+    .await
+    .map_err(|error| ApiError::internal(&format!("text title task failed: {error}")))??;
+    Ok(Json(serde_json::json!({"title": title})))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -3376,6 +3499,560 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn capture_text_title_request(
+        archive: &str,
+        body: &str,
+        provider: &str,
+        cookie: Option<&str>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(format!("/api/archives/{archive}/captures/text/title"))
+            .header("content-type", "application/json");
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        builder
+            .body(json_body(
+                &serde_json::json!({"body": body, "provider": provider}),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn capture_options_only_exposes_safe_fields_to_users_and_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let cookie = make_role_session(&auth_path, "capture-user", &["user"]);
+        let conn = database::open_auth_db(&auth_path).unwrap();
+        let uid: i64 = conn
+            .query_row(
+                "SELECT id FROM users WHERE username = 'capture-user'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        database::create_api_token(&conn, uid, &auth::hash_token("capture-token"), "Extension")
+            .unwrap();
+        let mut settings = database::get_instance_settings(&conn).unwrap();
+        settings.ublock_enabled = false;
+        settings.cookie_ext_enabled = false;
+        settings.modal_closer_enabled = false;
+        settings.title_model_openai_compatible = Some("private-model".into());
+        database::update_instance_settings(&conn, &settings).unwrap();
+        for (header, value) in [
+            ("cookie", cookie.as_str()),
+            ("authorization", "Bearer capture-token"),
+        ] {
+            let response = app(registry.clone(), auth_path.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/captures/options")
+                        .header(header, value)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload = body_json(response).await;
+            let expected = [
+                "ublock_enabled",
+                "cookie_ext_enabled",
+                "modal_closer_enabled",
+                "ublock_ext_available",
+                "cookie_ext_available",
+                "reader_mode",
+                "via_freedium",
+                "download_subtitles",
+                "title_providers",
+            ];
+            assert_eq!(payload.as_object().unwrap().len(), expected.len());
+            for key in expected {
+                assert!(payload.get(key).is_some(), "missing {key}");
+            }
+            assert_eq!(payload["ublock_enabled"], false);
+            assert_eq!(payload["cookie_ext_enabled"], false);
+            assert_eq!(payload["modal_closer_enabled"], false);
+            assert_eq!(payload["reader_mode"], false);
+            assert_eq!(payload["via_freedium"], true);
+            assert_eq!(payload["download_subtitles"], true);
+            for provider in payload["title_providers"].as_array().unwrap() {
+                assert_eq!(provider.as_object().unwrap().len(), 2);
+                assert!(summarizer::PROVIDER_KINDS.contains(&provider["kind"].as_str().unwrap()));
+                assert!(provider["label"].as_str().is_some_and(|v| !v.is_empty()));
+            }
+            assert!(!payload.to_string().contains("private-model"));
+            let admin = app(registry.clone(), auth_path.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/admin/instance-settings")
+                        .header(header, value)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(admin.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_provider_availability_searches_supplied_path_for_executable_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let filename = "archivr-fake-provider";
+        for (directory, permissions) in [(&first, 0o644), (&second, 0o755)] {
+            let file = directory.join(filename);
+            std::fs::write(&file, "#!/bin/sh\nexit 99\n").unwrap();
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(permissions)).unwrap();
+        }
+        let search_path = std::env::join_paths([&first, &second]).unwrap();
+        assert!(cli_executable_available(
+            std::path::Path::new(filename),
+            Some(&search_path)
+        ));
+        let nonexecutable_path = std::env::join_paths([&first]).unwrap();
+        assert!(!cli_executable_available(
+            std::path::Path::new(filename),
+            Some(&nonexecutable_path)
+        ));
+        assert!(!cli_executable_available(
+            std::path::Path::new(filename),
+            None
+        ));
+        assert!(!cli_executable_available(
+            std::path::Path::new("absent-provider"),
+            Some(&search_path)
+        ));
+        assert!(cli_executable_available(&second.join(filename), None));
+        assert!(!cli_executable_available(
+            &first.join(filename),
+            Some(&search_path)
+        ));
+        assert!(!cli_executable_available(&second, Some(&search_path)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capture_options_only_advertises_executable_cli_providers() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (name, previous) in &self.0 {
+                    unsafe {
+                        match previous {
+                            Some(value) => std::env::set_var(name, value),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                }
+            }
+        }
+        let _restore = RestoreEnv(
+            ["ARCHIVR_CLAUDE_CLI", "ARCHIVR_CODEX_CLI"]
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let cookie = make_role_session(&auth_path, "options-cli-user", &["user"]);
+        let executable = dir.path().join("fake-provider");
+        // The script fails if called; listing providers must only inspect the file.
+        std::fs::write(&executable, "#!/bin/sh\nexit 99\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let nonexecutable = dir.path().join("not-executable");
+        std::fs::write(&nonexecutable, "provider").unwrap();
+        std::fs::set_permissions(&nonexecutable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let missing = dir.path().join("missing-provider");
+        for (claude, codex, expected) in [
+            (missing.as_path(), missing.as_path(), vec![]),
+            (executable.as_path(), missing.as_path(), vec!["claude_cli"]),
+            (missing.as_path(), executable.as_path(), vec!["codex_cli"]),
+            (nonexecutable.as_path(), nonexecutable.as_path(), vec![]),
+            (dir.path(), dir.path(), vec![]),
+        ] {
+            unsafe {
+                std::env::set_var("ARCHIVR_CLAUDE_CLI", claude);
+                std::env::set_var("ARCHIVR_CODEX_CLI", codex);
+            }
+            let response = app(registry.clone(), auth_path.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/captures/options")
+                        .header("cookie", &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload = body_json(response).await;
+            let actual: Vec<_> = payload["title_providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|provider| {
+                    provider["kind"]
+                        .as_str()
+                        .filter(|kind| kind.ends_with("_cli"))
+                })
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_options_and_text_title_require_user_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let conn = database::open_auth_db(&auth_path).unwrap();
+        let owner_id: i64 = conn
+            .query_row(
+                "SELECT id FROM users WHERE username = 'testowner'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let guest = format!(
+            "session={}",
+            database::create_session(&conn, owner_id, ROLE_GUEST, None).unwrap()
+        );
+        for (cookie, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some(guest.as_str()), StatusCode::FORBIDDEN),
+        ] {
+            let mut request = Request::builder().uri("/api/captures/options");
+            if let Some(cookie) = cookie {
+                request = request.header("cookie", cookie);
+            }
+            let response = app(registry.clone(), auth_path.clone())
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            let response = app(registry.clone(), auth_path.clone())
+                .oneshot(capture_text_title_request(
+                    "test",
+                    "Note",
+                    "claude_cli",
+                    cookie,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_text_title_validates_body_archive_and_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let cookie = make_role_session(&auth_path, "title-user", &["user"]);
+        let oversized = "a".repeat(MAX_TEXT_CAPTURE_BODY_BYTES + 1);
+        for (archive, body, provider, status, message) in [
+            (
+                "test",
+                " \n\t ",
+                "claude_cli",
+                StatusCode::BAD_REQUEST,
+                "body must not be empty",
+            ),
+            (
+                "test",
+                oversized.as_str(),
+                "claude_cli",
+                StatusCode::BAD_REQUEST,
+                "body must not exceed 2 MiB",
+            ),
+            (
+                "missing",
+                "Note",
+                "claude_cli",
+                StatusCode::NOT_FOUND,
+                "archive not found",
+            ),
+            (
+                "test",
+                "Note",
+                "unknown",
+                StatusCode::BAD_REQUEST,
+                "unknown summary provider",
+            ),
+        ] {
+            let response = app(registry.clone(), auth_path.clone())
+                .oneshot(capture_text_title_request(
+                    archive,
+                    body,
+                    provider,
+                    Some(&cookie),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            let value = body_json(response).await;
+            assert!(
+                value["error"].as_str().unwrap().contains(message),
+                "{value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_text_title_uses_title_model_and_never_mutates_archive() {
+        use std::io::{Read, Write};
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (name, previous) in &self.0 {
+                    unsafe {
+                        match previous {
+                            Some(value) => std::env::set_var(name, value),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                }
+            }
+        }
+        let _restore = RestoreEnv(
+            [
+                "ARCHIVR_OPENAI_API_KEY",
+                "ARCHIVR_OPENAI_URL",
+                "ARCHIVR_OPENAI_TITLE_MODEL",
+                "ARCHIVR_UBLOCK_EXT",
+                "ARCHIVR_COOKIE_EXT",
+            ]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        let cookie = make_role_session(&auth_path, "text-title-user", &["user"]);
+        let conn = database::open_auth_db(&auth_path).unwrap();
+        let uid: i64 = conn
+            .query_row(
+                "SELECT id FROM users WHERE username = 'text-title-user'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        database::create_api_token(
+            &conn,
+            uid,
+            &auth::hash_token("text-title-token"),
+            "Extension",
+        )
+        .unwrap();
+        let mut settings = database::get_instance_settings(&conn).unwrap();
+        settings.title_model_openai_compatible = Some("instance-text-title".into());
+        database::update_instance_settings(&conn, &settings).unwrap();
+        unsafe {
+            std::env::remove_var("ARCHIVR_OPENAI_API_KEY");
+        }
+        let missing = app(registry.clone(), auth_path.clone())
+            .oneshot(capture_text_title_request(
+                "test",
+                "Note",
+                "openai_compatible",
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            body_json(missing).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("ARCHIVR_OPENAI_API_KEY")
+        );
+
+        let unavailable_options = app(registry.clone(), auth_path.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/captures/options")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let unavailable = body_json(unavailable_options).await;
+        assert!(
+            !unavailable["title_providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|provider| provider["kind"] == "openai_compatible")
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        unsafe {
+            std::env::set_var("ARCHIVR_OPENAI_API_KEY", "test-secret");
+            std::env::set_var("ARCHIVR_OPENAI_URL", endpoint);
+            std::env::set_var("ARCHIVR_OPENAI_TITLE_MODEL", "ignored-env-model");
+            std::env::set_var("ARCHIVR_UBLOCK_EXT", dir.path());
+            std::env::set_var("ARCHIVR_COOKIE_EXT", dir.path().join("missing-extension"));
+        }
+        let available_options = app(registry.clone(), auth_path.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/captures/options")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let available = body_json(available_options).await;
+        assert!(
+            available["title_providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|provider| provider["kind"] == "openai_compatible")
+        );
+        assert_eq!(available["ublock_ext_available"], true);
+        assert_eq!(available["cookie_ext_available"], false);
+        assert!(!available.to_string().contains("test-secret"));
+        let stub = std::thread::spawn(move || {
+            let mut prompts = Vec::new();
+            for index in 0..4 {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(error) => panic!("stub accept failed: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 4096];
+                let payload = loop {
+                    let read = stream.read(&mut chunk).unwrap();
+                    assert!(read > 0);
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if let Some(head_end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..head_end]);
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        if bytes.len() >= head_end + 4 + length {
+                            break serde_json::from_slice::<serde_json::Value>(
+                                &bytes[head_end + 4..head_end + 4 + length],
+                            )
+                            .unwrap();
+                        }
+                    }
+                };
+                prompts.push(payload);
+                let (status, reply) = if index == 2 {
+                    ("502 Bad Gateway", "upstream failed".to_string())
+                } else {
+                    ("200 OK", serde_json::json!({"choices":[{"message":{"content": if index == 3 { "" } else { "```\nTitle: **Thread about Rust async runtimes**\n```" }}}]}).to_string())
+                };
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            }
+            prompts
+        });
+        let archive_snapshot = || {
+            let conn = database::open_or_initialize(&archive_path).unwrap();
+            let mut snapshot = Vec::new();
+            for table in [
+                "archived_entries",
+                "archive_runs",
+                "entry_artifacts",
+                "entry_summaries",
+                "capture_jobs",
+            ] {
+                snapshot.push(
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                );
+            }
+            let title = conn
+                .query_row(
+                    "SELECT title FROM archived_entries WHERE entry_uid = ?1",
+                    [&entry.entry_uid],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .unwrap();
+            (snapshot, title)
+        };
+        let before = archive_snapshot();
+        for index in 0..4 {
+            let request = if index == 0 {
+                Request::builder().method("POST").uri("/api/archives/test/captures/text/title").header("content-type", "application/json").header("authorization", "Bearer text-title-token").body(json_body(&serde_json::json!({"body":"Rust runtime note", "provider":"openai_compatible"}))).unwrap()
+            } else {
+                // Exercise the full decoded limit and worst-case JSON expansion.
+                let body = if index == 1 {
+                    "\0".repeat(MAX_TEXT_CAPTURE_BODY_BYTES)
+                } else {
+                    "Note".into()
+                };
+                capture_text_title_request("test", &body, "openai_compatible", Some(&cookie))
+            };
+            let response = app(registry.clone(), auth_path.clone())
+                .oneshot(request)
+                .await
+                .unwrap();
+            let status = response.status();
+            let value = body_json(response).await;
+            if index < 2 {
+                assert_eq!(status, StatusCode::OK, "{value}");
+                assert_eq!(value, serde_json::json!({"title":"Rust async runtimes"}));
+            } else {
+                assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+            }
+        }
+        let prompts = stub.join().unwrap();
+        assert!(
+            prompts
+                .iter()
+                .all(|body| body["model"] == "instance-text-title")
+        );
+        assert_eq!(
+            prompts[1]["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .matches('\0')
+                .count(),
+            30_000
+        );
+        assert_eq!(archive_snapshot(), before);
+    }
 
     fn make_test_app() -> (Router, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -7117,6 +7794,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn thread_title_generates_and_persists() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let (registry, archive_path, auth_path) = make_test_registry(&dir);
