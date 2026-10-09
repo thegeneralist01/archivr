@@ -4280,8 +4280,12 @@ mod tests {
                         Err(error) => panic!("stub accept failed: {error}"),
                     }
                 };
+                // BSD/macOS accepted sockets inherit the listener's non-blocking mode.
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .set_nonblocking(false)
+                    .expect("stub stream must be blocking for synchronous reads");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
                     .unwrap();
                 let mut bytes = Vec::new();
                 let mut chunk = [0; 4096];
