@@ -578,7 +578,7 @@ Deno and exits 0 (the UI shows the Deno outcome as `skipped: …`).
 
 Access rules enforced by the server:
 
-- **Local files over the API.** A `file://` capture locator is accepted only for a file staged by an upload (under the archive's `temp/uploads/`); any other `file://` path returns 400. The CLI still reads local paths directly.
+- **Local files over the API.** A `file://` capture locator is accepted only for a file staged by an upload (under the archive's `temp/uploads/`); any other `file://` path returns 400, and so does a bare path locator (absolute, or relative to the server's working directory). The CLI still reads local paths directly.
 - **Read-only tokens.** A Bearer token with `scope: read` gets 403 (`read-only token`) on any method other than GET, HEAD or OPTIONS. Cookie sessions are not affected. Bearer use updates `last_used_at`, at most once per 60 seconds.
 - **Archive paths.** `GET /api/archives` returns each archive's `archive_path` to admins only. `GET /api/archives/:id/info` returns counts and sizes, never filesystem paths.
 - **Account guards.** Only an owner may manage an owner or admin account. Nobody can disable or delete their own account, and the last active owner cannot be removed or demoted (409).
