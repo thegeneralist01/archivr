@@ -422,6 +422,12 @@ pending or failed; rows with no completed summary contribute no summary-derived 
 
 **Capture job visibility.** `capture_jobs.created_by` stores the creator's `user_uid`. Job endpoints show a caller only jobs they created unless they hold ADMIN; rows with no creator are admin-only. `GET /api/archives/:id/runs` follows access: admins see all runs, other callers see runs whose job they created or that produced at least one entry they can see.
 
+**Entry visibility.** An entry is visible to a logged-in caller when ADMIN/OWNER, or when the caller's role bits overlap `collection_entries.visibility_bits` of one of its collections (or of its parent entry's). List and search use `database::entry_visible_to_caller_sql`; every by-uid endpoint (detail, artifacts, summary, tags, collections, media token, favicon, patch/delete, rearchive, thread title) calls `routes::ensure_entry_visible`, which answers `404` for a hidden entry so it cannot be told apart from a missing one. `/blobs/:sha256` applies the same rule through the entries that use the blob, and `list_tag_tree` counts only visible entries (tag names themselves stay visible to every signed-in user). Guests keep the separate `is_entry_publicly_accessible` rule. Signed-in role bits always include the guest bit, so custom roles start at bit 16. A non-admin cannot change or remove a collection membership in a way that leaves the entry invisible to their own roles (`apply_without_self_lockout`, `400`). Media tokens are capability URLs valid for two hours and are not revoked when an entry is hidden afterwards.
+
+**Capture job to run link.** `CaptureConfig.job_uid` is set by the server for API captures; the run is written onto `capture_jobs.run_uid` the moment it is created (`database::link_capture_job_run`), so the creator can see an in-progress run. Rearchive passes `None`.
+
+**Default collection.** `_default_` cannot be deleted (`400`), nor can entries be added to or removed from it by hand.
+
 **File locators.** `POST /api/archives/:id/captures` accepts `file://` only for a file staged under `temp/uploads/`, so an API caller cannot capture and read back arbitrary server files. The CLI reads local paths directly and is unaffected.
 
 **Inert settings.** `public_index_enabled`, `public_entry_content_enabled` and `open_registration_enabled` are stored and returned by the instance-settings endpoints, but no server logic reads them yet.

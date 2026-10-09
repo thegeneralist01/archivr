@@ -273,3 +273,15 @@ A `read` token cannot create tokens, change passwords, or capture (all non-GET).
 ## 4. Test requirements (all streams)
 
 Follow the `oneshot` style in `routes.rs` `mod tests`, helpers from `test_support.rs`. For every new endpoint: guest 401, USER 403, ADMIN 200/201/204. For user-targeting endpoints additionally: ADMIN-vs-OWNER 403, ADMIN-vs-ADMIN 403, self 409, last-owner 409 where applicable. Regressions: user delete after assigning roles (FK `assigned_by_user_id`), `session_uid` never in any response body, secret canary env value absent from effective-config, back-dated `expires_at` -> 401, read-scope token 403 on POST, job and run scoping between two users, `file:///etc/hosts` capture -> 400, disabled/deleted user's tokens and sessions stop working.
+
+## 5. Entry access rules (added after review of the first implementation)
+
+The first implementation hid entries only in lists and search; fetching by uid still worked. These rules close that gap.
+
+1. **Hidden means 404.** For a logged-in caller who is neither ADMIN nor OWNER, every endpoint that takes an entry uid answers `404 entry not found` when none of the entry's collection memberships (or its parent entry's) has `visibility_bits & caller_bits != 0`. This covers entry detail, artifacts, summary (GET and POST), tags (GET, POST, DELETE), entry collections, media token, favicon, PATCH and DELETE entry, thread title, rearchive, and collection add, remove and visibility. `GET /api/archives/:id/blobs/:sha256` allows a blob when at least one entry that uses it is visible. Guests keep `is_entry_publicly_accessible`. Rearchive of an unknown entry is `404` for everyone.
+2. **Tag counts.** `GET .../tags` counts only entries the caller can see. Tag names remain visible to every signed-in user.
+3. **No self-lockout.** A non-admin whose `PATCH .../collections/:c/entries/:uid` or `DELETE` would leave the entry invisible to the caller's own roles gets `400` and nothing changes. Admins and owners are exempt.
+4. **Run link at job start.** `CaptureConfig.job_uid` carries the job into the capture; `capture_jobs.run_uid` is written as soon as the run exists, so `GET .../runs` shows the creator an in-progress run (rule J3). Rearchive passes no job uid.
+5. **Default collection.** `DELETE .../collections/<default>` answers `400`.
+6. **Known limit.** A media token issued before an entry was hidden stays valid until it expires (two hours).
+

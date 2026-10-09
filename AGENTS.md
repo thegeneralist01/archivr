@@ -148,6 +148,7 @@ No CI is configured; no rustfmt.toml/clippy.toml — default `cargo fmt`/`clippy
 - `crates/archivr-server/src/token_scope.rs` — middleware that enforces read-scope tokens (GET/HEAD/OPTIONS only).
 - `crates/archivr-server/src/jobs.rs` — capture job list and detail (`created_by` filter, `items_truncated` at 200 items), with the `created_by` visibility rule.
 - `crates/archivr-server/src/effective_config.rs` — `GET /api/admin/effective-config`, the `ENV_VARS` registry and its drift test, and `GET /api/archives/:id/info`.
+- `crates/archivr-server/src/entry_access.rs` — router tests for entry visibility. Every handler that takes an entry uid (or a blob sha) must call `routes::ensure_entry_visible` (or `database::caller_can_access_blob`) so a hidden entry answers 404 like a missing one.
 - `crates/archivr-server/src/test_support.rs` — shared test helpers (router, auth DB and user/session setup) for the `oneshot` tests.
 - `crates/archivr-core/src/capture.rs` — `perform_capture()`, `Source` enum, shorthand parsing; tweet titles prefer an X Article's `article.title` (`<title> — @handle`).
 - `crates/archivr-core/src/downloader/ytdlp.rs` — every yt-dlp shell-out (playlist/channel probe and download, sync mode, subtitle planning/args/staging, the combined media+subtitle call with its media-only retry, and the subtitles-only `download_subtitles`) **plus** the binary resolver: `resolve_yt_dlp()`, `state_dir()`, `probe_version()`.
