@@ -1224,10 +1224,10 @@ fn fail_run(
 /// Records `run_uid` on the capture job (if any) the moment the run exists. Best effort: a
 /// failure must never fail the capture itself, it only delays the link until the job ends.
 fn link_job_to_run(conn: &rusqlite::Connection, job_uid: Option<&str>, run_uid: &str) {
-    if let Some(job_uid) = job_uid {
-        if let Err(e) = database::link_capture_job_run(conn, job_uid, run_uid) {
-            eprintln!("warn: could not link capture job {job_uid} to run {run_uid}: {e:#}");
-        }
+    if let Some(job_uid) = job_uid
+        && let Err(e) = database::link_capture_job_run(conn, job_uid, run_uid)
+    {
+        eprintln!("warn: could not link capture job {job_uid} to run {run_uid}: {e:#}");
     }
 }
 

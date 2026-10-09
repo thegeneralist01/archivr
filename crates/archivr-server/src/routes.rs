@@ -3294,12 +3294,11 @@ pub(crate) fn ensure_entry_visible(
     auth: &AuthUser,
     entry_uid: &str,
 ) -> Result<(), ApiError> {
-    if let AuthUser::Authenticated { role_bits, .. } = auth {
-        if role_bits & (ROLE_ADMIN | ROLE_OWNER) == 0
-            && !database::caller_can_access_entry(conn, entry_uid, *role_bits)?
-        {
-            return Err(ApiError::not_found("entry not found"));
-        }
+    if let AuthUser::Authenticated { role_bits, .. } = auth
+        && role_bits & (ROLE_ADMIN | ROLE_OWNER) == 0
+        && !database::caller_can_access_entry(conn, entry_uid, *role_bits)?
+    {
+        return Err(ApiError::not_found("entry not found"));
     }
     Ok(())
 }
@@ -7863,7 +7862,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("PATCH")
-                    .uri(&format!("/api/archives/test/entries/{}", entry.entry_uid))
+                    .uri(format!("/api/archives/test/entries/{}", entry.entry_uid))
                     .header("content-type", "application/json")
                     .header("cookie", &session_cookie)
                     .body(Body::from(r#"{"title":"Renamed Title"}"#))
@@ -7877,7 +7876,7 @@ mod tests {
         let get_resp = app(registry, auth_path)
             .oneshot(
                 Request::builder()
-                    .uri(&format!("/api/archives/test/entries/{}", entry.entry_uid))
+                    .uri(format!("/api/archives/test/entries/{}", entry.entry_uid))
                     .header("cookie", &session_cookie)
                     .body(Body::empty())
                     .unwrap(),

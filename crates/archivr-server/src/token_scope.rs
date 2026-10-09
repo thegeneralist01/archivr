@@ -31,22 +31,20 @@ pub async fn enforce_read_scope(
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    if let Some(raw_token) = raw_token {
-        if let Ok(conn) = database::open_auth_db(&state.auth_db_path) {
-            let jar = CookieJar::from_headers(req.headers());
-            let cookie_session_valid = jar
-                .get("session")
-                .map(|c| matches!(database::get_session(&conn, c.value()), Ok(Some(_))))
-                .unwrap_or(false);
-            if !cookie_session_valid {
-                if let Ok(Some(scope)) =
-                    auth_credentials::token_scope_for_hash(&conn, &hash_token(raw_token))
-                {
-                    if scope == "read" {
-                        return ApiError::forbidden("read-only token").into_response();
-                    }
-                }
-            }
+    if let Some(raw_token) = raw_token
+        && let Ok(conn) = database::open_auth_db(&state.auth_db_path)
+    {
+        let jar = CookieJar::from_headers(req.headers());
+        let cookie_session_valid = jar
+            .get("session")
+            .map(|c| matches!(database::get_session(&conn, c.value()), Ok(Some(_))))
+            .unwrap_or(false);
+        if !cookie_session_valid
+            && let Ok(Some(scope)) =
+                auth_credentials::token_scope_for_hash(&conn, &hash_token(raw_token))
+            && scope == "read"
+        {
+            return ApiError::forbidden("read-only token").into_response();
         }
     }
     next.run(req).await

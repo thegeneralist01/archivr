@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 
 use archivr_core::database;
 use axum::body::Body;
+use axum::{Router, http::{Request, StatusCode}};
+use serde_json::{Value, json};
+use tower::ServiceExt;
 
 use crate::auth;
 use crate::registry::{MountedArchive, ServerRegistry};
@@ -157,107 +160,8 @@ pub(crate) fn json_body(payload: &serde_json::Value) -> Body {
     Body::from(serde_json::to_vec(payload).unwrap())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::routes::app;
-    use axum::http::{Request, StatusCode};
-    use tower::ServiceExt;
-
-    #[tokio::test]
-    async fn session_helpers_and_bearer_token_authenticate() {
-        let dir = tempfile::tempdir().unwrap();
-        let (registry, _, auth_path) = make_test_registry(&dir);
-        let owner = owner_session(&auth_path);
-        let admin = admin_session(&auth_path);
-        let user = user_session(&auth_path);
-        let guest = guest_session(&auth_path);
-        let token = make_api_token(&auth_path, "test-user", None, "full");
-
-        let me = |cookie: Option<String>, bearer: Option<String>| {
-            let registry = registry.clone();
-            let auth_path = auth_path.clone();
-            async move {
-                let mut b = Request::builder().uri("/api/auth/me");
-                if let Some(c) = cookie {
-                    b = b.header("cookie", c);
-                }
-                if let Some(t) = bearer {
-                    b = b.header("authorization", format!("Bearer {t}"));
-                }
-                let resp = app(registry, auth_path)
-                    .oneshot(b.body(Body::empty()).unwrap())
-                    .await
-                    .unwrap();
-                let status = resp.status();
-                (status, body_json(resp).await)
-            }
-        };
-        for (cookie, role_bit) in [(owner, 8u64), (admin, 4), (user, 2), (guest, 1)] {
-            let (status, body) = me(Some(cookie), None).await;
-            assert_eq!(status, StatusCode::OK);
-            assert!(body["role_bits"].as_u64().unwrap() & role_bit != 0, "{body}");
-        }
-        let (status, body) = me(None, Some(token)).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["username"], "test-user");
-
-        // Back-dated token expiry is rejected as unauthenticated.
-        let past = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
-        let expired = make_api_token(&auth_path, "test-user", Some(&past), "full");
-        let (status, _) = me(None, Some(expired)).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-    }
-
-    // Axum 0.7.9 `Router::merge` semantics, pinned for the stream modules.
-    async fn status_of(router: axum::Router, method: &str, uri: &str) -> StatusCode {
-        router
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri(uri)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-            .status()
-    }
-
-    #[tokio::test]
-    async fn merge_adds_new_methods_to_an_existing_path() {
-        use axum::routing::{delete, get, post};
-        let base = axum::Router::new().route("/api/auth/tokens", get(|| async { "list" }).post(|| async { "create" }));
-        // A merged router adding DELETE (a new method) on the same path: fine.
-        let extra = axum::Router::new().route("/api/auth/tokens", delete(|| async { "revoke-all" }));
-        let merged = base.merge(extra);
-        assert_eq!(status_of(merged.clone(), "GET", "/api/auth/tokens").await, StatusCode::OK);
-        assert_eq!(status_of(merged.clone(), "POST", "/api/auth/tokens").await, StatusCode::OK);
-        assert_eq!(status_of(merged.clone(), "DELETE", "/api/auth/tokens").await, StatusCode::OK);
-        assert_eq!(status_of(merged, "PUT", "/api/auth/tokens").await, StatusCode::METHOD_NOT_ALLOWED);
-        // Same for routes registered by two merged routers on one new path.
-        let a = axum::Router::new().route("/x", get(|| async { "a" }));
-        let b = axum::Router::new().route("/x", post(|| async { "b" }));
-        let merged = a.merge(b);
-        assert_eq!(status_of(merged.clone(), "GET", "/x").await, StatusCode::OK);
-        assert_eq!(status_of(merged, "POST", "/x").await, StatusCode::OK);
-    }
-
-    #[test]
-    #[should_panic(expected = "Overlapping method route")]
-    fn merge_panics_when_the_same_method_is_registered_twice() {
-        use axum::routing::get;
-        let base = axum::Router::<()>::new().route("/api/auth/tokens", get(|| async { "list" }));
-        let extra = axum::Router::new().route("/api/auth/tokens", get(|| async { "dup" }));
-        let _ = base.merge(extra);
-    }
-}
 
 // ---- HTTP fixture shared by router-level tests ----
-
-use axum::{Router, http::{Request, StatusCode}};
-use serde_json::{Value, json};
-use tower::ServiceExt;
 
 pub(crate) struct Fixture {
     pub(crate) _dir: tempfile::TempDir,
@@ -392,4 +296,100 @@ pub(crate) async fn send_json(
 ) -> (StatusCode, Value) {
     let (status, bytes) = send(router, method, uri, cookie, payload).await;
     (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routes::app;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn session_helpers_and_bearer_token_authenticate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let owner = owner_session(&auth_path);
+        let admin = admin_session(&auth_path);
+        let user = user_session(&auth_path);
+        let guest = guest_session(&auth_path);
+        let token = make_api_token(&auth_path, "test-user", None, "full");
+
+        let me = |cookie: Option<String>, bearer: Option<String>| {
+            let registry = registry.clone();
+            let auth_path = auth_path.clone();
+            async move {
+                let mut b = Request::builder().uri("/api/auth/me");
+                if let Some(c) = cookie {
+                    b = b.header("cookie", c);
+                }
+                if let Some(t) = bearer {
+                    b = b.header("authorization", format!("Bearer {t}"));
+                }
+                let resp = app(registry, auth_path)
+                    .oneshot(b.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                (status, body_json(resp).await)
+            }
+        };
+        for (cookie, role_bit) in [(owner, 8u64), (admin, 4), (user, 2), (guest, 1)] {
+            let (status, body) = me(Some(cookie), None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body["role_bits"].as_u64().unwrap() & role_bit != 0, "{body}");
+        }
+        let (status, body) = me(None, Some(token)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["username"], "test-user");
+
+        // Back-dated token expiry is rejected as unauthenticated.
+        let past = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let expired = make_api_token(&auth_path, "test-user", Some(&past), "full");
+        let (status, _) = me(None, Some(expired)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // Axum 0.7.9 `Router::merge` semantics, pinned for the stream modules.
+    async fn status_of(router: axum::Router, method: &str, uri: &str) -> StatusCode {
+        router
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn merge_adds_new_methods_to_an_existing_path() {
+        use axum::routing::{delete, get, post};
+        let base = axum::Router::new().route("/api/auth/tokens", get(|| async { "list" }).post(|| async { "create" }));
+        // A merged router adding DELETE (a new method) on the same path: fine.
+        let extra = axum::Router::new().route("/api/auth/tokens", delete(|| async { "revoke-all" }));
+        let merged = base.merge(extra);
+        assert_eq!(status_of(merged.clone(), "GET", "/api/auth/tokens").await, StatusCode::OK);
+        assert_eq!(status_of(merged.clone(), "POST", "/api/auth/tokens").await, StatusCode::OK);
+        assert_eq!(status_of(merged.clone(), "DELETE", "/api/auth/tokens").await, StatusCode::OK);
+        assert_eq!(status_of(merged, "PUT", "/api/auth/tokens").await, StatusCode::METHOD_NOT_ALLOWED);
+        // Same for routes registered by two merged routers on one new path.
+        let a = axum::Router::new().route("/x", get(|| async { "a" }));
+        let b = axum::Router::new().route("/x", post(|| async { "b" }));
+        let merged = a.merge(b);
+        assert_eq!(status_of(merged.clone(), "GET", "/x").await, StatusCode::OK);
+        assert_eq!(status_of(merged, "POST", "/x").await, StatusCode::OK);
+    }
+
+    #[test]
+    #[should_panic(expected = "Overlapping method route")]
+    fn merge_panics_when_the_same_method_is_registered_twice() {
+        use axum::routing::get;
+        let base = axum::Router::<()>::new().route("/api/auth/tokens", get(|| async { "list" }));
+        let extra = axum::Router::new().route("/api/auth/tokens", get(|| async { "dup" }));
+        let _ = base.merge(extra);
+    }
 }

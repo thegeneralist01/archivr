@@ -67,12 +67,12 @@ async fn list_capture_jobs_handler(
     Query(q): Query<JobListQuery>,
 ) -> Result<Json<Vec<archive::CaptureJobSummary>>, ApiError> {
     auth.require_role(ROLE_USER)?;
-    if let Some(status) = q.status.as_deref() {
-        if !capture_jobs::JOB_STATUSES.contains(&status) {
-            return Err(ApiError::bad_request(
-                "invalid status: must be pending, running, completed, or failed",
-            ));
-        }
+    if let Some(status) = q.status.as_deref()
+        && !capture_jobs::JOB_STATUSES.contains(&status)
+    {
+        return Err(ApiError::bad_request(
+            "invalid status: must be pending, running, completed, or failed",
+        ));
     }
     let limit = parse_int_param("limit", q.limit.as_deref())?
         .unwrap_or(capture_jobs::JOB_LIST_DEFAULT_LIMIT);
