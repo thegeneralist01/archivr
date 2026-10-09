@@ -2,7 +2,7 @@
 //!
 //! Callers still do their own coarse role check (`require_role(ROLE_ADMIN)`);
 //! these guards add the target-aware rules on top.
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
 use crate::auth::{ROLE_ADMIN, ROLE_OWNER};
 use crate::routes::ApiError;
@@ -45,6 +45,19 @@ pub fn ensure_not_last_owner(conn: &Connection, target_id: i64) -> Result<(), Ap
         return Err(ApiError::conflict("cannot remove the last active owner"));
     }
     Ok(())
+}
+
+/// Runs `op` inside a `BEGIN IMMEDIATE` transaction. The last-owner check and the
+/// write it guards must share this lock: with a deferred transaction, two concurrent
+/// deletes of two different owners can both pass the check before either writes.
+pub fn with_write_lock<T>(
+    conn: &mut Connection,
+    op: impl FnOnce(&Connection) -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let out = op(&tx)?;
+    tx.commit()?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -122,5 +135,60 @@ mod tests {
         );
         // A disabled owner is not an active owner: touching it is fine.
         assert!(ensure_not_last_owner(&conn, second).is_ok());
+    }
+
+    #[test]
+    fn concurrent_last_owner_deletes_leave_one_active_owner() {
+        use archivr_core::auth_users;
+        // Each round races two deletes of two different owners on separate
+        // connections. The check and the delete share one BEGIN IMMEDIATE lock,
+        // so exactly one may succeed.
+        for _ in 0..30 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("auth.db");
+            let setup = database::open_auth_db(&path).unwrap();
+            let first = database::create_owner(&setup, "first", "pw").unwrap();
+            let second = add_owner(&setup, "second", first);
+            drop(setup);
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let handles: Vec<_> = [first, second]
+                .into_iter()
+                .map(|target| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        let mut conn = database::open_auth_db(&path).unwrap();
+                        barrier.wait();
+                        with_write_lock(&mut conn, |tx| {
+                            ensure_not_last_owner(tx, target)?;
+                            Ok(auth_users::delete_user_in(tx, target)?)
+                        })
+                    })
+                })
+                .collect();
+            let results: Vec<Result<bool, ApiError>> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+            let oks = results.iter().filter(|r| matches!(r, Ok(true))).count();
+            let conflicts = results
+                .iter()
+                .filter(|r| matches!(r, Err(e) if e.status == StatusCode::CONFLICT))
+                .count();
+            assert_eq!((oks, conflicts), (1, 1), "unexpected outcomes");
+
+            let check = database::open_auth_db(&path).unwrap();
+            let active: i64 = check
+                .query_row(
+                    "SELECT COUNT(*) FROM user_roles ur
+                     JOIN roles r ON r.id = ur.role_id
+                     JOIN users u ON u.id = ur.user_id
+                     WHERE r.slug = 'owner' AND u.status = 'active'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(active, 1);
+        }
     }
 }

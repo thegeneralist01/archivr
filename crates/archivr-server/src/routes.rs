@@ -3183,17 +3183,20 @@ async fn admin_set_user_status(
             "status must be 'active' or 'disabled'",
         ));
     }
-    let conn = database::open_auth_db(&state.auth_db_path)?;
+    let mut conn = database::open_auth_db(&state.auth_db_path)?;
     let target_id = database::get_user_id_by_uid(&conn, &uid)?
         .ok_or_else(|| ApiError::not_found("user not found"))?;
     if body.status == "disabled" {
         crate::guards::ensure_not_self(caller_id, target_id)?;
     }
     crate::guards::ensure_can_manage(caller_bits, database::compute_role_bits(&conn, target_id)?)?;
-    if body.status == "disabled" {
-        crate::guards::ensure_not_last_owner(&conn, target_id)?;
-    }
-    if !database::set_user_status(&conn, &uid, &body.status)? {
+    let updated = crate::guards::with_write_lock(&mut conn, |tx| {
+        if body.status == "disabled" {
+            crate::guards::ensure_not_last_owner(tx, target_id)?;
+        }
+        Ok(database::set_user_status(tx, &uid, &body.status)?)
+    })?;
+    if !updated {
         return Err(ApiError::not_found("user not found"));
     }
     Ok(Json(
@@ -3231,7 +3234,7 @@ async fn admin_remove_role(
 ) -> Result<StatusCode, ApiError> {
     auth_user.require_role(ROLE_ADMIN)?;
     let (_, caller_bits) = auth_user.require_auth()?;
-    let conn = database::open_auth_db(&state.auth_db_path)?;
+    let mut conn = database::open_auth_db(&state.auth_db_path)?;
     let target_id = database::get_user_id_by_uid(&conn, &uid)?
         .ok_or_else(|| ApiError::not_found("user not found"))?;
     crate::guards::ensure_can_manage(caller_bits, database::compute_role_bits(&conn, target_id)?)?;
@@ -3242,15 +3245,22 @@ async fn admin_remove_role(
             "only an owner can remove the owner or admin role",
         ));
     }
-    // Removing a role the user does not hold is a no-op.
-    if archivr_core::auth_users::user_has_role(&conn, target_id, &role_slug)? {
-        if role_slug == "owner" {
-            crate::guards::ensure_not_last_owner(&conn, target_id)?;
+    if role_slug == "owner" {
+        // The has-role check, last-owner checks and the removal share one write lock.
+        // Removing a role the user does not hold is a no-op.
+        crate::guards::with_write_lock(&mut conn, |tx| {
+            if !archivr_core::auth_users::user_has_role(tx, target_id, "owner")? {
+                return Ok(());
+            }
+            crate::guards::ensure_not_last_owner(tx, target_id)?;
             // `remove_role` also refuses to drop the sole owner row (even a disabled one).
-            if archivr_core::auth_users::count_role_holders(&conn, "owner")? <= 1 {
+            if archivr_core::auth_users::count_role_holders(tx, "owner")? <= 1 {
                 return Err(ApiError::conflict("cannot remove the last owner"));
             }
-        }
+            Ok(database::remove_role(tx, target_id, "owner")?)
+        })?;
+    } else if archivr_core::auth_users::user_has_role(&conn, target_id, &role_slug)? {
+        // Removing a role the user does not hold is a no-op.
         database::remove_role(&conn, target_id, &role_slug)?;
     }
     Ok(StatusCode::NO_CONTENT)

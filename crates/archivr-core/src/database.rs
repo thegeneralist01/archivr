@@ -828,6 +828,9 @@ pub fn open_auth_db(auth_db_path: &Path) -> Result<Connection> {
     }
     let conn = Connection::open(auth_db_path)
         .with_context(|| format!("failed to open auth database at {}", auth_db_path.display()))?;
+    // Owner-guarded writes take BEGIN IMMEDIATE; wait for a concurrent writer
+    // instead of failing with SQLITE_BUSY.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     initialize_auth_schema(&conn)?;
     Ok(conn)
 }

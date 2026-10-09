@@ -34,8 +34,11 @@ async fn admin_delete_user(
         .ok_or_else(|| ApiError::not_found("user not found"))?;
     guards::ensure_not_self(caller_id, target_id)?;
     guards::ensure_can_manage(caller_bits, database::compute_role_bits(&conn, target_id)?)?;
-    guards::ensure_not_last_owner(&conn, target_id)?;
-    if !auth_users::delete_user(&mut conn, target_id)? {
+    let deleted = guards::with_write_lock(&mut conn, |tx| {
+        guards::ensure_not_last_owner(tx, target_id)?;
+        Ok(auth_users::delete_user_in(tx, target_id)?)
+    })?;
+    if !deleted {
         return Err(ApiError::not_found("user not found"));
     }
     Ok(StatusCode::NO_CONTENT)

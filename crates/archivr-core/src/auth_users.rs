@@ -19,12 +19,19 @@ pub struct RoleDeletion {
 /// `user_roles` rows cascade. Returns false when the user does not exist.
 pub fn delete_user(conn: &mut Connection, user_id: i64) -> Result<bool> {
     let tx = conn.transaction()?;
-    tx.execute(
+    let deleted = delete_user_in(&tx, user_id)?;
+    tx.commit()?;
+    Ok(deleted)
+}
+
+/// [`delete_user`] without its own transaction, for callers that already hold one
+/// (e.g. a last-owner check that must run under the same write lock).
+pub fn delete_user_in(conn: &Connection, user_id: i64) -> Result<bool> {
+    conn.execute(
         "UPDATE user_roles SET assigned_by_user_id = NULL WHERE assigned_by_user_id = ?1",
         [user_id],
     )?;
-    let deleted = tx.execute("DELETE FROM users WHERE id = ?1", [user_id])?;
-    tx.commit()?;
+    let deleted = conn.execute("DELETE FROM users WHERE id = ?1", [user_id])?;
     Ok(deleted > 0)
 }
 
