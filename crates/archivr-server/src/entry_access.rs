@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::test_support::{
     Fixture, admin_session, fixture, guest_session, make_role_session, owner_session, send, send_json,
-    text_capture, wait_job,
+    text_capture, user_uid, wait_job,
 };
 
 const EDITORS_BIT: u32 = 16;
@@ -288,6 +288,112 @@ async fn media_tokens_are_only_issued_for_visible_entries() {
     let plain = entry_path(&w.hidden, "/artifacts/0");
     let (status, _) = send(&w.f.router, "GET", &plain, Some(&w.alice), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+fn set_visibility_bits(f: &Fixture, entry_uid: &str, bits: u32) {
+    let conn = database::open_or_initialize(&f.archive_path).unwrap();
+    conn.execute(
+        "UPDATE collection_entries SET visibility_bits = ?1 \
+         WHERE entry_id = (SELECT id FROM archived_entries WHERE entry_uid = ?2)",
+        rusqlite::params![bits as i64, entry_uid],
+    )
+    .unwrap();
+}
+
+fn visibility_bits(f: &Fixture, entry_uid: &str) -> u32 {
+    let conn = database::open_or_initialize(&f.archive_path).unwrap();
+    let bits: i64 = conn
+        .query_row(
+            "SELECT visibility_bits FROM collection_entries \
+             WHERE entry_id = (SELECT id FROM archived_entries WHERE entry_uid = ?1)",
+            [entry_uid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    bits as u32
+}
+
+async fn issue_media_token(w: &World, cookie: &str, entry_uid: &str) -> String {
+    let uri = entry_path(entry_uid, "/artifacts/0/media-token");
+    let (status, issued) = send_json(&w.f.router, "POST", &uri, Some(cookie), None).await;
+    assert_eq!(status, StatusCode::OK);
+    issued["url"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn media_token_is_rechecked_on_every_use() {
+    let w = world().await;
+    let url = issue_media_token(&w, &w.alice, &w.open).await;
+
+    for _ in 0..2 {
+        let (status, body) = send(&w.f.router, "GET", &url, None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(String::from_utf8_lossy(&body), "body of Open note");
+    }
+
+    // The issuer loses access to the entry: the still-unexpired token stops working.
+    let original = visibility_bits(&w.f, &w.open);
+    set_visibility_bits(&w.f, &w.open, EDITORS_BIT);
+    let (status, _) = send(&w.f.router, "GET", &url, None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Access restored: the same token works again.
+    set_visibility_bits(&w.f, &w.open, original);
+    let (status, _) = send(&w.f.router, "GET", &url, None, None).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn media_token_stops_working_when_its_issuer_is_disabled() {
+    let w = world().await;
+    let url = issue_media_token(&w, &w.alice, &w.open).await;
+
+    let alice_uid = user_uid(&w.f.auth_path, "alice");
+    let (status, _) = send_json(
+        &w.f.router,
+        "PATCH",
+        &format!("/api/admin/users/{alice_uid}/status"),
+        Some(&w.admin),
+        Some(&json!({"status": "disabled"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send(&w.f.router, "GET", &url, None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn media_token_stops_working_when_its_issuer_is_deleted() {
+    let w = world().await;
+    let dave = make_role_session(&w.f.auth_path, "dave", &["user"]);
+    let url = issue_media_token(&w, &dave, &w.open).await;
+
+    let dave_uid = user_uid(&w.f.auth_path, "dave");
+    let (status, _) = send(
+        &w.f.router,
+        "DELETE",
+        &format!("/api/admin/users/{dave_uid}"),
+        Some(&w.admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _) = send(&w.f.router, "GET", &url, None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn an_admin_issued_media_token_for_a_hidden_entry_keeps_working() {
+    let w = world().await;
+    let url = issue_media_token(&w, &w.admin, &w.hidden).await;
+    // Alice cannot see the entry at all, but the admin issuer still can.
+    let (status, _) = send(&w.f.router, "GET", &entry_path(&w.hidden, ""), Some(&w.alice), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = send(&w.f.router, "GET", &url, None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(String::from_utf8_lossy(&body), "body of Hidden note");
 }
 
 #[tokio::test]

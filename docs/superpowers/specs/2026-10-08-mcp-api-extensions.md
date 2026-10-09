@@ -283,5 +283,5 @@ The first implementation hid entries only in lists and search; fetching by uid s
 3. **No self-lockout.** A non-admin whose `PATCH .../collections/:c/entries/:uid` or `DELETE` would leave the entry invisible to the caller's own roles gets `400` and nothing changes. Admins and owners are exempt.
 4. **Run link at job start.** `CaptureConfig.job_uid` carries the job into the capture; `capture_jobs.run_uid` is written as soon as the run exists, so `GET .../runs` shows the creator an in-progress run (rule J3). Rearchive passes no job uid.
 5. **Default collection.** `DELETE .../collections/<default>` answers `400`.
-6. **Known limit.** A media token issued before an entry was hidden stays valid until it expires (two hours).
+6. **Media tokens are re-checked.** A media token is re-checked on every use against the issuer's current status, roles and access to the entry, so hiding the entry or disabling/deleting the issuer stops it immediately. It still expires after two hours.
 

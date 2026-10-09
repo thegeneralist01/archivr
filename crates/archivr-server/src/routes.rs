@@ -66,6 +66,8 @@ pub(crate) struct MediaToken {
     archive_id: String,
     entry_uid: String,
     artifact_index: usize,
+    /// The account that issued the token. Its status and access are re-checked on every use.
+    user_id: i64,
     expires_at: std::time::Instant,
 }
 
@@ -924,34 +926,36 @@ async fn serve_artifact(
     req: Request,
 ) -> Result<Response, ApiError> {
     // Auth: valid scoped token OR authenticated session OR publicly accessible entry.
-    // A token present but invalid/expired falls back to session/public check so that
+    // A token present but invalid/expired/revoked falls back to session/public check so that
     // a logged-in browser player keeps working after a token expires.
-    let token_valid = params.token.as_deref().map_or(false, |tok| {
+    let token_issuer = params.token.as_deref().and_then(|tok| {
         let tokens = state.media_tokens.lock();
-        tokens.get(tok).map_or(false, |t| {
-            t.archive_id == archive_id
-                && t.entry_uid == entry_uid
-                && t.artifact_index == artifact_index
-                && t.expires_at > std::time::Instant::now()
-        })
+        tokens
+            .get(tok)
+            .filter(|t| {
+                t.archive_id == archive_id
+                    && t.entry_uid == entry_uid
+                    && t.artifact_index == artifact_index
+                    && t.expires_at > std::time::Instant::now()
+            })
+            .map(|t| t.user_id)
     });
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let paths = archive::read_archive_paths(&mounted.archive_path)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let token_valid = match token_issuer {
+        Some(issuer_id) => media_token_issuer_can_view(&state, &conn, issuer_id, &entry_uid)?,
+        None => false,
+    };
     if !token_valid {
         if matches!(auth_user, AuthUser::Guest) {
-            let mounted_check = mounted_archive(&state, &archive_id)?;
-            let conn_check = database::open_or_initialize(&mounted_check.archive_path)?;
-            if !database::is_entry_publicly_accessible(&conn_check, &entry_uid)? {
+            if !database::is_entry_publicly_accessible(&conn, &entry_uid)? {
                 return Err(ApiError::unauthorized("login required"));
             }
         } else {
             auth_user.require_auth()?;
+            ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
         }
-    }
-    let mounted = mounted_archive(&state, &archive_id)?;
-    let paths = archive::read_archive_paths(&mounted.archive_path)?;
-    let conn = database::open_or_initialize(&mounted.archive_path)?;
-    if !token_valid {
-        // A media token was only issued after this check passed (issue_media_token).
-        ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     }
     let detail = archive::get_entry_detail(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
@@ -971,13 +975,14 @@ async fn serve_artifact(
 ///
 /// Requires an authenticated session. Returns a short-lived signed URL that
 /// allows unauthenticated GET of the specified artifact — intended for Cast /
-/// AirPlay devices that cannot carry the browser's session cookie.
+/// AirPlay devices that cannot carry the browser's session cookie. The token is
+/// tied to the issuing account and re-checked on every use (see `serve_artifact`).
 async fn issue_media_token(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path((archive_id, entry_uid, artifact_index)): Path<(String, String, usize)>,
 ) -> Result<Json<MediaTokenResponse>, ApiError> {
-    auth_user.require_auth()?;
+    let (user_id, _) = auth_user.require_auth()?;
     // Verify the artifact actually exists before issuing a token.
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
@@ -999,6 +1004,7 @@ async fn issue_media_token(
                 archive_id: archive_id.clone(),
                 entry_uid: entry_uid.clone(),
                 artifact_index,
+                user_id,
                 expires_at: now + MEDIA_TOKEN_TTL,
             },
         );
@@ -3311,6 +3317,26 @@ pub(crate) fn ensure_entry_visible(
         return Err(ApiError::not_found("entry not found"));
     }
     Ok(())
+}
+
+/// Re-checks a media token against its issuer's current state: the account must still exist and
+/// be active, and its current roles must still see the entry. ADMIN/OWNER bypass the query, the
+/// same as `ensure_entry_visible`.
+fn media_token_issuer_can_view(
+    state: &AppState,
+    conn: &rusqlite::Connection,
+    issuer_id: i64,
+    entry_uid: &str,
+) -> Result<bool, ApiError> {
+    let auth_conn = database::open_auth_db(&state.auth_db_path)?;
+    if !database::user_is_active(&auth_conn, issuer_id)? {
+        return Ok(false);
+    }
+    let role_bits = database::compute_role_bits(&auth_conn, issuer_id)?;
+    if role_bits & (ROLE_ADMIN | ROLE_OWNER) != 0 {
+        return Ok(true);
+    }
+    Ok(database::caller_can_access_entry(conn, entry_uid, role_bits)?)
 }
 
 /// Runs `change` (a mutation of collection memberships or their visibility touching `entry_uids`)

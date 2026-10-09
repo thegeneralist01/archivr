@@ -902,6 +902,16 @@ pub fn compute_role_bits(conn: &Connection, user_id: i64) -> Result<u32> {
     Ok(bits)
 }
 
+/// True when the user row exists and its status is `active`. A disabled or deleted user is not.
+/// Used to re-check credentials that were issued earlier (media tokens) against current state.
+pub fn user_is_active(conn: &Connection, user_id: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM users WHERE id = ?1 AND status = 'active')",
+        [user_id],
+        |row| row.get(0),
+    )?)
+}
+
 /// Returns a new session_uid (UUID).
 pub fn create_session(
     conn: &Connection,
@@ -4394,6 +4404,21 @@ mod tests {
         assert_eq!(alice.user_uid, uid);
         assert_eq!(alice.status, "active");
         assert!(alice.role_slugs.contains(&"user".to_string()));
+    }
+
+    #[test]
+    fn user_is_active_reflects_status_and_existence() {
+        let conn = make_auth_conn_for_mgmt();
+        let owner_id = create_owner(&conn, "owner", "hash").unwrap();
+        let uid = create_user(&conn, "dave", None, "hash", owner_id).unwrap();
+        let dave_id = get_user_id_by_uid(&conn, &uid).unwrap().unwrap();
+        assert!(user_is_active(&conn, dave_id).unwrap());
+        set_user_status(&conn, &uid, "disabled").unwrap();
+        assert!(!user_is_active(&conn, dave_id).unwrap());
+        set_user_status(&conn, &uid, "active").unwrap();
+        assert!(user_is_active(&conn, dave_id).unwrap());
+        conn.execute("DELETE FROM users WHERE id = ?1", [dave_id]).unwrap();
+        assert!(!user_is_active(&conn, dave_id).unwrap(), "a deleted user is not active");
     }
 
     #[test]
