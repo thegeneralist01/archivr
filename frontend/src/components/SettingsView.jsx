@@ -3,12 +3,14 @@ import { AuthContext } from '../App.jsx'
 import {
   updateProfile, changePassword, patchMe,
   listTokens, createToken, deleteToken,
+  listSessions, revokeSession, revokeOtherSessions,
   getInstanceSettings, updateInstanceSettings,
   scanOrphanBlobs, deleteOrphanBlobs,
   listCookieRules, createCookieRule, updateCookieRule, deleteCookieRule,
   listRoles, fetchMe,
   getYtDlpStatus, updateYtDlp,
 } from '../api.js'
+import { describeExpiry, formatTimestamp } from '../utils.js'
 
 const ROLE_ADMIN = 4
 const ROLE_OWNER = 8
@@ -18,8 +20,8 @@ export default function SettingsView({ tab, onTabChange, archiveId }) {
   const isAdmin = currentUser && ((currentUser.role_bits & ROLE_ADMIN) !== 0)
   const isOwner = !!currentUser && (currentUser.role_bits & ROLE_OWNER) !== 0
 
-  const tabs = ['profile', 'tokens', ...(isAdmin ? ['instance', 'cookies', 'extensions', 'storage'] : [])]
-  const tabLabels = { profile: 'Profile', tokens: 'API Tokens', instance: 'Instance', cookies: 'Cookies', extensions: 'Extensions', storage: 'Storage' }
+  const tabs = ['profile', 'tokens', 'sessions', ...(isAdmin ? ['instance', 'cookies', 'extensions', 'storage'] : [])]
+  const tabLabels = { profile: 'Profile', tokens: 'API Tokens', sessions: 'Sessions', instance: 'Instance', cookies: 'Cookies', extensions: 'Extensions', storage: 'Storage' }
 
   return (
     <section className="admin-view">
@@ -36,6 +38,7 @@ export default function SettingsView({ tab, onTabChange, archiveId }) {
 
       {tab === 'profile' && <ProfileTab currentUser={currentUser} setCurrentUser={setCurrentUser} />}
       {tab === 'tokens' && <TokensTab />}
+      {tab === 'sessions' && <SessionsTab />}
       {tab === 'instance' && isAdmin && (
         <>
           <InstanceTab isOwner={isOwner} setCurrentUser={setCurrentUser} />
@@ -165,6 +168,8 @@ function TokensTab() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [newName, setNewName] = useState('')
+  const [newScope, setNewScope] = useState('full')
+  const [newExpiry, setNewExpiry] = useState('')
   const [creating, setCreating] = useState(false)
   const [newToken, setNewToken] = useState(null)
 
@@ -182,9 +187,14 @@ function TokensTab() {
     if (!newName.trim()) return
     setCreating(true)
     try {
-      const tok = await createToken(newName.trim())
+      const tok = await createToken(newName.trim(), {
+        expiresInDays: newExpiry ? Number(newExpiry) : null,
+        scope: newScope,
+      })
       setNewToken(tok)
       setNewName('')
+      setNewScope('full')
+      setNewExpiry('')
       refresh()
     } catch (err) {
       setError(err.message)
@@ -216,6 +226,18 @@ function TokensTab() {
         <form className="token-create-row" onSubmit={handleCreate}>
           <input className="field-input field-input--flex" placeholder="Token name"
             value={newName} onChange={e => setNewName(e.target.value)} required />
+          <select className="field-input" aria-label="Token scope"
+            value={newScope} onChange={e => setNewScope(e.target.value)}>
+            <option value="full">Full access</option>
+            <option value="read">Read-only</option>
+          </select>
+          <select className="field-input" aria-label="Token expiry"
+            value={newExpiry} onChange={e => setNewExpiry(e.target.value)}>
+            <option value="">Never</option>
+            <option value="30">30 days</option>
+            <option value="90">90 days</option>
+            <option value="365">1 year</option>
+          </select>
           <button className="btn-primary" type="submit" disabled={creating}>
             {creating ? 'Creating\u2026' : 'Create token'}
           </button>
@@ -226,19 +248,110 @@ function TokensTab() {
         ) : (
           <div>
             {tokens.length === 0 && <div className="muted">No tokens yet.</div>}
-            {tokens.map(tok => (
+            {tokens.map(tok => {
+              const expiry = describeExpiry(tok.expires_at)
+              return (
               <div key={tok.token_uid} className="token-row">
                 <div className="token-row-info">
-                  <strong>{tok.name}</strong>
+                  <div className="token-row-title">
+                    <strong>{tok.name}</strong>
+                    {tok.scope === 'read' && <span className="token-badge">read-only</span>}
+                  </div>
                   <div className="muted">
                     Created {tok.created_at.slice(0, 10)}
                     {tok.last_used_at && ` \u00b7 Last used ${tok.last_used_at.slice(0, 10)}`}
+                  </div>
+                  <div className={`token-expiry${expiry.expired ? ' token-expiry--expired' : ''}`}>
+                    {expiry.text}
                   </div>
                 </div>
                 <button className="btn-danger" style={{ fontSize: 12, padding: '4px 10px' }}
                   onClick={() => handleDelete(tok.token_uid)}>
                   Revoke
                 </button>
+              </div>
+              )
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function SessionsTab() {
+  const [sessions, setSessions] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+  const [busy, setBusy] = useState(false)
+
+  const refresh = useCallback(async () => {
+    setLoading(true); setError(null)
+    try { setSessions(await listSessions()) }
+    catch (e) { setError(e.message) }
+    finally { setLoading(false) }
+  }, [])
+
+  useEffect(() => { refresh() }, [refresh])
+
+  const others = sessions.filter(s => !s.current)
+
+  async function handleRevoke(session) {
+    if (!window.confirm('Sign out this device?')) return
+    try {
+      await revokeSession(session.session_handle)
+      setSessions(ss => ss.filter(s => s.session_handle !== session.session_handle))
+    } catch (e) {
+      setError(e.message)
+    }
+  }
+
+  async function handleRevokeOthers() {
+    if (!window.confirm('Sign out all other devices? Your current session stays signed in.')) return
+    setBusy(true); setError(null)
+    try {
+      await revokeOtherSessions()
+      setSessions(ss => ss.filter(s => s.current))
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div style={{ maxWidth: 600 }}>
+      <div className="form-section">
+        <h2>Sessions</h2>
+        <p className="muted">Devices currently signed in to your account.</p>
+        <button className="btn-danger" type="button" style={{ fontSize: 12, padding: '4px 10px' }}
+          disabled={busy || loading || others.length === 0}
+          onClick={handleRevokeOthers}>
+          Sign out other devices
+        </button>
+        {error && <div className="form-msg form-msg--err">{error}</div>}
+        {loading ? (
+          <div className="muted">Loading…</div>
+        ) : (
+          <div>
+            {sessions.length === 0 && <div className="muted">No active sessions.</div>}
+            {sessions.map(s => (
+              <div key={s.session_handle} className="session-row">
+                <div className="token-row-info">
+                  <div className="token-row-title">
+                    <strong>{s.user_agent || 'Unknown device'}</strong>
+                    {s.current && <span className="session-badge">This device</span>}
+                  </div>
+                  <div className="muted">Signed in {formatTimestamp(s.created_at)}</div>
+                  <div className="muted">Last seen {formatTimestamp(s.last_seen_at)}</div>
+                  <div className="muted">Expires {formatTimestamp(s.expires_at)}</div>
+                </div>
+                {!s.current && (
+                  <button className="btn-danger" style={{ fontSize: 12, padding: '4px 10px' }}
+                    onClick={() => handleRevoke(s)}>
+                    Revoke
+                  </button>
+                )}
               </div>
             ))}
           </div>

@@ -2262,6 +2262,36 @@ select {
 .token-row-info strong { font-size: 14px; display: block; }
 .token-row-info .muted { font-size: 12px; margin-top: 2px; }
 .token-create-row { display: flex; gap: 8px; margin-bottom: 16px; }
+.token-row-title { display: flex; align-items: center; gap: 8px; }
+.token-badge,
+.session-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: var(--r);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  background: var(--paper-2);
+}
+.session-badge { background: #d8eddf; color: #235c35; border-color: #b4d9be; }
+.token-expiry { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.token-expiry--expired { color: var(--accent); }
+.session-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border: 1px solid var(--line);
+  background: var(--paper-3);
+  padding: 10px 12px;
+  border-radius: var(--r);
+  margin-bottom: 6px;
+}
+.session-row .muted { font-size: 12px; margin-top: 2px; }
+.admin-action-btn--danger { color: var(--accent); border-color: var(--accent); }
+.admin-action-btn--danger:hover { background: #f5ddd8; }
 
 /* ── Instance settings checkboxes ───────────────────────────────────────── */
 .checkbox-row {

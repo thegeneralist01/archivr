@@ -1,7 +1,7 @@
 import { useState, useEffect, useContext, useCallback } from 'react'
 import { AuthContext } from '../App.jsx'
 import {
-  listAdminUsers, createAdminUser, setUserStatus, assignRole, removeRole,
+  listAdminUsers, createAdminUser, setUserStatus, deleteAdminUser, assignRole, removeRole,
   listRoles, createRole, fetchArchives
 } from '../api.js'
 
@@ -60,6 +60,16 @@ export default function AdminView({ archives }) {
     try {
       await setUserStatus(user.user_uid, next)
       setUsers(us => us.map(u => u.user_uid === user.user_uid ? { ...u, status: next } : u))
+    } catch (e) {
+      setError(e.message)
+    }
+  }
+
+  async function handleDeleteUser(user) {
+    if (!window.confirm(`Delete user ${user.username}? This removes their sessions and API tokens and cannot be undone.`)) return
+    try {
+      await deleteAdminUser(user.user_uid)
+      setUsers(us => us.filter(u => u.user_uid !== user.user_uid))
     } catch (e) {
       setError(e.message)
     }
@@ -148,6 +158,11 @@ export default function AdminView({ archives }) {
                       <button className="admin-action-btn" onClick={() => handleToggleStatus(u)}>
                         {u.status === 'active' ? 'Ban' : 'Unban'}
                       </button>
+                      {u.user_uid !== currentUser?.user_uid && (
+                        <button className="admin-action-btn admin-action-btn--danger" onClick={() => handleDeleteUser(u)}>
+                          Delete
+                        </button>
+                      )}
                     </td>
                   </tr>
                 ))}
