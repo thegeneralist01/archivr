@@ -1,6 +1,6 @@
 # Spec: Archivr API extensions for the MCP server
 
-- **Status:** Contract (R0 foundation landed; endpoints are implemented by streams R1-R4).
+- **Status:** Contract (implemented on `mcp-api-extensions`, archivr HEAD 10afef9). Where the code and this text differed, the text now describes the code (see the "as implemented" notes in 1.5, 1.6 and 2.10).
 - **Date:** 2026-10-08
 - **Audience:** the Archivr (Rust) streams R1-R4 and the MCP (TypeScript) streams M0-M5. The MCP server is built against this document with a mocked `fetch`; the Rust streams implement it. Anything not written here is not part of the contract.
 - **Read first:** `AGENTS.md`, `ARCHIVR-MENTAL-MODEL.md`.
@@ -143,7 +143,9 @@ Errors: 400, 401, 403, 404 (unknown archive).
             "source_kind": "string", "entity_kind": "string", "status": "pending|in_progress|completed|failed",
             "error_text": "string|null", "entry_uid": "string|null"}]}
 ```
-`items` come from `archive_run_items` of the job's run (empty while `run_uid` is null), ordered by `ordinal`; `entry_uid` is the produced entry (`produced_entry_id`), and `entry_uids` is the de-duplicated non-null list in item order. A caller who is neither the creator nor ADMIN gets `404` (not `403`), so job existence is not disclosed. `created_by` is also included.
+`items` come from `archive_run_items` of the job's run (empty while `run_uid` is null), ordered by `ordinal`; `entry_uid` is the produced entry (`produced_entry_id`), and `entry_uids` is the de-duplicated non-null list in item order. A caller who is neither the creator nor ADMIN gets `404` (not `403`), so job existence is not disclosed.
+
+As implemented, J2 also returns `created_by` (the submitter's `user_uid`, or `null`) and `items_truncated: bool`. `items` is capped at 200 (`JOB_ITEMS_MAX`); `items_truncated` is `true` when the run had more items than were returned. `created_by` is also present on every row of J1.
 
 **J3.** Response unchanged in shape (array of run summaries):
 ```json
@@ -159,26 +161,34 @@ but filtered: a run is visible if the caller is ADMIN, **or** created the job th
 | I1 | `GET /api/archives/:id/info` | ADMIN |
 | I2 | `GET /api/admin/effective-config` | ADMIN |
 
-**I1.** Counts and sizes only; no filesystem paths. Response `200`:
+**I1.** Counts and sizes only. `name` is the archive's display name from its own metadata; no filesystem paths are returned. Response `200`:
 ```json
-{"archive_id": "string", "label": "string",
- "entry_count": 0, "root_entry_count": 0, "artifact_count": 0, "blob_count": 0, "blob_bytes": 0,
+{"archive_id": "string", "label": "string", "name": "string|null",
+ "entry_count": 0, "root_entry_count": 0, "child_entry_count": 0,
+ "artifact_count": 0, "blob_count": 0, "blob_bytes": 0,
  "tag_count": 0, "collection_count": 0, "run_count": 0, "summary_count": 0,
- "job_counts": {"pending": 0, "running": 0, "completed": 0, "failed": 0}}
+ "job_counts": {"pending": 0, "running": 0, "completed": 0, "failed": 0},
+ "db_bytes": 0}
 ```
-Errors: 401/403/404 (unknown archive).
+`child_entry_count` = `entry_count - root_entry_count`. `db_bytes` is the size of the archive's SQLite file (0 if it cannot be read). Errors: 401/403/404 (unknown archive).
 
-**I2.** Read-only view of env-derived configuration, from a static `ENV_VARS` table in `effective_config.rs` (every `ARCHIVR_*` variable the code reads; a unit test greps the crates' source for `ARCHIVR_*` literals and fails on drift). Response `200`:
+**I2.** Read-only view of the server's configuration, from a static `ENV_VARS` table in `effective_config.rs` (every `ARCHIVR_*` variable the code reads; a unit test greps the crates' source for `ARCHIVR_*` literals and fails on drift). Response `200`, top-level keys as below:
 ```json
-{"env_vars": [{"name": "ARCHIVR_ANTHROPIC_API_KEY", "group": "summaries", "description": "string",
+{"server": {"version": "string", "bind": {"value": "string", "source": "env|toml|default"},
+            "archives": [{"id": "string", "label": "string"}]},
+ "env_vars": [{"name": "ARCHIVR_ANTHROPIC_API_KEY", "group": "summaries", "description": "string",
                "secret": true, "default": "string|null", "set": true, "value": "string|null"}],
  "summary_providers": [{"kind": "anthropic_http", "configured": true, "model": "string|null", "error": "string|null"}],
- "title_models": {"anthropic_http": {"model": "string", "source": "instance|env|default"}}}
+ "title_models": {"anthropic_http": {"model": "string", "source": "instance|env|default"}},
+ "transcription_engines": [{"kind": "string", "enabled": true, "configured": true, "label": "string|null",
+                            "english_only": "bool|null", "languages": "string[]|null", "error": "string|null"}],
+ "extensions": {"ublock": {"available": true}, "cookie_consent": {"available": false}}}
 ```
 - `secret: true` entries never carry a value: `value` is `null`, only `set` (true when the variable is set and non-empty) is reported.
 - Non-secret `value` is the effective string, or `null` when unset. URL-valued variables lose userinfo and query string (`https://user:pw@host/p?k=v` -> `https://host/p`).
 - `group` is one of `server`, `tools`, `summaries`, `titles`, `transcription`.
 - `summary_providers[].error` is the (secret-free) reason `provider_from_env` fails, e.g. which variable is missing.
+- `server` and `extensions` are not in the original R4 list; they were added during implementation. `server.bind.value` is the effective bind address and never carries secrets.
 
 ## 2. Hardening of existing endpoints
 
@@ -193,6 +203,8 @@ Behavior changes to endpoints that already exist (R1 owns status/roles, R2 owns 
 7. **Read-scope tokens**: Bearer requests authenticated by a token with `scope = "read"` get `403 {"error": "read-only token"}` on any method other than `GET`, `HEAD`, `OPTIONS`. Cookie sessions are unaffected. Implemented as middleware in `token_scope.rs`.
 8. Bearer tokens past `expires_at` are rejected: the request is treated as unauthenticated (`401` on endpoints that require auth). (Already enforced in `database::get_user_for_token`; covered by a regression test.)
 9. `capture_jobs.created_by` is now recorded (the submitter's `user_uid`) by `capture_handler`, text capture, and rearchive via `database::create_capture_job_as`; other callers keep `create_capture_job` (NULL owner).
+10. **Inert instance settings (as implemented).** `public_index_enabled`, `public_entry_content_enabled` and `open_registration_enabled` (column `public_archive_submission_enabled`) are stored and returned by `PATCH` / `GET` instance settings, but no server logic reads them yet. Setting them changes nothing in behavior. Do not document them as enforced until a stream wires them in.
+11. **`file://` rule (as implemented).** The check of item 3 lives in the capture handler in `routes.rs`; the regression tests are in `jobs.rs` (`file:///etc/hosts` -> `400`, staged upload -> accepted).
 
 Out of scope (not proposed): entry metadata edits beyond title, job cancel, server-side entry pagination, frontend/UI updates, admin edit of email/display name.
 
@@ -218,9 +230,9 @@ pub fn get_user_uid(conn, user_id: i64) -> Result<Option<String>>;
 
 `list_user_tokens` and therefore the existing `GET /api/auth/tokens` response gained `expires_at` and `scope` (additive; this is T2). `CaptureJobRecord` is unchanged (add `created_by` there in R3 if needed).
 
-### 3.3 Module stubs
+### 3.3 Modules
 
-Core: `auth_users.rs`, `auth_credentials.rs`, `capture_jobs.rs` (empty, declared in `lib.rs`). Server: `admin_users`, `credentials`, `jobs`, `effective_config` (each `pub fn routes() -> Router<AppState>` returning `Router::new()`, merged in `app_with_state`), `token_scope` (stub `routes()` plus a pass-through `enforce_read_scope` middleware signature; not wired yet), `guards` (implemented, see 0.1), `test_support` (`#[cfg(test)]`).
+R0 created these as stubs; all are now implemented. Server: `admin_users.rs` (U1-U5, R1, R2), `credentials.rs` (S1-S3, T1/T2), `jobs.rs` (J1-J3), `effective_config.rs` (I1, I2), `guards.rs` (0.1), `token_scope.rs` (read-scope middleware, item 2.7), each merged in `app_with_state`. Core: `auth_users.rs`, `auth_credentials.rs`, `capture_jobs.rs`. `test_support` is `#[cfg(test)]`.
 
 ### 3.4 `guards.rs` (implemented)
 
