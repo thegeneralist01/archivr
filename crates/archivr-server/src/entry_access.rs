@@ -407,3 +407,32 @@ async fn collection_membership_endpoints_are_gated_by_entry_visibility() {
     let (status, _) = send_json(&w.f.router, "DELETE", &uri, Some(&w.carol), None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
+
+#[tokio::test]
+async fn a_plain_user_cannot_hide_an_entry_from_all_of_their_own_roles() {
+    let w = world().await;
+    let default_coll = {
+        let conn = database::open_or_initialize(&w.f.archive_path).unwrap();
+        database::get_collection_by_slug(&conn, "_default_").unwrap().unwrap().collection_uid
+    };
+    let uri = format!("/api/archives/test/collections/{default_coll}/entries/{}", w.open);
+
+    // alice may keep the entry for herself, but not narrow it to admins only (she could never undo it).
+    let (status, body) =
+        send_json(&w.f.router, "PATCH", &uri, Some(&w.alice), Some(&json!({"visibility_bits": 4}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("hide the entry from all of your own roles"), "{body}");
+    let (status, _) = send_json(
+        &w.f.router, "GET", &format!("/api/archives/test/entries/{}", w.open), Some(&w.alice), None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the rejected change must be rolled back");
+
+    // A change that still includes one of her roles is fine, and so is the same change by an admin.
+    let (status, _) =
+        send_json(&w.f.router, "PATCH", &uri, Some(&w.alice), Some(&json!({"visibility_bits": 6}))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) =
+        send_json(&w.f.router, "PATCH", &uri, Some(&w.admin), Some(&json!({"visibility_bits": 4}))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}

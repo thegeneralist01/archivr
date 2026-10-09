@@ -3303,6 +3303,33 @@ pub(crate) fn ensure_entry_visible(
     Ok(())
 }
 
+/// Runs `change` (a mutation of the entry's collection memberships or their visibility) and, for
+/// callers who are not admins, rolls it back with a 400 when it would leave the entry hidden from
+/// the caller's own roles. Without this a plain user could hide an entry from every role they hold
+/// and could never reach it again to undo it (only an admin could).
+fn apply_without_self_lockout<T>(
+    conn: &rusqlite::Connection,
+    auth: &AuthUser,
+    entry_uid: &str,
+    change: impl FnOnce() -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    let AuthUser::Authenticated { role_bits, .. } = auth else {
+        return change();
+    };
+    if role_bits & (ROLE_ADMIN | ROLE_OWNER) != 0 {
+        return change();
+    }
+    let tx = conn.unchecked_transaction()?;
+    let out = change()?;
+    if !database::caller_can_access_entry(conn, entry_uid, *role_bits)? {
+        return Err(ApiError::bad_request(
+            "this change would hide the entry from all of your own roles; ask an admin to do it",
+        ));
+    }
+    tx.commit()?;
+    Ok(out)
+}
+
 pub(crate) fn mounted_archive<'a>(
     state: &'a AppState,
     archive_id: &str,
@@ -3550,7 +3577,10 @@ async fn remove_entry_from_collection_handler(
         )
         .optional()?
         .ok_or(ApiError::not_found("entry not found"))?;
-    if database::remove_entry_from_collection(&conn, coll.id, entry_id)? {
+    let removed = apply_without_self_lockout(&conn, &auth, &entry_uid, || {
+        Ok(database::remove_entry_from_collection(&conn, coll.id, entry_id)?)
+    })?;
+    if removed {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found("entry not in collection"))
@@ -3577,8 +3607,15 @@ async fn update_entry_visibility_handler(
         )
         .optional()?
         .ok_or(ApiError::not_found("entry not found"))?;
-    if database::update_collection_entry_visibility(&conn, coll.id, entry_id, body.visibility_bits)?
-    {
+    let updated = apply_without_self_lockout(&conn, &auth, &entry_uid, || {
+        Ok(database::update_collection_entry_visibility(
+            &conn,
+            coll.id,
+            entry_id,
+            body.visibility_bits,
+        )?)
+    })?;
+    if updated {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found("entry not in collection"))
