@@ -1744,6 +1744,7 @@ async fn capture_handler(
         download_subtitles: body.download_subtitles.unwrap_or(true),
         per_item_quality: body.per_item_quality.clone(),
         sync: body.sync,
+        job_uid: Some(job_uid.clone()),
     };
 
     // Spawn background capture.
@@ -1897,12 +1898,13 @@ async fn capture_text_handler(
         };
         database::update_capture_job_status(&conn, &job_uid_bg, "running", None, None, None).ok();
 
-        match capture::perform_text_capture(
+        match capture::perform_text_capture_for_job(
             &archive_paths,
             &title,
             &text_body,
             &mime_str,
             Some(&archive_id_bg),
+            Some(&job_uid_bg),
         ) {
             Ok(result) => {
                 let job_status = if result.status == "completed" {
@@ -2144,6 +2146,8 @@ async fn rearchive_handler(
         download_subtitles: true,
         per_item_quality: std::collections::HashMap::new(),
         sync: false,
+        // Rearchive replaces an entry's artifacts in place and creates no run to link.
+        job_uid: None,
     };
 
     let job_uid_bg = job_uid.clone();

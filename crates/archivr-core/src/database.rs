@@ -1693,6 +1693,17 @@ pub fn update_capture_job_status(
     Ok(())
 }
 
+/// Links a capture job to the run it is executing, once, as soon as the run exists. Does
+/// nothing if the job already has a run (the final status update sets it again anyway).
+pub fn link_capture_job_run(conn: &Connection, job_uid: &str, run_uid: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE capture_jobs SET run_uid = ?2, updated_at = ?3 \
+         WHERE job_uid = ?1 AND run_uid IS NULL",
+        params![job_uid, run_uid, now_timestamp()],
+    )?;
+    Ok(())
+}
+
 /// Returns a capture job by uid.
 pub fn get_capture_job(conn: &Connection, job_uid: &str) -> Result<Option<CaptureJobRecord>> {
     conn.query_row(

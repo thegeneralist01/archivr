@@ -547,6 +547,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn creator_sees_their_run_while_the_job_is_still_in_progress() {
+        let f = fixture();
+        let alice = make_role_session(&f.auth_path, "alice", &["user"]);
+        let bob = make_role_session(&f.auth_path, "bob", &["user"]);
+        let alice_uid = user_uid(&f.auth_path, "alice");
+
+        // A job that created its run but has not finished: still `pending` in the jobs table.
+        let job_uid = {
+            let conn = database::open_or_initialize(&f.archive_path).unwrap();
+            database::create_capture_job_as(&conn, "test", Some(&alice_uid)).unwrap()
+        };
+        let paths = archivr_core::archive::read_archive_paths(&f.archive_path).unwrap();
+        let result = archivr_core::capture::perform_text_capture_for_job(
+            &paths, "In flight", "body", "text/plain", None, Some(&job_uid),
+        )
+        .unwrap();
+        hide_all_entries_from_users(&f.archive_path);
+
+        let runs = "/api/archives/test/runs";
+        let (_, l) = get(&f.router, runs, Some(&alice)).await;
+        assert_eq!(run_uids(&l), vec![result.run_uid.clone()], "the creator sees it at once");
+        let (_, l) = get(&f.router, runs, Some(&bob)).await;
+        assert!(run_uids(&l).is_empty(), "other users see neither the run nor its entry");
+        let conn = database::open_or_initialize(&f.archive_path).unwrap();
+        let job = database::get_capture_job(&conn, &job_uid).unwrap().unwrap();
+        assert_eq!(job.status, "pending");
+    }
+
+    #[tokio::test]
     async fn runs_support_limit_and_offset() {
         let f = fixture();
         let admin = admin_session(&f.auth_path);
