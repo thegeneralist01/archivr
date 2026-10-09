@@ -96,7 +96,24 @@ pub(crate) fn user_session(auth_path: &Path) -> String {
 
 /// Creates user `test-guest` (role: guest only) and returns its cookie. Once per auth DB.
 pub(crate) fn guest_session(auth_path: &Path) -> String {
-    make_role_session(auth_path, "test-guest", &["guest"])
+    make_role_session(auth_path, "test-guest", &["guest"]);
+    let conn = database::open_auth_db(auth_path).unwrap();
+    let user_id: i64 = conn
+        .query_row(
+            "SELECT id FROM users WHERE username = 'test-guest'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    // create_user always grants `user`; a guest-only account must not have it. remove_role
+    // invalidates the user's sessions, so the session is created afterwards.
+    database::remove_role(&conn, user_id, "user").unwrap();
+    let bits = database::compute_role_bits(&conn, user_id).unwrap();
+    assert_eq!(bits, auth::ROLE_GUEST, "guest_session must hold only the guest role");
+    format!(
+        "session={}",
+        database::create_session(&conn, user_id, bits, None).unwrap()
+    )
 }
 
 /// Creates an API token for the existing user `username` and returns the raw
@@ -235,4 +252,145 @@ mod tests {
         let extra = axum::Router::new().route("/api/auth/tokens", get(|| async { "dup" }));
         let _ = base.merge(extra);
     }
+}
+
+// ---- HTTP fixture shared by router-level tests ----
+
+use axum::{Router, http::{Request, StatusCode}};
+use serde_json::{Value, json};
+use tower::ServiceExt;
+
+pub(crate) struct Fixture {
+    pub(crate) _dir: tempfile::TempDir,
+    pub(crate) router: Router,
+    pub(crate) archive_path: PathBuf,
+    pub(crate) auth_path: PathBuf,
+}
+
+pub(crate) fn fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, archive_path, auth_path) = make_test_registry(&dir);
+    let router = crate::routes::app(registry, auth_path.clone());
+    Fixture {
+        _dir: dir,
+        router,
+        archive_path,
+        auth_path,
+    }
+}
+
+pub(crate) fn user_uid(auth_path: &Path, username: &str) -> String {
+    let conn = database::open_auth_db(auth_path).unwrap();
+    conn.query_row(
+        "SELECT user_uid FROM users WHERE username = ?1",
+        [username],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+pub(crate) async fn get(router: &Router, uri: &str, cookie: Option<&str>) -> (StatusCode, Value) {
+    let mut req = Request::builder().uri(uri);
+    if let Some(c) = cookie {
+        req = req.header("cookie", c);
+    }
+    let resp = router
+        .clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
+pub(crate) async fn post_json(
+    router: &Router,
+    uri: &str,
+    auth_header: (&str, &str),
+    payload: &Value,
+) -> (StatusCode, Value) {
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header(auth_header.0, auth_header.1)
+                .body(json_body(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
+pub(crate) async fn wait_job(archive_path: &Path, job_uid: &str) -> String {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let conn = database::open_or_initialize(archive_path).unwrap();
+            let job = database::get_capture_job(&conn, job_uid).unwrap().unwrap();
+            if job.status != "pending" && job.status != "running" {
+                break job.status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("capture job should finish")
+}
+
+/// Submits a text capture as `cookie` and waits for the job; returns the job uid.
+pub(crate) async fn text_capture(f: &Fixture, cookie: &str, title: &str) -> String {
+    let (status, body) = post_json(
+        &f.router,
+        "/api/archives/test/captures/text",
+        ("cookie", cookie),
+        &json!({"title": title, "body": format!("body of {title}"), "mime": "text/plain"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let job_uid = body["job_uid"].as_str().unwrap().to_string();
+    assert_eq!(wait_job(&f.archive_path, &job_uid).await, "completed");
+    job_uid
+}
+
+
+/// Sends `method uri` with an optional session cookie and optional JSON body; returns the
+/// status and the raw response bytes (artifacts and blobs are not JSON).
+pub(crate) async fn send(
+    router: &Router,
+    method: &str,
+    uri: &str,
+    cookie: Option<&str>,
+    payload: Option<&Value>,
+) -> (StatusCode, Vec<u8>) {
+    let mut req = Request::builder().method(method).uri(uri);
+    if let Some(c) = cookie {
+        req = req.header("cookie", c);
+    }
+    let body = match payload {
+        Some(p) => {
+            req = req.header("content-type", "application/json");
+            json_body(p)
+        }
+        None => Body::empty(),
+    };
+    let resp = router.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (status, bytes.to_vec())
+}
+
+/// Like [`send`], parsing the body as JSON (`Value::Null` when empty or not JSON).
+pub(crate) async fn send_json(
+    router: &Router,
+    method: &str,
+    uri: &str,
+    cookie: Option<&str>,
+    payload: Option<&Value>,
+) -> (StatusCode, Value) {
+    let (status, bytes) = send(router, method, uri, cookie, payload).await;
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }

@@ -151,133 +151,20 @@ pub(crate) fn get_job_detail(
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path as FsPath, PathBuf};
+    use std::path::Path as FsPath;
 
     use archivr_core::database;
     use axum::{
-        Router,
         body::Body,
         http::{Request, StatusCode},
     };
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
-    use crate::routes::app;
     use crate::test_support::{
-        admin_session, body_json, json_body, make_api_token, make_role_session, make_test_registry,
-        make_test_session,
+        Fixture, admin_session, body_json, fixture, get, guest_session, make_api_token,
+        make_role_session, make_test_session, post_json, text_capture, user_uid, wait_job,
     };
-
-    struct Fixture {
-        _dir: tempfile::TempDir,
-        router: Router,
-        archive_path: PathBuf,
-        auth_path: PathBuf,
-    }
-
-    fn fixture() -> Fixture {
-        let dir = tempfile::tempdir().unwrap();
-        let (registry, archive_path, auth_path) = make_test_registry(&dir);
-        let router = app(registry, auth_path.clone());
-        Fixture {
-            _dir: dir,
-            router,
-            archive_path,
-            auth_path,
-        }
-    }
-
-    /// Session whose cached role bits are GUEST only. (`guest_session` in test_support
-    /// still holds the `user` role because `create_user` always grants it.)
-    fn guest_only_session(auth_path: &FsPath) -> String {
-        make_role_session(auth_path, "guest-only", &["guest"]);
-        let conn = database::open_auth_db(auth_path).unwrap();
-        let user_id: i64 = conn
-            .query_row("SELECT id FROM users WHERE username = 'guest-only'", [], |r| r.get(0))
-            .unwrap();
-        conn.execute("DELETE FROM sessions WHERE user_id = ?1", [user_id]).unwrap();
-        format!(
-            "session={}",
-            database::create_session(&conn, user_id, 1, None).unwrap()
-        )
-    }
-
-    fn user_uid(auth_path: &FsPath, username: &str) -> String {
-        let conn = database::open_auth_db(auth_path).unwrap();
-        conn.query_row(
-            "SELECT user_uid FROM users WHERE username = ?1",
-            [username],
-            |r| r.get(0),
-        )
-        .unwrap()
-    }
-
-    async fn get(router: &Router, uri: &str, cookie: Option<&str>) -> (StatusCode, Value) {
-        let mut req = Request::builder().uri(uri);
-        if let Some(c) = cookie {
-            req = req.header("cookie", c);
-        }
-        let resp = router
-            .clone()
-            .oneshot(req.body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let status = resp.status();
-        (status, body_json(resp).await)
-    }
-
-    async fn post_json(
-        router: &Router,
-        uri: &str,
-        auth_header: (&str, &str),
-        payload: &Value,
-    ) -> (StatusCode, Value) {
-        let resp = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(uri)
-                    .header("content-type", "application/json")
-                    .header(auth_header.0, auth_header.1)
-                    .body(json_body(payload))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let status = resp.status();
-        (status, body_json(resp).await)
-    }
-
-    async fn wait_job(archive_path: &FsPath, job_uid: &str) -> String {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let conn = database::open_or_initialize(archive_path).unwrap();
-                let job = database::get_capture_job(&conn, job_uid).unwrap().unwrap();
-                if job.status != "pending" && job.status != "running" {
-                    break job.status;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("capture job should finish")
-    }
-
-    /// Submits a text capture as `cookie` and waits for the job; returns the job uid.
-    async fn text_capture(f: &Fixture, cookie: &str, title: &str) -> String {
-        let (status, body) = post_json(
-            &f.router,
-            "/api/archives/test/captures/text",
-            ("cookie", cookie),
-            &json!({"title": title, "body": format!("body of {title}"), "mime": "text/plain"}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-        let job_uid = body["job_uid"].as_str().unwrap().to_string();
-        assert_eq!(wait_job(&f.archive_path, &job_uid).await, "completed");
-        job_uid
-    }
 
     fn uids(list: &Value) -> Vec<String> {
         list.as_array()
@@ -292,7 +179,7 @@ mod tests {
         let f = fixture();
         let (s, _) = get(&f.router, "/api/archives/test/capture_jobs", None).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
-        let guest = guest_only_session(&f.auth_path);
+        let guest = guest_session(&f.auth_path);
         let (s, _) = get(&f.router, "/api/archives/test/capture_jobs", Some(&guest)).await;
         assert_eq!(s, StatusCode::FORBIDDEN);
         let (s, _) = get(
@@ -437,13 +324,38 @@ mod tests {
         let job_uid = body["job_uid"].as_str().unwrap();
         wait_job(&f.archive_path, job_uid).await;
 
-        // Rearchive of an unknown entry still records its job (then fails in the background).
-        let carol = make_role_session(&f.auth_path, "dave", &["user"]);
+        // Rearchive records its job (a non-tweet entry then fails in the background), but an
+        // unknown entry is a 404 and leaves no job behind.
+        let dave = make_role_session(&f.auth_path, "dave", &["user"]);
         let dave_uid = user_uid(&f.auth_path, "dave");
-        let (s, body) = post_json(
+        let jobs_before = {
+            let conn = database::open_or_initialize(&f.archive_path).unwrap();
+            conn.query_row("SELECT COUNT(*) FROM capture_jobs", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        let (s, _) = post_json(
             &f.router,
             "/api/archives/test/entries/ent_missing/rearchive",
-            ("cookie", &carol),
+            ("cookie", &dave),
+            &json!({}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let entry_uid: String = {
+            let conn = database::open_or_initialize(&f.archive_path).unwrap();
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM capture_jobs", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                jobs_before,
+                "a 404 rearchive must not create a job"
+            );
+            conn.query_row("SELECT entry_uid FROM archived_entries LIMIT 1", [], |r| r.get(0))
+                .unwrap()
+        };
+        let (s, body) = post_json(
+            &f.router,
+            &format!("/api/archives/test/entries/{entry_uid}/rearchive"),
+            ("cookie", &dave),
             &json!({}),
         )
         .await;
@@ -527,7 +439,7 @@ mod tests {
         let f = fixture();
         let (s, _) = get(&f.router, "/api/archives/test/capture_jobs/job_x", None).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
-        let guest = guest_only_session(&f.auth_path);
+        let guest = guest_session(&f.auth_path);
         let (s, _) = get(
             &f.router,
             "/api/archives/test/capture_jobs/job_x",

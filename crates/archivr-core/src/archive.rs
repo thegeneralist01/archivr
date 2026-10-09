@@ -953,22 +953,28 @@ pub fn create_tag(conn: &rusqlite::Connection, full_path: &str) -> Result<Tag> {
 
 /// Returns the full tag tree with root nodes at the top level and children nested.
 /// Each node includes a direct entry count and a subtree count (unique entries
-/// assigned to the tag itself or any descendant).
-pub fn list_tag_tree(conn: &rusqlite::Connection) -> Result<Vec<TagNode>> {
+/// assigned to the tag itself or any descendant). Tags are an archive-wide taxonomy that
+/// every logged-in user sees, but the counts only include entries visible to `caller_bits`
+/// (see `database::entry_visible_to_caller_sql`), so they cannot reveal hidden entries.
+pub fn list_tag_tree(conn: &rusqlite::Connection, caller_bits: u32) -> Result<Vec<TagNode>> {
     use std::collections::HashMap;
 
     let records = database::list_all_tags(conn)?;
+    let visible = database::entry_visible_to_caller_sql("e", "?1");
 
     // Fetch direct entry counts for all tags in a single query.
     let mut counts: HashMap<String, i64> = HashMap::new();
     {
-        let mut stmt = conn.prepare(
-            "SELECT t.tag_uid, COUNT(eta.entry_id) \
+        let mut stmt = conn.prepare(&format!(
+            "SELECT t.tag_uid, COUNT(e.id) \
              FROM tags t \
              LEFT JOIN entry_tag_assignments eta ON eta.tag_id = t.id \
+             LEFT JOIN archived_entries e ON e.id = eta.entry_id AND {visible} \
              GROUP BY t.id",
-        )?;
-        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+        ))?;
+        for row in stmt.query_map([caller_bits as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })? {
             let (uid, cnt) = row?;
             counts.insert(uid, cnt);
         }
@@ -979,20 +985,23 @@ pub fn list_tag_tree(conn: &rusqlite::Connection) -> Result<Vec<TagNode>> {
     // a parent and a child is counted only once.
     let mut subtree_counts: HashMap<String, i64> = HashMap::new();
     {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "WITH RECURSIVE descendants(ancestor_id, descendant_id) AS ( \
                  SELECT id, id FROM tags \
                  UNION ALL \
                  SELECT d.ancestor_id, t.id \
                  FROM tags t JOIN descendants d ON t.parent_tag_id = d.descendant_id \
              ) \
-             SELECT t.tag_uid, COUNT(DISTINCT eta.entry_id) \
+             SELECT t.tag_uid, COUNT(DISTINCT e.id) \
              FROM tags t \
              JOIN descendants d ON d.ancestor_id = t.id \
              LEFT JOIN entry_tag_assignments eta ON eta.tag_id = d.descendant_id \
+             LEFT JOIN archived_entries e ON e.id = eta.entry_id AND {visible} \
              GROUP BY t.id",
-        )?;
-        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+        ))?;
+        for row in stmt.query_map([caller_bits as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })? {
             let (uid, cnt) = row?;
             subtree_counts.insert(uid, cnt);
         }
@@ -1802,7 +1811,7 @@ mod tests {
         create_tag(&conn, "/science/cs").unwrap();
         create_tag(&conn, "/art").unwrap();
 
-        let tree = list_tag_tree(&conn).unwrap();
+        let tree = list_tag_tree(&conn, 12).unwrap();
         assert_eq!(tree.len(), 2, "expected two root nodes");
 
         let science = tree
@@ -1848,7 +1857,7 @@ mod tests {
         assign_entry_tag(&conn, &e1.entry_uid, "/science/cs/algorithms").unwrap();
         assign_entry_tag(&conn, &e2.entry_uid, "/science").unwrap();
 
-        let tree = list_tag_tree(&conn).unwrap();
+        let tree = list_tag_tree(&conn, 12).unwrap();
         let science = tree.iter().find(|n| n.tag.slug == "science").unwrap();
         let cs = science
             .children
@@ -1891,7 +1900,7 @@ mod tests {
         assign_entry_tag(&conn, &e.entry_uid, "/science").unwrap();
         assign_entry_tag(&conn, &e.entry_uid, "/science/cs").unwrap();
 
-        let tree = list_tag_tree(&conn).unwrap();
+        let tree = list_tag_tree(&conn, 12).unwrap();
         let science = tree.iter().find(|n| n.tag.slug == "science").unwrap();
 
         assert_eq!(
@@ -1900,6 +1909,124 @@ mod tests {
         );
         assert_eq!(science.entry_count, 1, "science direct = 1");
         assert_eq!(science.children[0].subtree_count, 1, "cs subtree = 1");
+    }
+
+    /// Sets the visibility bits of every `collection_entries` row of an entry.
+    fn set_entry_visibility(conn: &rusqlite::Connection, entry_uid: &str, bits: u32) {
+        conn.execute(
+            "UPDATE collection_entries SET visibility_bits = ?1 \
+             WHERE entry_id = (SELECT id FROM archived_entries WHERE entry_uid = ?2)",
+            rusqlite::params![bits as i64, entry_uid],
+        )
+        .unwrap();
+    }
+
+    const USER: u32 = 2;
+    const ADMIN: u32 = 4;
+    const OWNER: u32 = 8;
+    const CUSTOM_ROLE: u32 = 16;
+
+    #[test]
+    fn caller_can_access_entry_follows_the_list_visibility_rule() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        let open = make_entry_in_db(&conn, user_id, run_id, None, None, "Open", "https://e.test/open");
+        let hidden = make_entry_in_db(&conn, user_id, run_id, None, None, "Hidden", "https://e.test/hidden");
+        // Hidden from plain users; visible only to the custom role.
+        set_entry_visibility(&conn, &hidden.entry_uid, CUSTOM_ROLE);
+
+        let can = |uid: &str, bits: u32| database::caller_can_access_entry(&conn, uid, bits).unwrap();
+        assert!(can(&open.entry_uid, USER));
+        assert!(!can(&hidden.entry_uid, USER), "plain user must not reach a hidden entry");
+        assert!(can(&hidden.entry_uid, USER | CUSTOM_ROLE), "overlapping role bit grants access");
+        assert!(can(&hidden.entry_uid, ADMIN), "admins see everything");
+        assert!(can(&hidden.entry_uid, OWNER), "owners see everything");
+        assert!(!can("no-such-uid", ADMIN), "unknown entries are never accessible");
+        assert!(!can(&open.entry_uid, 0), "no role bits, no access");
+    }
+
+    #[test]
+    fn caller_can_access_child_entries_through_their_parent() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        let parent = make_entry_in_db(&conn, user_id, run_id, None, None, "Playlist", "https://e.test/pl");
+        let child = make_entry_in_db(
+            &conn, user_id, run_id, Some(parent.id), Some(parent.id), "Video", "https://e.test/pl/v1",
+        );
+        let can = |uid: &str, bits: u32| database::caller_can_access_entry(&conn, uid, bits).unwrap();
+
+        // The child inherits the parent's membership...
+        assert!(can(&child.entry_uid, USER));
+        // ...so hiding the parent hides the child, matching list_child_entries.
+        set_entry_visibility(&conn, &parent.entry_uid, CUSTOM_ROLE);
+        assert!(!can(&child.entry_uid, USER));
+        assert!(can(&child.entry_uid, USER | CUSTOM_ROLE));
+
+        // An individually shared child (its own membership row, private by default) is
+        // reachable even when the parent is hidden.
+        set_entry_visibility(&conn, &child.entry_uid, USER);
+        assert!(can(&child.entry_uid, USER));
+        assert!(!can(&parent.entry_uid, USER), "sharing the child does not expose the parent");
+    }
+
+    #[test]
+    fn caller_can_access_blob_needs_one_visible_entry() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        let a = make_entry_in_db(&conn, user_id, run_id, None, None, "A", "https://e.test/a");
+        let b = make_entry_in_db(&conn, user_id, run_id, None, None, "B", "https://e.test/b");
+        let blob = |sha: &str| database::BlobRecord {
+            sha256: sha.to_string(),
+            byte_size: 1,
+            mime_type: None,
+            extension: None,
+            raw_relpath: format!("raw/{sha}"),
+        };
+        let shared = database::upsert_blob(&conn, &blob("aa")).unwrap();
+        let only_b = database::upsert_blob(&conn, &blob("bb")).unwrap();
+        database::upsert_blob(&conn, &blob("orphan")).unwrap();
+        for (entry, blob_id) in [(&a, shared), (&b, shared), (&b, only_b)] {
+            database::add_entry_artifact(
+                &conn,
+                &database::NewArtifact {
+                    entry_id: entry.id,
+                    artifact_role: "media".to_string(),
+                    storage_area: "raw".to_string(),
+                    relpath: "x".to_string(),
+                    blob_id: Some(blob_id),
+                    logical_path: None,
+                    metadata_json: None,
+                },
+            )
+            .unwrap();
+        }
+        set_entry_visibility(&conn, &b.entry_uid, CUSTOM_ROLE);
+
+        let can = |sha: &str, bits: u32| database::caller_can_access_blob(&conn, sha, bits).unwrap();
+        assert!(can("aa", USER), "a blob shared with a visible entry stays readable");
+        assert!(!can("bb", USER), "a blob only a hidden entry uses is not readable");
+        assert!(can("bb", USER | CUSTOM_ROLE));
+        assert!(!can("orphan", USER), "unreferenced blobs are admin-only");
+        assert!(can("orphan", ADMIN));
+        assert!(can("bb", OWNER));
+        assert!(!can("missing", ADMIN), "unknown blobs are never accessible");
+    }
+
+    #[test]
+    fn tag_tree_counts_only_entries_visible_to_the_caller() {
+        let (conn, user_id, run_id) = make_tag_test_db();
+        let open = make_entry_in_db(&conn, user_id, run_id, None, None, "Open", "https://e.test/o");
+        let hidden = make_entry_in_db(&conn, user_id, run_id, None, None, "Hidden", "https://e.test/h");
+        assign_entry_tag(&conn, &open.entry_uid, "/topic/sub").unwrap();
+        assign_entry_tag(&conn, &hidden.entry_uid, "/topic/sub").unwrap();
+        assign_entry_tag(&conn, &hidden.entry_uid, "/topic").unwrap();
+        set_entry_visibility(&conn, &hidden.entry_uid, CUSTOM_ROLE);
+
+        let counts = |bits: u32| {
+            let tree = list_tag_tree(&conn, bits).unwrap();
+            let topic = tree.iter().find(|n| n.tag.slug == "topic").unwrap();
+            (topic.entry_count, topic.subtree_count, topic.children[0].entry_count)
+        };
+        assert_eq!(counts(ADMIN), (1, 2, 2), "admins count everything");
+        assert_eq!(counts(USER), (0, 1, 1), "hidden entries are not counted for plain users");
+        assert_eq!(counts(USER | CUSTOM_ROLE), (1, 2, 2));
     }
 
     #[test]

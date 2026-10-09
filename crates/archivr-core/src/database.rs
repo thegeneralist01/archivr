@@ -3335,6 +3335,55 @@ pub fn is_entry_publicly_accessible(conn: &Connection, entry_uid: &str) -> Resul
     Ok(count > 0)
 }
 
+/// SQL predicate: the archived entry aliased `entry_alias` is visible to a logged-in caller
+/// whose role bits are bound to the parameter `bits_param` (e.g. `"?2"`).
+///
+/// This is the rule `archive::list_entries_for_collection` and `archive::list_child_entries`
+/// apply: ADMIN/OWNER (bits 12) see every entry, everyone else needs a `collection_entries`
+/// row — for the entry itself or, for a child entry, for its parent — whose `visibility_bits`
+/// overlap theirs. `requires_auth` is not consulted: it only gates guests.
+pub(crate) fn entry_visible_to_caller_sql(entry_alias: &str, bits_param: &str) -> String {
+    format!(
+        "(CAST({bits} AS INTEGER) & 12 != 0 \
+          OR EXISTS (SELECT 1 FROM collection_entries vce \
+                     WHERE vce.entry_id = {e}.id \
+                       AND vce.visibility_bits & CAST({bits} AS INTEGER) != 0) \
+          OR EXISTS (SELECT 1 FROM collection_entries vcp \
+                     WHERE vcp.entry_id = {e}.parent_entry_id \
+                       AND vcp.visibility_bits & CAST({bits} AS INTEGER) != 0))",
+        e = entry_alias,
+        bits = bits_param,
+    )
+}
+
+/// True when a logged-in caller with `caller_bits` may read the entry `entry_uid`. Use this
+/// to gate every by-uid entry endpoint so an entry hidden from a role in the lists cannot be
+/// fetched directly either. False for an unknown entry. Guests are gated separately by
+/// [`is_entry_publicly_accessible`].
+pub fn caller_can_access_entry(conn: &Connection, entry_uid: &str, caller_bits: u32) -> Result<bool> {
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM archived_entries e WHERE e.entry_uid = ?1 AND {})",
+        entry_visible_to_caller_sql("e", "?2")
+    );
+    Ok(conn.query_row(&sql, params![entry_uid, caller_bits as i64], |row| row.get(0))?)
+}
+
+/// True when a logged-in caller with `caller_bits` may read the blob `sha256`: ADMIN/OWNER can
+/// read any blob; everyone else needs at least one entry referencing the blob that they can
+/// see (blobs are content-addressed, so one blob can back several entries). A blob no entry
+/// references is admin-only. False for an unknown blob.
+pub fn caller_can_access_blob(conn: &Connection, sha256: &str, caller_bits: u32) -> Result<bool> {
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM blobs b WHERE b.sha256 = ?1 AND (\
+             CAST(?2 AS INTEGER) & 12 != 0 \
+             OR EXISTS (SELECT 1 FROM entry_artifacts a \
+                        JOIN archived_entries e ON e.id = a.entry_id \
+                        WHERE a.blob_id = b.id AND {})))",
+        entry_visible_to_caller_sql("e", "?2")
+    );
+    Ok(conn.query_row(&sql, params![sha256, caller_bits as i64], |row| row.get(0))?)
+}
+
 /// Renames a collection and/or updates its default_visibility_bits.
 /// Returns true if updated, false if not found.
 /// Refuses to rename the '_default_' collection but allows changing its

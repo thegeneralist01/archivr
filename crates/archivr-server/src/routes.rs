@@ -581,6 +581,7 @@ async fn entry_detail(
             return Err(ApiError::unauthorized("login required"));
         }
     }
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     let mut detail = archive::get_entry_detail(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
     if matches!(auth_user, AuthUser::Guest) {
@@ -623,6 +624,7 @@ async fn entry_summary_handler(
     {
         return Err(ApiError::unauthorized("login required"));
     }
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     let entry_id = database::entry_id_for_uid(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
     let (summary, attempt) = if matches!(auth_user, AuthUser::Guest) {
@@ -667,6 +669,12 @@ async fn request_entry_summary_handler(
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     auth_user.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
+    // A hidden entry is not found: it must not be summarized, nor probe provider config.
+    ensure_entry_visible(
+        &database::open_or_initialize(&mounted.archive_path)?,
+        &auth_user,
+        &entry_uid,
+    )?;
     let archive_paths =
         archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;
 
@@ -941,6 +949,10 @@ async fn serve_artifact(
     let mounted = mounted_archive(&state, &archive_id)?;
     let paths = archive::read_archive_paths(&mounted.archive_path)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    if !token_valid {
+        // A media token was only issued after this check passed (issue_media_token).
+        ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
+    }
     let detail = archive::get_entry_detail(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
     let artifact = detail
@@ -969,6 +981,7 @@ async fn issue_media_token(
     // Verify the artifact actually exists before issuing a token.
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     let detail = archive::get_entry_detail(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
     if artifact_index >= detail.artifacts.len() {
@@ -1010,6 +1023,7 @@ async fn serve_entry_favicon(
     let mounted = mounted_archive(&state, &archive_id)?;
     let paths = archive::read_archive_paths(&mounted.archive_path)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     let detail = archive::get_entry_detail(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
     let artifact = detail
@@ -1035,6 +1049,11 @@ async fn serve_blob(
     let mounted = mounted_archive(&state, &archive_id)?;
     let paths = archive::read_archive_paths(&mounted.archive_path)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    // Blobs are content-addressed and shared between entries: readable when the caller can
+    // see at least one entry that uses the blob (ADMIN/OWNER: any existing blob).
+    if !database::caller_can_access_blob(&conn, &sha256, auth_to_caller_bits(&auth_user))? {
+        return Err(ApiError::not_found("blob not found"));
+    }
     let blob = database::get_blob_by_sha256(&conn, &sha256)?
         .ok_or(ApiError::not_found("blob not found"))?;
     let file_path = paths.store_path.join(&blob.raw_relpath);
@@ -1110,7 +1129,7 @@ async fn list_tags(
     auth_user.require_auth()?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
-    Ok(Json(archive::list_tag_tree(&conn)?))
+    Ok(Json(archive::list_tag_tree(&conn, auth_to_caller_bits(&auth_user))?))
 }
 
 async fn create_tag_handler(
@@ -1137,6 +1156,7 @@ async fn list_entry_tags(
     auth_user.require_auth()?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     match archive::get_entry_tags(&conn, &entry_uid)? {
         Some(tags) => Ok(Json(tags)),
         None => Err(ApiError::not_found("entry not found")),
@@ -1155,6 +1175,7 @@ async fn assign_entry_tag_handler(
     }
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     match archive::assign_entry_tag(&conn, &entry_uid, &body.tag_path)? {
         Some(tag) => Ok((StatusCode::CREATED, Json(tag))),
         None => Err(ApiError::not_found("entry not found")),
@@ -1169,6 +1190,7 @@ async fn remove_entry_tag_handler(
     auth_user.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     if archive::remove_entry_tag(&conn, &entry_uid, &tag_uid)? {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -1240,6 +1262,7 @@ async fn patch_entry_handler(
     auth_user.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     let title = body
         .title
         .as_deref()
@@ -1263,6 +1286,7 @@ async fn delete_entry_handler(
     auth_user.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let mut conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     // Transaction: if any step fails (cascade update, FK null, or delete), nothing is committed.
     let tx = conn.transaction()?;
     let found = database::delete_entry(&tx, &entry_uid)?;
@@ -1407,6 +1431,11 @@ async fn generate_thread_title_handler(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     auth_user.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
+    ensure_entry_visible(
+        &database::open_or_initialize(&mounted.archive_path)?,
+        &auth_user,
+        &entry_uid,
+    )?;
     let paths = archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;
     let settings = database::get_instance_settings(&database::open_auth_db(&state.auth_db_path)?)?;
     let cfg = thread_title::title_provider_from_env(
@@ -2091,6 +2120,11 @@ async fn rearchive_handler(
 
     // Create a capture job record so the client can poll for completion.
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
+    // Unknown (and, above, hidden) entries are a 404 for every caller; no doomed job row.
+    if database::entry_id_for_uid(&conn, &entry_uid)?.is_none() {
+        return Err(ApiError::not_found("entry not found"));
+    }
     let created_by = jobs::caller_user_uid(&state, &auth_user)?;
     let job_uid = database::create_capture_job_as(&conn, &archive_id, created_by.as_deref())?;
     drop(conn);
@@ -3246,6 +3280,26 @@ pub(crate) fn auth_to_caller_bits(auth: &AuthUser) -> u32 {
     }
 }
 
+/// Gate for every by-uid entry endpoint: a logged-in caller who cannot see the entry in the
+/// lists (`database::caller_can_access_entry`) gets the same 404 as for an unknown uid, so
+/// hiding an entry from a role also hides it from direct requests. ADMIN/OWNER always pass
+/// without a query. Guests are a no-op here: endpoints that allow them check
+/// `is_entry_publicly_accessible` themselves.
+pub(crate) fn ensure_entry_visible(
+    conn: &rusqlite::Connection,
+    auth: &AuthUser,
+    entry_uid: &str,
+) -> Result<(), ApiError> {
+    if let AuthUser::Authenticated { role_bits, .. } = auth {
+        if role_bits & (ROLE_ADMIN | ROLE_OWNER) == 0
+            && !database::caller_can_access_entry(conn, entry_uid, *role_bits)?
+        {
+            return Err(ApiError::not_found("entry not found"));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn mounted_archive<'a>(
     state: &'a AppState,
     archive_id: &str,
@@ -3456,6 +3510,7 @@ async fn add_entry_to_collection_handler(
             "cannot manually add entries to the default collection",
         ));
     }
+    ensure_entry_visible(&conn, &auth, &body.entry_uid)?;
     let entry_id: i64 = conn
         .query_row(
             "SELECT id FROM archived_entries WHERE entry_uid = ?1",
@@ -3483,6 +3538,7 @@ async fn remove_entry_from_collection_handler(
             "cannot manually remove entries from the default collection",
         ));
     }
+    ensure_entry_visible(&conn, &auth, &entry_uid)?;
     let entry_id: i64 = conn
         .query_row(
             "SELECT id FROM archived_entries WHERE entry_uid = ?1",
@@ -3509,6 +3565,7 @@ async fn update_entry_visibility_handler(
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let coll = database::get_collection_by_uid(&conn, &coll_uid)?
         .ok_or(ApiError::not_found("collection not found"))?;
+    ensure_entry_visible(&conn, &auth, &entry_uid)?;
     let entry_id: i64 = conn
         .query_row(
             "SELECT id FROM archived_entries WHERE entry_uid = ?1",
@@ -3533,6 +3590,7 @@ async fn list_entry_collections_handler(
     auth_user.require_auth()?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     match archive::get_entry_collections(&conn, &entry_uid)? {
         Some(memberships) => Ok(Json(memberships)),
         None => Err(ApiError::not_found("entry not found")),

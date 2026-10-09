@@ -2,6 +2,8 @@ mod admin_users;
 mod auth;
 mod credentials;
 mod effective_config;
+#[cfg(test)]
+mod entry_access;
 mod guards;
 mod jobs;
 mod registry;
