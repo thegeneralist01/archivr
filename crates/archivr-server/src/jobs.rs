@@ -708,6 +708,16 @@ mod tests {
         let (s, _) = capture_locator(&f, &alice, &format!("file://{}", outside.display())).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
 
+        // A bare path (no file:// prefix) is classified as a local file by core and must
+        // be refused too: absolute, and relative to the server's cwd.
+        let (s, body) = capture_locator(&f, &alice, &outside.display().to_string()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("local paths are not accepted"));
+        let (s, _) = capture_locator(&f, &alice, "/etc/hosts").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = capture_locator(&f, &alice, "Cargo.toml").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
         // Rejected requests must not leave job rows behind.
         {
             let conn = database::open_or_initialize(&f.archive_path).unwrap();

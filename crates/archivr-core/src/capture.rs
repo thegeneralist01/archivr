@@ -419,6 +419,13 @@ fn expand_shorthand_to_url(path: &str, source: &Source) -> String {
     path.to_string()
 }
 
+/// True when `locator` would be captured as a file on the local filesystem —
+/// a `file://` URI or any bare path that exists. Callers that accept locators
+/// from untrusted clients use this to refuse local reads.
+pub fn locator_is_local_path(locator: &str) -> bool {
+    determine_source(locator) == Source::Local
+}
+
 // INFO: yt-dlp supports a lot of sites; so, when archiving (for example) a website, the user
 // -> should be asked whether they want to archive the whole website or just the video(s) on it.
 fn determine_source(path: &str) -> Source {

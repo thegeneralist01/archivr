@@ -1651,6 +1651,14 @@ async fn capture_handler(
     // Canonicalize both sides to prevent path-traversal via `..` components in the locator.
     // Same pattern as artifact serving. The staged file must already exist on disk
     // (it was written by upload_handler), so canonicalize() will resolve symlinks correctly.
+    // A bare path (absolute, or relative to the server's cwd) is classified as a local
+    // file by core, so the file:// check alone would let it through; staged uploads
+    // are always submitted as file:// locators, so bare paths have no legitimate use here.
+    if !locator.starts_with("file://") && capture::locator_is_local_path(&locator) {
+        return Err(ApiError::bad_request(
+            "local paths are not accepted as locators; upload the file and capture the returned file:// locator",
+        ));
+    }
     let staged_upload_path: Option<std::path::PathBuf> = if locator.starts_with("file://") {
         let file_path = std::path::PathBuf::from(locator.trim_start_matches("file://"));
         let staging_dir = archive_paths.store_path.join("temp").join("uploads");
