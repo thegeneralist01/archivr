@@ -2,7 +2,6 @@
 //!
 //! Callers still do their own coarse role check (`require_role(ROLE_ADMIN)`);
 //! these guards add the target-aware rules on top.
-#![allow(dead_code)] // consumed by the admin_users / credentials streams
 use rusqlite::Connection;
 
 use crate::auth::{ROLE_ADMIN, ROLE_OWNER};

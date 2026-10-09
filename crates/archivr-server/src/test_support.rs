@@ -1,7 +1,6 @@
 //! Shared helpers for server tests (`#[cfg(test)]` only). Copied from
 //! `routes.rs`'s `mod tests` so new stream modules can reuse them without
 //! touching that file; the originals there are unchanged.
-#![allow(dead_code)] // helpers are consumed by the stream modules' tests
 use std::path::{Path, PathBuf};
 
 use archivr_core::database;

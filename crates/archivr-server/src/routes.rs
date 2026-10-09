@@ -3628,6 +3628,15 @@ async fn delete_collection_handler(
     auth.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    // Same rule (and status) as adding/removing entries: the default collection is permanent.
+    // core also refuses, but as an anyhow error that would surface as a 500.
+    if database::get_collection_by_uid(&conn, &coll_uid)?
+        .is_some_and(|coll| coll.slug == "_default_")
+    {
+        return Err(ApiError::bad_request(
+            "cannot delete the default collection",
+        ));
+    }
     let deleted = database::delete_collection(&conn, &coll_uid)?;
     if deleted {
         Ok(StatusCode::NO_CONTENT)
@@ -7493,6 +7502,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn deleting_the_default_collection_is_a_400_not_a_500() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let router = app(registry, auth_path);
+        let list = router.clone().oneshot(Request::builder()
+            .uri("/api/archives/test/collections").header("cookie", &session_cookie)
+            .body(Body::empty()).unwrap()).await.unwrap();
+        let collections = body_json(list).await;
+        let default_uid = collections.as_array().unwrap().iter()
+            .find(|c| c["slug"] == "_default_").unwrap()["collection_uid"].as_str().unwrap().to_string();
+        let response = router.oneshot(Request::builder().method("DELETE")
+            .uri(format!("/api/archives/test/collections/{default_uid}"))
+            .header("cookie", &session_cookie).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["error"], "cannot delete the default collection");
     }
 
     // ── Task 2: list_entries / search_entries auth enforcement ───────────────
