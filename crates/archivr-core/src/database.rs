@@ -749,6 +749,17 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
             ordinal      INTEGER NOT NULL DEFAULT 0,
             created_at   TEXT NOT NULL
         );
+
+        -- Every custom-role bit ever handed out, including bits whose role was deleted.
+        -- Bits are never reused: archives store visibility masks
+        -- (collection_entries.visibility_bits) that still carry a deleted role's bit,
+        -- so a new role given that bit would inherit access to the old hidden entries.
+        -- No foreign key on purpose: the row must outlive the roles row it describes.
+        CREATE TABLE IF NOT EXISTS role_bit_allocations (
+            bit_position INTEGER PRIMARY KEY,
+            role_uid     TEXT NOT NULL,
+            allocated_at TEXT NOT NULL
+        );
         "#,
     )?;
     // Add display_name column to users if not present (idempotent migration)
@@ -797,6 +808,15 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
             [],
         );
     }
+
+    // Backfill allocations for custom roles created before role_bit_allocations existed.
+    // Roles deleted before this migration left no record here, so their bits cannot be
+    // recovered from the auth DB.
+    conn.execute(
+        "INSERT OR IGNORE INTO role_bit_allocations (bit_position, role_uid, allocated_at)
+         SELECT bit_position, role_uid, ?1 FROM roles WHERE bit_position >= 4",
+        [now_timestamp()],
+    )?;
 
     Ok(())
 }
@@ -1593,7 +1613,10 @@ pub fn grantable_role_bits(conn: &Connection) -> Result<u32> {
     Ok(bits)
 }
 
-/// Creates a new custom role (level=2, bit_position = max existing + 1, min 4).
+/// Creates a new custom role (level=2). Its bit_position is one above the highest bit
+/// ever allocated (min 4), counting deleted roles via `role_bit_allocations`, so a bit
+/// is never reused. Fails once bit 31 is allocated (`maximum number of custom roles
+/// reached`); because bits are never freed, that is a lifetime cap per instance.
 /// Returns the created RoleRecord.
 pub fn create_custom_role(conn: &Connection, slug: &str, name: &str) -> Result<RoleRecord> {
     if slug.is_empty() || !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
@@ -1601,8 +1624,13 @@ pub fn create_custom_role(conn: &Connection, slug: &str, name: &str) -> Result<R
             "role slug must be non-empty and contain only ASCII letters, digits, or hyphens"
         );
     }
-    let next_bit: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(bit_position) + 1, 4) FROM roles WHERE bit_position >= 4",
+    let tx = conn.unchecked_transaction()?;
+    let next_bit: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(bit_position) + 1, 4) FROM (
+             SELECT bit_position FROM role_bit_allocations
+             UNION ALL
+             SELECT bit_position FROM roles
+         ) WHERE bit_position >= 4",
         [],
         |r| r.get(0),
     )?;
@@ -1610,11 +1638,18 @@ pub fn create_custom_role(conn: &Connection, slug: &str, name: &str) -> Result<R
         anyhow::bail!("maximum number of custom roles reached");
     }
     let role_uid = public_id("role");
-    conn.execute(
+    let now = now_timestamp();
+    tx.execute(
         "INSERT INTO roles (role_uid, slug, name, level, bit_position, is_builtin)
          VALUES (?1, ?2, ?3, 2, ?4, 0)",
         params![role_uid, slug, name, next_bit],
     )?;
+    tx.execute(
+        "INSERT INTO role_bit_allocations (bit_position, role_uid, allocated_at)
+         VALUES (?1, ?2, ?3)",
+        params![next_bit, role_uid, now],
+    )?;
+    tx.commit()?;
     Ok(RoleRecord {
         role_uid,
         slug: slug.to_string(),
@@ -4371,6 +4406,71 @@ mod tests {
         let r2 = create_custom_role(&conn, "helper", "Helper").unwrap();
         assert_eq!(r2.bit_position, 5);
         assert_eq!(r2.level, 2);
+    }
+
+    #[test]
+    fn deleted_custom_role_bit_is_never_reused() {
+        let mut conn = make_auth_conn_for_mgmt();
+        create_custom_role(&conn, "a", "A").unwrap();
+        create_custom_role(&conn, "b", "B").unwrap();
+        crate::auth_users::delete_custom_role(&mut conn, "b")
+            .unwrap()
+            .unwrap();
+        // Bit 5 belonged to "b": the new role must not inherit it.
+        let c = create_custom_role(&conn, "c", "C").unwrap();
+        assert_eq!(c.bit_position, 6);
+
+        // Deleting the highest role does not free its bit either.
+        crate::auth_users::delete_custom_role(&mut conn, "c")
+            .unwrap()
+            .unwrap();
+        let d = create_custom_role(&conn, "d", "D").unwrap();
+        assert_eq!(d.bit_position, 7);
+    }
+
+    #[test]
+    fn migration_backfills_allocations_for_existing_custom_roles() {
+        let mut conn = make_auth_conn_for_mgmt();
+        create_custom_role(&conn, "a", "A").unwrap();
+        create_custom_role(&conn, "b", "B").unwrap();
+        // Simulate a database created before role_bit_allocations existed.
+        conn.execute("DELETE FROM role_bit_allocations", []).unwrap();
+
+        // Re-running the schema init backfills the surviving roles, idempotently.
+        initialize_auth_schema(&conn).unwrap();
+        initialize_auth_schema(&conn).unwrap();
+        let recorded: i64 = conn
+            .query_row("SELECT COUNT(*) FROM role_bit_allocations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(recorded, 2);
+
+        // Bit 5 was allocated before the migration; deleting its role must not free it.
+        crate::auth_users::delete_custom_role(&mut conn, "b")
+            .unwrap()
+            .unwrap();
+        let c = create_custom_role(&conn, "c", "C").unwrap();
+        assert_eq!(c.bit_position, 6);
+    }
+
+    #[test]
+    fn custom_role_bits_are_capped_at_31_for_the_instance_lifetime() {
+        let mut conn = make_auth_conn_for_mgmt();
+        for bit in 4..32 {
+            let role = create_custom_role(&conn, &format!("r{bit}"), "R").unwrap();
+            assert_eq!(role.bit_position, bit);
+        }
+        let err = create_custom_role(&conn, "overflow", "O").unwrap_err();
+        assert!(
+            err.to_string().contains("maximum number of custom roles reached"),
+            "{err}"
+        );
+
+        // Deleting a role does not make room: its bit stays allocated.
+        crate::auth_users::delete_custom_role(&mut conn, "r4")
+            .unwrap()
+            .unwrap();
+        let err = create_custom_role(&conn, "overflow", "O").unwrap_err();
+        assert!(err.to_string().contains("maximum number of custom roles reached"));
     }
 
     #[test]

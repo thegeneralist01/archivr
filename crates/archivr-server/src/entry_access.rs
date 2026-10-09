@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 
 use crate::test_support::{
-    Fixture, admin_session, fixture, guest_session, make_role_session, send, send_json,
+    Fixture, admin_session, fixture, guest_session, make_role_session, owner_session, send, send_json,
     text_capture, wait_job,
 };
 
@@ -435,4 +435,40 @@ async fn a_plain_user_cannot_hide_an_entry_from_all_of_their_own_roles() {
     let (status, _) =
         send_json(&w.f.router, "PATCH", &uri, Some(&w.admin), Some(&json!({"visibility_bits": 4}))).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn a_role_created_after_deleting_one_never_inherits_its_hidden_entries() {
+    let w = world().await;
+    let owner = owner_session(&w.f.auth_path);
+
+    // Delete `editors` (bit 16). Its bit stays on `Hidden note` in the archive DB.
+    let (status, body) =
+        send_json(&w.f.router, "DELETE", "/api/admin/roles/editors", Some(&owner), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A new custom role must get a fresh bit, not the retired 16.
+    let (status, role) = send_json(
+        &w.f.router,
+        "POST",
+        "/api/admin/roles",
+        Some(&owner),
+        Some(&json!({"slug": "reviewers", "name": "Reviewers"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{role}");
+    let new_bit = 1u32 << role["bit_position"].as_u64().unwrap();
+    assert_ne!(new_bit, EDITORS_BIT);
+
+    let dave = make_role_session(&w.f.auth_path, "dave", &["user", "reviewers"]);
+    let (status, _) = send_json(
+        &w.f.router, "GET", &entry_path(&w.hidden, ""), Some(&dave), None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "retired bit must not grant access");
+    let (status, _) = send_json(
+        &w.f.router, "GET", &entry_path(&w.open, ""), Some(&dave), None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 }
