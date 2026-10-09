@@ -2,7 +2,7 @@ import { useState, useEffect, useContext, useCallback } from 'react'
 import { AuthContext } from '../App.jsx'
 import {
   listAdminUsers, createAdminUser, setUserStatus, assignRole, removeRole,
-  listRoles, createRole
+  listRoles, createRole, fetchArchives
 } from '../api.js'
 
 const ROLE_ADMIN = 4
@@ -14,6 +14,9 @@ export default function AdminView({ archives }) {
   const [tab, setTab] = useState('users')
   const [users, setUsers] = useState([])
   const [roles, setRoles] = useState([])
+  // The server only includes archive_path for admins, and the archives prop may have been
+  // fetched anonymously (before login), so admins re-fetch the list for the Archives tab.
+  const [adminArchives, setAdminArchives] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
 
@@ -46,6 +49,11 @@ export default function AdminView({ archives }) {
   }, [isAdmin])
 
   useEffect(() => { refresh() }, [refresh])
+
+  useEffect(() => {
+    if (!isAdmin) return
+    fetchArchives().then(setAdminArchives).catch(() => {})
+  }, [isAdmin])
 
   async function handleToggleStatus(user) {
     const next = user.status === 'active' ? 'disabled' : 'active'
@@ -102,7 +110,6 @@ export default function AdminView({ archives }) {
           {archives.map(a => (
             <div key={a.id} className="admin-archive">
               <strong>{a.label}</strong>
-              <div className="muted">{a.archive_path}</div>
             </div>
           ))}
         </div>
@@ -204,10 +211,10 @@ export default function AdminView({ archives }) {
         <div className="admin-section">
           <h2>Mounted Archives</h2>
           <div className="admin-list">
-            {archives.map(a => (
+            {(adminArchives ?? archives).map(a => (
               <div key={a.id} className="admin-archive">
                 <strong>{a.label}</strong>
-                <div className="muted">{a.archive_path}</div>
+                {a.archive_path && <div className="muted">{a.archive_path}</div>}
               </div>
             ))}
           </div>
