@@ -698,3 +698,30 @@ async fn a_role_created_after_deleting_one_never_inherits_its_hidden_entries() {
     .await;
     assert_eq!(status, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn a_role_created_on_an_upgraded_instance_skips_bits_still_in_archive_masks() {
+    // Upgraded instance: bit 5 belonged to a role deleted before allocations were recorded,
+    // so auth has no allocation for it, but `Hidden note`'s stored mask still carries it.
+    let w = world().await;
+    set_visibility_bits(&w.f, &w.hidden, 1 << 5);
+    let owner = owner_session(&w.f.auth_path);
+
+    let (status, role) = send_json(
+        &w.f.router,
+        "POST",
+        "/api/admin/roles",
+        Some(&owner),
+        Some(&json!({"slug": "reviewers", "name": "Reviewers"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{role}");
+    assert_ne!(role["bit_position"].as_u64(), Some(5), "stale archive bit reissued");
+
+    let dave = make_role_session(&w.f.auth_path, "dave", &["user", "reviewers"]);
+    let (status, _) = send_json(
+        &w.f.router, "GET", &entry_path(&w.hidden, ""), Some(&dave), None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "stale archive bit must not grant access");
+}

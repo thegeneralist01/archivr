@@ -1626,19 +1626,48 @@ pub fn grantable_role_bits(conn: &Connection) -> Result<u32> {
     Ok(bits)
 }
 
+/// Returns the bitwise OR of every visibility mask stored in an archive:
+/// `collection_entries.visibility_bits` and `collections.default_visibility_bits`.
+/// Bits in this mask may still belong to a role that no longer exists, so role creation
+/// must not hand them out again (see `create_custom_role_avoiding`).
+pub fn used_visibility_bits(conn: &Connection) -> Result<u32> {
+    let mut stmt = conn.prepare(
+        "SELECT visibility_bits FROM collection_entries
+         UNION
+         SELECT default_visibility_bits FROM collections",
+    )?;
+    let bits = stmt
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .try_fold(0u32, |acc, b| b.map(|b| acc | (b as u32)))?;
+    Ok(bits)
+}
+
+/// Creates a new custom role (level=2). Equivalent to `create_custom_role_avoiding` with
+/// no reserved bits.
+pub fn create_custom_role(conn: &Connection, slug: &str, name: &str) -> Result<RoleRecord> {
+    create_custom_role_avoiding(conn, slug, name, 0)
+}
+
 /// Creates a new custom role (level=2). Its bit_position is one above the highest bit
 /// ever allocated (min 4), counting deleted roles via `role_bit_allocations`, so a bit
-/// is never reused. Fails once bit 31 is allocated (`maximum number of custom roles
-/// reached`); because bits are never freed, that is a lifetime cap per instance.
-/// Returns the created RoleRecord.
-pub fn create_custom_role(conn: &Connection, slug: &str, name: &str) -> Result<RoleRecord> {
+/// is never reused. Bits set in `reserved_mask` (typically `used_visibility_bits` of the
+/// mounted archives, which can carry bits of roles deleted before allocations were
+/// recorded) are skipped and recorded as allocated. Fails once bit 31 is allocated
+/// (`maximum number of custom roles reached`); because bits are never freed, that is a
+/// lifetime cap per instance. Returns the created RoleRecord.
+pub fn create_custom_role_avoiding(
+    conn: &Connection,
+    slug: &str,
+    name: &str,
+    reserved_mask: u32,
+) -> Result<RoleRecord> {
     if slug.is_empty() || !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         anyhow::bail!(
             "role slug must be non-empty and contain only ASCII letters, digits, or hyphens"
         );
     }
     let tx = conn.unchecked_transaction()?;
-    let next_bit: i64 = tx.query_row(
+    let mut next_bit: i64 = tx.query_row(
         "SELECT COALESCE(MAX(bit_position) + 1, 4) FROM (
              SELECT bit_position FROM role_bit_allocations
              UNION ALL
@@ -1647,11 +1676,19 @@ pub fn create_custom_role(conn: &Connection, slug: &str, name: &str) -> Result<R
         [],
         |r| r.get(0),
     )?;
+    let now = now_timestamp();
+    while next_bit < 32 && reserved_mask & (1u32 << next_bit) != 0 {
+        tx.execute(
+            "INSERT OR IGNORE INTO role_bit_allocations (bit_position, role_uid, allocated_at)
+             VALUES (?1, 'reserved', ?2)",
+            params![next_bit, now],
+        )?;
+        next_bit += 1;
+    }
     if next_bit >= 32 {
         anyhow::bail!("maximum number of custom roles reached");
     }
     let role_uid = public_id("role");
-    let now = now_timestamp();
     tx.execute(
         "INSERT INTO roles (role_uid, slug, name, level, bit_position, is_builtin)
          VALUES (?1, ?2, ?3, 2, ?4, 0)",
@@ -4489,6 +4526,45 @@ mod tests {
             .unwrap();
         let d = create_custom_role(&conn, "d", "D").unwrap();
         assert_eq!(d.bit_position, 7);
+    }
+
+    #[test]
+    fn role_creation_skips_bits_still_present_in_archive_masks() {
+        // Upgraded instance: bit 5 was used by a role deleted before allocations were
+        // recorded, so auth knows only bit 4, but a stored archive mask still carries bit 5.
+        let archive = conn();
+        let collection_id = ensure_default_collection(&archive).unwrap();
+        let entry = create_entry_fixture(&archive, "private", None, None);
+        add_entry_to_collection(&archive, collection_id, entry.id, 2).unwrap();
+        archive
+            .execute(
+                "UPDATE collection_entries SET visibility_bits = 32 WHERE entry_id = ?1",
+                [entry.id],
+            )
+            .unwrap();
+        let reserved = used_visibility_bits(&archive).unwrap();
+        assert_eq!(reserved & (1 << 5), 1 << 5);
+
+        let auth = make_auth_conn_for_mgmt();
+        create_custom_role(&auth, "a", "A").unwrap();
+        let b = create_custom_role_avoiding(&auth, "b", "B", reserved).unwrap();
+        assert_eq!(b.bit_position, 6);
+        // The skipped bit is recorded, so a plain create also moves past it.
+        let c = create_custom_role(&auth, "c", "C").unwrap();
+        assert_eq!(c.bit_position, 7);
+    }
+
+    #[test]
+    fn used_visibility_bits_covers_entry_and_collection_masks() {
+        let archive = conn();
+        assert_eq!(used_visibility_bits(&archive).unwrap() & !2, 0);
+        archive
+            .execute(
+                "UPDATE collections SET default_visibility_bits = 64 WHERE id = ?1",
+                [ensure_default_collection(&archive).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(used_visibility_bits(&archive).unwrap() & 64, 64);
     }
 
     #[test]

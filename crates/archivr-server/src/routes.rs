@@ -3291,8 +3291,15 @@ async fn admin_create_role(
 ) -> Result<(StatusCode, Json<database::RoleRecord>), ApiError> {
     auth_user.require_role(ROLE_ADMIN)?;
     let conn = database::open_auth_db(&state.auth_db_path)?;
-    let role =
-        database::create_custom_role(&conn, &body.slug, &body.name).map_err(ApiError::from)?;
+    // Stored archive masks can still carry bits of roles deleted before allocations were
+    // recorded, so skip every bit any mounted archive uses. Fail closed if one cannot be read.
+    let mut reserved = 0u32;
+    for archive in &state.registry.archives {
+        let archive_conn = database::open_or_initialize(&archive.archive_path)?;
+        reserved |= database::used_visibility_bits(&archive_conn)?;
+    }
+    let role = database::create_custom_role_avoiding(&conn, &body.slug, &body.name, reserved)
+        .map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(role)))
 }
 

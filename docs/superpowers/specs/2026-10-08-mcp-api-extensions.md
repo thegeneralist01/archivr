@@ -276,7 +276,7 @@ Follow the `oneshot` style in `routes.rs` `mod tests`, helpers from `test_suppor
 
 ## 5. Entry access rules (added after review of the first implementation)
 
-The first implementation hid entries only in lists and search; fetching by uid still worked. These rules close that gap.
+The first implementation hid entries only in lists and search; fetching by uid still worked. These rules close that gap. Role creation also skips any bit present in the stored visibility masks of the mounted archives.
 
 1. **Hidden means 404.** For a logged-in caller who is neither ADMIN nor OWNER, every endpoint that takes an entry uid answers `404 entry not found` when none of the entry's collection memberships (or its parent entry's) has `visibility_bits & caller_bits != 0`. This covers entry detail, artifacts, summary (GET and POST), tags (GET, POST, DELETE), entry collections, media token, favicon, PATCH and DELETE entry, thread title, rearchive, and collection add, remove and visibility. `GET /api/archives/:id/blobs/:sha256` allows a blob when at least one entry that uses it is visible. Guests keep `is_entry_publicly_accessible`. Rearchive of an unknown entry is `404` for everyone.
 2. **Tag counts.** `GET .../tags` counts only entries the caller can see. Tag names remain visible to every signed-in user.
