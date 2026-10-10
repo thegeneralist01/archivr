@@ -385,6 +385,27 @@ async fn media_token_stops_working_when_its_issuer_is_deleted() {
 }
 
 #[tokio::test]
+async fn media_token_does_not_pass_to_a_new_user_that_reuses_the_issuers_row_id() {
+    let w = world().await;
+    // The newest user gets the highest row id; SQLite hands that id out again after a delete.
+    let zed = make_role_session(&w.f.auth_path, "zed", &["user"]);
+    let url = issue_media_token(&w, &zed, &w.open).await;
+    let (status, _) = send(&w.f.router, "GET", &url, None, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let zed_uid = user_uid(&w.f.auth_path, "zed");
+    let (status, _) = send(
+        &w.f.router, "DELETE", &format!("/api/admin/users/{zed_uid}"), Some(&w.admin), None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let _yan = make_role_session(&w.f.auth_path, "yan", &["user"]);
+
+    let (status, _) = send(&w.f.router, "GET", &url, None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the token belonged to a deleted account");
+}
+
+#[tokio::test]
 async fn an_admin_issued_media_token_for_a_hidden_entry_keeps_working() {
     let w = world().await;
     let url = issue_media_token(&w, &w.admin, &w.hidden).await;

@@ -417,7 +417,7 @@ export async function createToken(name, { expiresInDays = null, scope = 'full' }
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name, expires_in_days: expiresInDays, scope }),
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || `HTTP ${res.status}`); }
   return res.json();
 }
 

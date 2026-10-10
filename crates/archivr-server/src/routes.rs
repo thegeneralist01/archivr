@@ -66,8 +66,9 @@ pub(crate) struct MediaToken {
     archive_id: String,
     entry_uid: String,
     artifact_index: usize,
-    /// The account that issued the token. Its status and access are re-checked on every use.
-    user_id: i64,
+    /// The `user_uid` of the account that issued the token (not the integer id: SQLite reuses the
+    /// rowid of the newest user once deleted). Its status and access are re-checked on every use.
+    user_uid: String,
     expires_at: std::time::Instant,
 }
 
@@ -938,13 +939,13 @@ async fn serve_artifact(
                     && t.artifact_index == artifact_index
                     && t.expires_at > std::time::Instant::now()
             })
-            .map(|t| t.user_id)
+            .map(|t| t.user_uid.clone())
     });
     let mounted = mounted_archive(&state, &archive_id)?;
     let paths = archive::read_archive_paths(&mounted.archive_path)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let token_valid = match token_issuer {
-        Some(issuer_id) => media_token_issuer_can_view(&state, &conn, issuer_id, &entry_uid)?,
+        Some(issuer_uid) => media_token_issuer_can_view(&state, &conn, &issuer_uid, &entry_uid)?,
         None => false,
     };
     if !token_valid {
@@ -983,6 +984,8 @@ async fn issue_media_token(
     Path((archive_id, entry_uid, artifact_index)): Path<(String, String, usize)>,
 ) -> Result<Json<MediaTokenResponse>, ApiError> {
     let (user_id, _) = auth_user.require_auth()?;
+    let user_uid = database::get_user_uid(&database::open_auth_db(&state.auth_db_path)?, user_id)?
+        .ok_or_else(|| ApiError::unauthorized("login required"))?;
     // Verify the artifact actually exists before issuing a token.
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
@@ -1004,7 +1007,7 @@ async fn issue_media_token(
                 archive_id: archive_id.clone(),
                 entry_uid: entry_uid.clone(),
                 artifact_index,
-                user_id,
+                user_uid,
                 expires_at: now + MEDIA_TOKEN_TTL,
             },
         );
@@ -3325,10 +3328,13 @@ pub(crate) fn ensure_entry_visible(
 fn media_token_issuer_can_view(
     state: &AppState,
     conn: &rusqlite::Connection,
-    issuer_id: i64,
+    issuer_uid: &str,
     entry_uid: &str,
 ) -> Result<bool, ApiError> {
     let auth_conn = database::open_auth_db(&state.auth_db_path)?;
+    let Some(issuer_id) = database::get_user_id_by_uid(&auth_conn, issuer_uid)? else {
+        return Ok(false);
+    };
     if !database::user_is_active(&auth_conn, issuer_id)? {
         return Ok(false);
     }
