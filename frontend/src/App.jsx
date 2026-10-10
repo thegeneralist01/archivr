@@ -22,7 +22,7 @@ import { parseCaptureLink, resolveCaptureLink, makeCaptureLinkRequest } from './
 export const AuthContext = createContext(null);
 
 const VIEWS = ['archive','tags','collections','runs','admin','settings']
-const SETTINGS_TABS = ['profile','tokens','instance','cookies','extensions','storage']
+const SETTINGS_TABS = ['profile','tokens','sessions','instance','cookies','extensions','storage']
 
 // Detect /preview/:archiveId/:entryUid at load time (static — no navigation)
 const PREVIEW_ROUTE = (() => {
