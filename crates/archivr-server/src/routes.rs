@@ -2561,6 +2561,10 @@ async fn update_instance_settings_handler(
     Json(body): Json<UpdateInstanceSettingsBody>,
 ) -> Result<StatusCode, ApiError> {
     auth_user.require_role(ROLE_ADMIN)?;
+    if let Some(bits) = body.default_entry_visibility {
+        // Before the IMMEDIATE transaction below: the helper opens its own auth connection.
+        ensure_known_visibility_bits(&state, bits)?;
+    }
     let mut conn = database::open_auth_db(&state.auth_db_path)?;
     // IMMEDIATE: the read-merge-write below rewrites every column, so it must
     // not interleave with another PATCH (an admin save could otherwise write a
@@ -3310,6 +3314,21 @@ pub(crate) fn auth_to_caller_bits(auth: &AuthUser) -> u32 {
     }
 }
 
+/// Rejects a client-supplied visibility mask that carries a bit no role owns. Guest and the
+/// bits of existing non-guest roles are allowed. Anything else would be stored as-is, and
+/// `admin_create_role` reserves every stored bit, so a stray bit would be permanently
+/// unusable for a new role.
+fn ensure_known_visibility_bits(state: &AppState, bits: u32) -> Result<(), ApiError> {
+    let auth_conn = database::open_auth_db(&state.auth_db_path)?;
+    let known = ROLE_GUEST | database::grantable_role_bits(&auth_conn)?;
+    if bits & !known != 0 {
+        return Err(ApiError::bad_request(
+            "visibility_bits contains bits that do not belong to any role",
+        ));
+    }
+    Ok(())
+}
+
 /// Gate for every by-uid entry endpoint: a logged-in caller who cannot see the entry in the
 /// lists (`database::caller_can_access_entry`) gets the same 404 as for an unknown uid, so
 /// hiding an entry from a role also hides it from direct requests. ADMIN/OWNER always pass
@@ -3518,6 +3537,7 @@ async fn create_collection_handler(
     }
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_known_visibility_bits(&state, body.default_visibility_bits)?;
     let record =
         database::create_collection(&conn, &body.name, &body.slug, body.default_visibility_bits, body.requires_auth)
             .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
@@ -3619,6 +3639,7 @@ async fn add_entry_to_collection_handler(
         )
         .optional()?
         .ok_or(ApiError::not_found("entry not found"))?;
+    ensure_known_visibility_bits(&state, body.visibility_bits)?;
     database::add_entry_to_collection(&conn, coll.id, entry_id, body.visibility_bits)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -3677,6 +3698,7 @@ async fn update_entry_visibility_handler(
         )
         .optional()?
         .ok_or(ApiError::not_found("entry not found"))?;
+    ensure_known_visibility_bits(&state, body.visibility_bits)?;
     let updated = apply_without_self_lockout(&conn, &auth, std::slice::from_ref(&entry_uid), || {
         Ok(database::update_collection_entry_visibility(
             &conn,
@@ -3716,6 +3738,9 @@ async fn patch_collection_handler(
     auth.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    if let Some(bits) = body.default_visibility_bits {
+        ensure_known_visibility_bits(&state, bits)?;
+    }
     let name_ref: Option<&str> = body.name.as_deref();
     let updated =
         database::update_collection(&conn, &coll_uid, name_ref, body.default_visibility_bits, body.requires_auth)?;

@@ -725,3 +725,183 @@ async fn a_role_created_on_an_upgraded_instance_skips_bits_still_in_archive_mask
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "stale archive bit must not grant access");
 }
+
+/// No role owns this bit, so every mask-accepting endpoint must refuse it.
+const UNOWNED_BITS: u32 = u32::MAX;
+const UNOWNED_ERROR: &str = "visibility_bits contains bits that do not belong to any role";
+
+fn default_collection_uid(f: &Fixture) -> String {
+    let conn = database::open_or_initialize(&f.archive_path).unwrap();
+    database::get_collection_by_slug(&conn, "_default_").unwrap().unwrap().collection_uid
+}
+
+fn collection_uid_by_slug(f: &Fixture, slug: &str) -> String {
+    let conn = database::open_or_initialize(&f.archive_path).unwrap();
+    database::get_collection_by_slug(&conn, slug).unwrap().unwrap().collection_uid
+}
+
+fn membership_bits(f: &Fixture, coll_uid: &str, entry_uid: &str) -> u32 {
+    let conn = database::open_or_initialize(&f.archive_path).unwrap();
+    let bits: i64 = conn
+        .query_row(
+            "SELECT ce.visibility_bits FROM collection_entries ce \
+             JOIN collections c ON c.id = ce.collection_id \
+             JOIN archived_entries e ON e.id = ce.entry_id \
+             WHERE c.collection_uid = ?1 AND e.entry_uid = ?2",
+            [coll_uid, entry_uid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    bits as u32
+}
+
+fn instance_default_visibility(f: &Fixture) -> u32 {
+    let conn = database::open_auth_db(&f.auth_path).unwrap();
+    database::get_instance_settings(&conn).unwrap().default_entry_visibility
+}
+
+/// Every collection default, membership mask and the instance default, in a fixed order.
+type MaskState = (Vec<(i64, i64)>, Vec<(i64, i64, i64)>, u32);
+
+fn mask_state(f: &Fixture) -> MaskState {
+    let conn = database::open_or_initialize(&f.archive_path).unwrap();
+    let collections = conn
+        .prepare("SELECT id, default_visibility_bits FROM collections ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let memberships = conn
+        .prepare(
+            "SELECT collection_id, entry_id, visibility_bits FROM collection_entries \
+             ORDER BY collection_id, entry_id",
+        )
+        .unwrap()
+        .query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    (collections, memberships, instance_default_visibility(f))
+}
+
+fn assert_unowned_bits_rejected(status: StatusCode, body: &Value, what: &str) {
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {body}");
+    assert_eq!(body["error"], UNOWNED_ERROR, "{what}");
+}
+
+#[tokio::test]
+async fn a_visibility_mask_with_a_bit_no_role_owns_is_rejected_before_anything_changes() {
+    let w = world().await;
+    let default_coll = default_collection_uid(&w.f);
+    // Each plain user and admin gets a collection of their own to attack.
+    for (name, session) in [("alice-shelf", &w.alice), ("admin-shelf", &w.admin)] {
+        let (status, body) = send_json(
+            &w.f.router, "POST", "/api/archives/test/collections", Some(session),
+            Some(&json!({"name": name, "slug": name})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let alice_shelf = collection_uid_by_slug(&w.f, "alice-shelf");
+    let admin_shelf = collection_uid_by_slug(&w.f, "admin-shelf");
+    let before = mask_state(&w.f);
+
+    for (who, session) in [("alice", &w.alice), ("admin", &w.admin)] {
+        let (status, body) = send_json(
+            &w.f.router, "POST", "/api/archives/test/collections", Some(session),
+            Some(&json!({"name": "Bad", "slug": format!("bad-{who}"), "default_visibility_bits": UNOWNED_BITS})),
+        )
+        .await;
+        assert_unowned_bits_rejected(status, &body, &format!("{who} create collection"));
+
+        let own_shelf = if who == "alice" { &alice_shelf } else { &admin_shelf };
+        let (status, body) = send_json(
+            &w.f.router, "PATCH", &format!("/api/archives/test/collections/{own_shelf}"), Some(session),
+            Some(&json!({"default_visibility_bits": UNOWNED_BITS})),
+        )
+        .await;
+        assert_unowned_bits_rejected(status, &body, &format!("{who} patch collection"));
+
+        let (status, body) = send_json(
+            &w.f.router, "PATCH", &format!("/api/archives/test/collections/{default_coll}/entries/{}", w.open),
+            Some(session), Some(&json!({"visibility_bits": UNOWNED_BITS})),
+        )
+        .await;
+        assert_unowned_bits_rejected(status, &body, &format!("{who} patch entry visibility"));
+
+        let (status, body) = send_json(
+            &w.f.router, "POST", &format!("/api/archives/test/collections/{own_shelf}/entries"), Some(session),
+            Some(&json!({"entry_uid": w.open, "visibility_bits": UNOWNED_BITS})),
+        )
+        .await;
+        assert_unowned_bits_rejected(status, &body, &format!("{who} add entry"));
+    }
+
+    let (status, body) = send_json(
+        &w.f.router, "PATCH", "/api/admin/instance-settings", Some(&w.admin),
+        Some(&json!({"default_entry_visibility": UNOWNED_BITS})),
+    )
+    .await;
+    assert_unowned_bits_rejected(status, &body, "admin instance settings");
+
+    assert_eq!(mask_state(&w.f), before, "a rejected request changed stored state");
+}
+
+#[tokio::test]
+async fn visibility_masks_built_from_real_role_bits_are_still_accepted() {
+    let w = world().await;
+    let default_coll = default_collection_uid(&w.f);
+
+    // alice: a collection with her USER bit, and the open entry added to it with 6 (user|admin).
+    let (status, created) = send_json(
+        &w.f.router, "POST", "/api/archives/test/collections", Some(&w.alice),
+        Some(&json!({"name": "Mine", "slug": "mine", "default_visibility_bits": 6})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let mine = created["collection_uid"].as_str().unwrap().to_string();
+    let (status, _) = send_json(
+        &w.f.router, "POST", &format!("/api/archives/test/collections/{mine}/entries"), Some(&w.alice),
+        Some(&json!({"entry_uid": w.open, "visibility_bits": 6})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(membership_bits(&w.f, &mine, &w.open), 6);
+
+    // admin: a collection defaulting to the editors bit, holding the hidden entry for carol.
+    let (status, created) = send_json(
+        &w.f.router, "POST", "/api/archives/test/collections", Some(&w.admin),
+        Some(&json!({"name": "Editors", "slug": "editors-only", "default_visibility_bits": EDITORS_BIT})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let editors = created["collection_uid"].as_str().unwrap().to_string();
+    let (status, _) = send_json(
+        &w.f.router, "POST", &format!("/api/archives/test/collections/{editors}/entries"), Some(&w.admin),
+        Some(&json!({"entry_uid": w.hidden, "visibility_bits": EDITORS_BIT})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(membership_bits(&w.f, &editors, &w.hidden), EDITORS_BIT);
+
+    // alice narrows her default-collection membership to 2 (her USER bit); still allowed.
+    let (status, _) = send_json(
+        &w.f.router, "PATCH", &format!("/api/archives/test/collections/{default_coll}/entries/{}", w.open),
+        Some(&w.alice), Some(&json!({"visibility_bits": 2})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(membership_bits(&w.f, &default_coll, &w.open), 2);
+
+    // The instance default accepts a real mask (6), and it is stored.
+    let (status, _) = send_json(
+        &w.f.router, "PATCH", "/api/admin/instance-settings", Some(&w.admin),
+        Some(&json!({"default_entry_visibility": 6})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(instance_default_visibility(&w.f), 6);
+}
