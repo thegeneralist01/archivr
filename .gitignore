@@ -32,6 +32,8 @@ crates/archivr-server/static/**
 !ARCHIVR-MENTAL-MODEL.md
 !NEXT.md
 !AGENTS.md
+!CONTRIBUTING.md
+!docs/ecosystem-change-checklist.md
 
 !Dockerfile
 !.dockerignore

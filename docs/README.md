@@ -15,6 +15,8 @@
 
 Archivr is a self-hosted tool for capturing and preserving digital content — YouTube videos and playlists, tweets and threads, Instagram, TikTok, web pages, and local files — into self-contained, locally-owned archives. Content is stored in SQLite with SHA3-256 blob deduplication, hierarchical tags, a browser-based UI, and role-based auth.
 
+Contributing? See the [contributor guide](../CONTRIBUTING.md) and its ecosystem change checklist.
+
 ## Table of Contents
 
 - [Features](#features)

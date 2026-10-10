@@ -6,6 +6,8 @@ archivr is a self-hosted archival tool that captures and preserves digital conte
 
 Read `ARCHIVR-MENTAL-MODEL.md` before making structural changes.
 
+For user-facing behavior, API contracts, capture options, shared UI, permissions, docs, or branding, use the [ecosystem change checklist](docs/ecosystem-change-checklist.md) before implementation and again before reporting completion. Record applicability, action or reason, verification, and links for Archivr, the Chrome extension, and the MCP server. This applies to direct agent work as well as PRs; an applicable unfinished companion change needs a named follow-up.
+
 ## Architecture & Data Flow
 
 Three crates with a strict ownership split — **core owns truth; CLI and server are adapters**:
