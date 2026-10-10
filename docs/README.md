@@ -49,7 +49,7 @@ Archivr is a self-hosted tool for capturing and preserving digital content — Y
 - **Deduplication** — SHA3-256 content-addressed blob store shared across all captures; identical files are stored once
 - **Tags and search** — hierarchical tag tree, full-text search (including the latest completed summary and its generated JSON tags), filterable entry list
 - **Multiple archives** — the server mounts any number of separate archives from a single TOML config
-- **Role-based auth** — Guest / User / Admin / Owner roles; session cookies and API tokens; Argon2 passwords; the Owner can choose which roles (including custom ones) may reorder child entries
+- **Role-based auth** — Guest / User / Admin / Owner roles; session cookies and API tokens (`full` or read-only scope, optional expiry); Argon2 passwords; the Owner can choose which roles (including custom ones) may reorder child entries; users manage their own sessions and tokens, and admins manage other accounts within the guard rules below
 - **Quality selection** — choose video quality or audio-only per capture; a live metadata probe populates the selector before download
 - **LLM summaries** — regenerable per-entry summary via the Anthropic HTTP API, an OpenAI-compatible HTTP API, a local `claude` CLI, or a local `codex` CLI; triggered manually from the entry rail, never automatically on capture; text-only by default, with an explicit `Include attached images` option; YouTube videos are summarized from their subtitles
 - **Text notes** — capture a plain-text or Markdown note with a title and no URL; the byte-preserving note is stored as a normal deduplicated blob and opens in the usual entry-rail preview
@@ -121,7 +121,7 @@ my-archive/
     └── temp/          # staging area during capture
 ```
 
-A separate auth database (`archivr-auth.sqlite`, path set in TOML) holds users, sessions, API tokens, and role bits. It is independent of individual archives.
+A separate auth database (`archivr-auth.sqlite`, path set in TOML) holds users, sessions, API tokens (with scope and expiry), and role bits. It is independent of individual archives.
 
 ## Supported Inputs
 
@@ -129,7 +129,7 @@ A separate auth database (`archivr-auth.sqlite`, path set in TOML) holds users, 
 
 | Platform | Input examples |
 |---|---|
-| Local file | `file:///absolute/path/to/file.pdf` |
+| Local file | `file:///absolute/path/to/file.pdf` (CLI only; the HTTP API accepts `file://` only for files staged by an upload, see [Security](#security)) |
 | YouTube video / short | `https://youtube.com/watch?v=ID` · `yt:video/ID` · `yt:short/ID` |
 | YouTube playlist | `https://youtube.com/playlist?list=ID` |
 | YouTube channel | `https://youtube.com/@handle` |
@@ -576,6 +576,17 @@ Deno and exits 0 (the UI shows the Deno outcome as `skipped: …`).
 
 `archivr-server` binds to `127.0.0.1:8080` by default. Do not expose it to a public network without understanding the risks. When started on a non-loopback address the server logs a warning to stderr.
 
+Access rules enforced by the server:
+
+- **Local files over the API.** A `file://` capture locator is accepted only for a file staged by an upload (under the archive's `temp/uploads/`); any other `file://` path returns 400, and so does a bare path locator (absolute, or relative to the server's working directory). The CLI still reads local paths directly.
+- **Read-only tokens.** A Bearer token with `scope: read` gets 403 (`read-only token`) on any method other than GET, HEAD or OPTIONS. Cookie sessions are not affected. Bearer use updates `last_used_at`, at most once per 60 seconds.
+- **Archive paths.** `GET /api/archives` returns each archive's `archive_path` to admins only. `GET /api/archives/:id/info` returns counts and sizes, never filesystem paths.
+- **Account guards.** Only an owner may manage an owner or admin account. Nobody can disable or delete their own account, and the last active owner cannot be removed or demoted (409).
+- **Capture jobs.** A user sees only the capture jobs they created (`created_by`); admins see all. Jobs with no recorded creator are admin-only. A run is listed when the caller is an admin, created its job, or can see at least one entry it produced.
+- **Admin endpoints.** `GET /api/admin/effective-config` lists every `ARCHIVR_*` setting; secret values are shown only as `set`, and URLs lose their userinfo and query string.
+
+The instance settings `public_index_enabled`, `public_entry_content_enabled` and `open_registration_enabled` are stored and returned by the API but no server logic reads them yet.
+
 ### Hosting on NixOS
 
 The flake exposes `nixosModules.default`:
@@ -719,3 +730,13 @@ nix build .#archivr-server
 
 MIT — see [LICENSE](../LICENSE.md).
 \n
+
+## Chrome extension
+
+The companion `archivr-extension` checkout builds an unpacked Chrome Manifest V3 extension (Chrome 123+). Keep it next to this checkout, rebuild the current Archivr server/frontend, then run `bun install` and `bun run zip` from the extension checkout. Load its `dist` directory through Chrome’s Developer mode.
+
+Connect by entering your server origin (localhost or a Tailscale address are supported), then log in in the server tab. The extension creates a named, revocable API token using that login and lets you choose a mounted archive. Captures remain reviewable in the shared Capture dialog. Selected text has editable title/body and optional manual title generation. Playlists/channels open this app’s prefilled capture dialog.
+
+Capture deep links use `/?archive=<id>&capture=<encoded-locator>`. They wait for login, require a valid mounted archive, open once, and never submit automatically. The `capture` parameter is removed after opening.
+
+Capture users can read safe defaults and configured-provider availability through `GET /api/captures/options`. `POST /api/archives/:archive_id/captures/text/title` accepts `{body, provider}` and returns `{title}` without creating or modifying archive entries. Both endpoints require the capture role; administrator settings remain administrator-only.

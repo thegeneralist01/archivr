@@ -1,8 +1,8 @@
 import { useState, useEffect, useContext, useCallback } from 'react'
 import { AuthContext } from '../App.jsx'
 import {
-  listAdminUsers, createAdminUser, setUserStatus, assignRole, removeRole,
-  listRoles, createRole
+  listAdminUsers, createAdminUser, setUserStatus, deleteAdminUser, assignRole, removeRole,
+  listRoles, createRole, fetchArchives
 } from '../api.js'
 
 const ROLE_ADMIN = 4
@@ -14,6 +14,9 @@ export default function AdminView({ archives }) {
   const [tab, setTab] = useState('users')
   const [users, setUsers] = useState([])
   const [roles, setRoles] = useState([])
+  // The server only includes archive_path for admins, and the archives prop may have been
+  // fetched anonymously (before login), so admins re-fetch the list for the Archives tab.
+  const [adminArchives, setAdminArchives] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
 
@@ -47,11 +50,26 @@ export default function AdminView({ archives }) {
 
   useEffect(() => { refresh() }, [refresh])
 
+  useEffect(() => {
+    if (!isAdmin) return
+    fetchArchives().then(setAdminArchives).catch(() => {})
+  }, [isAdmin])
+
   async function handleToggleStatus(user) {
     const next = user.status === 'active' ? 'disabled' : 'active'
     try {
       await setUserStatus(user.user_uid, next)
       setUsers(us => us.map(u => u.user_uid === user.user_uid ? { ...u, status: next } : u))
+    } catch (e) {
+      setError(e.message)
+    }
+  }
+
+  async function handleDeleteUser(user) {
+    if (!window.confirm(`Delete user ${user.username}? This removes their sessions and API tokens and cannot be undone.`)) return
+    try {
+      await deleteAdminUser(user.user_uid)
+      setUsers(us => us.filter(u => u.user_uid !== user.user_uid))
     } catch (e) {
       setError(e.message)
     }
@@ -102,7 +120,6 @@ export default function AdminView({ archives }) {
           {archives.map(a => (
             <div key={a.id} className="admin-archive">
               <strong>{a.label}</strong>
-              <div className="muted">{a.archive_path}</div>
             </div>
           ))}
         </div>
@@ -141,6 +158,11 @@ export default function AdminView({ archives }) {
                       <button className="admin-action-btn" onClick={() => handleToggleStatus(u)}>
                         {u.status === 'active' ? 'Ban' : 'Unban'}
                       </button>
+                      {u.user_uid !== currentUser?.user_uid && (
+                        <button className="admin-action-btn admin-action-btn--danger" onClick={() => handleDeleteUser(u)}>
+                          Delete
+                        </button>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -204,10 +226,10 @@ export default function AdminView({ archives }) {
         <div className="admin-section">
           <h2>Mounted Archives</h2>
           <div className="admin-list">
-            {archives.map(a => (
+            {(adminArchives ?? archives).map(a => (
               <div key={a.id} className="admin-archive">
                 <strong>{a.label}</strong>
-                <div className="muted">{a.archive_path}</div>
+                {a.archive_path && <div className="muted">{a.archive_path}</div>}
               </div>
             ))}
           </div>

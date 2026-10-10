@@ -375,7 +375,14 @@ fetch is in flight (`has_pending_subtitle_fetches`). Every one of these calls is
 | `entry_summaries` schema and summary CRUD | `crates/archivr-core/src/database.rs` |
 | CLI commands, argument parsing, terminal output | `crates/archivr-cli/src/main.rs` |
 | Server API routes | `crates/archivr-server/src/routes.rs` |
-| Auth model (users, sessions, tokens, roles) | `crates/archivr-server/src/auth.rs` |
+| Auth model (users, sessions, tokens, roles), Bearer/cookie extraction | `crates/archivr-server/src/auth.rs` |
+| Own sessions and API tokens (`/api/auth/sessions`, token scope/expiry), admin password reset and per-user session/token revocation | `crates/archivr-server/src/credentials.rs` |
+| Admin user delete/status, role CRUD and assignment | `crates/archivr-server/src/admin_users.rs` |
+| Target-aware guards (manage, not self, last owner) | `crates/archivr-server/src/guards.rs` |
+| Read-scope token enforcement (non-GET/HEAD/OPTIONS → 403) | `crates/archivr-server/src/token_scope.rs` |
+| Capture job list/detail, `created_by` visibility, run visibility | `crates/archivr-server/src/jobs.rs` |
+| Effective config and `ENV_VARS` registry, archive info | `crates/archivr-server/src/effective_config.rs` |
+| Shared server test helpers | `crates/archivr-server/src/test_support.rs` |
 | Mounted archive config model | `crates/archivr-server/src/registry.rs` |
 | Frontend root state + routing | `frontend/src/App.jsx` |
 | Frontend API client | `frontend/src/api.js` |
@@ -409,4 +416,20 @@ The server both reads and writes archive data. Capture jobs are asynchronous: `P
 searched as text, so generated `tags` participate. Older completed summaries stay searchable while a newer request is
 pending or failed; rows with no completed summary contribute no summary-derived match.
 
-**Admin view** covers mounted archives, users, sessions, and API tokens.
+**Token scope and expiry.** API tokens carry `scope` (`full` or `read`) and an optional expiry. `token_scope.rs` answers 403 `read-only token` to a read-scope Bearer request that is not GET, HEAD or OPTIONS. Cookie sessions bypass this check. Bearer use goes through `auth_credentials::touch_token_throttled`, so `last_used_at` is written at most once per 60 seconds.
+
+**Guards.** Management endpoints call `guards.rs` after their coarse `require_role(ROLE_ADMIN)` check: `ensure_can_manage` (only an OWNER may act on a target that has OWNER or ADMIN), `ensure_not_self` (409), and `ensure_not_last_owner` (409, counts active owners). Keep new management endpoints on these helpers rather than re-deriving the rules.
+
+**Capture job visibility.** `capture_jobs.created_by` stores the creator's `user_uid`. Job endpoints show a caller only jobs they created unless they hold ADMIN; rows with no creator are admin-only. `GET /api/archives/:id/runs` follows access: admins see all runs, other callers see runs whose job they created or that produced at least one entry they can see.
+
+**Entry visibility.** An entry is visible to a logged-in caller when ADMIN/OWNER, or when the caller's role bits overlap `collection_entries.visibility_bits` of one of its collections (or of its parent entry's). List and search use `database::entry_visible_to_caller_sql`; every by-uid endpoint (detail, artifacts, summary, tags, collections, media token, favicon, patch/delete, rearchive, thread title) calls `routes::ensure_entry_visible`, which answers `404` for a hidden entry so it cannot be told apart from a missing one. `/blobs/:sha256` applies the same rule through the entries that use the blob, and `list_tag_tree` counts only visible entries (tag names themselves stay visible to every signed-in user). Guests keep the separate `is_entry_publicly_accessible` rule. Signed-in role bits always include the guest bit, so custom roles start at bit 16. A non-admin cannot change or remove a collection membership in a way that leaves the entry invisible to their own roles (`apply_without_self_lockout`, `400`). A media token is re-checked on every use against the issuer's current status, roles and access to the entry, so hiding the entry or disabling/deleting the issuer stops it immediately; it still expires after two hours.
+
+**Capture job to run link.** `CaptureConfig.job_uid` is set by the server for API captures; the run is written onto `capture_jobs.run_uid` the moment it is created (`database::link_capture_job_run`), so the creator can see an in-progress run. Rearchive passes `None`.
+
+**Default collection.** `_default_` cannot be deleted (`400`), nor can entries be added to or removed from it by hand.
+
+**File locators.** `POST /api/archives/:id/captures` accepts `file://` only for a file staged under `temp/uploads/`, so an API caller cannot capture and read back arbitrary server files. The CLI reads local paths directly and is unaffected.
+
+**Inert settings.** `public_index_enabled`, `public_entry_content_enabled` and `open_registration_enabled` are stored and returned by the instance-settings endpoints, but no server logic reads them yet.
+
+**Admin view** covers mounted archives, users, sessions, and API tokens. `admin_users.rs` handles user delete and status, and role CRUD and assignment. `credentials.rs` handles password reset and per-user session and token revocation (`GET /api/admin/users/:uid/tokens`, `DELETE .../tokens/:token_uid`). `GET /api/admin/effective-config` (`effective_config.rs`) serves the static `ENV_VARS` table, with secrets shown only as `set`. `GET /api/archives/:id/info` gives counts and sizes without paths, and `GET /api/archives` returns `archive_path` to admins only.

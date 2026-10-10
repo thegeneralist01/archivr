@@ -97,6 +97,9 @@ pub struct ApiTokenRecord {
     pub name: String,
     pub created_at: String,
     pub last_used_at: Option<String>,
+    pub expires_at: Option<String>,
+    /// `full` or `read`; read-scope tokens may only issue GET/HEAD requests.
+    pub scope: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -109,6 +112,8 @@ pub struct CaptureJobRecord {
     pub notes_json: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Auth-DB `user_uid` of the submitter; None for CLI/legacy jobs.
+    pub created_by: Option<String>,
 }
 
 /// One row of `entry_summaries` — a regenerable LLM summary of an entry.
@@ -394,7 +399,8 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
             error_text  TEXT,
             notes_json  TEXT,
             created_at  TEXT NOT NULL,
-            updated_at  TEXT NOT NULL
+            updated_at  TEXT NOT NULL,
+            created_by  TEXT
         );
         CREATE TABLE IF NOT EXISTS entry_summaries (
             id INTEGER PRIMARY KEY,
@@ -530,6 +536,13 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     // Migration: add notes_json column to existing capture_jobs tables.
     // Silently ignored when the column already exists (idempotent).
     let _ = conn.execute("ALTER TABLE capture_jobs ADD COLUMN notes_json TEXT", []);
+    // Migration: add created_by (auth-DB `user_uid` of the submitter; NULL for
+    // pre-migration and CLI rows). The index follows the ALTER so legacy tables
+    // have the column by the time it is created.
+    let _ = conn.execute("ALTER TABLE capture_jobs ADD COLUMN created_by TEXT", []);
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_capture_jobs_created_by ON capture_jobs(created_by);",
+    )?;
     // Provider responses may resolve a requested alias to a concrete model.
     // Keep that display-only value outside the cache key.
     let _ = conn.execute(
@@ -688,7 +701,8 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
             name         TEXT NOT NULL,
             created_at   TEXT NOT NULL,
             last_used_at TEXT,
-            expires_at   TEXT
+            expires_at   TEXT,
+            scope        TEXT NOT NULL DEFAULT 'full'
         );
         CREATE INDEX IF NOT EXISTS idx_api_tokens_user_id ON api_tokens(user_id);
 
@@ -735,6 +749,17 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
             ordinal      INTEGER NOT NULL DEFAULT 0,
             created_at   TEXT NOT NULL
         );
+
+        -- Every custom-role bit ever handed out, including bits whose role was deleted.
+        -- Bits are never reused: archives store visibility masks
+        -- (collection_entries.visibility_bits) that still carry a deleted role's bit,
+        -- so a new role given that bit would inherit access to the old hidden entries.
+        -- No foreign key on purpose: the row must outlive the roles row it describes.
+        CREATE TABLE IF NOT EXISTS role_bit_allocations (
+            bit_position INTEGER PRIMARY KEY,
+            role_uid     TEXT NOT NULL,
+            allocated_at TEXT NOT NULL
+        );
         "#,
     )?;
     // Add display_name column to users if not present (idempotent migration)
@@ -742,6 +767,12 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
     // Add humanize_slugs column to users if not present (idempotent migration)
     let _ = conn.execute(
         "ALTER TABLE users ADD COLUMN humanize_slugs INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+
+    // Add scope column to api_tokens if not present ('full' | 'read'; idempotent migration)
+    let _ = conn.execute(
+        "ALTER TABLE api_tokens ADD COLUMN scope TEXT NOT NULL DEFAULT 'full'",
         [],
     );
 
@@ -778,6 +809,15 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
         );
     }
 
+    // Backfill allocations for custom roles created before role_bit_allocations existed.
+    // Roles deleted before this migration left no record here, so their bits cannot be
+    // recovered from the auth DB.
+    conn.execute(
+        "INSERT OR IGNORE INTO role_bit_allocations (bit_position, role_uid, allocated_at)
+         SELECT bit_position, role_uid, ?1 FROM roles WHERE bit_position >= 4",
+        [now_timestamp()],
+    )?;
+
     Ok(())
 }
 
@@ -788,6 +828,9 @@ pub fn open_auth_db(auth_db_path: &Path) -> Result<Connection> {
     }
     let conn = Connection::open(auth_db_path)
         .with_context(|| format!("failed to open auth database at {}", auth_db_path.display()))?;
+    // Owner-guarded writes take BEGIN IMMEDIATE; wait for a concurrent writer
+    // instead of failing with SQLITE_BUSY.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     initialize_auth_schema(&conn)?;
     Ok(conn)
 }
@@ -857,6 +900,16 @@ pub fn compute_role_bits(conn: &Connection, user_id: i64) -> Result<u32> {
         .query_map([user_id], |row| row.get::<_, i64>(0))?
         .try_fold(1u32, |acc, val| val.map(|v| acc | v as u32))?;
     Ok(bits)
+}
+
+/// True when the user row exists and its status is `active`. A disabled or deleted user is not.
+/// Used to re-check credentials that were issued earlier (media tokens) against current state.
+pub fn user_is_active(conn: &Connection, user_id: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM users WHERE id = ?1 AND status = 'active')",
+        [user_id],
+        |row| row.get(0),
+    )?)
 }
 
 /// Returns a new session_uid (UUID).
@@ -930,32 +983,40 @@ pub fn delete_expired_sessions(conn: &Connection) -> Result<usize> {
 }
 
 /// Creates an API token. `token_hash` is SHA3-256 hex of the raw token.
+/// `expires_at` is an RFC 3339 timestamp (None = never expires); `scope` is
+/// `full` or `read`.
 pub fn create_api_token(
     conn: &Connection,
     user_id: i64,
     token_hash: &str,
     name: &str,
+    expires_at: Option<&str>,
+    scope: &str,
 ) -> Result<String> {
     let token_uid = public_id("tok");
     conn.execute(
-        "INSERT INTO api_tokens (token_uid, user_id, token_hash, name, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![token_uid, user_id, token_hash, name, now_timestamp()],
+        "INSERT INTO api_tokens (token_uid, user_id, token_hash, name, created_at, expires_at, scope)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![token_uid, user_id, token_hash, name, now_timestamp(), expires_at, scope],
     )?;
     Ok(token_uid)
 }
 
-/// Returns the user_id for a given token hash, if the token is valid and user is active.
-pub fn get_user_for_token(conn: &Connection, token_hash: &str) -> Result<Option<i64>> {
+/// Returns `(user_id, token_uid)` for a given token hash, if the token is valid
+/// (unexpired) and its user is active.
+pub fn get_user_for_token(
+    conn: &Connection,
+    token_hash: &str,
+) -> Result<Option<(i64, String)>> {
     let now = now_timestamp();
     conn.query_row(
-        "SELECT t.user_id FROM api_tokens t
+        "SELECT t.user_id, t.token_uid FROM api_tokens t
          JOIN users u ON u.id = t.user_id
          WHERE t.token_hash = ?1
            AND u.status = 'active'
            AND (t.expires_at IS NULL OR t.expires_at > ?2)",
         params![token_hash, now],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )
     .optional()
     .map_err(Into::into)
@@ -980,7 +1041,7 @@ pub fn delete_api_token(conn: &Connection, token_uid: &str, user_id: i64) -> Res
 
 pub fn list_user_tokens(conn: &Connection, user_id: i64) -> Result<Vec<ApiTokenRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT token_uid, name, created_at, last_used_at
+        "SELECT token_uid, name, created_at, last_used_at, expires_at, scope
          FROM api_tokens WHERE user_id = ?1 ORDER BY created_at DESC",
     )?;
     let records = stmt
@@ -990,6 +1051,8 @@ pub fn list_user_tokens(conn: &Connection, user_id: i64) -> Result<Vec<ApiTokenR
                 name: row.get(1)?,
                 created_at: row.get(2)?,
                 last_used_at: row.get(3)?,
+                expires_at: row.get(4)?,
+                scope: row.get(5)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -1314,6 +1377,17 @@ pub fn invalidate_user_sessions(conn: &Connection, user_id: i64) -> Result<usize
     Ok(n)
 }
 
+/// Returns the `user_uid` for an integer user id, or None if not found.
+pub fn get_user_uid(conn: &Connection, user_id: i64) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT user_uid FROM users WHERE id = ?1",
+        [user_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 /// Returns the integer id for a user_uid, or None if not found.
 pub fn get_user_id_by_uid(conn: &Connection, user_uid: &str) -> Result<Option<i64>> {
     conn.query_row(
@@ -1552,28 +1626,80 @@ pub fn grantable_role_bits(conn: &Connection) -> Result<u32> {
     Ok(bits)
 }
 
-/// Creates a new custom role (level=2, bit_position = max existing + 1, min 4).
-/// Returns the created RoleRecord.
+/// Returns the bitwise OR of every visibility mask stored in an archive:
+/// `collection_entries.visibility_bits` and `collections.default_visibility_bits`.
+/// Bits in this mask may still belong to a role that no longer exists, so role creation
+/// must not hand them out again (see `create_custom_role_avoiding`).
+pub fn used_visibility_bits(conn: &Connection) -> Result<u32> {
+    let mut stmt = conn.prepare(
+        "SELECT visibility_bits FROM collection_entries
+         UNION
+         SELECT default_visibility_bits FROM collections",
+    )?;
+    let bits = stmt
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .try_fold(0u32, |acc, b| b.map(|b| acc | (b as u32)))?;
+    Ok(bits)
+}
+
+/// Creates a new custom role (level=2). Equivalent to `create_custom_role_avoiding` with
+/// no reserved bits.
 pub fn create_custom_role(conn: &Connection, slug: &str, name: &str) -> Result<RoleRecord> {
+    create_custom_role_avoiding(conn, slug, name, 0)
+}
+
+/// Creates a new custom role (level=2). Its bit_position is one above the highest bit
+/// ever allocated (min 4), counting deleted roles via `role_bit_allocations`, so a bit
+/// is never reused. Bits set in `reserved_mask` (typically `used_visibility_bits` of the
+/// mounted archives, which can carry bits of roles deleted before allocations were
+/// recorded) are skipped and recorded as allocated. Fails once bit 31 is allocated
+/// (`maximum number of custom roles reached`); because bits are never freed, that is a
+/// lifetime cap per instance. Returns the created RoleRecord.
+pub fn create_custom_role_avoiding(
+    conn: &Connection,
+    slug: &str,
+    name: &str,
+    reserved_mask: u32,
+) -> Result<RoleRecord> {
     if slug.is_empty() || !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         anyhow::bail!(
             "role slug must be non-empty and contain only ASCII letters, digits, or hyphens"
         );
     }
-    let next_bit: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(bit_position) + 1, 4) FROM roles WHERE bit_position >= 4",
+    let tx = conn.unchecked_transaction()?;
+    let mut next_bit: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(bit_position) + 1, 4) FROM (
+             SELECT bit_position FROM role_bit_allocations
+             UNION ALL
+             SELECT bit_position FROM roles
+         ) WHERE bit_position >= 4",
         [],
         |r| r.get(0),
     )?;
+    let now = now_timestamp();
+    while next_bit < 32 && reserved_mask & (1u32 << next_bit) != 0 {
+        tx.execute(
+            "INSERT OR IGNORE INTO role_bit_allocations (bit_position, role_uid, allocated_at)
+             VALUES (?1, 'reserved', ?2)",
+            params![next_bit, now],
+        )?;
+        next_bit += 1;
+    }
     if next_bit >= 32 {
         anyhow::bail!("maximum number of custom roles reached");
     }
     let role_uid = public_id("role");
-    conn.execute(
+    tx.execute(
         "INSERT INTO roles (role_uid, slug, name, level, bit_position, is_builtin)
          VALUES (?1, ?2, ?3, 2, ?4, 0)",
         params![role_uid, slug, name, next_bit],
     )?;
+    tx.execute(
+        "INSERT INTO role_bit_allocations (bit_position, role_uid, allocated_at)
+         VALUES (?1, ?2, ?3)",
+        params![next_bit, role_uid, now],
+    )?;
+    tx.commit()?;
     Ok(RoleRecord {
         role_uid,
         slug: slug.to_string(),
@@ -1613,12 +1739,22 @@ pub fn ensure_default_user(conn: &Connection) -> Result<i64> {
 
 /// Creates a pending capture job. Returns the new `job_uid`.
 pub fn create_capture_job(conn: &Connection, archive_id: &str) -> Result<String> {
+    create_capture_job_as(conn, archive_id, None)
+}
+
+/// Creates a pending capture job attributed to `created_by` (the submitter's
+/// auth-DB `user_uid`; None for CLI/legacy callers). Returns the new `job_uid`.
+pub fn create_capture_job_as(
+    conn: &Connection,
+    archive_id: &str,
+    created_by: Option<&str>,
+) -> Result<String> {
     let job_uid = public_id("job");
     let now = now_timestamp();
     conn.execute(
-        "INSERT INTO capture_jobs (job_uid, archive_id, run_uid, status, error_text, created_at, updated_at)
-         VALUES (?1, ?2, NULL, 'pending', NULL, ?3, ?3)",
-        rusqlite::params![job_uid, archive_id, now],
+        "INSERT INTO capture_jobs (job_uid, archive_id, run_uid, status, error_text, created_at, updated_at, created_by)
+         VALUES (?1, ?2, NULL, 'pending', NULL, ?3, ?3, ?4)",
+        rusqlite::params![job_uid, archive_id, now, created_by],
     )?;
     Ok(job_uid)
 }
@@ -1642,10 +1778,21 @@ pub fn update_capture_job_status(
     Ok(())
 }
 
+/// Links a capture job to the run it is executing, once, as soon as the run exists. Does
+/// nothing if the job already has a run (the final status update sets it again anyway).
+pub fn link_capture_job_run(conn: &Connection, job_uid: &str, run_uid: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE capture_jobs SET run_uid = ?2, updated_at = ?3 \
+         WHERE job_uid = ?1 AND run_uid IS NULL",
+        params![job_uid, run_uid, now_timestamp()],
+    )?;
+    Ok(())
+}
+
 /// Returns a capture job by uid.
 pub fn get_capture_job(conn: &Connection, job_uid: &str) -> Result<Option<CaptureJobRecord>> {
     conn.query_row(
-        "SELECT job_uid, archive_id, run_uid, status, error_text, notes_json, created_at, updated_at
+        "SELECT job_uid, archive_id, run_uid, status, error_text, notes_json, created_at, updated_at, created_by
          FROM capture_jobs WHERE job_uid = ?1",
         [job_uid],
         |row| {
@@ -1658,6 +1805,7 @@ pub fn get_capture_job(conn: &Connection, job_uid: &str) -> Result<Option<Captur
                 notes_json: row.get(5)?,
                 created_at: row.get(6)?,
                 updated_at: row.get(7)?,
+                created_by: row.get(8)?,
             })
         },
     )
@@ -3283,6 +3431,55 @@ pub fn is_entry_publicly_accessible(conn: &Connection, entry_uid: &str) -> Resul
     Ok(count > 0)
 }
 
+/// SQL predicate: the archived entry aliased `entry_alias` is visible to a logged-in caller
+/// whose role bits are bound to the parameter `bits_param` (e.g. `"?2"`).
+///
+/// This is the rule `archive::list_entries_for_collection` and `archive::list_child_entries`
+/// apply: ADMIN/OWNER (bits 12) see every entry, everyone else needs a `collection_entries`
+/// row — for the entry itself or, for a child entry, for its parent — whose `visibility_bits`
+/// overlap theirs. `requires_auth` is not consulted: it only gates guests.
+pub(crate) fn entry_visible_to_caller_sql(entry_alias: &str, bits_param: &str) -> String {
+    format!(
+        "(CAST({bits} AS INTEGER) & 12 != 0 \
+          OR EXISTS (SELECT 1 FROM collection_entries vce \
+                     WHERE vce.entry_id = {e}.id \
+                       AND vce.visibility_bits & CAST({bits} AS INTEGER) != 0) \
+          OR EXISTS (SELECT 1 FROM collection_entries vcp \
+                     WHERE vcp.entry_id = {e}.parent_entry_id \
+                       AND vcp.visibility_bits & CAST({bits} AS INTEGER) != 0))",
+        e = entry_alias,
+        bits = bits_param,
+    )
+}
+
+/// True when a logged-in caller with `caller_bits` may read the entry `entry_uid`. Use this
+/// to gate every by-uid entry endpoint so an entry hidden from a role in the lists cannot be
+/// fetched directly either. False for an unknown entry. Guests are gated separately by
+/// [`is_entry_publicly_accessible`].
+pub fn caller_can_access_entry(conn: &Connection, entry_uid: &str, caller_bits: u32) -> Result<bool> {
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM archived_entries e WHERE e.entry_uid = ?1 AND {})",
+        entry_visible_to_caller_sql("e", "?2")
+    );
+    Ok(conn.query_row(&sql, params![entry_uid, caller_bits as i64], |row| row.get(0))?)
+}
+
+/// True when a logged-in caller with `caller_bits` may read the blob `sha256`: ADMIN/OWNER can
+/// read any blob; everyone else needs at least one entry referencing the blob that they can
+/// see (blobs are content-addressed, so one blob can back several entries). A blob no entry
+/// references is admin-only. False for an unknown blob.
+pub fn caller_can_access_blob(conn: &Connection, sha256: &str, caller_bits: u32) -> Result<bool> {
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM blobs b WHERE b.sha256 = ?1 AND (\
+             CAST(?2 AS INTEGER) & 12 != 0 \
+             OR EXISTS (SELECT 1 FROM entry_artifacts a \
+                        JOIN archived_entries e ON e.id = a.entry_id \
+                        WHERE a.blob_id = b.id AND {})))",
+        entry_visible_to_caller_sql("e", "?2")
+    );
+    Ok(conn.query_row(&sql, params![sha256, caller_bits as i64], |row| row.get(0))?)
+}
+
 /// Renames a collection and/or updates its default_visibility_bits.
 /// Returns true if updated, false if not found.
 /// Refuses to rename the '_default_' collection but allows changing its
@@ -3307,6 +3504,20 @@ pub fn update_collection(
         params![name, vbits as i64, auth as i64, coll.id],
     )?;
     Ok(true)
+}
+
+/// Returns the entry_uid of every entry that is a member of the collection.
+pub fn collection_entry_uids(conn: &Connection, collection_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.entry_uid FROM collection_entries ce \
+         JOIN archived_entries e ON e.id = ce.entry_id \
+         WHERE ce.collection_id = ?1 \
+         ORDER BY e.id",
+    )?;
+    let uids = stmt
+        .query_map([collection_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(uids)
 }
 
 /// Deletes a collection and cascades to collection_entries.
@@ -3774,6 +3985,27 @@ mod tests {
     }
 
     #[test]
+    fn collection_entry_uids_lists_members_only() {
+        let conn = conn();
+        let a = create_entry_fixture(&conn, "private", None, None);
+        let b = create_entry_fixture(&conn, "private", None, None);
+        let outside = create_entry_fixture(&conn, "private", None, None);
+        let coll = create_collection(&conn, "Mine", "mine", 2, false).unwrap();
+        add_entry_to_collection(&conn, coll.id, a.id, 2).unwrap();
+        add_entry_to_collection(&conn, coll.id, b.id, 4).unwrap();
+
+        let mut uids = collection_entry_uids(&conn, coll.id).unwrap();
+        uids.sort();
+        let mut expected = vec![a.entry_uid.clone(), b.entry_uid.clone()];
+        expected.sort();
+        assert_eq!(uids, expected);
+        assert!(!uids.contains(&outside.entry_uid));
+
+        let empty = create_collection(&conn, "Empty", "empty", 2, false).unwrap();
+        assert!(collection_entry_uids(&conn, empty.id).unwrap().is_empty());
+    }
+
+    #[test]
     fn default_collection_allows_visibility_change_but_not_rename() {
         let conn = conn();
         let coll_uid = {
@@ -4036,9 +4268,78 @@ mod tests {
     fn token_hash_round_trips() {
         let conn = make_auth_conn();
         let user_id = create_owner(&conn, "alice", "pw").unwrap();
-        create_api_token(&conn, user_id, "hash_abc", "My Token").unwrap();
-        let found_id = get_user_for_token(&conn, "hash_abc").unwrap();
-        assert_eq!(found_id, Some(user_id));
+        let token_uid =
+            create_api_token(&conn, user_id, "hash_abc", "My Token", None, "full").unwrap();
+        let found = get_user_for_token(&conn, "hash_abc").unwrap();
+        assert_eq!(found, Some((user_id, token_uid)));
+    }
+
+    #[test]
+    fn token_expiry_and_scope_round_trip() {
+        let conn = make_auth_conn();
+        let user_id = create_owner(&conn, "alice", "pw").unwrap();
+        let past = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        create_api_token(&conn, user_id, "h_expired", "old", Some(&past), "full").unwrap();
+        create_api_token(&conn, user_id, "h_live", "new", Some(&future), "read").unwrap();
+        assert!(get_user_for_token(&conn, "h_expired").unwrap().is_none());
+        assert!(get_user_for_token(&conn, "h_live").unwrap().is_some());
+        let tokens = list_user_tokens(&conn, user_id).unwrap();
+        let live = tokens.iter().find(|t| t.name == "new").unwrap();
+        assert_eq!(live.scope, "read");
+        assert_eq!(live.expires_at.as_deref(), Some(future.as_str()));
+        let old = tokens.iter().find(|t| t.name == "old").unwrap();
+        assert_eq!(old.scope, "full");
+    }
+
+    #[test]
+    fn get_user_uid_round_trips_and_misses() {
+        let conn = make_auth_conn();
+        let user_id = create_owner(&conn, "alice", "pw").unwrap();
+        let uid = get_user_uid(&conn, user_id).unwrap().unwrap();
+        assert_eq!(get_user_id_by_uid(&conn, &uid).unwrap(), Some(user_id));
+        assert!(get_user_uid(&conn, user_id + 1000).unwrap().is_none());
+    }
+
+    #[test]
+    fn initialize_auth_schema_migrates_scope_for_existing_api_tokens() {
+        let c = Connection::open_in_memory().unwrap();
+        // Legacy tables: api_tokens without scope (users/roles arrive via the init).
+        c.execute_batch(
+            "CREATE TABLE api_tokens (
+                id           INTEGER PRIMARY KEY,
+                token_uid    TEXT NOT NULL UNIQUE,
+                user_id      INTEGER NOT NULL,
+                token_hash   TEXT NOT NULL UNIQUE,
+                name         TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                last_used_at TEXT,
+                expires_at   TEXT
+            );
+            INSERT INTO api_tokens (token_uid, user_id, token_hash, name, created_at)
+                VALUES ('tok-legacy', 1, 'h', 'legacy', 't');",
+        )
+        .unwrap();
+
+        initialize_auth_schema(&c).unwrap();
+        initialize_auth_schema(&c).unwrap();
+
+        let has_column: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('api_tokens') WHERE name = 'scope'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_column, 1);
+        let scope: String = c
+            .query_row(
+                "SELECT scope FROM api_tokens WHERE token_uid = 'tok-legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(scope, "full", "legacy tokens keep full access");
     }
 
     #[test]
@@ -4143,6 +4444,21 @@ mod tests {
     }
 
     #[test]
+    fn user_is_active_reflects_status_and_existence() {
+        let conn = make_auth_conn_for_mgmt();
+        let owner_id = create_owner(&conn, "owner", "hash").unwrap();
+        let uid = create_user(&conn, "dave", None, "hash", owner_id).unwrap();
+        let dave_id = get_user_id_by_uid(&conn, &uid).unwrap().unwrap();
+        assert!(user_is_active(&conn, dave_id).unwrap());
+        set_user_status(&conn, &uid, "disabled").unwrap();
+        assert!(!user_is_active(&conn, dave_id).unwrap());
+        set_user_status(&conn, &uid, "active").unwrap();
+        assert!(user_is_active(&conn, dave_id).unwrap());
+        conn.execute("DELETE FROM users WHERE id = ?1", [dave_id]).unwrap();
+        assert!(!user_is_active(&conn, dave_id).unwrap(), "a deleted user is not active");
+    }
+
+    #[test]
     fn set_status_disables_user_and_kills_sessions() {
         let conn = make_auth_conn_for_mgmt();
         let owner_id = create_owner(&conn, "owner", "hash").unwrap();
@@ -4190,6 +4506,110 @@ mod tests {
         let r2 = create_custom_role(&conn, "helper", "Helper").unwrap();
         assert_eq!(r2.bit_position, 5);
         assert_eq!(r2.level, 2);
+    }
+
+    #[test]
+    fn deleted_custom_role_bit_is_never_reused() {
+        let mut conn = make_auth_conn_for_mgmt();
+        create_custom_role(&conn, "a", "A").unwrap();
+        create_custom_role(&conn, "b", "B").unwrap();
+        crate::auth_users::delete_custom_role(&mut conn, "b")
+            .unwrap()
+            .unwrap();
+        // Bit 5 belonged to "b": the new role must not inherit it.
+        let c = create_custom_role(&conn, "c", "C").unwrap();
+        assert_eq!(c.bit_position, 6);
+
+        // Deleting the highest role does not free its bit either.
+        crate::auth_users::delete_custom_role(&mut conn, "c")
+            .unwrap()
+            .unwrap();
+        let d = create_custom_role(&conn, "d", "D").unwrap();
+        assert_eq!(d.bit_position, 7);
+    }
+
+    #[test]
+    fn role_creation_skips_bits_still_present_in_archive_masks() {
+        // Upgraded instance: bit 5 was used by a role deleted before allocations were
+        // recorded, so auth knows only bit 4, but a stored archive mask still carries bit 5.
+        let archive = conn();
+        let collection_id = ensure_default_collection(&archive).unwrap();
+        let entry = create_entry_fixture(&archive, "private", None, None);
+        add_entry_to_collection(&archive, collection_id, entry.id, 2).unwrap();
+        archive
+            .execute(
+                "UPDATE collection_entries SET visibility_bits = 32 WHERE entry_id = ?1",
+                [entry.id],
+            )
+            .unwrap();
+        let reserved = used_visibility_bits(&archive).unwrap();
+        assert_eq!(reserved & (1 << 5), 1 << 5);
+
+        let auth = make_auth_conn_for_mgmt();
+        create_custom_role(&auth, "a", "A").unwrap();
+        let b = create_custom_role_avoiding(&auth, "b", "B", reserved).unwrap();
+        assert_eq!(b.bit_position, 6);
+        // The skipped bit is recorded, so a plain create also moves past it.
+        let c = create_custom_role(&auth, "c", "C").unwrap();
+        assert_eq!(c.bit_position, 7);
+    }
+
+    #[test]
+    fn used_visibility_bits_covers_entry_and_collection_masks() {
+        let archive = conn();
+        assert_eq!(used_visibility_bits(&archive).unwrap() & !2, 0);
+        archive
+            .execute(
+                "UPDATE collections SET default_visibility_bits = 64 WHERE id = ?1",
+                [ensure_default_collection(&archive).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(used_visibility_bits(&archive).unwrap() & 64, 64);
+    }
+
+    #[test]
+    fn migration_backfills_allocations_for_existing_custom_roles() {
+        let mut conn = make_auth_conn_for_mgmt();
+        create_custom_role(&conn, "a", "A").unwrap();
+        create_custom_role(&conn, "b", "B").unwrap();
+        // Simulate a database created before role_bit_allocations existed.
+        conn.execute("DELETE FROM role_bit_allocations", []).unwrap();
+
+        // Re-running the schema init backfills the surviving roles, idempotently.
+        initialize_auth_schema(&conn).unwrap();
+        initialize_auth_schema(&conn).unwrap();
+        let recorded: i64 = conn
+            .query_row("SELECT COUNT(*) FROM role_bit_allocations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(recorded, 2);
+
+        // Bit 5 was allocated before the migration; deleting its role must not free it.
+        crate::auth_users::delete_custom_role(&mut conn, "b")
+            .unwrap()
+            .unwrap();
+        let c = create_custom_role(&conn, "c", "C").unwrap();
+        assert_eq!(c.bit_position, 6);
+    }
+
+    #[test]
+    fn custom_role_bits_are_capped_at_31_for_the_instance_lifetime() {
+        let mut conn = make_auth_conn_for_mgmt();
+        for bit in 4..32 {
+            let role = create_custom_role(&conn, &format!("r{bit}"), "R").unwrap();
+            assert_eq!(role.bit_position, bit);
+        }
+        let err = create_custom_role(&conn, "overflow", "O").unwrap_err();
+        assert!(
+            err.to_string().contains("maximum number of custom roles reached"),
+            "{err}"
+        );
+
+        // Deleting a role does not make room: its bit stays allocated.
+        crate::auth_users::delete_custom_role(&mut conn, "r4")
+            .unwrap()
+            .unwrap();
+        let err = create_custom_role(&conn, "overflow", "O").unwrap_err();
+        assert!(err.to_string().contains("maximum number of custom roles reached"));
     }
 
     #[test]
@@ -5101,6 +5521,72 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_resolved_model, 1);
+    }
+
+    #[test]
+    fn initialize_schema_migrates_created_by_for_existing_capture_jobs() {
+        let c = Connection::open_in_memory().unwrap();
+        // Legacy table: no created_by, no notes_json.
+        c.execute_batch(
+            "CREATE TABLE capture_jobs (
+                id          INTEGER PRIMARY KEY,
+                job_uid     TEXT NOT NULL UNIQUE,
+                archive_id  TEXT NOT NULL,
+                run_uid     TEXT,
+                status      TEXT NOT NULL CHECK (status IN ('pending','running','completed','failed')) DEFAULT 'pending',
+                error_text  TEXT,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+            INSERT INTO capture_jobs (job_uid, archive_id, status, created_at, updated_at)
+                VALUES ('job-legacy', 'a', 'completed', 't', 't');",
+        )
+        .unwrap();
+
+        initialize_schema(&c).unwrap();
+        initialize_schema(&c).unwrap();
+
+        let has_column: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('capture_jobs') WHERE name = 'created_by'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_column, 1);
+        let has_index: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_capture_jobs_created_by'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_index, 1);
+        let legacy_owner: Option<String> = c
+            .query_row(
+                "SELECT created_by FROM capture_jobs WHERE job_uid = 'job-legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(legacy_owner.is_none(), "pre-migration rows stay NULL-owned");
+    }
+
+    #[test]
+    fn create_capture_job_as_records_submitter() {
+        let c = conn();
+        let owned = create_capture_job_as(&c, "a", Some("usr-1")).unwrap();
+        let anon = create_capture_job(&c, "a").unwrap();
+        let by = |uid: &str| -> Option<String> {
+            c.query_row(
+                "SELECT created_by FROM capture_jobs WHERE job_uid = ?1",
+                [uid],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(by(&owned).as_deref(), Some("usr-1"));
+        assert_eq!(by(&anon), None);
     }
 
     #[test]

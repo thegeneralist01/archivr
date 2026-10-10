@@ -33,6 +33,18 @@ export function formatTimestamp(value) {
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
 }
 
+// Describes a token's expiry for display. `expiresAt` is an RFC 3339 string or
+// null (never expires). Returns { expired, text } where text is the date-only
+// UTC form, e.g. "Expires 2026-11-01" or "Expired 2026-10-01".
+export function describeExpiry(expiresAt, now = new Date()) {
+  if (!expiresAt) return { expired: false, text: "Never expires" };
+  const d = new Date(expiresAt);
+  if (isNaN(d)) return { expired: false, text: `Expires ${expiresAt}` };
+  const date = d.toISOString().slice(0, 10);
+  const expired = d.getTime() <= now.getTime();
+  return { expired, text: `${expired ? "Expired" : "Expires"} ${date}` };
+}
+
 export const SOURCE_ICONS = {
   youtube: `<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#FF0000" d="M23.5 6.2a3 3 0 0 0-2.1-2.1C19.5 3.6 12 3.6 12 3.6s-7.5 0-9.4.5A3 3 0 0 0 .5 6.2C0 8.1 0 12 0 12s0 3.9.5 5.8a3 3 0 0 0 2.1 2.1c1.9.5 9.4.5 9.4.5s7.5 0 9.4-.5a3 3 0 0 0 2.1-2.1C24 15.9 24 12 24 12s0-3.9-.5-5.8z"/><polygon fill="#fff" points="9.6,15.6 15.8,12 9.6,8.4"/></svg>`,
   youtube_music: `<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="12" fill="#FF0000"/><polygon fill="#fff" points="9.6,15.6 15.8,12 9.6,8.4"/></svg>`,

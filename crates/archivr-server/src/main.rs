@@ -1,6 +1,16 @@
+mod admin_users;
 mod auth;
+mod credentials;
+mod effective_config;
+#[cfg(test)]
+mod entry_access;
+mod guards;
+mod jobs;
 mod registry;
 mod routes;
+#[cfg(test)]
+mod test_support;
+mod token_scope;
 
 use anyhow::{Context, Result};
 use std::{net::SocketAddr, path::PathBuf};

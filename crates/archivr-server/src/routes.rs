@@ -34,7 +34,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use archivr_core::{archive, capture, database, downloader, summarizer, thread_title};
+use archivr_core::{archive, capture, database, downloader, summarizer, text_title, thread_title};
 use axum::{
     Json, Router,
     extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, Request, State},
@@ -51,6 +51,7 @@ pub use crate::auth::{AuthUser, ROLE_ADMIN, ROLE_GUEST, ROLE_OWNER, ROLE_USER};
 use crate::registry::{MountedArchive, ServerRegistry};
 use axum_extra::extract::CookieJar;
 use rusqlite::OptionalExtension;
+use crate::jobs;
 
 const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
 const LOGIN_MAX_ATTEMPTS: usize = 5;
@@ -65,12 +66,15 @@ pub(crate) struct MediaToken {
     archive_id: String,
     entry_uid: String,
     artifact_index: usize,
+    /// The `user_uid` of the account that issued the token (not the integer id: SQLite reuses the
+    /// rowid of the newest user once deleted). Its status and access are re-checked on every use.
+    user_uid: String,
     expires_at: std::time::Instant,
 }
 
 #[derive(Clone)]
 pub struct AppState {
-    registry: Arc<ServerRegistry>,
+    pub(crate) registry: Arc<ServerRegistry>,
     pub auth_db_path: Arc<std::path::PathBuf>,
     pub login_attempts: Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
     pub media_tokens: Arc<Mutex<HashMap<String, MediaToken>>>,
@@ -299,7 +303,13 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route("/api/archives/:archive_id/blobs/:sha256", get(serve_blob))
         .route("/api/archives/:archive_id/runs", get(list_runs))
+        .route("/api/captures/options", get(capture_options_handler))
         .route("/api/archives/:archive_id/captures", post(capture_handler))
+        .route(
+            "/api/archives/:archive_id/captures/text/title",
+            post(generate_text_title_handler)
+                .layer(DefaultBodyLimit::max(MAX_TEXT_CAPTURE_REQUEST_BYTES)),
+        )
         .route(
             "/api/archives/:archive_id/captures/text",
             post(capture_text_handler)
@@ -419,7 +429,19 @@ pub fn app_with_state(state: AppState) -> Router {
             get(blob_cleanup_scan_handler).delete(blob_cleanup_delete_handler),
         )
         .route("/api/util/resolve-tco", post(resolve_tco_handler))
+        // Workstream routers (admin_users, credentials, jobs, effective_config).
+        // Axum 0.7 merges different methods on an existing path but panics on a
+        // duplicate path+method, so streams extending an existing path edit the
+        // existing handler in place (see the contract spec).
+        .merge(crate::admin_users::routes())
+        .merge(crate::credentials::routes())
+        .merge(crate::jobs::routes())
+        .merge(crate::effective_config::routes())
         .fallback_service(ServeDir::new(&static_dir).not_found_service(ServeFile::new(static_dir.join("index.html"))))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::token_scope::enforce_read_scope,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             setup_guard,
@@ -449,8 +471,30 @@ fn static_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static"))
 }
 
-async fn list_archives(State(state): State<AppState>) -> Json<Vec<MountedArchive>> {
-    Json(state.registry.archives.clone())
+/// `GET /api/archives` item. `archive_path` (a server filesystem path) is only
+/// included for ADMIN callers.
+#[derive(serde::Serialize)]
+struct ArchiveListItem {
+    id: String,
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archive_path: Option<PathBuf>,
+}
+
+async fn list_archives(State(state): State<AppState>, auth: AuthUser) -> Json<Vec<ArchiveListItem>> {
+    let is_admin = auth.has_role(ROLE_ADMIN);
+    Json(
+        state
+            .registry
+            .archives
+            .iter()
+            .map(|a| ArchiveListItem {
+                id: a.id.clone(),
+                label: a.label.clone(),
+                archive_path: is_admin.then(|| a.archive_path.clone()),
+            })
+            .collect(),
+    )
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -540,6 +584,7 @@ async fn entry_detail(
             return Err(ApiError::unauthorized("login required"));
         }
     }
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     let mut detail = archive::get_entry_detail(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
     if matches!(auth_user, AuthUser::Guest) {
@@ -582,6 +627,7 @@ async fn entry_summary_handler(
     {
         return Err(ApiError::unauthorized("login required"));
     }
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     let entry_id = database::entry_id_for_uid(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
     let (summary, attempt) = if matches!(auth_user, AuthUser::Guest) {
@@ -626,6 +672,12 @@ async fn request_entry_summary_handler(
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     auth_user.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
+    // A hidden entry is not found: it must not be summarized, nor probe provider config.
+    ensure_entry_visible(
+        &database::open_or_initialize(&mounted.archive_path)?,
+        &auth_user,
+        &entry_uid,
+    )?;
     let archive_paths =
         archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;
 
@@ -828,11 +880,31 @@ async fn list_runs(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path(archive_id): Path<String>,
+    Query(page): Query<RunsPageQuery>,
 ) -> Result<Json<Vec<archive::RunSummary>>, ApiError> {
-    auth_user.require_auth()?;
+    let (_, role_bits) = auth_user.require_auth()?;
+    let limit = jobs::parse_int_param("limit", page.limit.as_deref())?.map(|n| n.max(0));
+    let offset = jobs::parse_int_param("offset", page.offset.as_deref())?
+        .unwrap_or(0)
+        .max(0);
     let mounted = mounted_archive(&state, &archive_id)?;
+    let caller_uid = jobs::caller_user_uid(&state, &auth_user)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
-    Ok(Json(archive::list_runs(&conn)?))
+    // Visibility follows access: admins see all runs; others see runs whose capture job
+    // they created or that produced at least one entry they can see.
+    Ok(Json(archive::list_runs_for_caller(
+        &conn,
+        role_bits,
+        caller_uid.as_deref(),
+        limit,
+        offset,
+    )?))
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct RunsPageQuery {
+    limit: Option<String>,
+    offset: Option<String>,
 }
 const MEDIA_TOKEN_TTL: Duration = Duration::from_secs(2 * 60 * 60); // 2 h
 
@@ -855,31 +927,37 @@ async fn serve_artifact(
     req: Request,
 ) -> Result<Response, ApiError> {
     // Auth: valid scoped token OR authenticated session OR publicly accessible entry.
-    // A token present but invalid/expired falls back to session/public check so that
+    // A token present but invalid/expired/revoked falls back to session/public check so that
     // a logged-in browser player keeps working after a token expires.
-    let token_valid = params.token.as_deref().map_or(false, |tok| {
+    let token_issuer = params.token.as_deref().and_then(|tok| {
         let tokens = state.media_tokens.lock();
-        tokens.get(tok).map_or(false, |t| {
-            t.archive_id == archive_id
-                && t.entry_uid == entry_uid
-                && t.artifact_index == artifact_index
-                && t.expires_at > std::time::Instant::now()
-        })
+        tokens
+            .get(tok)
+            .filter(|t| {
+                t.archive_id == archive_id
+                    && t.entry_uid == entry_uid
+                    && t.artifact_index == artifact_index
+                    && t.expires_at > std::time::Instant::now()
+            })
+            .map(|t| t.user_uid.clone())
     });
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let paths = archive::read_archive_paths(&mounted.archive_path)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    let token_valid = match token_issuer {
+        Some(issuer_uid) => media_token_issuer_can_view(&state, &conn, &issuer_uid, &entry_uid)?,
+        None => false,
+    };
     if !token_valid {
         if matches!(auth_user, AuthUser::Guest) {
-            let mounted_check = mounted_archive(&state, &archive_id)?;
-            let conn_check = database::open_or_initialize(&mounted_check.archive_path)?;
-            if !database::is_entry_publicly_accessible(&conn_check, &entry_uid)? {
+            if !database::is_entry_publicly_accessible(&conn, &entry_uid)? {
                 return Err(ApiError::unauthorized("login required"));
             }
         } else {
             auth_user.require_auth()?;
+            ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
         }
     }
-    let mounted = mounted_archive(&state, &archive_id)?;
-    let paths = archive::read_archive_paths(&mounted.archive_path)?;
-    let conn = database::open_or_initialize(&mounted.archive_path)?;
     let detail = archive::get_entry_detail(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
     let artifact = detail
@@ -898,16 +976,20 @@ async fn serve_artifact(
 ///
 /// Requires an authenticated session. Returns a short-lived signed URL that
 /// allows unauthenticated GET of the specified artifact — intended for Cast /
-/// AirPlay devices that cannot carry the browser's session cookie.
+/// AirPlay devices that cannot carry the browser's session cookie. The token is
+/// tied to the issuing account and re-checked on every use (see `serve_artifact`).
 async fn issue_media_token(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path((archive_id, entry_uid, artifact_index)): Path<(String, String, usize)>,
 ) -> Result<Json<MediaTokenResponse>, ApiError> {
-    auth_user.require_auth()?;
+    let (user_id, _) = auth_user.require_auth()?;
+    let user_uid = database::get_user_uid(&database::open_auth_db(&state.auth_db_path)?, user_id)?
+        .ok_or_else(|| ApiError::unauthorized("login required"))?;
     // Verify the artifact actually exists before issuing a token.
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     let detail = archive::get_entry_detail(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
     if artifact_index >= detail.artifacts.len() {
@@ -925,6 +1007,7 @@ async fn issue_media_token(
                 archive_id: archive_id.clone(),
                 entry_uid: entry_uid.clone(),
                 artifact_index,
+                user_uid,
                 expires_at: now + MEDIA_TOKEN_TTL,
             },
         );
@@ -949,6 +1032,7 @@ async fn serve_entry_favicon(
     let mounted = mounted_archive(&state, &archive_id)?;
     let paths = archive::read_archive_paths(&mounted.archive_path)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     let detail = archive::get_entry_detail(&conn, &entry_uid)?
         .ok_or(ApiError::not_found("entry not found"))?;
     let artifact = detail
@@ -974,6 +1058,11 @@ async fn serve_blob(
     let mounted = mounted_archive(&state, &archive_id)?;
     let paths = archive::read_archive_paths(&mounted.archive_path)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    // Blobs are content-addressed and shared between entries: readable when the caller can
+    // see at least one entry that uses the blob (ADMIN/OWNER: any existing blob).
+    if !database::caller_can_access_blob(&conn, &sha256, auth_to_caller_bits(&auth_user))? {
+        return Err(ApiError::not_found("blob not found"));
+    }
     let blob = database::get_blob_by_sha256(&conn, &sha256)?
         .ok_or(ApiError::not_found("blob not found"))?;
     let file_path = paths.store_path.join(&blob.raw_relpath);
@@ -1049,7 +1138,7 @@ async fn list_tags(
     auth_user.require_auth()?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
-    Ok(Json(archive::list_tag_tree(&conn)?))
+    Ok(Json(archive::list_tag_tree(&conn, auth_to_caller_bits(&auth_user))?))
 }
 
 async fn create_tag_handler(
@@ -1076,6 +1165,7 @@ async fn list_entry_tags(
     auth_user.require_auth()?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     match archive::get_entry_tags(&conn, &entry_uid)? {
         Some(tags) => Ok(Json(tags)),
         None => Err(ApiError::not_found("entry not found")),
@@ -1094,6 +1184,7 @@ async fn assign_entry_tag_handler(
     }
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     match archive::assign_entry_tag(&conn, &entry_uid, &body.tag_path)? {
         Some(tag) => Ok((StatusCode::CREATED, Json(tag))),
         None => Err(ApiError::not_found("entry not found")),
@@ -1108,6 +1199,7 @@ async fn remove_entry_tag_handler(
     auth_user.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     if archive::remove_entry_tag(&conn, &entry_uid, &tag_uid)? {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -1179,6 +1271,7 @@ async fn patch_entry_handler(
     auth_user.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     let title = body
         .title
         .as_deref()
@@ -1202,6 +1295,7 @@ async fn delete_entry_handler(
     auth_user.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let mut conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     // Transaction: if any step fails (cascade update, FK null, or delete), nothing is committed.
     let tx = conn.transaction()?;
     let found = database::delete_entry(&tx, &entry_uid)?;
@@ -1211,6 +1305,123 @@ async fn delete_entry_handler(
     } else {
         Err(ApiError::not_found("entry not found"))
     }
+}
+
+/// Inspect the already-resolved CLI path without invoking a provider. Bare
+/// names use PATH, while explicit paths must themselves be executable files.
+pub(crate) fn cli_executable_available(
+    executable: &std::path::Path,
+    search_path: Option<&std::ffi::OsStr>,
+) -> bool {
+    let is_executable = |path: &std::path::Path| {
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return false;
+        };
+        if !metadata.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    };
+    if executable.is_absolute() || executable.components().count() > 1 {
+        return is_executable(executable);
+    }
+    search_path.is_some_and(|path| {
+        std::env::split_paths(path).any(|directory| is_executable(&directory.join(executable)))
+    })
+}
+
+/// Safe capture defaults for all users who can submit a capture.
+async fn capture_options_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    let settings = database::get_instance_settings(&conn)?;
+    let extension_available = |var: &str| {
+        std::env::var(var)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .is_some_and(|path| std::path::Path::new(&path).is_dir())
+    };
+    let providers: Vec<_> = [
+        ("anthropic_http", "Anthropic"),
+        ("openai_compatible", "OpenAI-compatible"),
+        ("claude_cli", "Claude CLI"),
+        ("codex_cli", "Codex CLI"),
+    ]
+    .into_iter()
+    .filter(|(kind, _)| {
+        summarizer::provider_from_env(kind).is_ok_and(|config| match config {
+            summarizer::ProviderConfig::AnthropicHttp(_)
+            | summarizer::ProviderConfig::OpenAiCompatible(_) => true,
+            summarizer::ProviderConfig::ClaudeCli(config)
+            | summarizer::ProviderConfig::CodexCli(config) => {
+                cli_executable_available(&config.executable, std::env::var_os("PATH").as_deref())
+            }
+        })
+    })
+    .map(|(kind, label)| serde_json::json!({"kind": kind, "label": label}))
+    .collect();
+    Ok(Json(serde_json::json!({
+        "ublock_enabled": settings.ublock_enabled,
+        "cookie_ext_enabled": settings.cookie_ext_enabled,
+        "modal_closer_enabled": settings.modal_closer_enabled,
+        "ublock_ext_available": extension_available("ARCHIVR_UBLOCK_EXT"),
+        "cookie_ext_available": extension_available("ARCHIVR_COOKIE_EXT"),
+        "reader_mode": false,
+        "via_freedium": true,
+        "download_subtitles": true,
+        "title_providers": providers,
+    })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TextTitleBody {
+    body: String,
+    provider: String,
+}
+
+async fn generate_text_title_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(archive_id): Path<String>,
+    Json(body): Json<TextTitleBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    if body.body.trim().is_empty() {
+        return Err(ApiError::bad_request("body must not be empty"));
+    }
+    if body.body.len() > MAX_TEXT_CAPTURE_BODY_BYTES {
+        return Err(ApiError::bad_request("body must not exceed 2 MiB"));
+    }
+    mounted_archive(&state, &archive_id)?;
+    let settings = database::get_instance_settings(&database::open_auth_db(&state.auth_db_path)?)?;
+    let cfg = thread_title::title_provider_from_env(
+        &body.provider,
+        settings.title_model_override(&body.provider),
+    )
+    .map_err(|error| ApiError::bad_request(&format!("{error:#}")))?;
+    let title = tokio::task::spawn_blocking(move || {
+        text_title::generate_text_title(&cfg, &body.body).map_err(|error| {
+            eprintln!("warn: text title: {error:#}");
+            ApiError {
+                status: StatusCode::BAD_GATEWAY,
+                message: format!("{error:#}"),
+            }
+        })
+    })
+    .await
+    .map_err(|error| ApiError::internal(&format!("text title task failed: {error}")))??;
+    Ok(Json(serde_json::json!({"title": title})))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1229,6 +1440,11 @@ async fn generate_thread_title_handler(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     auth_user.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
+    ensure_entry_visible(
+        &database::open_or_initialize(&mounted.archive_path)?,
+        &auth_user,
+        &entry_uid,
+    )?;
     let paths = archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;
     let settings = database::get_instance_settings(&database::open_auth_db(&state.auth_db_path)?)?;
     let cfg = thread_title::title_provider_from_env(
@@ -1366,6 +1582,10 @@ struct SetupBody {
 #[derive(Debug, serde::Deserialize)]
 struct CreateTokenBody {
     name: String,
+    /// 1..=3650; absent/null = never expires.
+    expires_in_days: Option<i64>,
+    /// `full` (default) or `read`.
+    scope: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1462,9 +1682,44 @@ async fn capture_handler(
     let archive_paths =
         archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;
 
+    let locator = body.locator.trim().to_string();
+    // A file:// locator is accepted only for a file staged by upload_handler under
+    // temp/uploads/ (it is also tracked for cleanup). Anything else would let an API
+    // caller capture and read back arbitrary server files, e.g. file:///etc/passwd.
+    // Canonicalize both sides to prevent path-traversal via `..` components in the locator.
+    // Same pattern as artifact serving. The staged file must already exist on disk
+    // (it was written by upload_handler), so canonicalize() will resolve symlinks correctly.
+    // A bare path (absolute, or relative to the server's cwd) is classified as a local
+    // file by core, so the file:// check alone would let it through; staged uploads
+    // are always submitted as file:// locators, so bare paths have no legitimate use here.
+    if !locator.starts_with("file://") && capture::locator_is_local_path(&locator) {
+        return Err(ApiError::bad_request(
+            "local paths are not accepted as locators; upload the file and capture the returned file:// locator",
+        ));
+    }
+    let staged_upload_path: Option<std::path::PathBuf> = if locator.starts_with("file://") {
+        let file_path = std::path::PathBuf::from(locator.trim_start_matches("file://"));
+        let staging_dir = archive_paths.store_path.join("temp").join("uploads");
+        match (file_path.canonicalize(), staging_dir.canonicalize()) {
+            (Ok(canonical_file), Ok(canonical_staging))
+                if canonical_file.starts_with(&canonical_staging) =>
+            {
+                Some(canonical_file)
+            }
+            _ => {
+                return Err(ApiError::bad_request(
+                    "file:// locators must reference a staged upload",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
     // Create job record in the archive DB.
     let conn = database::open_or_initialize(&mounted.archive_path)?;
-    let job_uid = database::create_capture_job(&conn, &archive_id)?;
+    let created_by = jobs::caller_user_uid(&state, &auth_user)?;
+    let job_uid = database::create_capture_job_as(&conn, &archive_id, created_by.as_deref())?;
     drop(conn);
     // Load cookie rules and global uBlock / cookie-ext settings from the auth DB.
     let (cookie_rules, global_ublock, global_cookie_ext, global_modal_closer) = {
@@ -1498,28 +1753,10 @@ async fn capture_handler(
         download_subtitles: body.download_subtitles.unwrap_or(true),
         per_item_quality: body.per_item_quality.clone(),
         sync: body.sync,
+        job_uid: Some(job_uid.clone()),
     };
 
     // Spawn background capture.
-    let locator = body.locator.trim().to_string();
-    // If the locator is a file:// path staged under temp/uploads/, track it for cleanup.
-    // Canonicalize both sides to prevent path-traversal via `..` components in the locator.
-    // Same pattern as artifact serving (line ~631). The staged file must already exist on disk
-    // (it was written by upload_handler), so canonicalize() will resolve symlinks correctly.
-    let staged_upload_path: Option<std::path::PathBuf> = if locator.starts_with("file://") {
-        let file_path = std::path::PathBuf::from(locator.trim_start_matches("file://"));
-        let staging_dir = archive_paths.store_path.join("temp").join("uploads");
-        match (file_path.canonicalize(), staging_dir.canonicalize()) {
-            (Ok(canonical_file), Ok(canonical_staging))
-                if canonical_file.starts_with(&canonical_staging) =>
-            {
-                Some(canonical_file)
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
     let quality = body.quality.clone();
     let archive_path = mounted.archive_path.clone();
     let job_uid_bg = job_uid.clone();
@@ -1648,7 +1885,8 @@ async fn capture_text_handler(
 
     // Create job record in the archive DB.
     let conn = database::open_or_initialize(&mounted.archive_path)?;
-    let job_uid = database::create_capture_job(&conn, &archive_id)?;
+    let created_by = jobs::caller_user_uid(&state, &auth_user)?;
+    let job_uid = database::create_capture_job_as(&conn, &archive_id, created_by.as_deref())?;
     drop(conn);
 
     // Spawn background text capture.
@@ -1669,12 +1907,13 @@ async fn capture_text_handler(
         };
         database::update_capture_job_status(&conn, &job_uid_bg, "running", None, None, None).ok();
 
-        match capture::perform_text_capture(
+        match capture::perform_text_capture_for_job(
             &archive_paths,
             &title,
             &text_body,
             &mime_str,
             Some(&archive_id_bg),
+            Some(&job_uid_bg),
         ) {
             Ok(result) => {
                 let job_status = if result.status == "completed" {
@@ -1865,13 +2104,10 @@ async fn get_capture_job_handler(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Path((archive_id, job_uid)): Path<(String, String)>,
-) -> Result<Json<archive::CaptureJobSummary>, ApiError> {
+) -> Result<Json<jobs::CaptureJobDetail>, ApiError> {
     auth_user.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
-    let conn = database::open_or_initialize(&mounted.archive_path)?;
-    archive::get_capture_job(&conn, &job_uid)?
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found("capture job not found"))
+    jobs::get_job_detail(&state, &auth_user, &mounted.archive_path, &job_uid).map(Json)
 }
 
 /// POST /api/archives/:archive_id/entries/:entry_uid/rearchive
@@ -1895,7 +2131,13 @@ async fn rearchive_handler(
 
     // Create a capture job record so the client can poll for completion.
     let conn = database::open_or_initialize(&mounted.archive_path)?;
-    let job_uid = database::create_capture_job(&conn, &archive_id)?;
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
+    // Unknown (and, above, hidden) entries are a 404 for every caller; no doomed job row.
+    if database::entry_id_for_uid(&conn, &entry_uid)?.is_none() {
+        return Err(ApiError::not_found("entry not found"));
+    }
+    let created_by = jobs::caller_user_uid(&state, &auth_user)?;
+    let job_uid = database::create_capture_job_as(&conn, &archive_id, created_by.as_deref())?;
     drop(conn);
 
     // Load cookie rules from the auth DB (needed for Twitter credentials resolution).
@@ -1913,6 +2155,8 @@ async fn rearchive_handler(
         download_subtitles: true,
         per_item_quality: std::collections::HashMap::new(),
         sync: false,
+        // Rearchive replaces an entry's artifacts in place and creates no run to link.
+        job_uid: None,
     };
 
     let job_uid_bg = job_uid.clone();
@@ -2197,7 +2441,11 @@ async fn auth_me(
         .map_err(|e| ApiError::from(anyhow::anyhow!("db error: {e}")))?;
     let humanize_slugs = humanize_slugs_int != 0;
     let settings = database::get_instance_settings(&conn)?;
+    let user_uid = database::get_user_uid(&conn, user_id)?;
+    let roles = archivr_core::auth_credentials::list_user_role_slugs(&conn, user_id)?;
     Ok(Json(serde_json::json!({
+        "user_uid": user_uid,
+        "roles": roles,
         "role_bits": role_bits,
         "username": username,
         "display_name": display_name,
@@ -2209,6 +2457,7 @@ async fn auth_me(
 async fn patch_me(
     State(state): State<AppState>,
     auth_user: AuthUser,
+    jar: CookieJar,
     Json(body): Json<UpdateProfileBody>,
 ) -> Result<StatusCode, ApiError> {
     let (user_id, _) = auth_user.require_auth()?;
@@ -2224,8 +2473,19 @@ async fn patch_me(
         if !auth::verify_password(current_pw, &hash).map_err(ApiError::from)? {
             return Err(ApiError::unauthorized("current password is incorrect"));
         }
+        if new_pw.chars().count() < 8 {
+            return Err(ApiError::bad_request(
+                "new_password must be at least 8 characters",
+            ));
+        }
         let new_hash = auth::hash_password(new_pw).map_err(ApiError::from)?;
         database::update_user_password(&conn, user_id, &new_hash)?;
+        // Every other session is stale now; the caller's own cookie session survives.
+        archivr_core::auth_credentials::delete_other_sessions(
+            &conn,
+            user_id,
+            jar.get("session").map(|c| c.value()),
+        )?;
     }
 
     if let Some(ref dn) = body.display_name {
@@ -2301,6 +2561,10 @@ async fn update_instance_settings_handler(
     Json(body): Json<UpdateInstanceSettingsBody>,
 ) -> Result<StatusCode, ApiError> {
     auth_user.require_role(ROLE_ADMIN)?;
+    if let Some(bits) = body.default_entry_visibility {
+        // Before the IMMEDIATE transaction below: the helper opens its own auth connection.
+        ensure_known_visibility_bits(&state, bits)?;
+    }
     let mut conn = database::open_auth_db(&state.auth_db_path)?;
     // IMMEDIATE: the read-merge-write below rewrites every column, so it must
     // not interleave with another PATCH (an admin save could otherwise write a
@@ -2775,16 +3039,40 @@ async fn create_token(
     if body.name.trim().is_empty() {
         return Err(ApiError::bad_request("token name is required"));
     }
+    let scope = body.scope.as_deref().unwrap_or("full");
+    if scope != "full" && scope != "read" {
+        return Err(ApiError::bad_request("scope must be 'full' or 'read'"));
+    }
+    let expires_at = match body.expires_in_days {
+        None => None,
+        Some(days) if (1..=3650).contains(&days) => Some(
+            (chrono::Utc::now() + chrono::Duration::days(days)).to_rfc3339(),
+        ),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "expires_in_days must be between 1 and 3650",
+            ));
+        }
+    };
     let raw_token = auth::generate_token();
     let token_hash = auth::hash_token(&raw_token);
     let conn = database::open_auth_db(&state.auth_db_path)?;
-    let token_uid = database::create_api_token(&conn, user_id, &token_hash, &body.name)?;
+    let token_uid = database::create_api_token(
+        &conn,
+        user_id,
+        &token_hash,
+        &body.name,
+        expires_at.as_deref(),
+        scope,
+    )?;
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({
             "token_uid": token_uid,
             "raw_token": raw_token,
             "name": body.name,
+            "expires_at": expires_at,
+            "scope": scope,
         })),
     ))
 }
@@ -2902,13 +3190,26 @@ async fn admin_set_user_status(
     Json(body): Json<AdminSetStatusBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     auth_user.require_role(ROLE_ADMIN)?;
+    let (caller_id, caller_bits) = auth_user.require_auth()?;
     if body.status != "active" && body.status != "disabled" {
         return Err(ApiError::bad_request(
             "status must be 'active' or 'disabled'",
         ));
     }
-    let conn = database::open_auth_db(&state.auth_db_path)?;
-    if !database::set_user_status(&conn, &uid, &body.status)? {
+    let mut conn = database::open_auth_db(&state.auth_db_path)?;
+    let target_id = database::get_user_id_by_uid(&conn, &uid)?
+        .ok_or_else(|| ApiError::not_found("user not found"))?;
+    if body.status == "disabled" {
+        crate::guards::ensure_not_self(caller_id, target_id)?;
+    }
+    crate::guards::ensure_can_manage(caller_bits, database::compute_role_bits(&conn, target_id)?)?;
+    let updated = crate::guards::with_write_lock(&mut conn, |tx| {
+        if body.status == "disabled" {
+            crate::guards::ensure_not_last_owner(tx, target_id)?;
+        }
+        Ok(database::set_user_status(tx, &uid, &body.status)?)
+    })?;
+    if !updated {
         return Err(ApiError::not_found("user not found"));
     }
     Ok(Json(
@@ -2923,10 +3224,18 @@ async fn admin_assign_role(
     Json(body): Json<AdminAssignRoleBody>,
 ) -> Result<StatusCode, ApiError> {
     auth_user.require_role(ROLE_ADMIN)?;
-    let (caller_id, _) = auth_user.require_auth()?;
+    let (caller_id, caller_bits) = auth_user.require_auth()?;
     let conn = database::open_auth_db(&state.auth_db_path)?;
     let target_id = database::get_user_id_by_uid(&conn, &uid)?
         .ok_or_else(|| ApiError::not_found("user not found"))?;
+    crate::guards::ensure_can_manage(caller_bits, database::compute_role_bits(&conn, target_id)?)?;
+    archivr_core::auth_users::get_role_by_slug(&conn, &body.role_slug)?
+        .ok_or_else(|| ApiError::not_found("role not found"))?;
+    if matches!(body.role_slug.as_str(), "owner" | "admin") && caller_bits & ROLE_OWNER == 0 {
+        return Err(ApiError::forbidden(
+            "only an owner can grant the owner or admin role",
+        ));
+    }
     database::assign_role(&conn, target_id, &body.role_slug, caller_id)?;
     Ok(StatusCode::OK)
 }
@@ -2937,10 +3246,36 @@ async fn admin_remove_role(
     Path((uid, role_slug)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     auth_user.require_role(ROLE_ADMIN)?;
-    let conn = database::open_auth_db(&state.auth_db_path)?;
+    let (_, caller_bits) = auth_user.require_auth()?;
+    let mut conn = database::open_auth_db(&state.auth_db_path)?;
     let target_id = database::get_user_id_by_uid(&conn, &uid)?
         .ok_or_else(|| ApiError::not_found("user not found"))?;
-    database::remove_role(&conn, target_id, &role_slug)?;
+    crate::guards::ensure_can_manage(caller_bits, database::compute_role_bits(&conn, target_id)?)?;
+    archivr_core::auth_users::get_role_by_slug(&conn, &role_slug)?
+        .ok_or_else(|| ApiError::not_found("role not found"))?;
+    if matches!(role_slug.as_str(), "owner" | "admin") && caller_bits & ROLE_OWNER == 0 {
+        return Err(ApiError::forbidden(
+            "only an owner can remove the owner or admin role",
+        ));
+    }
+    if role_slug == "owner" {
+        // The has-role check, last-owner checks and the removal share one write lock.
+        // Removing a role the user does not hold is a no-op.
+        crate::guards::with_write_lock(&mut conn, |tx| {
+            if !archivr_core::auth_users::user_has_role(tx, target_id, "owner")? {
+                return Ok(());
+            }
+            crate::guards::ensure_not_last_owner(tx, target_id)?;
+            // `remove_role` also refuses to drop the sole owner row (even a disabled one).
+            if archivr_core::auth_users::count_role_holders(tx, "owner")? <= 1 {
+                return Err(ApiError::conflict("cannot remove the last owner"));
+            }
+            Ok(database::remove_role(tx, target_id, "owner")?)
+        })?;
+    } else if archivr_core::auth_users::user_has_role(&conn, target_id, &role_slug)? {
+        // Removing a role the user does not hold is a no-op.
+        database::remove_role(&conn, target_id, &role_slug)?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2960,19 +3295,131 @@ async fn admin_create_role(
 ) -> Result<(StatusCode, Json<database::RoleRecord>), ApiError> {
     auth_user.require_role(ROLE_ADMIN)?;
     let conn = database::open_auth_db(&state.auth_db_path)?;
-    let role =
-        database::create_custom_role(&conn, &body.slug, &body.name).map_err(ApiError::from)?;
+    // Stored archive masks can still carry bits of roles deleted before allocations were
+    // recorded, so skip every bit any mounted archive uses. Fail closed if one cannot be read.
+    let mut reserved = 0u32;
+    for archive in &state.registry.archives {
+        let archive_conn = database::open_or_initialize(&archive.archive_path)?;
+        reserved |= database::used_visibility_bits(&archive_conn)?;
+    }
+    let role = database::create_custom_role_avoiding(&conn, &body.slug, &body.name, reserved)
+        .map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(role)))
 }
 
-fn auth_to_caller_bits(auth: &AuthUser) -> u32 {
+pub(crate) fn auth_to_caller_bits(auth: &AuthUser) -> u32 {
     match auth {
         AuthUser::Authenticated { role_bits, .. } => *role_bits,
         AuthUser::Guest => ROLE_GUEST,
     }
 }
 
-fn mounted_archive<'a>(
+/// Rejects a client-supplied visibility mask that carries a bit no role owns. Guest and the
+/// bits of existing non-guest roles are allowed. Anything else would be stored as-is, and
+/// `admin_create_role` reserves every stored bit, so a stray bit would be permanently
+/// unusable for a new role.
+fn ensure_known_visibility_bits(state: &AppState, bits: u32) -> Result<(), ApiError> {
+    let auth_conn = database::open_auth_db(&state.auth_db_path)?;
+    let known = ROLE_GUEST | database::grantable_role_bits(&auth_conn)?;
+    if bits & !known != 0 {
+        return Err(ApiError::bad_request(
+            "visibility_bits contains bits that do not belong to any role",
+        ));
+    }
+    Ok(())
+}
+
+/// Gate for every by-uid entry endpoint: a logged-in caller who cannot see the entry in the
+/// lists (`database::caller_can_access_entry`) gets the same 404 as for an unknown uid, so
+/// hiding an entry from a role also hides it from direct requests. ADMIN/OWNER always pass
+/// without a query. Guests are a no-op here: endpoints that allow them check
+/// `is_entry_publicly_accessible` themselves.
+pub(crate) fn ensure_entry_visible(
+    conn: &rusqlite::Connection,
+    auth: &AuthUser,
+    entry_uid: &str,
+) -> Result<(), ApiError> {
+    if let AuthUser::Authenticated { role_bits, .. } = auth
+        && role_bits & (ROLE_ADMIN | ROLE_OWNER) == 0
+        && !database::caller_can_access_entry(conn, entry_uid, *role_bits)?
+    {
+        return Err(ApiError::not_found("entry not found"));
+    }
+    Ok(())
+}
+
+/// Re-checks a media token against its issuer's current state: the account must still exist and
+/// be active, and its current roles must still see the entry. ADMIN/OWNER bypass the query, the
+/// same as `ensure_entry_visible`.
+fn media_token_issuer_can_view(
+    state: &AppState,
+    conn: &rusqlite::Connection,
+    issuer_uid: &str,
+    entry_uid: &str,
+) -> Result<bool, ApiError> {
+    let auth_conn = database::open_auth_db(&state.auth_db_path)?;
+    let Some(issuer_id) = database::get_user_id_by_uid(&auth_conn, issuer_uid)? else {
+        return Ok(false);
+    };
+    if !database::user_is_active(&auth_conn, issuer_id)? {
+        return Ok(false);
+    }
+    let role_bits = database::compute_role_bits(&auth_conn, issuer_id)?;
+    if role_bits & (ROLE_ADMIN | ROLE_OWNER) != 0 {
+        return Ok(true);
+    }
+    Ok(database::caller_can_access_entry(conn, entry_uid, role_bits)?)
+}
+
+/// Runs `change` (a mutation of collection memberships or their visibility touching `entry_uids`)
+/// and, for callers who are not admins, rolls it back with a 400 when it would leave any of those
+/// entries hidden from the caller's own roles. Without this a plain user could hide an entry from
+/// every role they hold and could never reach it again to undo it (only an admin could).
+fn apply_without_self_lockout<T>(
+    conn: &rusqlite::Connection,
+    auth: &AuthUser,
+    entry_uids: &[String],
+    change: impl FnOnce() -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    let AuthUser::Authenticated { role_bits, .. } = auth else {
+        return change();
+    };
+    if role_bits & (ROLE_ADMIN | ROLE_OWNER) != 0 {
+        return change();
+    }
+    // Only entries the caller can see now can be locked out by the change; entries they could
+    // not see before are not theirs to lose.
+    let mut visible_before = Vec::new();
+    for uid in entry_uids {
+        if database::caller_can_access_entry(conn, uid, *role_bits)? {
+            visible_before.push(uid);
+        }
+    }
+    let tx = conn.unchecked_transaction()?;
+    let out = change()?;
+    let mut hidden = 0usize;
+    for uid in &visible_before {
+        if !database::caller_can_access_entry(conn, uid, *role_bits)? {
+            hidden += 1;
+        }
+    }
+    if hidden > 0 {
+        // Returning before `commit` drops `tx`, which rolls the change back.
+        let message = if hidden == 1 {
+            "this change would hide the entry from all of your own roles; ask an admin to do it"
+                .to_string()
+        } else {
+            format!(
+                "this change would hide {hidden} entries from all of your own roles; ask an admin to do it"
+            )
+        };
+        return Err(ApiError::bad_request(&message));
+    }
+    tx.commit()?;
+    Ok(out)
+}
+
+pub(crate) fn mounted_archive<'a>(
     state: &'a AppState,
     archive_id: &str,
 ) -> Result<&'a MountedArchive, ApiError> {
@@ -2986,26 +3433,26 @@ fn mounted_archive<'a>(
 
 #[derive(Debug)]
 pub struct ApiError {
-    status: StatusCode,
-    message: String,
+    pub(crate) status: StatusCode,
+    pub(crate) message: String,
 }
 
 impl ApiError {
-    fn not_found(message: &str) -> Self {
+    pub(crate) fn not_found(message: &str) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.to_string(),
         }
     }
 
-    fn bad_request(message: &str) -> Self {
+    pub(crate) fn bad_request(message: &str) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.to_string(),
         }
     }
 
-    fn internal(message: &str) -> Self {
+    pub(crate) fn internal(message: &str) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.to_string(),
@@ -3026,7 +3473,7 @@ impl ApiError {
         }
     }
 
-    fn conflict(message: &str) -> Self {
+    pub(crate) fn conflict(message: &str) -> Self {
         Self {
             status: StatusCode::CONFLICT,
             message: message.to_string(),
@@ -3090,6 +3537,7 @@ async fn create_collection_handler(
     }
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_known_visibility_bits(&state, body.default_visibility_bits)?;
     let record =
         database::create_collection(&conn, &body.name, &body.slug, body.default_visibility_bits, body.requires_auth)
             .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
@@ -3182,6 +3630,7 @@ async fn add_entry_to_collection_handler(
             "cannot manually add entries to the default collection",
         ));
     }
+    ensure_entry_visible(&conn, &auth, &body.entry_uid)?;
     let entry_id: i64 = conn
         .query_row(
             "SELECT id FROM archived_entries WHERE entry_uid = ?1",
@@ -3190,6 +3639,7 @@ async fn add_entry_to_collection_handler(
         )
         .optional()?
         .ok_or(ApiError::not_found("entry not found"))?;
+    ensure_known_visibility_bits(&state, body.visibility_bits)?;
     database::add_entry_to_collection(&conn, coll.id, entry_id, body.visibility_bits)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -3209,6 +3659,7 @@ async fn remove_entry_from_collection_handler(
             "cannot manually remove entries from the default collection",
         ));
     }
+    ensure_entry_visible(&conn, &auth, &entry_uid)?;
     let entry_id: i64 = conn
         .query_row(
             "SELECT id FROM archived_entries WHERE entry_uid = ?1",
@@ -3217,7 +3668,10 @@ async fn remove_entry_from_collection_handler(
         )
         .optional()?
         .ok_or(ApiError::not_found("entry not found"))?;
-    if database::remove_entry_from_collection(&conn, coll.id, entry_id)? {
+    let removed = apply_without_self_lockout(&conn, &auth, std::slice::from_ref(&entry_uid), || {
+        Ok(database::remove_entry_from_collection(&conn, coll.id, entry_id)?)
+    })?;
+    if removed {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found("entry not in collection"))
@@ -3235,6 +3689,7 @@ async fn update_entry_visibility_handler(
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let coll = database::get_collection_by_uid(&conn, &coll_uid)?
         .ok_or(ApiError::not_found("collection not found"))?;
+    ensure_entry_visible(&conn, &auth, &entry_uid)?;
     let entry_id: i64 = conn
         .query_row(
             "SELECT id FROM archived_entries WHERE entry_uid = ?1",
@@ -3243,8 +3698,16 @@ async fn update_entry_visibility_handler(
         )
         .optional()?
         .ok_or(ApiError::not_found("entry not found"))?;
-    if database::update_collection_entry_visibility(&conn, coll.id, entry_id, body.visibility_bits)?
-    {
+    ensure_known_visibility_bits(&state, body.visibility_bits)?;
+    let updated = apply_without_self_lockout(&conn, &auth, std::slice::from_ref(&entry_uid), || {
+        Ok(database::update_collection_entry_visibility(
+            &conn,
+            coll.id,
+            entry_id,
+            body.visibility_bits,
+        )?)
+    })?;
+    if updated {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found("entry not in collection"))
@@ -3259,6 +3722,7 @@ async fn list_entry_collections_handler(
     auth_user.require_auth()?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
     match archive::get_entry_collections(&conn, &entry_uid)? {
         Some(memberships) => Ok(Json(memberships)),
         None => Err(ApiError::not_found("entry not found")),
@@ -3274,6 +3738,9 @@ async fn patch_collection_handler(
     auth.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    if let Some(bits) = body.default_visibility_bits {
+        ensure_known_visibility_bits(&state, bits)?;
+    }
     let name_ref: Option<&str> = body.name.as_deref();
     let updated =
         database::update_collection(&conn, &coll_uid, name_ref, body.default_visibility_bits, body.requires_auth)?;
@@ -3292,7 +3759,24 @@ async fn delete_collection_handler(
     auth.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
     let conn = database::open_or_initialize(&mounted.archive_path)?;
-    let deleted = database::delete_collection(&conn, &coll_uid)?;
+    // Same rule (and status) as adding/removing entries: the default collection is permanent.
+    // core also refuses, but as an anyhow error that would surface as a 500.
+    if database::get_collection_by_uid(&conn, &coll_uid)?
+        .is_some_and(|coll| coll.slug == "_default_")
+    {
+        return Err(ApiError::bad_request(
+            "cannot delete the default collection",
+        ));
+    }
+    // Deleting a collection drops its memberships. Refuse (like the other membership changes) when
+    // that would hide an entry from a non-admin caller's own roles.
+    let Some(coll) = database::get_collection_by_uid(&conn, &coll_uid)? else {
+        return Err(ApiError::not_found("collection not found"));
+    };
+    let member_uids = database::collection_entry_uids(&conn, coll.id)?;
+    let deleted = apply_without_self_lockout(&conn, &auth, &member_uids, || {
+        Ok(database::delete_collection(&conn, &coll_uid)?)
+    })?;
     if deleted {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -3376,6 +3860,573 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn capture_text_title_request(
+        archive: &str,
+        body: &str,
+        provider: &str,
+        cookie: Option<&str>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(format!("/api/archives/{archive}/captures/text/title"))
+            .header("content-type", "application/json");
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        builder
+            .body(json_body(
+                &serde_json::json!({"body": body, "provider": provider}),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn capture_options_only_exposes_safe_fields_to_users_and_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let cookie = make_role_session(&auth_path, "capture-user", &["user"]);
+        let conn = database::open_auth_db(&auth_path).unwrap();
+        let uid: i64 = conn
+            .query_row(
+                "SELECT id FROM users WHERE username = 'capture-user'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        database::create_api_token(
+            &conn,
+            uid,
+            &auth::hash_token("capture-token"),
+            "Extension",
+            None,
+            "full",
+        )
+        .unwrap();
+        let mut settings = database::get_instance_settings(&conn).unwrap();
+        settings.ublock_enabled = false;
+        settings.cookie_ext_enabled = false;
+        settings.modal_closer_enabled = false;
+        settings.title_model_openai_compatible = Some("private-model".into());
+        database::update_instance_settings(&conn, &settings).unwrap();
+        for (header, value) in [
+            ("cookie", cookie.as_str()),
+            ("authorization", "Bearer capture-token"),
+        ] {
+            let response = app(registry.clone(), auth_path.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/captures/options")
+                        .header(header, value)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload = body_json(response).await;
+            let expected = [
+                "ublock_enabled",
+                "cookie_ext_enabled",
+                "modal_closer_enabled",
+                "ublock_ext_available",
+                "cookie_ext_available",
+                "reader_mode",
+                "via_freedium",
+                "download_subtitles",
+                "title_providers",
+            ];
+            assert_eq!(payload.as_object().unwrap().len(), expected.len());
+            for key in expected {
+                assert!(payload.get(key).is_some(), "missing {key}");
+            }
+            assert_eq!(payload["ublock_enabled"], false);
+            assert_eq!(payload["cookie_ext_enabled"], false);
+            assert_eq!(payload["modal_closer_enabled"], false);
+            assert_eq!(payload["reader_mode"], false);
+            assert_eq!(payload["via_freedium"], true);
+            assert_eq!(payload["download_subtitles"], true);
+            for provider in payload["title_providers"].as_array().unwrap() {
+                assert_eq!(provider.as_object().unwrap().len(), 2);
+                assert!(summarizer::PROVIDER_KINDS.contains(&provider["kind"].as_str().unwrap()));
+                assert!(provider["label"].as_str().is_some_and(|v| !v.is_empty()));
+            }
+            assert!(!payload.to_string().contains("private-model"));
+            let admin = app(registry.clone(), auth_path.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/admin/instance-settings")
+                        .header(header, value)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(admin.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_provider_availability_searches_supplied_path_for_executable_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let filename = "archivr-fake-provider";
+        for (directory, permissions) in [(&first, 0o644), (&second, 0o755)] {
+            let file = directory.join(filename);
+            std::fs::write(&file, "#!/bin/sh\nexit 99\n").unwrap();
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(permissions)).unwrap();
+        }
+        let search_path = std::env::join_paths([&first, &second]).unwrap();
+        assert!(cli_executable_available(
+            std::path::Path::new(filename),
+            Some(&search_path)
+        ));
+        let nonexecutable_path = std::env::join_paths([&first]).unwrap();
+        assert!(!cli_executable_available(
+            std::path::Path::new(filename),
+            Some(&nonexecutable_path)
+        ));
+        assert!(!cli_executable_available(
+            std::path::Path::new(filename),
+            None
+        ));
+        assert!(!cli_executable_available(
+            std::path::Path::new("absent-provider"),
+            Some(&search_path)
+        ));
+        assert!(cli_executable_available(&second.join(filename), None));
+        assert!(!cli_executable_available(
+            &first.join(filename),
+            Some(&search_path)
+        ));
+        assert!(!cli_executable_available(&second, Some(&search_path)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capture_options_only_advertises_executable_cli_providers() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (name, previous) in &self.0 {
+                    unsafe {
+                        match previous {
+                            Some(value) => std::env::set_var(name, value),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                }
+            }
+        }
+        let _restore = RestoreEnv(
+            ["ARCHIVR_CLAUDE_CLI", "ARCHIVR_CODEX_CLI"]
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let cookie = make_role_session(&auth_path, "options-cli-user", &["user"]);
+        let executable = dir.path().join("fake-provider");
+        // The script fails if called; listing providers must only inspect the file.
+        std::fs::write(&executable, "#!/bin/sh\nexit 99\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let nonexecutable = dir.path().join("not-executable");
+        std::fs::write(&nonexecutable, "provider").unwrap();
+        std::fs::set_permissions(&nonexecutable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let missing = dir.path().join("missing-provider");
+        for (claude, codex, expected) in [
+            (missing.as_path(), missing.as_path(), vec![]),
+            (executable.as_path(), missing.as_path(), vec!["claude_cli"]),
+            (missing.as_path(), executable.as_path(), vec!["codex_cli"]),
+            (nonexecutable.as_path(), nonexecutable.as_path(), vec![]),
+            (dir.path(), dir.path(), vec![]),
+        ] {
+            unsafe {
+                std::env::set_var("ARCHIVR_CLAUDE_CLI", claude);
+                std::env::set_var("ARCHIVR_CODEX_CLI", codex);
+            }
+            let response = app(registry.clone(), auth_path.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/captures/options")
+                        .header("cookie", &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload = body_json(response).await;
+            let actual: Vec<_> = payload["title_providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|provider| {
+                    provider["kind"]
+                        .as_str()
+                        .filter(|kind| kind.ends_with("_cli"))
+                })
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_options_and_text_title_require_user_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let conn = database::open_auth_db(&auth_path).unwrap();
+        let owner_id: i64 = conn
+            .query_row(
+                "SELECT id FROM users WHERE username = 'testowner'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let guest = format!(
+            "session={}",
+            database::create_session(&conn, owner_id, ROLE_GUEST, None).unwrap()
+        );
+        for (cookie, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some(guest.as_str()), StatusCode::FORBIDDEN),
+        ] {
+            let mut request = Request::builder().uri("/api/captures/options");
+            if let Some(cookie) = cookie {
+                request = request.header("cookie", cookie);
+            }
+            let response = app(registry.clone(), auth_path.clone())
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            let response = app(registry.clone(), auth_path.clone())
+                .oneshot(capture_text_title_request(
+                    "test",
+                    "Note",
+                    "claude_cli",
+                    cookie,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_text_title_validates_body_archive_and_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let cookie = make_role_session(&auth_path, "title-user", &["user"]);
+        let oversized = "a".repeat(MAX_TEXT_CAPTURE_BODY_BYTES + 1);
+        for (archive, body, provider, status, message) in [
+            (
+                "test",
+                " \n\t ",
+                "claude_cli",
+                StatusCode::BAD_REQUEST,
+                "body must not be empty",
+            ),
+            (
+                "test",
+                oversized.as_str(),
+                "claude_cli",
+                StatusCode::BAD_REQUEST,
+                "body must not exceed 2 MiB",
+            ),
+            (
+                "missing",
+                "Note",
+                "claude_cli",
+                StatusCode::NOT_FOUND,
+                "archive not found",
+            ),
+            (
+                "test",
+                "Note",
+                "unknown",
+                StatusCode::BAD_REQUEST,
+                "unknown summary provider",
+            ),
+        ] {
+            let response = app(registry.clone(), auth_path.clone())
+                .oneshot(capture_text_title_request(
+                    archive,
+                    body,
+                    provider,
+                    Some(&cookie),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            let value = body_json(response).await;
+            assert!(
+                value["error"].as_str().unwrap().contains(message),
+                "{value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_text_title_uses_title_model_and_never_mutates_archive() {
+        use std::io::{Read, Write};
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (name, previous) in &self.0 {
+                    unsafe {
+                        match previous {
+                            Some(value) => std::env::set_var(name, value),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                }
+            }
+        }
+        let _restore = RestoreEnv(
+            [
+                "ARCHIVR_OPENAI_API_KEY",
+                "ARCHIVR_OPENAI_URL",
+                "ARCHIVR_OPENAI_TITLE_MODEL",
+                "ARCHIVR_UBLOCK_EXT",
+                "ARCHIVR_COOKIE_EXT",
+            ]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        let cookie = make_role_session(&auth_path, "text-title-user", &["user"]);
+        let conn = database::open_auth_db(&auth_path).unwrap();
+        let uid: i64 = conn
+            .query_row(
+                "SELECT id FROM users WHERE username = 'text-title-user'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        database::create_api_token(
+            &conn,
+            uid,
+            &auth::hash_token("text-title-token"),
+            "Extension",
+            None,
+            "full",
+        )
+        .unwrap();
+        let mut settings = database::get_instance_settings(&conn).unwrap();
+        settings.title_model_openai_compatible = Some("instance-text-title".into());
+        database::update_instance_settings(&conn, &settings).unwrap();
+        unsafe {
+            std::env::remove_var("ARCHIVR_OPENAI_API_KEY");
+        }
+        let missing = app(registry.clone(), auth_path.clone())
+            .oneshot(capture_text_title_request(
+                "test",
+                "Note",
+                "openai_compatible",
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            body_json(missing).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("ARCHIVR_OPENAI_API_KEY")
+        );
+
+        let unavailable_options = app(registry.clone(), auth_path.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/captures/options")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let unavailable = body_json(unavailable_options).await;
+        assert!(
+            !unavailable["title_providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|provider| provider["kind"] == "openai_compatible")
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        unsafe {
+            std::env::set_var("ARCHIVR_OPENAI_API_KEY", "test-secret");
+            std::env::set_var("ARCHIVR_OPENAI_URL", endpoint);
+            std::env::set_var("ARCHIVR_OPENAI_TITLE_MODEL", "ignored-env-model");
+            std::env::set_var("ARCHIVR_UBLOCK_EXT", dir.path());
+            std::env::set_var("ARCHIVR_COOKIE_EXT", dir.path().join("missing-extension"));
+        }
+        let available_options = app(registry.clone(), auth_path.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/captures/options")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let available = body_json(available_options).await;
+        assert!(
+            available["title_providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|provider| provider["kind"] == "openai_compatible")
+        );
+        assert_eq!(available["ublock_ext_available"], true);
+        assert_eq!(available["cookie_ext_available"], false);
+        assert!(!available.to_string().contains("test-secret"));
+        let stub = std::thread::spawn(move || {
+            let mut prompts = Vec::new();
+            for index in 0..4 {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(error) => panic!("stub accept failed: {error}"),
+                    }
+                };
+                // BSD/macOS accepted sockets inherit the listener's non-blocking mode.
+                stream
+                    .set_nonblocking(false)
+                    .expect("stub stream must be blocking for synchronous reads");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 4096];
+                let payload = loop {
+                    let read = stream.read(&mut chunk).unwrap();
+                    assert!(read > 0);
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if let Some(head_end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..head_end]);
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        if bytes.len() >= head_end + 4 + length {
+                            break serde_json::from_slice::<serde_json::Value>(
+                                &bytes[head_end + 4..head_end + 4 + length],
+                            )
+                            .unwrap();
+                        }
+                    }
+                };
+                prompts.push(payload);
+                let (status, reply) = if index == 2 {
+                    ("502 Bad Gateway", "upstream failed".to_string())
+                } else {
+                    ("200 OK", serde_json::json!({"choices":[{"message":{"content": if index == 3 { "" } else { "```\nTitle: **Thread about Rust async runtimes**\n```" }}}]}).to_string())
+                };
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            }
+            prompts
+        });
+        let archive_snapshot = || {
+            let conn = database::open_or_initialize(&archive_path).unwrap();
+            let mut snapshot = Vec::new();
+            for table in [
+                "archived_entries",
+                "archive_runs",
+                "entry_artifacts",
+                "entry_summaries",
+                "capture_jobs",
+            ] {
+                snapshot.push(
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                );
+            }
+            let title = conn
+                .query_row(
+                    "SELECT title FROM archived_entries WHERE entry_uid = ?1",
+                    [&entry.entry_uid],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .unwrap();
+            (snapshot, title)
+        };
+        let before = archive_snapshot();
+        for index in 0..4 {
+            let request = if index == 0 {
+                Request::builder().method("POST").uri("/api/archives/test/captures/text/title").header("content-type", "application/json").header("authorization", "Bearer text-title-token").body(json_body(&serde_json::json!({"body":"Rust runtime note", "provider":"openai_compatible"}))).unwrap()
+            } else {
+                // Exercise the full decoded limit and worst-case JSON expansion.
+                let body = if index == 1 {
+                    "\0".repeat(MAX_TEXT_CAPTURE_BODY_BYTES)
+                } else {
+                    "Note".into()
+                };
+                capture_text_title_request("test", &body, "openai_compatible", Some(&cookie))
+            };
+            let response = app(registry.clone(), auth_path.clone())
+                .oneshot(request)
+                .await
+                .unwrap();
+            let status = response.status();
+            let value = body_json(response).await;
+            if index < 2 {
+                assert_eq!(status, StatusCode::OK, "{value}");
+                assert_eq!(value, serde_json::json!({"title":"Rust async runtimes"}));
+            } else {
+                assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+            }
+        }
+        let prompts = stub.join().unwrap();
+        assert!(
+            prompts
+                .iter()
+                .all(|body| body["model"] == "instance-text-title")
+        );
+        assert_eq!(
+            prompts[1]["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .matches('\0')
+                .count(),
+            30_000
+        );
+        assert_eq!(archive_snapshot(), before);
+    }
 
     fn make_test_app() -> (Router, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -6596,6 +7647,25 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn deleting_the_default_collection_is_a_400_not_a_500() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let router = app(registry, auth_path);
+        let list = router.clone().oneshot(Request::builder()
+            .uri("/api/archives/test/collections").header("cookie", &session_cookie)
+            .body(Body::empty()).unwrap()).await.unwrap();
+        let collections = body_json(list).await;
+        let default_uid = collections.as_array().unwrap().iter()
+            .find(|c| c["slug"] == "_default_").unwrap()["collection_uid"].as_str().unwrap().to_string();
+        let response = router.oneshot(Request::builder().method("DELETE")
+            .uri(format!("/api/archives/test/collections/{default_uid}"))
+            .header("cookie", &session_cookie).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["error"], "cannot delete the default collection");
+    }
+
     // ── Task 2: list_entries / search_entries auth enforcement ───────────────
 
     #[tokio::test]
@@ -6936,7 +8006,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("PATCH")
-                    .uri(&format!("/api/archives/test/entries/{}", entry.entry_uid))
+                    .uri(format!("/api/archives/test/entries/{}", entry.entry_uid))
                     .header("content-type", "application/json")
                     .header("cookie", &session_cookie)
                     .body(Body::from(r#"{"title":"Renamed Title"}"#))
@@ -6950,7 +8020,7 @@ mod tests {
         let get_resp = app(registry, auth_path)
             .oneshot(
                 Request::builder()
-                    .uri(&format!("/api/archives/test/entries/{}", entry.entry_uid))
+                    .uri(format!("/api/archives/test/entries/{}", entry.entry_uid))
                     .header("cookie", &session_cookie)
                     .body(Body::empty())
                     .unwrap(),
@@ -7117,6 +8187,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn thread_title_generates_and_persists() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let (registry, archive_path, auth_path) = make_test_registry(&dir);

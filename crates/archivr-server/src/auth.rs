@@ -6,7 +6,10 @@ use axum_extra::extract::CookieJar;
 use rand::RngCore;
 
 use crate::routes::{ApiError, AppState};
-use archivr_core::database;
+use archivr_core::{auth_credentials, database};
+
+/// Minimum seconds between `api_tokens.last_used_at` writes for one token.
+const TOKEN_TOUCH_INTERVAL_SECS: i64 = 60;
 
 // Role bit constants
 pub const ROLE_GUEST: u32 = 1;  // bit 0
@@ -81,8 +84,16 @@ impl FromRequestParts<AppState> for AuthUser {
                 if let Some(raw_token) = header_str.strip_prefix("Bearer ") {
                     let token_hash = hash_token(raw_token);
                     if let Ok(conn) = database::open_auth_db(auth_db_path) {
-                        if let Ok(Some(user_id)) = database::get_user_for_token(&conn, &token_hash) {
+                        if let Ok(Some((user_id, token_uid))) =
+                            database::get_user_for_token(&conn, &token_hash)
+                        {
                             if let Ok(role_bits) = database::compute_role_bits(&conn, user_id) {
+                                // Throttled: writes last_used_at at most once per 60s per token.
+                                let _ = auth_credentials::touch_token_throttled(
+                                    &conn,
+                                    &token_uid,
+                                    TOKEN_TOUCH_INTERVAL_SECS,
+                                );
                                 return Ok(AuthUser::Authenticated { user_id, role_bits });
                             }
                         }

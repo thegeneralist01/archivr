@@ -292,6 +292,25 @@ export async function submitTextCapture(archiveId, {title, body, mime = 'text/ma
   return res.json(); // { job_uid, status: "pending" }
 }
 
+export async function getCaptureOptions() {
+  return getJson('/api/captures/options');
+}
+
+export async function generateTextTitle(archiveId, { body, provider }) {
+  const res = await fetch(`/api/archives/${encodeURIComponent(archiveId)}/captures/text/title`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ body, provider }),
+  });
+  const result = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const error = new Error(result.error || `HTTP ${res.status}`);
+    error.status = res.status;
+    throw error;
+  }
+  return result;
+}
+
 // Returns { has_video: bool, qualities: string[] } e.g. { has_video: true, qualities: ["1080p","720p","480p"] }
 // Throws on network error; returns { has_video: false, qualities: [] } on non-video locators.
 export async function probeCapture(archiveId, locator) {
@@ -390,19 +409,40 @@ export async function listTokens() {
   return getJson('/api/auth/tokens');
 }
 
-export async function createToken(name) {
+// `expiresInDays` null means the token never expires; `scope` is 'full' or 'read'.
+// Omitting both sends the same behaviour as before (full access, no expiry).
+export async function createToken(name, { expiresInDays = null, scope = 'full' } = {}) {
   const res = await fetch('/api/auth/tokens', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name, expires_in_days: expiresInDays, scope }),
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || `HTTP ${res.status}`); }
   return res.json();
 }
 
 export async function deleteToken(tokenUid) {
   const res = await fetch(`/api/auth/tokens/${tokenUid}`, { method: 'DELETE' });
   if (!res.ok) throw new Error(await res.text());
+}
+
+// ── Sessions ──────────────────────────────────────────────────────────────────
+// Rows: { session_handle, created_at, last_seen_at, expires_at, user_agent|null, current }.
+
+export async function listSessions() {
+  return getJson('/api/auth/sessions');
+}
+
+export async function revokeSession(sessionHandle) {
+  const res = await fetch(`/api/auth/sessions/${encodeURIComponent(sessionHandle)}`, { method: 'DELETE' });
+  if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || `HTTP ${res.status}`); }
+}
+
+// Revokes every session except the caller's own. Resolves to { revoked: n }.
+export async function revokeOtherSessions() {
+  const res = await fetch('/api/auth/sessions', { method: 'DELETE' });
+  if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || `HTTP ${res.status}`); }
+  return res.json();
 }
 
 export async function getInstanceSettings() {
@@ -459,6 +499,12 @@ export async function setUserStatus(userUid, status) {
   });
   if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || `HTTP ${res.status}`); }
   return res.json();
+}
+
+// Server removes the user with their sessions, API tokens and role rows. 204, no body.
+export async function deleteAdminUser(userUid) {
+  const res = await fetch(`/api/admin/users/${userUid}`, { method: 'DELETE' });
+  if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || `HTTP ${res.status}`); }
 }
 
 export async function assignRole(userUid, roleSlug) {

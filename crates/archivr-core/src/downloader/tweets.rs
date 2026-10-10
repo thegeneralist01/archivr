@@ -12,9 +12,40 @@ use std::{
 
 use crate::{downloader::store, twitter::parse_tweet_id};
 
-/// Extracts a tweet ID from an archivr path like `"tweet:123"` by taking the
-/// last colon-separated segment and validating it as a numeric ID.
+/// Extracts a tweet ID from a supported X/Twitter status URL or an archivr
+/// shorthand like `"tweet:123"`.
 fn tweet_id_from_path(path: &str) -> Option<String> {
+    if let Some(without_scheme) = path
+        .strip_prefix("https://")
+        .or_else(|| path.strip_prefix("http://"))
+    {
+        let (host, url_path) = without_scheme.split_once('/')?;
+        if !matches!(
+            host,
+            "x.com"
+                | "www.x.com"
+                | "mobile.x.com"
+                | "twitter.com"
+                | "www.twitter.com"
+                | "mobile.twitter.com"
+        ) {
+            return None;
+        }
+
+        let mut segments = url_path.split('/');
+        let first = segments.next()?;
+        let id = if first == "i" && segments.next() == Some("web") {
+            (segments.next() == Some("status"))
+                .then(|| segments.next())
+                .flatten()
+        } else {
+            (first != "" && segments.next() == Some("status"))
+                .then(|| segments.next())
+                .flatten()
+        }?;
+        return id.split(['?', '#']).next().and_then(parse_tweet_id);
+    }
+
     path.split(':').next_back().and_then(parse_tweet_id)
 }
 
@@ -520,21 +551,64 @@ mod tests {
     }
 
     #[test]
-    fn test_archive_skips_existing_flat_tweet() {
+    fn test_tweet_id_from_path_accepts_status_urls_and_legacy_inputs() {
+        let id = "2107253221244715130";
+        let cases = [
+            "https://x.com/eriknewsha/status/2107253221244715130",
+            "https://www.x.com/eriknewsha/status/2107253221244715130?utm_source=test",
+            "http://mobile.twitter.com/i/web/status/2107253221244715130/media/1#fragment",
+            "tweet:2107253221244715130",
+            "x:tweet:2107253221244715130",
+            "x:thread:2107253221244715130",
+            "2107253221244715130",
+        ];
+
+        for path in cases {
+            assert_eq!(tweet_id_from_path(path).as_deref(), Some(id), "{path}");
+        }
+    }
+
+    #[test]
+    fn test_tweet_id_from_path_rejects_non_status_and_foreign_urls() {
+        let cases = [
+            "https://x.com/eriknewsha/likes/2107253221244715130",
+            "https://x.com/eriknewsha/status/not-a-number",
+            "https://example.com/eriknewsha/status/2107253221244715130",
+            "https://example.com:2107253221244715130",
+        ];
+
+        for path in cases {
+            assert_eq!(tweet_id_from_path(path), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn test_archive_skips_existing_tweet_status_url() {
         let _guard = env_lock();
         let store_path = unique_path("archivr-tweet-skip");
         let output_dir = store_path.join("raw_tweets");
         fs::create_dir_all(&output_dir).unwrap();
         fs::create_dir_all(store_path.join("temp")).unwrap();
-        fs::write(output_dir.join("tweet-123.json"), r#"{"id":"123"}"#).unwrap();
+        fs::write(
+            output_dir.join("tweet-2107253221244715130.json"),
+            r#"{"id":"2107253221244715130"}"#,
+        )
+        .unwrap();
 
         let credentials = store_path.join("creds.txt");
         fs::write(&credentials, "ct0=test;auth_token=test").unwrap();
         set_test_env("ARCHIVR_TWITTER_CREDENTIALS_FILE", &credentials);
 
-        let relpaths = archive("tweet:123", false, &store_path, "ts", &HashMap::new()).unwrap();
+        let relpaths = archive(
+            "https://x.com/eriknewsha/status/2107253221244715130",
+            false,
+            &store_path,
+            "ts",
+            &HashMap::new(),
+        )
+        .unwrap();
 
-        assert_eq!(relpaths, vec!["raw_tweets/tweet-123.json"]);
+        assert_eq!(relpaths, vec!["raw_tweets/tweet-2107253221244715130.json"]);
 
         remove_test_env("ARCHIVR_TWITTER_CREDENTIALS_FILE");
         let _ = fs::remove_dir_all(store_path);

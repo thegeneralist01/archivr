@@ -110,6 +110,9 @@ pub struct CaptureConfig {
     pub sync: bool,
     /// Download subtitles for YouTube videos (manual preferred, auto fallback). Default true.
     pub download_subtitles: bool,
+    /// `capture_jobs` row to link to the run as soon as the run exists, so the job's creator
+    /// can see the in-progress run (the job otherwise learns its `run_uid` only when it ends).
+    pub job_uid: Option<String>,
 }
 
 impl Default for CaptureConfig {
@@ -124,6 +127,7 @@ impl Default for CaptureConfig {
             per_item_quality: HashMap::new(),
             sync: false,
             download_subtitles: true,
+            job_uid: None,
         }
     }
 }
@@ -417,6 +421,13 @@ fn expand_shorthand_to_url(path: &str, source: &Source) -> String {
     }
 
     path.to_string()
+}
+
+/// True when `locator` would be captured as a file on the local filesystem —
+/// a `file://` URI or any bare path that exists. Callers that accept locators
+/// from untrusted clients use this to refuse local reads.
+pub fn locator_is_local_path(locator: &str) -> bool {
+    determine_source(locator) == Source::Local
 }
 
 // INFO: yt-dlp supports a lot of sites; so, when archiving (for example) a website, the user
@@ -1210,6 +1221,16 @@ fn fail_run(
     anyhow::anyhow!("{}", message)
 }
 
+/// Records `run_uid` on the capture job (if any) the moment the run exists. Best effort: a
+/// failure must never fail the capture itself, it only delays the link until the job ends.
+fn link_job_to_run(conn: &rusqlite::Connection, job_uid: Option<&str>, run_uid: &str) {
+    if let Some(job_uid) = job_uid
+        && let Err(e) = database::link_capture_job_run(conn, job_uid, run_uid)
+    {
+        eprintln!("warn: could not link capture job {job_uid} to run {run_uid}: {e:#}");
+    }
+}
+
 pub fn perform_capture(
     archive_paths: &ArchivePaths,
     locator: &str,
@@ -1238,6 +1259,7 @@ pub fn perform_capture(
     // Create the run record before probing so every attempt — including
     // probe failures — is visible in /runs with a proper status and error.
     let run = database::create_archive_run(&conn, user_id, 1)?;
+    link_job_to_run(&conn, config.job_uid.as_deref(), &run.run_uid);
 
     // For generic http/https URLs, probe Content-Type to decide whether to
     // treat the URL as a raw file download or an HTML page for SingleFile.
@@ -2127,7 +2149,19 @@ pub fn perform_text_capture(
     title: &str,
     body: &str,
     mime: &str,
+    archive_id: Option<&str>,
+) -> Result<CaptureResult> {
+    perform_text_capture_for_job(archive_paths, title, body, mime, archive_id, None)
+}
+
+/// [`perform_text_capture`] for a capture job: links `job_uid` to the run as soon as it exists.
+pub fn perform_text_capture_for_job(
+    archive_paths: &ArchivePaths,
+    title: &str,
+    body: &str,
+    mime: &str,
     _archive_id: Option<&str>,
+    job_uid: Option<&str>,
 ) -> Result<CaptureResult> {
     // Validate title
     let title = title.trim();
@@ -2165,6 +2199,7 @@ pub fn perform_text_capture(
 
     // Create run and item
     let run = database::create_archive_run(&conn, user_id, 1)?;
+    link_job_to_run(&conn, job_uid, &run.run_uid);
     let source_kind = "text";
     let entity_kind = "document";
     let item = database::create_archive_run_item(
@@ -3042,6 +3077,51 @@ mod tests {
         assert_eq!(entry.entity_kind, "document");
 
         // Clean up
+        let _ = fs::remove_dir_all(&base_path);
+    }
+
+    #[test]
+    fn capture_links_its_job_to_the_run_as_soon_as_the_run_exists() {
+        let base_path = env::temp_dir().join(format!(
+            "archivr-job-link-test-{}",
+            Local::now().format("%Y%m%d%H%M%S%3f")
+        ));
+        let _ = fs::remove_dir_all(&base_path);
+        let store_path = base_path.join("store");
+        let archive_path = base_path.join(".archivr");
+        archive::initialize_store_directories(&store_path).unwrap();
+        fs::create_dir_all(&archive_path).unwrap();
+        fs::write(archive_path.join("name"), "test-archive").unwrap();
+        fs::write(archive_path.join("store_path"), store_path.to_str().unwrap()).unwrap();
+        let archive_paths = ArchivePaths {
+            archive_path: archive_path.clone(),
+            store_path,
+            name: "test-archive".to_string(),
+        };
+
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let linked = database::create_capture_job_as(&conn, "test", Some("user_x")).unwrap();
+        let unlinked = database::create_capture_job_as(&conn, "test", Some("user_x")).unwrap();
+
+        let result = perform_text_capture_for_job(
+            &archive_paths, "Linked", "body", "text/plain", None, Some(&linked),
+        )
+        .unwrap();
+        // The job row was never moved out of `pending` (that is the server's job at the end of
+        // the capture), yet it already points at the run, so its creator can see the run.
+        let job = database::get_capture_job(&conn, &linked).unwrap().unwrap();
+        assert_eq!(job.status, "pending");
+        assert_eq!(job.run_uid.as_deref(), Some(result.run_uid.as_str()));
+
+        // The plain entry point and an unrelated job are untouched.
+        perform_text_capture(&archive_paths, "Plain", "body", "text/plain", None).unwrap();
+        assert_eq!(database::get_capture_job(&conn, &unlinked).unwrap().unwrap().run_uid, None);
+
+        // Linking is once-only: a later run never overwrites the first one.
+        database::link_capture_job_run(&conn, &linked, "run_other").unwrap();
+        let job = database::get_capture_job(&conn, &linked).unwrap().unwrap();
+        assert_eq!(job.run_uid.as_deref(), Some(result.run_uid.as_str()));
+
         let _ = fs::remove_dir_all(&base_path);
     }
 

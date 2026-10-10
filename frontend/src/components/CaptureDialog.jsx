@@ -1,7 +1,24 @@
-import { useRef, useEffect, useState, useCallback } from 'react'
-import { submitCapture, submitTextCapture, pollCaptureJob, probeCapture, probePlaylist, getInstanceSettings, uploadFile, deleteUpload } from '../api'
+import { useRef, useEffect, useState } from 'react'
+import * as defaultApi from '../api'
+import { capturePersistenceKey, captureDraftItems, applyGeneratedTitle, applyTitleGenerationError } from '../captureRequests'
 
 let nextItemId = 1
+
+function isWholeTweetUrl(locator) {
+  try {
+    const url = new URL(locator.trim())
+    const host = url.hostname.toLowerCase()
+    if (!['x.com', 'www.x.com', 'mobile.x.com', 'twitter.com', 'www.twitter.com', 'mobile.twitter.com'].includes(host)) {
+      return false
+    }
+
+    const segments = url.pathname.split('/').filter(Boolean)
+    const statusIndex = segments.findIndex(segment => segment.toLowerCase() === 'status')
+    return statusIndex > 0 && /^\d+$/.test(segments[statusIndex + 1] || '')
+  } catch {
+    return false
+  }
+}
 
 // Returns true only for locators that determine_source() routes to yt-dlp download.
 // Mirrors the exact conditions in capture.rs — playlist/channel shorthands are excluded
@@ -9,6 +26,11 @@ let nextItemId = 1
 function isVideoSource(locator) {
   const l = locator.trim()
   const ll = l.toLowerCase()
+
+  // Status URLs and tweet/thread shorthands capture the complete tweet, including
+  // attachments, through the tweet downloader. Only explicit *:media: shorthands
+  // are video captures that need a quality probe.
+  if (isWholeTweetUrl(l)) return false
 
   // yt: / youtube: shorthands — video/short/shorts only; playlist and channel are unsupported
   for (const scheme of ['yt:', 'youtube:']) {
@@ -48,7 +70,7 @@ function isVideoSource(locator) {
     if (/^https?:\/\/music\.youtube\.com\/watch/.test(ll)) return true
     // YouTube video (watch, youtu.be, shorts) — not playlist or channel
     if (/^https?:\/\/(?:www\.)?(?:youtu\.be\/[0-9A-Za-z_-]+|youtube\.com\/watch\?v=[0-9A-Za-z_-]+|youtube\.com\/shorts\/[0-9A-Za-z_-]+)/.test(l)) return true
-    // x.com → Source::X → yt-dlp (note: twitter.com URLs fall through to Source::Url, not yt-dlp)
+    // Non-status x.com URLs route to yt-dlp as Source::X.
     if (ll.startsWith('https://x.com/') || ll.startsWith('http://x.com/')) return true
     // Instagram
     if (/^https?:\/\/(?:www\.)?instagram\.com\//.test(ll)) return true
@@ -163,6 +185,7 @@ function makeTextItem() {
     kind: 'text',
     title: '',
     body: '',
+    draftRevision: 0, titleRequestId: null, titleBusy: false, titleError: null,
     mime: 'text/markdown',
     // Fields present for submission-logic compatibility
     locator: '',
@@ -212,9 +235,15 @@ function hasConflict(item) {
   return Array.isArray(item.playlistItems) && item.playlistItems.some(pi => pi.quality === null)
 }
 
-export default function CaptureDialog({ open, archiveId, onClose, onCaptured, onToast, onJobStarted, onJobSettled, activeJobs = [] }) {
+export default function CaptureDialog({ open, archiveId, onClose, onCaptured, onToast, onJobStarted, onJobSettled, activeJobs = [], api = defaultApi, initialItems, persistenceKey = 'captureItems', requestKey, allowFileUpload = true }) {
+  const draftKey = capturePersistenceKey(persistenceKey, initialItems, requestKey)
+  const apiRef = useRef(api)
+  apiRef.current = api
+  const requestRef = useRef({ requestKey, draftKey })
+  const titleRequestCounter = useRef(0)
   const dialogRef = useRef(null)
   const isFirstRenderRef = useRef(true)
+  const wasOpenRef = useRef(false)
   // jobUid → intervalId; survives dialog close since component stays mounted
   const pollIntervals = useRef(new Map())
   // itemId → debounce timeoutId for probe calls
@@ -246,28 +275,51 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   useEffect(() => { onJobStartedRef.current = onJobStarted }, [onJobStarted])
   useEffect(() => { onJobSettledRef.current = onJobSettled }, [onJobSettled])
 
-  const [items, setItems] = useState(() => {
-    try {
-      const saved = JSON.parse(sessionStorage.getItem('captureItems') || 'null')
-      if (Array.isArray(saved) && saved.length > 0) {
-        const idle = saved.filter(it => !it.status || it.status === 'idle')
-        if (idle.length > 0) {
-          idle.forEach(it => { if (it.id >= nextItemId) nextItemId = it.id + 1 })
-          // Merge with makeItem() defaults so items saved before the playlist
-          // fields were added don't have undefined where null/false is expected.
-          return idle.map(it => ({ ...makeItem(it.locator), ...it }))
-        }
-      }
-    } catch {}
-    return [makeItem()]
-  })
+  function loadItems(seed, key, restore = true) {
+    let saved = null
+    if (restore) {
+      try { saved = JSON.parse(sessionStorage.getItem(key) || 'null') } catch {}
+    }
+    const drafts = captureDraftItems(saved, seed, requestKey)
+      .filter(it => it.kind !== 'file' && (!it.status || it.status === 'idle'))
+    drafts.forEach(it => { if (it.id >= nextItemId) nextItemId = it.id + 1 })
+    const restored = drafts.map(it => ({
+      ...(it.kind === 'text' ? makeTextItem() : makeItem(it.locator)), ...it,
+      titleBusy: false, titleRequestId: null, titleError: null,
+    }))
+    return restored.length ? restored : [makeItem()]
+  }
+  const [items, setItems] = useState(() => loadItems(initialItems, draftKey))
+  itemsRef.current = items
 
-  // Persist items to sessionStorage on every change
+  // Ignore the transitional render when a new request arrives. Its old rows
+  // belong to the previous namespace, and must never leak into the new one.
   useEffect(() => {
-    sessionStorage.setItem('captureItems', JSON.stringify(items.filter(it => it.kind !== 'file')))
-  }, [items])
-  // Keep itemsRef in sync so the 'close' handler always sees current items.
-  useEffect(() => { itemsRef.current = items }, [items])
+    if (requestRef.current.requestKey !== requestKey || requestRef.current.draftKey !== draftKey) {
+      probeTimers.current.forEach(id => clearTimeout(id))
+      probeTimers.current.clear()
+      requestRef.current = { requestKey, draftKey }
+      setItems(loadItems(initialItems, draftKey, false))
+      return
+    }
+    const drafts = items.filter(it => it.kind !== 'file')
+    const saved = initialItems != null || requestKey != null ? { requestKey: requestKey ?? null, items: drafts } : drafts
+    try { sessionStorage.setItem(draftKey, JSON.stringify(saved)) } catch {}
+  }, [items, draftKey, requestKey])
+
+  const providerKey = `${persistenceKey}:titleProvider`
+  const [titleProvider, setTitleProvider] = useState(() => {
+    try { return sessionStorage.getItem(providerKey) || '' } catch { return '' }
+  })
+  const providerKeyRef = useRef(providerKey)
+  useEffect(() => {
+    if (providerKeyRef.current !== providerKey) {
+      providerKeyRef.current = providerKey
+      try { setTitleProvider(sessionStorage.getItem(providerKey) || '') } catch { setTitleProvider('') }
+      return
+    }
+    try { sessionStorage.setItem(providerKey, titleProvider) } catch {}
+  }, [titleProvider, providerKey])
 
   // Advanced options panel state
   const [advancedOpen, setAdvancedOpen] = useState(false)
@@ -283,14 +335,20 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
 
   // Load global settings from server once on mount
   useEffect(() => {
-    getInstanceSettings()
+    let cancelled = false
+    api.getCaptureOptions()
       .then(s => {
+        if (cancelled) return
         setGlobalSettings(s)
         setCookieExtEnabled(s.cookie_ext_enabled ?? true)
         setModalCloserEnabled(s.modal_closer_enabled ?? true)
+        setFreediumEnabled(s.via_freedium ?? true)
+        setDownloadSubtitles(s.download_subtitles ?? true)
+        setReaderMode(s.reader_mode ?? false)
       })
-      .catch(() => setGlobalSettings({}))
-  }, [])
+      .catch(() => { if (!cancelled) setGlobalSettings({}) })
+    return () => { cancelled = true }
+  }, [api])
 
   // Effective uBlock for this session
   const ublockEnabled = ublockOverride !== null ? ublockOverride : (globalSettings?.ublock_enabled ?? true)
@@ -301,7 +359,9 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   // On mount: clean up old single-locator sessionStorage keys; reconnect running bg jobs
   useEffect(() => {
     ;['captureDialogLocator','captureDialogError','captureDialogBusy',
-      'captureDialogJobStatus','captureDialogJobUid'].forEach(k => sessionStorage.removeItem(k))
+      'captureDialogJobStatus','captureDialogJobUid'].forEach(k => {
+        if (draftKey === 'captureItems') { try { sessionStorage.removeItem(k) } catch {} }
+      })
 
     // Reconnect polling for any bg jobs still running from a previous session.
     // activeJobs is read from the initial prop value (App's sessionStorage-seeded state).
@@ -334,7 +394,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
             uploadXhrs.current.get(it.id)?.()
             uploadXhrs.current.delete(it.id)
           } else if (it.uploadStatus === 'done' && it.uploadLocator) {
-            deleteUpload(aid, it.uploadLocator).catch(() => {})
+            apiRef.current.deleteUpload(aid, it.uploadLocator).catch(() => {})
           }
         })
       }
@@ -345,17 +405,20 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     return () => dialog.removeEventListener('close', handler)
   }, [onClose])
 
-  // Open/close driven by parent; always reset form on reopen
+  // Ordinary captures keep their existing reset-on-reopen behavior. A supplied
+  // request is instead reset by requestKey, and survives close/reopen as a draft.
   useEffect(() => {
     const dialog = dialogRef.current
     if (!dialog) return
     if (open) {
-      if (!isFirstRenderRef.current) {
+      if (!wasOpenRef.current && !isFirstRenderRef.current && initialItems == null && requestKey == null) {
         setItems([makeItem()])
       }
+      wasOpenRef.current = true
       isFirstRenderRef.current = false
       if (!dialog.open) dialog.showModal()
     } else {
+      wasOpenRef.current = false
       probeTimers.current.forEach(id => clearTimeout(id))
       probeTimers.current.clear()
       if (dialog.open) dialog.close()
@@ -374,7 +437,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     if (pollIntervals.current.has(jobUid)) return
     const intervalId = setInterval(async () => {
       try {
-        const updated = await pollCaptureJob(aid, jobUid)
+        const updated = await apiRef.current.pollCaptureJob(aid, jobUid)
         if (updated.status === 'completed') {
           clearInterval(pollIntervals.current.get(jobUid))
           pollIntervals.current.delete(jobUid)
@@ -462,7 +525,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     // Text submission
     if (submission.type === 'text') {
       try {
-        const job = await submitTextCapture(aid, { title: submission.title, body: submission.body, mime: submission.mime })
+        const job = await apiRef.current.submitTextCapture(aid, { title: submission.title, body: submission.body, mime: submission.mime })
         const locator = `text:${submission.title}`
         // Notify App to add skeleton + persist
         onJobStartedRef.current?.({ id, jobUid: job.job_uid, locator, archiveId: aid })
@@ -490,7 +553,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
       ...extraExtensions,
     }
     try {
-      const job = await submitCapture(aid, locator, quality, extensions)
+      const job = await apiRef.current.submitCapture(aid, locator, quality, extensions)
       // Notify App to add skeleton + persist
       onJobStartedRef.current?.({ id, jobUid: job.job_uid, locator, archiveId: aid })
       startPolling(id, job.job_uid, locator, aid, batchId)
@@ -504,12 +567,13 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
       // after the server accepted the job — deleting here would race the
       // in-flight capture and remove its input file.
       if (locator.startsWith('file://') && e.status) {
-        deleteUpload(aid, locator).catch(() => {})
+        apiRef.current.deleteUpload(aid, locator).catch(() => {})
       }
     }
   }
 
   function handleArchive() {
+    if (!archiveIdRef.current) return
     // Guard against the Enter-key shortcut in CaptureRow bypassing the
     // disabled button — uploads must be complete before archiving starts.
     if (items.some(it => it.kind === 'file' && it.uploadStatus === 'uploading')) return
@@ -521,7 +585,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     if (toSubmit.length === 0) return
     if (toSubmit.some(it => it.kind !== 'file' && it.kind !== 'text' && hasConflict(it))) return
     if (toSubmit.some(it => it.kind !== 'file' && it.kind !== 'text' && (
-        it.probeState === 'probing' ||
+        (isVideoSource(it.locator) && it.probeState === 'probing') ||
         (isPlaylistSource(it.locator) && it.playlistProbeState !== 'done'))))
       return
     if (toSubmit.some(it => it.kind !== 'file' && it.kind !== 'text' && Array.isArray(it.playlistItems) && it.playlistItems.length === 0)) return
@@ -576,7 +640,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
         uploadXhrs.current.delete(id)
       } else if (item.uploadStatus === 'done' && item.uploadLocator) {
         // Discard the fully staged file that was never submitted for capture.
-        deleteUpload(archiveIdRef.current, item.uploadLocator).catch(() => {})
+        apiRef.current.deleteUpload(archiveIdRef.current, item.uploadLocator).catch(() => {})
       }
     }
     setItems(prev => {
@@ -603,7 +667,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
         probeTimers.current.delete(id)
         setItems(prev => prev.map(it => it.id === id ? { ...it, probeState: 'probing' } : it))
         try {
-          const result = await probeCapture(archiveIdRef.current, val.trim())
+          const result = await apiRef.current.probeCapture(archiveIdRef.current, val.trim())
           setItems(prev => prev.map(it => {
             if (it.id !== id || it.locator !== val) return it // stale — locator changed again
             const qualities = result.qualities ?? []
@@ -626,7 +690,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
         probeTimers.current.delete(id)
         setItems(prev => prev.map(it => it.id === id ? { ...it, playlistProbeState: 'probing' } : it))
         try {
-          const result = await probePlaylist(archiveIdRef.current, val.trim())
+          const result = await apiRef.current.probePlaylist(archiveIdRef.current, val.trim())
           setItems(prev => prev.map(it => {
             if (it.id !== id || it.locator !== val) return it // stale — locator changed again
             return {
@@ -677,7 +741,43 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     ))
   }
 
+  const titleProviders = globalSettings?.title_providers ?? []
+  const effectiveTitleProvider = titleProviders.some(p => p.kind === titleProvider) ? titleProvider : (titleProviders[0]?.kind ?? '')
+
+  function updateText(id, field, value) {
+    setItems(prev => prev.map(it => it.id === id
+      ? { ...it, [field]: value, draftRevision: (it.draftRevision ?? 0) + 1, titleError: null } : it))
+  }
+
+  async function generateTitle(id) {
+    const item = itemsRef.current.find(it => it.id === id)
+    if (!item || item.kind !== 'text' || item.titleBusy || !item.body.trim() || !effectiveTitleProvider || !archiveIdRef.current) return
+    const aid = archiveIdRef.current
+    const snapshot = { ...item, titleRequestId: ++titleRequestCounter.current }
+    setItems(prev => prev.map(it => it.id === id ? { ...it, titleRequestId: snapshot.titleRequestId, titleBusy: true, titleError: null } : it))
+    try {
+      const result = await apiRef.current.generateTextTitle(aid, { body: snapshot.body, provider: effectiveTitleProvider })
+      if (typeof result.title !== 'string' || !result.title.trim()) throw new Error('Title generation returned an empty title.')
+      setItems(prev => prev.map(it => it.id === id
+        ? applyGeneratedTitle(it, snapshot, result.title) : it))
+    } catch (error) {
+      setItems(prev => prev.map(it => it.id === id
+        ? applyTitleGenerationError(it, snapshot.titleRequestId, error.message || 'Title generation failed.') : it))
+    }
+  }
+
+  // Seeded video/playlist rows need the same probes as typed locators. IDs
+  // change on every reseed, so a response from an older request cannot match.
+  const probedSeedRef = useRef(null)
+  useEffect(() => {
+    if (initialItems == null || !archiveId || probedSeedRef.current === items[0]?.id) return
+    probedSeedRef.current = items[0]?.id
+    items.forEach(item => { if (!item.kind && item.locator) updateLocator(item.id, item.locator) })
+    return () => { probedSeedRef.current = null }
+  }, [requestKey, draftKey, archiveId, items[0]?.id])
+
   function handleFiles(fileList) {
+    if (!allowFileUpload || !archiveIdRef.current) return
     const files = Array.from(fileList)
     if (files.length === 0) return
     files.forEach(file => {
@@ -692,7 +792,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
         return [...prev, newItem]
       })
       const aid = archiveIdRef.current
-      const { promise, abort } = uploadFile(aid, file, progress => {
+      const { promise, abort } = apiRef.current.uploadFile(aid, file, progress => {
         setItems(prev => prev.map(it =>
           it.id === newItem.id ? { ...it, uploadProgress: progress } : it
         ))
@@ -723,7 +823,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   function handleDragOver(e) {
     e.preventDefault()
     e.stopPropagation()
-    if (e.dataTransfer.types.includes('Files')) setDragOver(true)
+    if (allowFileUpload && e.dataTransfer.types.includes('Files')) setDragOver(true)
   }
   function handleDragLeave(e) {
     // Only clear when leaving the dialog itself, not a child element
@@ -754,7 +854,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   )
   const anyProbing = items.some(it =>
     it.kind !== 'file' && it.kind !== 'text' && (
-      it.probeState === 'probing' ||
+      (isVideoSource(it.locator) && it.probeState === 'probing') ||
       // For playlist sources block unless probe completed successfully:
       // idle = debounce not yet fired; probing = in flight; error = no quality data.
       (isPlaylistSource(it.locator) && it.playlistProbeState !== 'done')
@@ -797,9 +897,13 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
                 key={item.id}
                 item={item}
                 autoFocus={idx === items.length - 1}
-                onTitleChange={val => setItems(prev => prev.map(it => it.id === item.id ? { ...it, title: val } : it))}
-                onBodyChange={val => setItems(prev => prev.map(it => it.id === item.id ? { ...it, body: val } : it))}
+                onTitleChange={val => updateText(item.id, 'title', val)}
+                onBodyChange={val => updateText(item.id, 'body', val)}
                 onMimeChange={val => setItems(prev => prev.map(it => it.id === item.id ? { ...it, mime: val } : it))}
+                titleProviders={globalSettings?.title_providers ?? []}
+                titleProvider={effectiveTitleProvider}
+                onProviderChange={setTitleProvider}
+                onGenerateTitle={() => generateTitle(item.id)}
                 onRemove={() => removeRow(item.id)}
                 onSubmit={handleArchive}
               />
@@ -823,7 +927,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
         </div>
 
         {/* Hidden file input */}
-        <input
+        {allowFileUpload && <input
           ref={fileInputRef}
           type="file"
           multiple
@@ -831,7 +935,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
           onChange={handleFileInput}
           aria-hidden="true"
           tabIndex={-1}
-        />
+        />}
 
         <div className="capture-add-row-group">
           <button type="button" className="capture-add-row" onClick={addRow}>
@@ -840,7 +944,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
             </svg>
             Add URL
           </button>
-          <button type="button" className="capture-add-row capture-add-file" onClick={() => fileInputRef.current?.click()}>
+          {allowFileUpload && <button type="button" className="capture-add-row capture-add-file" onClick={() => fileInputRef.current?.click()}>
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
               <rect x="3" y="1" width="10" height="14" rx="1.5"/>
               <line x1="5.5" y1="5.5" x2="10.5" y2="5.5"/>
@@ -848,7 +952,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
               <line x1="5.5" y1="10.5" x2="8.5" y2="10.5"/>
             </svg>
             Upload file
-          </button>
+          </button>}
           <button type="button" className="capture-add-row capture-add-text" onClick={() => setItems(prev => [...prev, makeTextItem()])}>
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
               <path d="M2 3h12M2 7h12M2 11h8"/>
@@ -985,7 +1089,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
             type="button"
             className="capture-submit"
             onClick={handleArchive}
-            disabled={pendingCount === 0 || anyConflict || anyProbing || anyEmptyPlaylist || anyUploading}
+            disabled={!archiveId || pendingCount === 0 || anyConflict || anyProbing || anyEmptyPlaylist || anyUploading}
           >
             {pendingCount > 1 ? `Archive ${pendingCount}` : 'Archive'}
           </button>
@@ -1230,7 +1334,7 @@ function CaptureFileRow({ item, onRemove }) {
   )
 }
 
-function CaptureTextRow({ item, autoFocus, onTitleChange, onBodyChange, onMimeChange, onRemove, onSubmit }) {
+export function CaptureTextRow({ item, autoFocus, onTitleChange, onBodyChange, onMimeChange, onRemove, titleProviders = [], titleProvider, onProviderChange, onGenerateTitle }) {
   const titleInputRef = useRef(null)
 
   useEffect(() => {
@@ -1265,6 +1369,14 @@ function CaptureTextRow({ item, autoFocus, onTitleChange, onBodyChange, onMimeCh
             rows={6}
           />
           <div className="capture-text-footer">
+            {titleProviders.length > 0 && <>
+              <select className="capture-text-mime capture-title-provider" aria-label="Title provider" value={titleProvider} onChange={e => onProviderChange(e.target.value)}>
+                {titleProviders.map(provider => <option key={provider.kind} value={provider.kind}>{provider.label}</option>)}
+              </select>
+              <button type="button" className="capture-generate-title" disabled={item.titleBusy || !item.body.trim()} onClick={onGenerateTitle}>
+                {item.titleBusy ? 'Generating…' : 'Generate title'}
+              </button>
+            </>}
             <select
               className="capture-text-mime"
               value={item.mime}
@@ -1274,6 +1386,7 @@ function CaptureTextRow({ item, autoFocus, onTitleChange, onBodyChange, onMimeCh
               <option value="text/plain">Plain text</option>
             </select>
           </div>
+          {item.titleError && <p className="capture-row-error" role="alert">{item.titleError}</p>}
         </div>
         <button
           type="button"
