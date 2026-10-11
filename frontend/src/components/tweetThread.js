@@ -8,7 +8,7 @@ export function buildTweetThread(tweets, requestedId) {
   });
 
   const seed = byId.get(String(requestedId)) || [...byId.values()].at(-1);
-  if (!seed) return { tree: null, rows: [], byId, mainIds: new Set(), extra: [] };
+  if (!seed) return { tree: null, rows: [], byId, mainIds: new Set(), extra: [], extraIds: new Set() };
 
   const children = new Map();
   for (const tweet of byId.values()) {
@@ -43,11 +43,14 @@ export function buildTweetThread(tweets, requestedId) {
   }
   const tree = visit(root, 0);
 
+  const relatedIds = tweet => [
+    String(tweet.quoted_status_id || ''),
+    String(tweet.retweeted_status?.id || ''),
+    ...linkedStatusIds(tweet),
+  ].filter(Boolean);
   const referenced = new Set();
   function markReferences(tweet) {
-    const ids = [String(tweet.quoted_status_id || '')];
-    ids.push(...linkedStatusIds(tweet));
-    for (const id of ids) {
+    for (const id of relatedIds(tweet)) {
       if (!id || !byId.has(id) || referenced.has(id)) continue;
       referenced.add(id);
       markReferences(byId.get(id));
@@ -55,12 +58,28 @@ export function buildTweetThread(tweets, requestedId) {
   }
   rows.forEach(({ tweet }) => markReferences(tweet));
 
-  // Keep any disconnected archived posts accessible, even if the scraper
-  // returned incomplete relationship fields.
-  const extra = [...byId.values()].filter(tweet =>
-    !mainIds.has(String(tweet.id)) && !referenced.has(String(tweet.id))
-  );
-  return { tree, rows, byId, mainIds, extra };
+  // Also surface references that cannot fit within the card nesting limit.
+  // Those posts remain available offline under Other archived posts.
+  const extraIds = new Set([...byId.keys()].filter(id => !mainIds.has(id) && !referenced.has(id)));
+  function markDeferred(tweet, trail = []) {
+    const id = String(tweet.id);
+    const canEmbed = trail.length < 4 && !trail.includes(id);
+    for (const relatedId of relatedIds(tweet)) {
+      if (!byId.has(relatedId) || mainIds.has(relatedId) || extraIds.has(relatedId)) continue;
+      if (!canEmbed) {
+        extraIds.add(relatedId);
+      } else {
+        markDeferred(byId.get(relatedId), [...trail, id]);
+      }
+    }
+  }
+  rows.forEach(({ tweet }) => markDeferred(tweet));
+  // Iteration includes ids added during the walk, so deeper chains can start
+  // another compact branch without losing their final archived post.
+  for (const id of extraIds) markDeferred(byId.get(id));
+
+  const extra = [...byId.values()].filter(tweet => extraIds.has(String(tweet.id)));
+  return { tree, rows, byId, mainIds, extra, extraIds };
 }
 
 export function statusIdFromUrl(value) {

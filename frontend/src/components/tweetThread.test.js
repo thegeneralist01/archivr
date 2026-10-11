@@ -37,6 +37,24 @@ describe('buildTweetThread', () => {
     expect(view.byId.has('quoted')).toBe(true);
   });
 
+  test('keeps a local destination for quotes beyond the card nesting limit', () => {
+    const tweets = Array.from({ length: 10 }, (_, index) =>
+      post(String(index + 1), null, index < 9 ? String(index + 2) : null)
+    );
+    const view = buildTweetThread(tweets, '1');
+    expect(view.rows.map(row => row.tweet.id)).toEqual(['1']);
+    expect(view.extra.map(tweet => tweet.id)).toEqual(['6']);
+    expect(view.extraIds.has('6')).toBe(true);
+  });
+
+  test('keeps an archived retweet source with its retweet', () => {
+    const retweet = { ...post('retweet'), retweeted_status: { id: 'source' } };
+    const view = buildTweetThread([post('source'), retweet], 'retweet');
+    expect(view.rows.map(row => row.tweet.id)).toEqual(['retweet']);
+    expect(view.extra).toEqual([]);
+    expect(view.byId.has('source')).toBe(true);
+  });
+
   test('retains disconnected posts when relationship data is incomplete', () => {
     const view = buildTweetThread([post('orphan'), post('seed', 'missing')], 'seed');
     expect(view.rows.map(row => row.tweet.id)).toEqual(['seed']);
