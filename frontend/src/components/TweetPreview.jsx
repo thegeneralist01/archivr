@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { fetchEntryArtifacts, resolveTcoUrls } from '../api';
+import { buildTweetThread, linkedStatusIds, resolveEntityBounds, statusIdFromUrl } from './tweetThread';
 
 // ── Date helper ────────────────────────────────────────────────────────────────
 
@@ -10,6 +11,10 @@ function fmtDate(secs) {
     day: 'numeric',
     year: 'numeric',
   }).format(new Date(secs * 1000));
+}
+
+function focusedTweetIdFromHash() {
+  return window.location.hash.match(/^#tweet-(\d+)$/)?.[1] || null;
 }
 
 // Decode common HTML entities Twitter stores in full_text.
@@ -38,15 +43,6 @@ const S = {
     overflow: 'hidden',
     maxWidth: '560px',
     margin: '0 auto',
-    fontFamily: 'var(--sans, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif)',
-  },
-  threadOuter: {
-    border: '1px solid var(--line)',
-    borderRadius: '12px',
-    overflow: 'hidden',
-    maxWidth: '560px',
-    margin: '0 auto',
-    background: 'var(--paper)',
     fontFamily: 'var(--sans, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif)',
   },
   tweetRow: {
@@ -85,14 +81,6 @@ const S = {
     borderRadius: '50%',
     background: 'var(--line)',
     flexShrink: 0,
-  },
-  threadLine: {
-    flex: 1,
-    width: '2px',
-    background: 'var(--line-soft, var(--line))',
-    margin: '4px 0',
-    minHeight: '12px',
-    borderRadius: '1px',
   },
   authorRow: {
     display: 'flex',
@@ -536,24 +524,6 @@ function XLogo() {
 // links and @mentions with x.com links. Returns an array of React nodes.
 // white-space: pre-line on the container preserves newlines in plain segments.
 
-// Resolve start/end offsets for a URL or mention entity, handling three
-// storage formats: camelCase fromIndex/toIndex (article inline), Twitter
-// native indices:[s,e] array, and fallback exact-string search in fullText.
-function resolveEntityBounds(ent, fullText, ...candidates) {
-  if (ent.fromIndex != null && ent.toIndex != null)
-    return { s: ent.fromIndex, e: ent.toIndex };
-  if (ent.indices?.length === 2)
-    return { s: ent.indices[0], e: ent.indices[1] };
-  if (fullText) {
-    for (const c of candidates) {
-      if (!c) continue;
-      const idx = fullText.indexOf(c);
-      if (idx !== -1) return { s: idx, e: idx + c.length };
-    }
-  }
-  return null;
-}
-
 // Build a canonical URL annotation from any entity format.
 // Search candidates: short url first (appears in fullText), then expanded.
 function normalizeUrlAnn(u, fullText) {
@@ -578,7 +548,7 @@ function normalizeMentionAnn(m, fullText) {
 const URL_RE = /https?:\/\/[^\s<>"'\]）]+/g;
 // Characters that commonly trail a URL but aren't part of it
 const TRAIL_PUNCT = /[.,;:!?)（）]+$/;
-function linkifyText(text, linkStyle) {
+function linkifyText(text, linkStyle, mainIds) {
   const parts = [];
   let last = 0;
   let m;
@@ -586,8 +556,11 @@ function linkifyText(text, linkStyle) {
   while ((m = URL_RE.exec(text)) !== null) {
     if (m.index > last) parts.push(text.slice(last, m.index));
     let href = m[0].replace(TRAIL_PUNCT, '');
+    const linkedId = statusIdFromUrl(href);
+    const local = linkedId && mainIds?.has(linkedId);
     parts.push(
-      <a key={m.index} href={href} target="_blank" rel="noopener noreferrer" style={linkStyle}>
+      <a key={m.index} href={local ? `#tweet-${linkedId}` : href}
+        target={local ? undefined : '_blank'} rel={local ? undefined : 'noopener noreferrer'} style={linkStyle}>
         {href}
       </a>
     );
@@ -601,7 +574,7 @@ function linkifyText(text, linkStyle) {
   return parts;
 }
 
-function renderTweetTextJSX(fullText, entities, skipSpans = []) {
+function renderTweetTextJSX(fullText, entities, skipSpans = [], mainIds) {
   if (!fullText) return null;
 
   const anns = [
@@ -610,7 +583,7 @@ function renderTweetTextJSX(fullText, entities, skipSpans = []) {
   ];
 
   // If there are no annotations and no spans to skip, fast path.
-  if (anns.length === 0 && skipSpans.length === 0) return linkifyText(decodeEnt(fullText), S.link);
+  if (anns.length === 0 && skipSpans.length === 0) return linkifyText(decodeEnt(fullText), S.link, mainIds);
 
   const pts = new Set([0, fullText.length]);
   for (const a of anns) {
@@ -637,8 +610,11 @@ function renderTweetTextJSX(fullText, entities, skipSpans = []) {
 
     const url = active.find(a => a.kind === 'url');
     if (url) {
+      const linkedId = statusIdFromUrl(url.href);
+      const local = linkedId && mainIds?.has(linkedId);
       return (
-        <a key={i} href={url.href} target="_blank" rel="noopener noreferrer" style={S.link}>
+        <a key={i} href={local ? `#tweet-${linkedId}` : url.href}
+          target={local ? undefined : '_blank'} rel={local ? undefined : 'noopener noreferrer'} style={S.link}>
           {url.display || seg}
         </a>
       );
@@ -659,7 +635,7 @@ function renderTweetTextJSX(fullText, entities, skipSpans = []) {
       );
     }
 
-    return <span key={i}>{linkifyText(decodeEnt(seg), S.link)}</span>;
+    return <span key={i}>{linkifyText(decodeEnt(seg), S.link, mainIds)}</span>;
   }).filter(n => n !== null);
 }
 
@@ -1009,8 +985,7 @@ function ArticleRenderer({ article, tweetAuthor, artifactMap, fullPage, onXArtic
 }
 
 // ── Tweet card ─────────────────────────────────────────────────────────────────
-// Renders one tweet. When isInThread, omits bottom padding from the row and
-// shows a thread connector line below the avatar (except on the last card).
+// Renders one status, including archived quote and linked-post context.
 
 
 // ── Photo grid ─────────────────────────────────────────────────────────────────
@@ -1089,7 +1064,7 @@ function MediaLightbox({ items, startIndex, onClose }) {
 
   const item = items[idx];
   return (
-    <div style={S.lightboxBackdrop} onClick={onClose}>
+    <div className="tw-media-lightbox" style={S.lightboxBackdrop} onClick={onClose}>
       <div style={S.lightboxContent} onClick={e => e.stopPropagation()}>
         <div style={S.lightboxToolbar}>
           {items.length > 1 && (
@@ -1101,7 +1076,7 @@ function MediaLightbox({ items, startIndex, onClose }) {
             rel="noopener noreferrer"
             style={S.lightboxLink}
             title="Open in new tab"
-          >↗</a>
+          >Open image</a>
           <button style={S.lightboxBtn} onClick={onClose} aria-label="Close">×</button>
         </div>
         <img src={item.src} alt={item.alt || ''} style={S.lightboxImg} />
@@ -1124,17 +1099,38 @@ function MediaLightbox({ items, startIndex, onClose }) {
   );
 }
 
-function TweetCard({ tweet, isInThread, isLast, artifactMap }) {
+function TweetCard({ tweet, isInThread, artifactMap, byId, mainIds, extraIds, embedded = false, trail = [] }) {
   const [lightboxIdx, setLightboxIdx] = useState(null);
+  const [expanded, setExpanded] = useState(false);
 
   const author = tweet.author || {};
   const date = tweet.created_at_secs ? fmtDate(tweet.created_at_secs) : '';
   const entities = tweet.entities || {};
   const avatarSrc = resolveUrl(author.avatar_local_path, author.avatar_url, artifactMap);
-  const showConnector = isInThread && !isLast;
   const isQT = tweet.is_quote_status === true;
-  const rowStyle = isInThread ? S.tweetRowThread : S.tweetRow;
+  const rowStyle = embedded
+    ? { ...S.tweetRowThread, padding: '9px 11px' }
+    : isInThread ? S.tweetRowThread : S.tweetRow;
   const ft = tweet.full_text || '';
+  const tweetId = String(tweet.id || '');
+  const quoteId = String(tweet.quoted_status_id || '');
+  const quoted = byId?.get(quoteId);
+  const retweetId = String(tweet.retweeted_status?.id || '');
+  const retweeted = byId?.get(retweetId);
+  const replyTo = byId?.get(String(tweet.in_reply_to_status_id || ''));
+  const canEmbed = trail.length < 4 && !trail.includes(tweetId);
+  const sourceUrl = tweet.id
+    ? `https://x.com/${encodeURIComponent(author.screen_name || 'i')}/status/${tweetId}`
+    : null;
+
+  // Linked X posts already in the archive get a local preview if they are not
+  // part of the reply timeline. Posts on the timeline remain in-place links.
+  const linked = new Map();
+  for (const id of linkedStatusIds(tweet)) {
+    if (id && id !== quoteId && id !== retweetId && id !== tweetId && byId?.has(id) && !mainIds?.has(id)) {
+      linked.set(id, byId.get(id));
+    }
+  }
 
   // Build resolved media lists first; skip the grid entirely if every item resolves to null.
   const rawMedia = (tweet.extended_entities?.media?.length
@@ -1158,7 +1154,12 @@ function TweetCard({ tweet, isInThread, isLast, artifactMap }) {
       if (src) videoItems.push({ kind: m.type === 'animated_gif' ? 'gif' : 'video', src });
     }
   }
-
+  const canCollapse = embedded && (ft.length > 220 || photos.length > 0 || videoItems.length > 0 || !!quoteId || !!retweetId || linked.size > 0);
+  const collapsed = canCollapse && !expanded;
+  const mediaSummary = [
+    photos.length && `${photos.length} ${photos.length === 1 ? 'photo' : 'photos'}`,
+    videoItems.length && `${videoItems.length} ${videoItems.length === 1 ? 'video' : 'videos'}`,
+  ].filter(Boolean).join(' · ');
   // Suppress media attachment t.co links from the tweet text when the media
   // actually rendered. Uses resolveEntityBounds (prefers indices/fromIndex,
   // falls back to indexOf) so the span is always precise.
@@ -1173,6 +1174,13 @@ function TweetCard({ tweet, isInThread, isLast, artifactMap }) {
     const b = resolveEntityBounds(m, ft, m.url);
     if (b) mediaSkipSpans.push([b.s, b.e]);
   }
+  if (quoted) {
+    for (const u of entities.urls || []) {
+      if (statusIdFromUrl(u.expanded_url || u.url) !== quoteId) continue;
+      const b = resolveEntityBounds(u, ft, u.url);
+      if (b) mediaSkipSpans.push([b.s, b.e]);
+    }
+  }
 
   return (
     <>
@@ -1183,18 +1191,27 @@ function TweetCard({ tweet, isInThread, isLast, artifactMap }) {
           onClose={() => setLightboxIdx(null)}
         />
       )}
-      <div style={rowStyle}>
+      <div style={rowStyle} className={embedded ? 'tw-embedded-post' : undefined}>
         <div style={S.leftCol}>
           {avatarSrc
             ? <img src={avatarSrc} style={S.avatar} alt={author.name || ''} />
             : <div style={S.avatarPh} />
           }
-          {showConnector && <div style={S.threadLine} />}
         </div>
 
         <div style={S.rightCol}>
+          {isInThread && tweet.in_reply_to_status_id && (
+            <div className="tw-reply-context">
+              Replying to {replyTo ? `@${replyTo.author?.screen_name || 'unknown'}` : 'a post outside this archive'}
+            </div>
+          )}
           <div style={S.authorRow}>
-            <span style={S.authorName}>{author.name || author.screen_name || 'Unknown'}</span>
+            {sourceUrl
+              ? <a className="tw-post-author-link" style={S.authorName} href={sourceUrl}
+                  target="_blank" rel="noopener noreferrer" title="Open original post on X">
+                  {author.name || author.screen_name || 'Unknown'}
+                </a>
+              : <span style={S.authorName}>{author.name || author.screen_name || 'Unknown'}</span>}
             {author.screen_name && (
               <span style={S.authorHandle}>@{author.screen_name}</span>
             )}
@@ -1204,17 +1221,17 @@ function TweetCard({ tweet, isInThread, isLast, artifactMap }) {
             )}
           </div>
 
-          <div style={S.tweetText}>
-            {renderTweetTextJSX(ft, entities, mediaSkipSpans)}
+          <div style={S.tweetText} className={collapsed ? 'tw-embedded-post__text--collapsed' : undefined}>
+            {renderTweetTextJSX(ft, entities, mediaSkipSpans, mainIds)}
           </div>
 
-          {photos.length > 0 && (
+          {!collapsed && photos.length > 0 && (
             <div style={S.mediaGrid}>
               <PhotoGrid photos={photos} onOpen={i => setLightboxIdx(i)} />
             </div>
           )}
 
-          {videoItems.map((v, i) => (
+          {!collapsed && videoItems.map((v, i) => (
             <div key={i} style={S.mediaGrid}>
               <video
                 src={v.src}
@@ -1227,7 +1244,60 @@ function TweetCard({ tweet, isInThread, isLast, artifactMap }) {
             </div>
           ))}
 
-          {(tweet.retweet_count > 0 || tweet.favorite_count > 0) && (
+          {!collapsed && quoteId && (
+            <div className="tw-related-post">
+              <div className="tw-related-post__label">Quoted post</div>
+              {quoted && (mainIds?.has(quoteId) || extraIds?.has(quoteId))
+                ? <a className="tw-related-post__jump" href={`#tweet-${quoteId}`}>
+                    @{quoted.author?.screen_name || 'unknown'} · View archived post
+                  </a>
+                : quoted && canEmbed
+                  ? <TweetCard tweet={quoted} artifactMap={artifactMap} byId={byId} mainIds={mainIds} extraIds={extraIds}
+                      embedded trail={[...trail, tweetId]} />
+                  : <a className="tw-related-post__jump" href={`https://x.com/i/status/${quoteId}`}
+                      target="_blank" rel="noopener noreferrer">View quoted post on X</a>}
+            </div>
+          )}
+
+          {!collapsed && retweetId && (
+            <div className="tw-related-post">
+              <div className="tw-related-post__label">Retweeted post</div>
+              {retweeted && (mainIds?.has(retweetId) || extraIds?.has(retweetId))
+                ? <a className="tw-related-post__jump" href={`#tweet-${retweetId}`}>
+                    @{retweeted.author?.screen_name || 'unknown'} · View archived post
+                  </a>
+                : retweeted && canEmbed
+                  ? <TweetCard tweet={retweeted} artifactMap={artifactMap} byId={byId} mainIds={mainIds} extraIds={extraIds}
+                      embedded trail={[...trail, tweetId]} />
+                  : <a className="tw-related-post__jump" href={`https://x.com/i/status/${retweetId}`}
+                      target="_blank" rel="noopener noreferrer">View retweeted post on X</a>}
+            </div>
+          )}
+
+          {!collapsed && [...linked].map(([id, post]) => (
+            <div className="tw-related-post" key={id}>
+              <div className="tw-related-post__label">Linked post</div>
+              {extraIds?.has(id)
+                ? <a className="tw-related-post__jump" href={`#tweet-${id}`}>
+                    @{post.author?.screen_name || 'unknown'} · View archived post
+                  </a>
+                : canEmbed
+                  ? <TweetCard tweet={post} artifactMap={artifactMap} byId={byId} mainIds={mainIds} extraIds={extraIds}
+                      embedded trail={[...trail, tweetId]} />
+                  : <a className="tw-related-post__jump" href={`https://x.com/i/status/${id}`}
+                      target="_blank" rel="noopener noreferrer">View linked post on X</a>}
+            </div>
+          ))}
+
+          {canCollapse && (
+            <button type="button" className="tw-embedded-post__expand"
+              aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>
+              {expanded ? 'Show less' : 'Show full post'}
+              {collapsed && mediaSummary && <span> · {mediaSummary}</span>}
+            </button>
+          )}
+
+          {!collapsed && (tweet.retweet_count > 0 || tweet.favorite_count > 0) && (
             <div style={S.stats}>
               {tweet.favorite_count > 0 && (
                 <span>❤️ {tweet.favorite_count.toLocaleString()}</span>
@@ -1243,12 +1313,89 @@ function TweetCard({ tweet, isInThread, isLast, artifactMap }) {
   );
 }
 
+function ThreadNode({ node, artifactMap, byId, mainIds, extraIds, focusedTweetId }) {
+  const { tweet, children } = node;
+  return (
+    <>
+      <article id={`tweet-${tweet.id}`}
+        className={`tw-conversation__post${focusedTweetId === String(tweet.id) ? ' tw-conversation__post--focused' : ''}`}>
+        <TweetCard tweet={tweet} isInThread artifactMap={artifactMap} byId={byId} mainIds={mainIds} extraIds={extraIds} />
+      </article>
+      {children.length === 1 && (
+        <ThreadNode node={children[0]} artifactMap={artifactMap} byId={byId} mainIds={mainIds} extraIds={extraIds}
+          focusedTweetId={focusedTweetId} />
+      )}
+      {children.length > 1 && (
+        <section className="tw-fork" aria-label={`${children.length} reply branches`}>
+          <div className="tw-fork__heading">{children.length} replies to this post</div>
+          {children.map((child, index) => (
+            <section key={child.tweet.id} className="tw-fork__branch"
+              aria-label={`Branch ${index + 1} of ${children.length}`}>
+              <div className="tw-fork__branch-label">
+                <strong>Branch {index + 1} of {children.length}</strong>
+                {child.tweet.author?.screen_name && <span>@{child.tweet.author.screen_name}</span>}
+              </div>
+              <ThreadNode node={child} artifactMap={artifactMap} byId={byId} mainIds={mainIds} extraIds={extraIds}
+                focusedTweetId={focusedTweetId} />
+            </section>
+          ))}
+        </section>
+      )}
+    </>
+  );
+}
+
 // ── TweetPreview ───────────────────────────────────────────────────────────────
 
-export default function TweetPreview({ archiveId, entryUid, artifacts, entityKind, fullPage, onXArticle }) {
+export default function TweetPreview({ archiveId, entryUid, artifacts, entityKind, originalUrl, fullPage, onXArticle }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [tweets, setTweets] = useState([]);
+  const [focusedTweetId, setFocusedTweetId] = useState(focusedTweetIdFromHash);
+
+  useEffect(() => {
+    if (entityKind !== 'tweet_thread') return;
+
+    const syncFocus = () => setFocusedTweetId(focusedTweetIdFromHash());
+    const clearFocus = () => {
+      window.history.replaceState(window.history.state, '', window.location.pathname + window.location.search);
+      setFocusedTweetId(null);
+    };
+    const onKeyDown = event => {
+      if (event.key !== 'Escape' || !focusedTweetIdFromHash()) return;
+      if (document.querySelector('.tw-media-lightbox')) return;
+      event.preventDefault();
+      event.stopPropagation();
+      clearFocus();
+    };
+    const onClick = event => {
+      if (!focusedTweetIdFromHash()) return;
+      const target = event.target;
+      if (target instanceof Element && target.closest(
+        '.tw-conversation__post, .tw-media-lightbox, a, button, input, textarea, select'
+      )) return;
+      clearFocus();
+    };
+
+    syncFocus();
+    window.addEventListener('hashchange', syncFocus);
+    window.addEventListener('popstate', syncFocus);
+    document.addEventListener('keydown', onKeyDown);
+    document.addEventListener('click', onClick);
+    return () => {
+      window.removeEventListener('hashchange', syncFocus);
+      window.removeEventListener('popstate', syncFocus);
+      document.removeEventListener('keydown', onKeyDown);
+      document.removeEventListener('click', onClick);
+    };
+  }, [entityKind, entryUid]);
+
+  // The archived JSON arrives after the initial page load. A direct link's
+  // target is absent when the browser first processes its fragment.
+  useEffect(() => {
+    if (entityKind !== 'tweet_thread' || loading || !focusedTweetId) return;
+    document.getElementById(`tweet-${focusedTweetId}`)?.scrollIntoView({ block: 'start' });
+  }, [entityKind, loading, focusedTweetId, tweets]);
 
   useEffect(() => {
     setLoading(true);
@@ -1284,10 +1431,8 @@ export default function TweetPreview({ archiveId, entryUid, artifacts, entityKin
         const coveredRanges = tweet => {
           const ft = tweet.full_text || '';
           return (tweet.entities?.urls || []).map(u => {
-            if (u.fromIndex != null && u.toIndex != null) return [u.fromIndex, u.toIndex];
-            if (u.indices?.length === 2) return [u.indices[0], u.indices[1]];
-            if (u.url) { const i = ft.indexOf(u.url); if (i !== -1) return [i, i + u.url.length]; }
-            return null;
+            const bounds = resolveEntityBounds(u, ft, u.url, u.text, u.display_url, u.expanded_url);
+            return bounds && [bounds.s, bounds.e];
           }).filter(Boolean);
         };
         const isCovered = (ranges, s, e) => ranges.some(([cs, ce]) => cs <= s && ce >= e);
@@ -1338,17 +1483,36 @@ export default function TweetPreview({ archiveId, entryUid, artifacts, entityKin
   const artifactMap = buildArtifactMap(archiveId, entryUid, artifacts);
 
   if (entityKind === 'tweet_thread') {
+    const requestedId = statusIdFromUrl(originalUrl);
+    const { tree, rows, byId, mainIds, extra, extraIds } = buildTweetThread(tweets, requestedId);
+    const jumpToArchivedPost = event => {
+      const link = event.target instanceof Element ? event.target.closest('a[href^="#tweet-"]') : null;
+      if (!link || !event.currentTarget.contains(link)) return;
+      const id = link.getAttribute('href')?.match(/^#tweet-(\d+)$/)?.[1];
+      if (!id) return;
+      const post = document.getElementById(`tweet-${id}`);
+      if (!post) return;
+      event.preventDefault();
+      window.history.replaceState(window.history.state, '', window.location.pathname + window.location.search + `#tweet-${id}`);
+      setFocusedTweetId(id);
+      post.scrollIntoView({ block: 'start' });
+    };
     return (
-      <div style={S.threadOuter}>
-        {tweets.map((tweet, i) => (
-          <TweetCard
-            key={tweet.id || i}
-            tweet={tweet}
-            isInThread
-            isLast={i === tweets.length - 1}
-            artifactMap={artifactMap}
-          />
-        ))}
+      <div className="tw-conversation" onClickCapture={jumpToArchivedPost}>
+        <div className="tw-conversation__intro">Conversation · {rows.length} {rows.length === 1 ? 'post' : 'posts'}</div>
+        {tree && <ThreadNode node={tree} artifactMap={artifactMap} byId={byId} mainIds={mainIds} extraIds={extraIds}
+          focusedTweetId={focusedTweetId} />}
+        {extra.length > 0 && (
+          <section className="tw-conversation__extra" aria-label="Other archived posts">
+            <div className="tw-conversation__intro">Other archived posts</div>
+            {extra.map(tweet => (
+              <article key={tweet.id} id={`tweet-${tweet.id}`}
+                className={`tw-conversation__post${focusedTweetId === String(tweet.id) ? ' tw-conversation__post--focused' : ''}`}>
+                <TweetCard tweet={tweet} isInThread artifactMap={artifactMap} byId={byId} mainIds={mainIds} extraIds={extraIds} />
+              </article>
+            ))}
+          </section>
+        )}
       </div>
     );
   }
@@ -1360,7 +1524,7 @@ export default function TweetPreview({ archiveId, entryUid, artifacts, entityKin
 
   return (
     <div style={S.card}>
-      <TweetCard tweet={tweet} isInThread={false} isLast artifactMap={artifactMap} />
+      <TweetCard tweet={tweet} artifactMap={artifactMap} />
     </div>
   );
 }

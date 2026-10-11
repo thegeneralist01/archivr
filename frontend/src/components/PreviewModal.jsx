@@ -2,22 +2,30 @@ import { useEffect } from 'react'
 import PreviewPanel from './PreviewPanel'
 
 export default function PreviewModal({ archiveId, entry, detail, onClose }) {
-  // Close on Escape key
+  const entityKind = detail?.summary?.entity_kind
+  // A focused post uses Escape to return to the conversation first.
   useEffect(() => {
-    const handler = (e) => { if (e.key === 'Escape') onClose() }
+    const handler = (e) => {
+      if (e.key !== 'Escape') return
+      if (entityKind === 'tweet_thread' && /^#tweet-\d+$/.test(window.location.hash)
+        && !document.querySelector('.tw-media-lightbox')) {
+        e.preventDefault()
+        window.history.replaceState(window.history.state, '', window.location.pathname + window.location.search)
+        window.dispatchEvent(new Event('hashchange'))
+        return
+      }
+      onClose()
+    }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [onClose])
+  }, [entityKind, onClose])
 
   return (
     <div className="preview-modal-backdrop" onClick={onClose}>
       <div
         className={`preview-modal${
-          detail?.summary?.entity_kind === 'tweet' ||
-          detail?.summary?.entity_kind === 'tweet_thread'
-            ? ''
-            : ' preview-modal--full'
-        }`}
+          entityKind === 'tweet' || entityKind === 'tweet_thread' ? '' : ' preview-modal--full'
+        }${entityKind === 'tweet_thread' ? ' preview-modal--thread' : ''}`}
         onClick={e => e.stopPropagation()}
       >
         <div className="preview-modal-header">
