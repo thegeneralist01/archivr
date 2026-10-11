@@ -47,6 +47,7 @@ export default function PreviewPanel({ archiveId, entry, detail, fullPage, onXAr
         entryUid={entryUid}
         artifacts={artifacts}
         entityKind={entityKind}
+        originalUrl={summary.original_url}
         fullPage={fullPage}
         onXArticle={onXArticle}
       />

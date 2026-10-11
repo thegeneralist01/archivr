@@ -81,7 +81,7 @@ export default function PreviewPage({ archiveId, entryUid }) {
             target="_blank"
             rel="noopener noreferrer"
             style={{ color: xArticle ? '#71767b' : 'var(--muted)', textDecoration: 'none', fontSize: '13px', flexShrink: 0 }}
-          >Original ↗</a>
+          >Original</a>
         )}
       </div>
 

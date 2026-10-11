@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 import PreviewPanel from './PreviewPanel'
 
 export default function PreviewModal({ archiveId, entry, detail, onClose }) {
+  const entityKind = detail?.summary?.entity_kind
   // Close on Escape key
   useEffect(() => {
     const handler = (e) => { if (e.key === 'Escape') onClose() }
@@ -13,11 +14,8 @@ export default function PreviewModal({ archiveId, entry, detail, onClose }) {
     <div className="preview-modal-backdrop" onClick={onClose}>
       <div
         className={`preview-modal${
-          detail?.summary?.entity_kind === 'tweet' ||
-          detail?.summary?.entity_kind === 'tweet_thread'
-            ? ''
-            : ' preview-modal--full'
-        }`}
+          entityKind === 'tweet' || entityKind === 'tweet_thread' ? '' : ' preview-modal--full'
+        }${entityKind === 'tweet_thread' ? ' preview-modal--thread' : ''}`}
         onClick={e => e.stopPropagation()}
       >
         <div className="preview-modal-header">

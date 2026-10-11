@@ -145,6 +145,8 @@ A separate auth database (`archivr-auth.sqlite`, path set in TOML) holds users, 
 | Snapchat | Direct URL · `snapchat:ID` |
 | Arbitrary URL / web page | Any `https://` URL |
 
+Thread previews follow archived reply relationships, group each reply branch under its parent post, and show captured quoted or linked posts inside the post that references them. Long or media-heavy quoted and linked posts start as compact previews; **Show full post** reveals their complete archived content. Links to posts already in the conversation jump to their place in the thread; press Esc or click/tap beside the thread to clear the focused post. Posts with missing relationship data remain available under “Other archived posts”.
+
 X Articles are titled `<article title> — @handle` from the article's own title instead of the tweet text (usually a
 bare `t.co` link). Article entries archived before this change are retitled on the next `archivr-server` start, but only
 while their title still equals the old auto-generated bare-link title; a renamed entry is left alone. Titles have no
