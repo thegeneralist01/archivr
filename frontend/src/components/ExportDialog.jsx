@@ -101,7 +101,6 @@ export default function ExportDialog({ open, archiveId, entryUids, onClose }) {
                 disabled={status === 'running'}
               >
                 <option value="html">Web page — HTML (.zip)</option>
-                <option value="pdf">PDF</option>
                 <option value="markdown">Markdown (.zip)</option>
               </select>
             </label>

@@ -42,7 +42,7 @@ async fn export_handler(
 
     // 2. Parse format, layout, and credit.
     let format = export::ExportFormat::parse(&q.format)
-        .ok_or_else(|| ApiError::bad_request("format must be html, pdf, or markdown"))?;
+        .ok_or_else(|| ApiError::bad_request("format must be html or markdown"))?;
 
     let layout = match q.layout.as_deref().unwrap_or("together") {
         "together" => export::ExportLayout::Together,

@@ -130,30 +130,6 @@ pub(crate) fn write_zip_multi_with_extra(
     Ok(())
 }
 
-/// Build a ZIP that holds multiple PDFs: `<folder>/<NN>-<slug>.pdf`.
-pub(crate) fn write_pdf_zip(
-    zip_path: &Path,
-    folder: &str,
-    pdfs: &[(String, PathBuf)], // (name_in_zip, source_path)
-) -> Result<()> {
-    let file = std::fs::File::create(zip_path)
-        .with_context(|| format!("failed to create zip: {}", zip_path.display()))?;
-    let mut zip = ZipWriter::new(file);
-
-    for (name, source) in pdfs {
-        let entry_path = format!("{folder}/{name}");
-        let size = source.metadata().map(|m| m.len()).unwrap_or(0);
-        let opts = asset_options(name, size);
-        zip.start_file(&entry_path, opts)
-            .with_context(|| format!("failed to start {entry_path}"))?;
-        let mut f = std::fs::File::open(source)
-            .with_context(|| format!("failed to open pdf: {}", source.display()))?;
-        io::copy(&mut f, &mut zip)?;
-    }
-
-    zip.finish().context("failed to finish pdf zip")?;
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Helpers

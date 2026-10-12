@@ -52,7 +52,7 @@ enum Command {
         #[arg(long = "force-with-info-removal")]
         force_with_info_removal: bool,
     },
-    /// Export entries as a shareable HTML/Markdown bundle or PDF
+    /// Export entries as a shareable HTML or Markdown bundle
     Export {
         /// Entry UIDs to export, in output order
         #[arg(required = true)]
@@ -81,7 +81,6 @@ enum Command {
 #[derive(clap::ValueEnum, Debug, Clone, Copy)]
 enum ExportFormatArg {
     Html,
-    Pdf,
     Markdown,
 }
 
@@ -89,7 +88,6 @@ impl From<ExportFormatArg> for ExportFormat {
     fn from(a: ExportFormatArg) -> Self {
         match a {
             ExportFormatArg::Html => ExportFormat::Html,
-            ExportFormatArg::Pdf => ExportFormat::Pdf,
             ExportFormatArg::Markdown => ExportFormat::Markdown,
         }
     }

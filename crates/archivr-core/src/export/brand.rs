@@ -48,9 +48,3 @@ h2.ax-title{font-size:30px}h3.ax-title{font-size:23px}
 pub(crate) const CREDIT_HTML: &str = r#"<footer class="ax-colophon"><a class="ax-credit" href="https://github.com/thegeneralist01/archivr" rel="noopener">
 <span class="ax-mark" aria-hidden="true">A</span><span>Preserved with <span class="ax-wordmark">archivr</span></span></a></footer>"#;
 
-/// Inline-style credit div injected into SingleFile snapshots for PDF export.
-/// The wrapper uses `all:initial` so the host page cannot restyle it.
-pub(crate) const CREDIT_INLINE_HTML: &str = r#"<div style="all:initial;display:block;max-width:760px;margin:48px auto 0;padding:22px 28px 56px;border-top:1px solid #d2c6b5;text-align:center;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif">
-<a style="display:inline-flex;align-items:center;gap:8px;font-size:11px;letter-spacing:.08em;color:#6b6f66;text-decoration:none" href="https://github.com/thegeneralist01/archivr" rel="noopener">
-<span style="display:inline-grid;place-items:center;width:16px;height:16px;border-radius:2.5px;background:#8d3f30;color:#f4ead8;font:600 12px/1 Georgia,serif" aria-hidden="true">A</span>
-<span>Preserved with <span style="font:600 15px/1 Georgia,serif;letter-spacing:.01em;color:#20251f">archivr</span></span></a></div>"#;

@@ -1,4 +1,4 @@
-//! Entry export: HTML ZIP, PDF, Markdown ZIP.
+//! Entry export: HTML ZIP and Markdown ZIP.
 //!
 //! The public entry point is [`export_entries`].
 
@@ -7,7 +7,6 @@ mod bundle;
 mod html;
 mod markdown;
 mod model;
-mod pdf;
 
 use std::collections::HashMap;
 use std::fs;
@@ -32,7 +31,6 @@ use crate::process;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
     Html,
-    Pdf,
     Markdown,
 }
 
@@ -40,7 +38,6 @@ impl ExportFormat {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "html" => Some(Self::Html),
-            "pdf" => Some(Self::Pdf),
             "markdown" => Some(Self::Markdown),
             _ => None,
         }
@@ -202,7 +199,7 @@ pub fn export_entries(
 
     // 7. Dispatch.
     let (out_path, filename, content_type) =
-        assemble(&entries, options, &wpath, &posters, &paths.store_path)?;
+        assemble(&entries, options, &wpath, &posters)?;
 
     Ok(ExportFile {
         path: out_path,
@@ -374,7 +371,6 @@ fn assemble(
     options: &ExportOptions,
     work_dir: &Path,
     posters: &HashMap<String, PathBuf>,
-    store_path: &Path,
 ) -> Result<(PathBuf, String, &'static str)> {
     let date = Utc::now().format("%Y-%m-%d").to_string();
     let n = entries.len();
@@ -384,7 +380,6 @@ fn assemble(
         ExportFormat::Markdown => {
             assemble_markdown(entries, options, work_dir, posters, &date, n)
         }
-        ExportFormat::Pdf => assemble_pdf(entries, options, work_dir, posters, store_path, &date, n),
     }
 }
 
@@ -503,74 +498,6 @@ fn assemble_markdown(
     }
 }
 
-// ---------------------------------------------------------------------------
-// PDF assembly
-// ---------------------------------------------------------------------------
-
-fn assemble_pdf(
-    entries: &[model::ExportEntry],
-    options: &ExportOptions,
-    work_dir: &Path,
-    posters: &HashMap<String, PathBuf>,
-    _store_path: &Path,
-    date: &str,
-    n: usize,
-) -> Result<(PathBuf, String, &'static str)> {
-    if n == 1 {
-        let slug = entry_slug(entries[0].summary.title.as_deref().unwrap_or(""));
-        let filename = format!("{slug}.pdf");
-        let pdf_path = work_dir.join(&filename);
-        let entry_path =
-            pdf::entry_pdf(&entries[0], 0, options.include_credit, work_dir, posters)?;
-        fs::rename(&entry_path, &pdf_path)
-            .or_else(|_| fs::copy(&entry_path, &pdf_path).map(|_| ()))?;
-        return Ok((pdf_path, filename, "application/pdf"));
-    }
-
-    match options.layout {
-        ExportLayout::Together => {
-            let filename = format!("export-{n}-entries-{date}.pdf");
-            let out = work_dir.join(&filename);
-
-            // Cover page.
-            let cover_html = html::render_cover(entries, options.include_credit);
-            let cover_html_path = work_dir.join("cover.html");
-            fs::write(&cover_html_path, &cover_html)?;
-            let cover_pdf_path = work_dir.join("cover.pdf");
-            let profile_dir = work_dir.join("chrome-profile");
-            fs::create_dir_all(&profile_dir)?;
-            pdf::print_pdf(&cover_html_path, &cover_pdf_path, &profile_dir)?;
-
-            // Per-entry PDFs (no credit: it's on the cover).
-            let mut pdf_paths: Vec<PathBuf> = vec![cover_pdf_path];
-            for (i, entry) in entries.iter().enumerate() {
-                let p = pdf::entry_pdf(entry, i, false, work_dir, posters)?;
-                pdf_paths.push(p);
-            }
-
-            pdf::merge_pdf_files(&pdf_paths, &out)?;
-            Ok((out, filename, "application/pdf"))
-        }
-        ExportLayout::Separate => {
-            // A ZIP of individual PDFs.
-            let outer = format!("export-{date}");
-            let filename = format!("export-{n}-entries-{date}.zip");
-            let zip_path = work_dir.join(&filename);
-
-            let mut pdf_names: Vec<(String, PathBuf)> = Vec::new();
-            for (i, entry) in entries.iter().enumerate() {
-                let nn = format!("{:02}", i + 1);
-                let slug = entry_slug(entry.summary.title.as_deref().unwrap_or(""));
-                let pdf_path = pdf::entry_pdf(entry, i, options.include_credit, work_dir, posters)?;
-                let name_in_zip = format!("{nn}-{slug}.pdf");
-                pdf_names.push((name_in_zip, pdf_path));
-            }
-
-            bundle::write_pdf_zip(&zip_path, &outer, &pdf_names)?;
-            Ok((zip_path, filename, "application/zip"))
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Asset collection
@@ -762,7 +689,6 @@ pub fn prune_stale_export_dirs(store_path: &Path, older_than: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::pdf::merge_documents;
     use crate::archive::initialize_archive;
     use crate::database;
 
@@ -1031,45 +957,4 @@ mod tests {
         assert_eq!(entry_slug("my-entry"), "my-entry");
     }
 
-    #[test]
-    fn test_merge_pdfs_page_count() {
-        use lopdf::{Dictionary, Document, Object, Stream};
-        let make_doc = |content: &[u8]| -> Document {
-            let mut doc = Document::with_version("1.4");
-            let stream_id = doc.add_object(Object::Stream(Stream::new(Dictionary::new(), content.to_vec())));
-            let mut page_dict = Dictionary::new();
-            page_dict.set("Type", Object::Name(b"Page".to_vec()));
-            page_dict.set("Contents", Object::Reference(stream_id));
-            page_dict.set("MediaBox", Object::Array(vec![
-                Object::Integer(0), Object::Integer(0),
-                Object::Integer(612), Object::Integer(792),
-            ]));
-            let page_id = doc.add_object(Object::Dictionary(page_dict));
-            let mut pages_dict = Dictionary::new();
-            pages_dict.set("Type", Object::Name(b"Pages".to_vec()));
-            pages_dict.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
-            pages_dict.set("Count", Object::Integer(1));
-            let pages_id = doc.add_object(Object::Dictionary(pages_dict));
-            if let Some(Object::Dictionary(pd)) = doc.objects.get_mut(&page_id) {
-                pd.set("Parent", Object::Reference(pages_id));
-            }
-            let mut catalog = Dictionary::new();
-            catalog.set("Type", Object::Name(b"Catalog".to_vec()));
-            catalog.set("Pages", Object::Reference(pages_id));
-            let catalog_id = doc.add_object(Object::Dictionary(catalog));
-            doc.trailer.set("Root", Object::Reference(catalog_id));
-            doc
-        };
-
-        let doc1 = make_doc(b"BT /F1 12 Tf 100 700 Td (Page one) Tj ET");
-        let doc2_p1 = make_doc(b"BT /F1 12 Tf 100 700 Td (Page two) Tj ET");
-        let doc2_p2 = make_doc(b"BT /F1 12 Tf 100 700 Td (Page three) Tj ET");
-
-        let doc2 = merge_documents(vec![doc2_p1, doc2_p2]).unwrap();
-        let mut merged = merge_documents(vec![doc1, doc2]).unwrap();
-        let mut bytes: Vec<u8> = Vec::new();
-        merged.save_to(&mut bytes).unwrap();
-        let reloaded = lopdf::Document::load_mem(&bytes).unwrap();
-        assert_eq!(reloaded.get_pages().len(), 3, "merged PDF should have 3 pages");
-    }
 }

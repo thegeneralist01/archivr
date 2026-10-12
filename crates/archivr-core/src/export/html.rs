@@ -14,44 +14,15 @@ use crate::export::model::{Asset, ExportBody, ExportEntry, Post, Span, ext_of_s}
 pub(crate) enum AssetMode {
     /// `assets/<name>` — for ZIP bundles.
     Bundle,
-    /// `file://<percent-encoded absolute path>` — for Chrome PDF printing.
-    Print,
 }
 
 pub(crate) fn asset_src(mode: AssetMode, asset: &Asset) -> String {
     match mode {
         AssetMode::Bundle => format!("assets/{}", asset.name),
-        AssetMode::Print => file_url(&asset.source),
     }
 }
 
-pub(crate) fn asset_src_path(mode: AssetMode, path: &std::path::Path) -> String {
-    match mode {
-        AssetMode::Bundle => {
-            // Fallback: use the file name.
-            path.file_name()
-                .map(|n| format!("assets/{}", n.to_string_lossy()))
-                .unwrap_or_default()
-        }
-        AssetMode::Print => file_url(path),
-    }
-}
 
-/// Percent-encodes a file path into a `file://` URL.
-fn file_url(path: &std::path::Path) -> String {
-    let s = path.to_string_lossy();
-    let mut out = String::with_capacity(s.len() + 7);
-    out.push_str("file://");
-    for byte in s.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b'~' => {
-                out.push(*byte as char)
-            }
-            b => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -257,54 +228,6 @@ pub(crate) fn render_document(
     html
 }
 
-/// Render a PDF cover page (collection header + TOC, no anchors per entry).
-pub(crate) fn render_cover(
-    entries: &[ExportEntry],
-    include_credit: bool,
-) -> String {
-    let generator_meta = if include_credit {
-        r#"<meta name="generator" content="Archivr">"#
-    } else {
-        ""
-    };
-
-    let mut html = format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="referrer" content="no-referrer">
-{generator_meta}
-<title>{n} archived entries</title><style>{css}</style></head>
-<body><main class="ax-doc">
-"#,
-        n = entries.len(),
-        css = brand::EXPORT_CSS,
-        generator_meta = generator_meta,
-    );
-
-    html.push_str(&format!(
-        r#"<header class="ax-collection"><p class="ax-eyebrow">Collection</p><h1 class="ax-title">{n} archived entries</h1>
-<ol class="ax-toc">"#,
-        n = entries.len(),
-    ));
-    for entry in entries {
-        let title = entry_title(entry);
-        let label = source_label(&entry.summary.source_kind, &entry.summary.entity_kind);
-        html.push_str(&format!(
-            r#"<li>{title} <span class="ax-muted">{label}</span></li>"#,
-            title = esc(&title),
-            label = esc(&label),
-        ));
-    }
-    html.push_str("</ol></header>\n");
-    html.push_str("</main>");
-    if include_credit {
-        html.push('\n');
-        html.push_str(brand::CREDIT_HTML);
-        html.push('\n');
-    }
-    html.push_str("</body></html>\n");
-    html
-}
 
 fn render_collection_header(entries: &[ExportEntry]) -> String {
     let mut s = format!(
@@ -404,70 +327,39 @@ fn render_video(
 ) -> String {
     let src = asset_src(mode, asset);
     let poster = posters.get(&asset.name);
-
-    match mode {
-        AssetMode::Bundle => {
-            let poster_attr = poster
-                .map(|p| {
-                    let pname = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    format!(r#" poster="assets/{pname}""#)
-                })
+    let poster_attr = poster
+        .map(|p| {
+            let pname = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            format!(r#" poster="assets/{pname}""#)
+        })
+        .unwrap_or_default();
+    let tracks: String = subtitles
+        .iter()
+        .enumerate()
+        .map(|(i, sub)| {
+            let sub_src = asset_src(mode, sub);
+            let label = sub.name.clone();
+            let srclang_attr = label
+                .split('-')
+                .next()
+                .map(|l| format!(r#" srclang="{l}""#))
                 .unwrap_or_default();
-            let tracks: String = subtitles
-                .iter()
-                .enumerate()
-                .map(|(i, sub)| {
-                    let sub_src = asset_src(mode, sub);
-                    let label = sub.name.clone();
-                    let srclang_attr = label
-                        .split('-')
-                        .next()
-                        .map(|l| format!(r#" srclang="{l}""#))
-                        .unwrap_or_default();
-                    let default_attr = if i == 0 { r#" default"# } else { "" };
-                    format!(
-                        r#"<track kind="subtitles" src="{sub_src}" label="{label}"{srclang_attr}{default_attr}>"#,
-                        label = esc(&label),
-                    )
-                })
-                .collect();
+            let default_attr = if i == 0 { r#" default"# } else { "" };
             format!(
-                r#"<figure class="ax-media"><video controls preload="metadata" playsinline{poster_attr} src="{src}">{tracks}</video></figure>"#,
-                src = esc(&src),
+                r#"<track kind="subtitles" src="{sub_src}" label="{label}"{srclang_attr}{default_attr}>"#,
+                label = esc(&label),
             )
-        }
-        AssetMode::Print => {
-            if let Some(poster_path) = poster {
-                let poster_src = asset_src_path(mode, poster_path);
-                let name = asset.name.clone();
-                format!(
-                    r#"<figure class="ax-media"><img src="{poster_src}" alt=""><figcaption>Video · {name}</figcaption></figure>"#,
-                    poster_src = esc(&poster_src),
-                    name = esc(&name),
-                )
-            } else {
-                format!(
-                    r#"<div class="ax-placeholder">Video · {}</div>"#,
-                    esc(&asset.name)
-                )
-            }
-        }
-    }
+        })
+        .collect();
+    format!(
+        r#"<figure class="ax-media"><video controls preload="metadata" playsinline{poster_attr} src="{src}">{tracks}</video></figure>"#,
+        src = esc(&src),
+    )
 }
 
 fn render_audio(asset: &Asset, mode: AssetMode) -> String {
-    match mode {
-        AssetMode::Bundle => {
-            let src = asset_src(mode, asset);
-            format!(r#"<audio controls preload="metadata" src="{}"></audio>"#, esc(&src))
-        }
-        AssetMode::Print => {
-            format!(
-                r#"<div class="ax-placeholder">Audio · {}</div>"#,
-                esc(&asset.name)
-            )
-        }
-    }
+    let src = asset_src(mode, asset);
+    format!(r#"<audio controls preload="metadata" src="{}"></audio>"#, esc(&src))
 }
 
 fn render_image(asset: &Asset, mode: AssetMode, title: &str) -> String {
@@ -479,39 +371,23 @@ fn render_image(asset: &Asset, mode: AssetMode, title: &str) -> String {
     )
 }
 
-fn render_pdf(asset: &Asset, mode: AssetMode, title: &str) -> String {
-    match mode {
-        AssetMode::Bundle => {
-            let src = asset_src(mode, asset);
-            format!(
-                r#"<object class="ax-frame" data="{src}" type="application/pdf"></object>
+fn render_pdf(asset: &Asset, mode: AssetMode, _title: &str) -> String {
+    let src = asset_src(mode, asset);
+    format!(
+        r#"<object class="ax-frame" data="{src}" type="application/pdf"></object>
 <p class="ax-aside"><a href="{src}">Open the PDF</a></p>"#,
-                src = esc(&src),
-            )
-        }
-        AssetMode::Print => {
-            // Handled separately in pdf.rs: the PDF asset is merged directly.
-            format!(r#"<p class="ax-aside">{}</p>"#, esc(title))
-        }
-    }
+        src = esc(&src),
+    )
 }
 
 fn render_page(asset: &Asset, mode: AssetMode, title: &str) -> String {
-    match mode {
-        AssetMode::Bundle => {
-            let src = asset_src(mode, asset);
-            format!(
-                r#"<iframe class="ax-frame" src="{src}" title="{title}" sandbox="allow-same-origin allow-popups" referrerpolicy="no-referrer" loading="lazy"></iframe>
+    let src = asset_src(mode, asset);
+    format!(
+        r#"<iframe class="ax-frame" src="{src}" title="{title}" sandbox="allow-same-origin allow-popups" referrerpolicy="no-referrer" loading="lazy"></iframe>
 <p class="ax-aside"><a href="{src}">Open the archived page on its own</a></p>"#,
-                src = esc(&src),
-                title = esc(title),
-            )
-        }
-        AssetMode::Print => {
-            // Handled in pdf.rs: the snapshot gets masthead/colophon injected.
-            format!(r#"<p class="ax-aside">{}</p>"#, esc(title))
-        }
-    }
+        src = esc(&src),
+        title = esc(title),
+    )
 }
 
 fn render_download_link(asset: &Asset, mode: AssetMode) -> String {
@@ -627,36 +503,17 @@ fn render_post(
             ));
         }
         for (video, is_gif) in &post.videos {
-            match mode {
-                AssetMode::Bundle => {
-                    let src = asset_src(mode, video);
-                    if *is_gif {
-                        s.push_str(&format!(
-                            r#"<video autoplay loop muted playsinline src="{src}"></video>"#,
-                            src = esc(&src)
-                        ));
-                    } else {
-                        s.push_str(&format!(
-                            r#"<video controls src="{src}"></video>"#,
-                            src = esc(&src)
-                        ));
-                    }
-                }
-                AssetMode::Print => {
-                    let poster = posters.get(&video.name);
-                    if let Some(poster_path) = poster {
-                        let poster_src = asset_src_path(mode, poster_path);
-                        s.push_str(&format!(
-                            r#"<img src="{poster_src}" alt="" loading="lazy">"#,
-                            poster_src = esc(&poster_src)
-                        ));
-                    } else {
-                        s.push_str(&format!(
-                            r#"<div class="ax-placeholder">Video · {}</div>"#,
-                            esc(&video.name)
-                        ));
-                    }
-                }
+            let src = asset_src(mode, video);
+            if *is_gif {
+                s.push_str(&format!(
+                    r#"<video autoplay loop muted playsinline src="{src}"></video>"#,
+                    src = esc(&src)
+                ));
+            } else {
+                s.push_str(&format!(
+                    r#"<video controls src="{src}"></video>"#,
+                    src = esc(&src)
+                ));
             }
         }
         s.push_str("</div>");
