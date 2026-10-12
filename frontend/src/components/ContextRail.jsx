@@ -697,14 +697,15 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
           )}
 
           <div className="rail-section">
-            <p className="rail-section-heading">Export</p>
+            <div className="rail-section-heading">Actions</div>
             <button
               className="rail-rearchive-btn"
               onClick={() => setExportOpen(true)}
             >
-              {`Export ${selectedUids.size} entries\u2026`}
+              {`Export ${selectedUids.size} entr${selectedUids.size === 1 ? 'y' : 'ies'}\u2026`}
             </button>
           </div>
+
 
           <div className="rail-delete-zone">
             <button
@@ -778,11 +779,6 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
           {isPreviewable && onOpenPreview && (
             <button className="rail-preview-btn" onClick={onOpenPreview}>
               Preview
-            </button>
-          )}
-          {!isPublicSession && (
-            <button className="rail-preview-btn rail-export-btn" onClick={() => setExportOpen(true)}>
-              Export\u2026
             </button>
           )}
 
@@ -1047,43 +1043,52 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
             </div>
           )}
 
-          {detail && (detail.summary.entity_kind === 'tweet' || detail.summary.entity_kind === 'tweet_thread') && (
-            <div className="rail-section">
-              <div className="rail-section-heading">Actions</div>
-              <button
-                className="rail-rearchive-btn"
-                onClick={handleRearchive}
-                disabled={rearchiveState === 'running'}
-              >
-                {rearchiveState === 'running' ? 'Re-archiving\u2026' : 'Re-archive'}
-              </button>
-              {rearchiveState === 'done' && (
-                <p className="form-msg form-msg--ok" style={{ marginTop: '6px' }}>Re-archived successfully.</p>
-              )}
-              {rearchiveState === 'error' && (
-                <p className="form-msg form-msg--err" style={{ marginTop: '6px' }}>{rearchiveError}</p>
-              )}
-              {detail.summary.entity_kind === 'tweet_thread' && (
-                <>
-                  <button
-                    className="rail-rearchive-btn"
-                    style={{ marginTop: '8px' }}
-                    onClick={handleGenerateThreadTitle}
-                    disabled={titleGenState === 'running'}
-                    title={`Names this thread with a small model via ${PROVIDER_LABEL[summaryProvider] || summaryProvider} (the Summary provider)`}
-                  >
-                    {titleGenState === 'running' ? 'Generating title\u2026' : 'Generate title'}
-                  </button>
-                  {titleGenState === 'done' && (
-                    <p className="form-msg form-msg--ok" style={{ marginTop: '6px' }}>Title updated.</p>
-                  )}
-                  {titleGenState === 'error' && (
-                    <p className="form-msg form-msg--err" style={{ marginTop: '6px' }}>{titleGenError}</p>
-                  )}
-                </>
-              )}
-            </div>
-          )}
+          <div className="rail-section">
+            <div className="rail-section-heading">Actions</div>
+            {detail && (detail.summary.entity_kind === 'tweet' || detail.summary.entity_kind === 'tweet_thread') && (
+              <>
+                <button
+                  className="rail-rearchive-btn"
+                  onClick={handleRearchive}
+                  disabled={rearchiveState === 'running'}
+                >
+                  {rearchiveState === 'running' ? 'Re-archiving\u2026' : 'Re-archive'}
+                </button>
+                {rearchiveState === 'done' && (
+                  <p className="form-msg form-msg--ok" style={{ marginTop: '6px' }}>Re-archived successfully.</p>
+                )}
+                {rearchiveState === 'error' && (
+                  <p className="form-msg form-msg--err" style={{ marginTop: '6px' }}>{rearchiveError}</p>
+                )}
+                {detail.summary.entity_kind === 'tweet_thread' && (
+                  <>
+                    <button
+                      className="rail-rearchive-btn"
+                      style={{ marginTop: '8px' }}
+                      onClick={handleGenerateThreadTitle}
+                      disabled={titleGenState === 'running'}
+                      title={`Names this thread with a small model via ${PROVIDER_LABEL[summaryProvider] || summaryProvider} (the Summary provider)`}
+                    >
+                      {titleGenState === 'running' ? 'Generating title\u2026' : 'Generate title'}
+                    </button>
+                    {titleGenState === 'done' && (
+                      <p className="form-msg form-msg--ok" style={{ marginTop: '6px' }}>Title updated.</p>
+                    )}
+                    {titleGenState === 'error' && (
+                      <p className="form-msg form-msg--err" style={{ marginTop: '6px' }}>{titleGenError}</p>
+                    )}
+                  </>
+                )}
+              </>
+            )}
+            <button
+              className="rail-rearchive-btn"
+              style={{ marginTop: detail && (detail.summary.entity_kind === 'tweet' || detail.summary.entity_kind === 'tweet_thread') ? '8px' : undefined }}
+              onClick={() => setExportOpen(true)}
+            >
+              {'Export\u2026'}
+            </button>
+          </div>
 
           <div className="rail-delete-zone">
             <button className="rail-delete-btn" onClick={handleDeleteEntry}>
