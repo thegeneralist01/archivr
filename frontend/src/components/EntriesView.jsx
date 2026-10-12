@@ -2,7 +2,7 @@ import SkeletonEntryRow from './SkeletonEntryRow';
 
 import EntryRow from './EntryRow';
 
-export default function EntriesView({ entries, selectedUids, onRowClick, archiveId, pendingCaptures = [], deletedUids, renamedTitles, isPublicSession, canReorder = false, onChildReorderError }) {
+export default function EntriesView({ entries, selectedUids, onRowClick, archiveId, pendingCaptures = [], foreignCaptures = [], deletedUids, renamedTitles, isPublicSession, canReorder = false, onChildReorderError }) {
   return (
     <section id="archive-view" className="view is-active">
       <div className="entry-table">
@@ -16,6 +16,9 @@ export default function EntriesView({ entries, selectedUids, onRowClick, archive
         </div>
         <div id="entries-body">
           {pendingCaptures.filter(c => c.archiveId === archiveId).reverse().map(cap => (
+            <SkeletonEntryRow key={cap.id} locator={cap.locator} />
+          ))}
+          {foreignCaptures.filter(c => c.archiveId === archiveId).map(cap => (
             <SkeletonEntryRow key={cap.id} locator={cap.locator} />
           ))}
           {entries.map((entry, idx) => (

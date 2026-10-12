@@ -67,11 +67,18 @@ async fn list_capture_jobs_handler(
     Query(q): Query<JobListQuery>,
 ) -> Result<Json<Vec<archive::CaptureJobSummary>>, ApiError> {
     auth.require_role(ROLE_USER)?;
+    // `status=active` is a special value meaning all pending+running jobs, visible to every
+    // authorized user (no creator scoping). Used by other users to render in-progress skeletons.
+    if q.status.as_deref() == Some("active") {
+        let mounted = mounted_archive(&state, &archive_id)?;
+        let conn = database::open_or_initialize(&mounted.archive_path)?;
+        return Ok(Json(capture_jobs::list_active_capture_jobs(&conn)?));
+    }
     if let Some(status) = q.status.as_deref()
         && !capture_jobs::JOB_STATUSES.contains(&status)
     {
         return Err(ApiError::bad_request(
-            "invalid status: must be pending, running, completed, or failed",
+            "invalid status: must be pending, running, completed, failed, or active",
         ));
     }
     let limit = parse_int_param("limit", q.limit.as_deref())?
@@ -724,5 +731,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body_json(resp).await[0]["archive_path"], expected.as_str());
+    }
+
+    #[tokio::test]
+    async fn active_status_shows_pending_and_running_jobs_from_all_users() {
+        let f = fixture();
+        let alice = make_role_session(&f.auth_path, "alice", &["user"]);
+        let bob = make_role_session(&f.auth_path, "bob", &["user"]);
+        let alice_uid = user_uid(&f.auth_path, "alice");
+        let bob_uid = user_uid(&f.auth_path, "bob");
+        let base = "/api/archives/test/capture_jobs";
+
+        // Create pending jobs for alice and bob; set one running and one completed.
+        let (alice_pending, bob_running, alice_completed) = {
+            let conn = database::open_or_initialize(&f.archive_path).unwrap();
+            let a = database::create_capture_job_as(&conn, "test", Some(&alice_uid)).unwrap();
+            let b = database::create_capture_job_as(&conn, "test", Some(&bob_uid)).unwrap();
+            let c = database::create_capture_job_as(&conn, "test", Some(&alice_uid)).unwrap();
+            database::update_capture_job_status(&conn, &b, "running", None, None, None).unwrap();
+            database::update_capture_job_status(&conn, &c, "completed", Some("run-x"), None, None).unwrap();
+            (a, b, c)
+        };
+
+        // Alice using status=active sees both the pending (own) and running (bob's) jobs,
+        // but not the completed one.
+        let (s, list) = get(&f.router, &format!("{base}?status=active"), Some(&alice)).await;
+        assert_eq!(s, StatusCode::OK);
+        let visible = uids(&list);
+        assert!(visible.contains(&alice_pending), "alice_pending should be visible");
+        assert!(visible.contains(&bob_running), "bob_running should be visible");
+        assert!(!visible.contains(&alice_completed), "completed should not appear");
+
+        // Bob also sees both active jobs (including alice's pending).
+        let (_, list) = get(&f.router, &format!("{base}?status=active"), Some(&bob)).await;
+        let visible = uids(&list);
+        assert!(visible.contains(&alice_pending));
+        assert!(visible.contains(&bob_running));
+
+        // Regular (non-active) status=pending still scopes to own jobs only.
+        let (_, list) = get(&f.router, &format!("{base}?status=pending"), Some(&alice)).await;
+        assert_eq!(uids(&list), vec![alice_pending]);
+
+        // Regular listing without status filter still scopes to own jobs only.
+        let (_, list) = get(&f.router, base, Some(&bob)).await;
+        assert_eq!(uids(&list), vec![bob_running]);
     }
 }

@@ -334,6 +334,10 @@ export async function pollCaptureJob(archiveId, jobUid) {
   return getJson(`/api/archives/${archiveId}/capture_jobs/${jobUid}`);
 }
 
+export async function listActiveCaptureJobs(archiveId) {
+  return getJson(`/api/archives/${archiveId}/capture_jobs?status=active`);
+}
+
 // ── Auth helpers ─────────────────────────────────────────────────────────────
 
 export async function checkSetup() {

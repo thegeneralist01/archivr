@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo, createContext } from 'react'
-import { fetchArchives, fetchEntries, searchEntries, fetchRuns, fetchTags, checkSetup, fetchMe, fetchEntryDetail, listCollections } from './api'
+import { fetchArchives, fetchEntries, searchEntries, fetchRuns, fetchTags, checkSetup, fetchMe, fetchEntryDetail, listCollections, listActiveCaptureJobs } from './api'
 import LoginPage from './components/LoginPage.jsx'
 import SetupPage from './components/SetupPage.jsx'
 
@@ -166,6 +166,48 @@ export default function App() {
   useEffect(() => {
     sessionStorage.setItem('pendingCaptures', JSON.stringify(pendingCaptures))
   }, [pendingCaptures])
+
+  // Foreign captures: active jobs started by other users (or other tabs) that this session
+  // didn't submit. Polled every 3 s so all authorized viewers see in-progress skeletons.
+  const [foreignCaptures, setForeignCaptures] = useState([])
+  const pendingCapturesRef = useRef(pendingCaptures)
+  useEffect(() => { pendingCapturesRef.current = pendingCaptures }, [pendingCaptures])
+  const handleCapturedRef = useRef(null)
+
+  useEffect(() => {
+    if (!archiveId || !currentUser) {
+      setForeignCaptures([])
+      return
+    }
+    // Track which foreign job UIDs were active on the last successful poll so we can
+    // detect when they settle (disappear from the active list) and refresh entries.
+    let prevForeignUids = new Set()
+
+    const poll = async () => {
+      try {
+        const activeJobs = await listActiveCaptureJobs(archiveId)
+        // Exclude jobs the current session is already tracking locally.
+        const ownJobUids = new Set(pendingCapturesRef.current.map(c => c.jobUid))
+        const foreign = activeJobs
+          .filter(job => !ownJobUids.has(job.job_uid))
+          .map(job => {
+            let locator = ''
+            try { locator = JSON.parse(job.notes_json || '{}').locator || '' } catch {}
+            return { id: job.job_uid, jobUid: job.job_uid, locator, archiveId: job.archive_id }
+          })
+        setForeignCaptures(foreign)
+        // If any previously-active foreign job no longer appears → it settled; refresh.
+        const newUids = new Set(foreign.map(j => j.jobUid))
+        const hadSettled = [...prevForeignUids].some(uid => !newUids.has(uid))
+        if (hadSettled) handleCapturedRef.current?.()
+        prevForeignUids = newUids
+      } catch {}
+    }
+
+    poll()
+    const timer = setInterval(poll, 3000)
+    return () => { clearInterval(timer); setForeignCaptures([]) }
+  }, [archiveId, currentUser])
 
   const [ublockWarningIgnored, setUblockWarningIgnored] = useState(
     () => sessionStorage.getItem('ublockWarningIgnored') === 'true'
@@ -647,6 +689,7 @@ export default function App() {
       fetchRuns(archiveId).then(setRuns),
     ])
   }, [archiveId, searchQuery, tagFilter, selectedCollectionUid, loadEntries])
+  useEffect(() => { handleCapturedRef.current = handleCaptured }, [handleCaptured])
 
   const handleToast = useCallback((text, locator, type = 'error', headline = null) => {
     // Only suppress per-item ublock/cookie warnings (those carry a locator).
@@ -798,6 +841,7 @@ export default function App() {
                 onRowClick={handleRowClick}
                 archiveId={archiveId}
                 pendingCaptures={pendingCaptures}
+                foreignCaptures={foreignCaptures}
                 deletedUids={deletedUids}
                 renamedTitles={renamedTitles}
                 isPublicSession={!currentUser}
