@@ -3,6 +3,7 @@ use archivr_core::{
     archive,
     capture::CaptureConfig,
     downloader::ytdlp_tools::{tools_status, update_tools, ToolCandidate},
+    export::{self, ExportFormat, ExportLayout, ExportOptions},
 };
 use clap::{Parser, Subcommand};
 use std::{env, path::Path, process};
@@ -51,13 +52,47 @@ enum Command {
         #[arg(long = "force-with-info-removal")]
         force_with_info_removal: bool,
     },
-
+    /// Export entries as a shareable HTML/Markdown bundle or PDF
+    Export {
+        /// Entry UIDs to export, in output order
+        #[arg(required = true)]
+        entries: Vec<String>,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = ExportFormatArg::Html)]
+        format: ExportFormatArg,
+        /// Export each entry as its own file instead of one combined document
+        #[arg(long)]
+        separate: bool,
+        /// Omit the "Preserved with archivr" credit
+        #[arg(long)]
+        no_credit: bool,
+        /// Directory to write the export into
+        #[arg(short, long, default_value = ".")]
+        output_dir: String,
+    },
     /// Inspect or update the yt-dlp binary and the JavaScript runtime (Deno) archivr runs
     #[command(name = "yt-dlp")]
     YtDlp {
         #[command(subcommand)]
         subcmd: YtDlpCmd,
     },
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+enum ExportFormatArg {
+    Html,
+    Pdf,
+    Markdown,
+}
+
+impl From<ExportFormatArg> for ExportFormat {
+    fn from(a: ExportFormatArg) -> Self {
+        match a {
+            ExportFormatArg::Html => ExportFormat::Html,
+            ExportFormatArg::Pdf => ExportFormat::Pdf,
+            ExportFormatArg::Markdown => ExportFormat::Markdown,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -122,6 +157,29 @@ fn main() -> Result<()> {
                 paths.archive_path.display()
             );
 
+            Ok(())
+        }
+
+
+        Command::Export { entries, format, separate, no_credit, output_dir } => {
+            let archive_path = match archive::find_archive_path()? {
+                Some(p) => p,
+                None => {
+                    eprintln!("Not in an archive. Use 'archivr init' to create one.");
+                    process::exit(1);
+                }
+            };
+            let paths = archive::read_archive_paths(&archive_path)?;
+            let options = ExportOptions {
+                format: ExportFormat::from(format),
+                layout: if separate { ExportLayout::Separate } else { ExportLayout::Together },
+                include_credit: !no_credit,
+                caller_bits: u32::MAX,
+            };
+            let dest = std::path::Path::new(&output_dir);
+            let export_file = export::export_entries(&paths, &entries, &options)?;
+            let dest_path = export_file.persist_into(dest)?;
+            println!("Exported: {}", dest_path.display());
             Ok(())
         }
 

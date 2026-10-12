@@ -436,6 +436,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .merge(crate::admin_users::routes())
         .merge(crate::credentials::routes())
         .merge(crate::jobs::routes())
+        .merge(crate::exports::routes())
         .merge(crate::effective_config::routes())
         .fallback_service(ServeDir::new(&static_dir).not_found_service(ServeFile::new(static_dir.join("index.html"))))
         .layer(axum::middleware::from_fn_with_state(

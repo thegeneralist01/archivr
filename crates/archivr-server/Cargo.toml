@@ -24,6 +24,9 @@ regex.workspace = true
 reqwest.workspace = true
 uuid.workspace = true
 
+tokio-util.workspace = true
+zip.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 tower.workspace = true

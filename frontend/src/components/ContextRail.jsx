@@ -1,5 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useRef } from 'react'
 import { fetchEntryTags, assignTag, removeTag, listEntryCollections, listCollections, addEntryToCollection, updateEntryTitle, generateThreadTitle, deleteEntry, rearchiveEntry, pollCaptureJob, fetchEntrySummary, requestEntrySummary, fetchTranscriptionEngines } from '../api'
+import ExportDialog from './ExportDialog'
 import { formatTimestamp, formatBytes, valueText, sourceIconSvg, displayPath } from '../utils'
 
 const VIS_LABEL = { 0: 'Private', 1: 'Public', 2: 'Users only', 3: 'Public' }
@@ -46,8 +47,26 @@ const ExternalIcon = () => (
   </svg>
 )
 
+/// Returns UIDs in the DOM order of `rows`, then any UIDs in `selectedUids`
+/// not found in `rows` in Set iteration order.
+function orderedSelection(rows, selectedUids) {
+  const seen = new Set()
+  const result = []
+  for (const uid of rows) {
+    if (selectedUids.has(uid) && !seen.has(uid)) {
+      seen.add(uid)
+      result.push(uid)
+    }
+  }
+  for (const uid of selectedUids) {
+    if (!seen.has(uid)) result.push(uid)
+  }
+  return result
+}
+
 export default function ContextRail({ archiveId, selectedEntry, selectedUids, selectedEntries, detail, onTagFilterSet, tagNodes, onTagsRefresh, onEntryTitleChange, onEntryDeleted, onBulkDeleted, humanizeTags, onDetailRefresh, onOpenPreview, onPlay, isPublicSession }) {
   const [tags, setTags] = useState([])
+  const [exportOpen, setExportOpen] = useState(false)
   const [assignInput, setAssignInput] = useState('')
   const [entryCollections, setEntryCollections] = useState([])
   const [assignError, setAssignError] = useState('')
@@ -677,6 +696,16 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
             </div>
           )}
 
+          <div className="rail-section">
+            <p className="rail-section-heading">Export</p>
+            <button
+              className="rail-rearchive-btn"
+              onClick={() => setExportOpen(true)}
+            >
+              {`Export ${selectedUids.size} entries\u2026`}
+            </button>
+          </div>
+
           <div className="rail-delete-zone">
             <button
               className="rail-delete-btn"
@@ -749,6 +778,11 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
           {isPreviewable && onOpenPreview && (
             <button className="rail-preview-btn" onClick={onOpenPreview}>
               Preview
+            </button>
+          )}
+          {!isPublicSession && (
+            <button className="rail-preview-btn rail-export-btn" onClick={() => setExportOpen(true)}>
+              Export\u2026
             </button>
           )}
 
@@ -1058,6 +1092,16 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
           </div>
         </>
       )}
+      <ExportDialog
+        open={exportOpen}
+        archiveId={archiveId}
+        entryUids={(() => {
+          if (!isBulk) return detail ? [detail.summary.entry_uid] : []
+          const rows = Array.from(document.querySelectorAll('#entries-body [data-entry-uid]')).map(el => el.dataset.entryUid)
+          return orderedSelection(rows, selectedUids)
+        })()}
+        onClose={() => setExportOpen(false)}
+      />
     </aside>
   )
 }
