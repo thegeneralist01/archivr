@@ -53,18 +53,22 @@ pub fn list_capture_jobs(
     Ok(rows)
 }
 
-/// Lists all `pending` and `running` capture jobs for an archive, ordered oldest-first.
-/// No creator scoping: any authorized user can see active jobs for cross-user skeleton display.
-pub fn list_active_capture_jobs(conn: &Connection) -> Result<Vec<CaptureJobSummary>> {
+/// Lists `pending` and `running` capture jobs, ordered oldest-first.
+/// `created_by = Some(uid)` limits the result to that user's jobs.
+pub fn list_active_capture_jobs(
+    conn: &Connection,
+    created_by: Option<&str>,
+) -> Result<Vec<CaptureJobSummary>> {
     let mut stmt = conn.prepare(
         "SELECT job_uid, archive_id, run_uid, status, error_text, notes_json,
                 created_at, updated_at, created_by
          FROM capture_jobs
          WHERE status IN ('pending', 'running')
+           AND (?1 IS NULL OR created_by = ?1)
          ORDER BY created_at ASC, id ASC",
     )?;
     let rows = stmt
-        .query_map([], |row| {
+        .query_map([created_by], |row| {
             Ok(CaptureJobSummary {
                 job_uid: row.get(0)?,
                 archive_id: row.get(1)?,

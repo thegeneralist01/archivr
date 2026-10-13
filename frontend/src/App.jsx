@@ -167,8 +167,8 @@ export default function App() {
     sessionStorage.setItem('pendingCaptures', JSON.stringify(pendingCaptures))
   }, [pendingCaptures])
 
-  // Foreign captures: active jobs started by other users (or other tabs) that this session
-  // didn't submit. Polled every 3 s so all authorized viewers see in-progress skeletons.
+  // Active jobs this session didn't submit: other tabs for users, any user for admins.
+  // Poll every 3 s so their in-progress skeletons stay visible here too.
   const [foreignCaptures, setForeignCaptures] = useState([])
   const pendingCapturesRef = useRef(pendingCaptures)
   useEffect(() => { pendingCapturesRef.current = pendingCaptures }, [pendingCaptures])
