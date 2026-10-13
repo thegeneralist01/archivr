@@ -334,6 +334,10 @@ export async function pollCaptureJob(archiveId, jobUid) {
   return getJson(`/api/archives/${archiveId}/capture_jobs/${jobUid}`);
 }
 
+export async function listActiveCaptureJobs(archiveId) {
+  return getJson(`/api/archives/${archiveId}/capture_jobs?status=active`);
+}
+
 // ── Auth helpers ─────────────────────────────────────────────────────────────
 
 export async function checkSetup() {
@@ -732,6 +736,34 @@ export async function deleteUpload(archiveId, locator) {
     })
   } catch {}
 }
+
+// Builds the export on the server and returns { blob, filename }.
+// Errors carry the server's {error} text.
+export async function downloadEntryExport(archiveId, { entryUids, format, layout, credit }) {
+  const params = new URLSearchParams({
+    entries: entryUids.join(','),
+    format,
+    layout,
+    credit: String(credit),
+  });
+  const res = await fetch(`/api/archives/${archiveId}/export?${params}`, {
+    credentials: 'same-origin',
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    let message = detail.trim();
+    try {
+      message = JSON.parse(detail).error || message;
+    } catch {
+      // non-JSON body
+    }
+    throw new Error(message || `Export failed (${res.status} ${res.statusText})`);
+  }
+  const disposition = res.headers.get('Content-Disposition') || '';
+  const filename = /filename="([^"]+)"/.exec(disposition)?.[1] || 'export';
+  return { blob: await res.blob(), filename };
+}
+
 
 // ── 401 interceptor ───────────────────────────────────────────────────────────
 const _origFetch = window.fetch;

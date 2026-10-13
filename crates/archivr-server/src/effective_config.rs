@@ -69,7 +69,7 @@ pub(crate) static ENV_VARS: &[EnvSpec] = &[
     spec("ARCHIVR_DENO", "tools", None, "Pinned Deno binary offered to the JS runtime resolver."),
     spec("ARCHIVR_JS_RUNTIME", "tools", None, "Forced JS runtime for yt-dlp as RUNTIME[:ABS_PATH] (deno, node, bun, quickjs)."),
     spec("ARCHIVR_SINGLE_FILE", "tools", Some("single-file"), "single-file-cli binary for web page archiving."),
-    spec("ARCHIVR_CHROME", "tools", Some("chromium"), "Chromium executable passed to single-file."),
+    spec("ARCHIVR_CHROME", "tools", Some("chromium"), "Chromium executable used by single-file captures."),
     spec("ARCHIVR_CHROME_ARGS", "tools", None, "Extra space-separated Chromium flags."),
     spec("ARCHIVR_UBLOCK", "tools", Some("true"), "Default for the uBlock extension toggle when no instance setting overrides it (false or 0 disables)."),
     spec("ARCHIVR_UBLOCK_EXT", "tools", None, "Directory of the unpacked uBlock extension."),

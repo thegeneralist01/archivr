@@ -10,7 +10,7 @@ use std::{
     process::Command,
 };
 
-use crate::downloader::cookies::{domain_from_url, write_netscape_cookie_file};
+use crate::downloader::cookies::{domain_from_url, write_json_cookie_file};
 use crate::hash::hash_file;
 
 /// Combined reader-mode script: Readability.js (Apache 2.0) bundled with the
@@ -611,9 +611,9 @@ fn save_with(
 
     // Write cookie file (secrets must never appear in process args).
     let cookie_file: Option<PathBuf> = if !cookies.is_empty() {
-        let cf = temp_dir.join("cookies.txt");
+        let cf = temp_dir.join("cookies.json");
         let domain = domain_from_url(url);
-        write_netscape_cookie_file(cookies, &domain, &cf)
+        write_json_cookie_file(cookies, &domain, url, &cf)
             .context("failed to write single-file cookie file")?;
         Some(cf)
     } else {

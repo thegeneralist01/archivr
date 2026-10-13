@@ -3629,3 +3629,6 @@ body.has-audio-bar { padding-bottom: 56px; }
   letter-spacing: .04em;
   text-align: right;
 }
+
+/* ── Export ───────────────────────────────────────────────────────────────── */
+.export-dialog .export-format { width: 100%; margin: 4px 0 14px; }

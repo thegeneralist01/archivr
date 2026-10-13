@@ -69,3 +69,27 @@ describe('token and session API calls', () => {
     expect(calls[0].method).toBe('DELETE')
   })
 })
+
+describe('downloadEntryExport', () => {
+  test('builds correct query string', async () => {
+    const fakeBlob = new Blob(['zip-content'], { type: 'application/zip' })
+    const headers = new Headers({ 'Content-Disposition': 'attachment; filename="my-export.zip"' })
+    const calls = mockFetch(new Response(fakeBlob, { status: 200, headers }))
+    const result = await api.downloadEntryExport('a', {
+      entryUids: ['u1', 'u2'],
+      format: 'pdf',
+      layout: 'separate',
+      credit: false,
+    })
+    expect(calls).toHaveLength(1)
+    expect(calls[0].url).toBe('/api/archives/a/export?entries=u1%2Cu2&format=pdf&layout=separate&credit=false')
+    expect(result.filename).toBe('my-export.zip')
+  })
+
+  test('throws the server error text on failure', async () => {
+    mockFetch(new Response(JSON.stringify({ error: 'select at most 100 entries' }), { status: 400 }))
+    await expect(
+      api.downloadEntryExport('a', { entryUids: ['u1'], format: 'html', layout: 'together', credit: true })
+    ).rejects.toThrow('select at most 100 entries')
+  })
+})

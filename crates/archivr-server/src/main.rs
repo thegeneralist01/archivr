@@ -6,6 +6,7 @@ mod effective_config;
 mod entry_access;
 mod guards;
 mod jobs;
+mod exports;
 mod registry;
 mod routes;
 #[cfg(test)]
@@ -150,6 +151,10 @@ async fn main() -> Result<()> {
         if let Ok(paths) = archivr_core::archive::read_archive_paths(&archive.archive_path) {
             let uploads_dir = paths.store_path.join("temp").join("uploads");
             prune_stale_upload_dirs(&uploads_dir, prune_cutoff, true);
+            archivr_core::export::prune_stale_export_dirs(
+                &paths.store_path,
+                std::time::Duration::from_secs(6 * 60 * 60),
+            );
         }
     }
 

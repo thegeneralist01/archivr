@@ -1789,6 +1789,16 @@ pub fn link_capture_job_run(conn: &Connection, job_uid: &str, run_uid: &str) -> 
     Ok(())
 }
 
+/// Sets (or overwrites) the `notes_json` field of a capture job.
+/// Used to store a display locator immediately after job creation.
+pub fn update_capture_job_notes(conn: &Connection, job_uid: &str, notes_json: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE capture_jobs SET notes_json = ?1, updated_at = ?2 WHERE job_uid = ?3",
+        params![notes_json, now_timestamp(), job_uid],
+    )?;
+    Ok(())
+}
+
 /// Returns a capture job by uid.
 pub fn get_capture_job(conn: &Connection, job_uid: &str) -> Result<Option<CaptureJobRecord>> {
     conn.query_row(

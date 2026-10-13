@@ -838,7 +838,11 @@ fn flatten_article_blocks(v: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
-fn article_text(status: &serde_json::Value) -> Option<String> {
+/// Extract the article title and body from a tweet status object.
+///
+/// Returns `Some((title, body))` when the status has an `article` object with
+/// usable body text; `None` otherwise.
+pub(crate) fn article_parts(status: &serde_json::Value) -> Option<(Option<String>, String)> {
     let article = status.get("article")?;
     article.as_object()?;
     let title = nonempty_string(article, "title");
@@ -852,9 +856,12 @@ fn article_text(status: &serde_json::Value) -> Option<String> {
         })
         .or_else(|| nonempty_string(article, "preview_text"))
         .or_else(|| nonempty_string(article, "summary_text"))?;
+    Some((title, body))
+}
 
-    Some(match title.as_deref() {
-        Some(title) => format!("{title}\n\n{body}"),
+fn article_text(status: &serde_json::Value) -> Option<String> {
+    article_parts(status).map(|(title, body)| match title.as_deref() {
+        Some(t) => format!("{t}\n\n{body}"),
         None => body,
     })
 }

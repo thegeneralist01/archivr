@@ -1,5 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useRef } from 'react'
 import { fetchEntryTags, assignTag, removeTag, listEntryCollections, listCollections, addEntryToCollection, updateEntryTitle, generateThreadTitle, deleteEntry, rearchiveEntry, pollCaptureJob, fetchEntrySummary, requestEntrySummary, fetchTranscriptionEngines } from '../api'
+import ExportDialog from './ExportDialog'
 import { formatTimestamp, formatBytes, valueText, sourceIconSvg, displayPath } from '../utils'
 
 const VIS_LABEL = { 0: 'Private', 1: 'Public', 2: 'Users only', 3: 'Public' }
@@ -46,8 +47,26 @@ const ExternalIcon = () => (
   </svg>
 )
 
+/// Returns UIDs in the DOM order of `rows`, then any UIDs in `selectedUids`
+/// not found in `rows` in Set iteration order.
+function orderedSelection(rows, selectedUids) {
+  const seen = new Set()
+  const result = []
+  for (const uid of rows) {
+    if (selectedUids.has(uid) && !seen.has(uid)) {
+      seen.add(uid)
+      result.push(uid)
+    }
+  }
+  for (const uid of selectedUids) {
+    if (!seen.has(uid)) result.push(uid)
+  }
+  return result
+}
+
 export default function ContextRail({ archiveId, selectedEntry, selectedUids, selectedEntries, detail, onTagFilterSet, tagNodes, onTagsRefresh, onEntryTitleChange, onEntryDeleted, onBulkDeleted, humanizeTags, onDetailRefresh, onOpenPreview, onPlay, isPublicSession }) {
   const [tags, setTags] = useState([])
+  const [exportOpen, setExportOpen] = useState(false)
   const [assignInput, setAssignInput] = useState('')
   const [entryCollections, setEntryCollections] = useState([])
   const [assignError, setAssignError] = useState('')
@@ -677,6 +696,17 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
             </div>
           )}
 
+          <div className="rail-section">
+            <div className="rail-section-heading">Actions</div>
+            <button
+              className="rail-rearchive-btn"
+              onClick={() => setExportOpen(true)}
+            >
+              {`Export ${selectedUids.size} entr${selectedUids.size === 1 ? 'y' : 'ies'}\u2026`}
+            </button>
+          </div>
+
+
           <div className="rail-delete-zone">
             <button
               className="rail-delete-btn"
@@ -1013,43 +1043,52 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
             </div>
           )}
 
-          {detail && (detail.summary.entity_kind === 'tweet' || detail.summary.entity_kind === 'tweet_thread') && (
-            <div className="rail-section">
-              <div className="rail-section-heading">Actions</div>
-              <button
-                className="rail-rearchive-btn"
-                onClick={handleRearchive}
-                disabled={rearchiveState === 'running'}
-              >
-                {rearchiveState === 'running' ? 'Re-archiving\u2026' : 'Re-archive'}
-              </button>
-              {rearchiveState === 'done' && (
-                <p className="form-msg form-msg--ok" style={{ marginTop: '6px' }}>Re-archived successfully.</p>
-              )}
-              {rearchiveState === 'error' && (
-                <p className="form-msg form-msg--err" style={{ marginTop: '6px' }}>{rearchiveError}</p>
-              )}
-              {detail.summary.entity_kind === 'tweet_thread' && (
-                <>
-                  <button
-                    className="rail-rearchive-btn"
-                    style={{ marginTop: '8px' }}
-                    onClick={handleGenerateThreadTitle}
-                    disabled={titleGenState === 'running'}
-                    title={`Names this thread with a small model via ${PROVIDER_LABEL[summaryProvider] || summaryProvider} (the Summary provider)`}
-                  >
-                    {titleGenState === 'running' ? 'Generating title\u2026' : 'Generate title'}
-                  </button>
-                  {titleGenState === 'done' && (
-                    <p className="form-msg form-msg--ok" style={{ marginTop: '6px' }}>Title updated.</p>
-                  )}
-                  {titleGenState === 'error' && (
-                    <p className="form-msg form-msg--err" style={{ marginTop: '6px' }}>{titleGenError}</p>
-                  )}
-                </>
-              )}
-            </div>
-          )}
+          <div className="rail-section">
+            <div className="rail-section-heading">Actions</div>
+            {detail && (detail.summary.entity_kind === 'tweet' || detail.summary.entity_kind === 'tweet_thread') && (
+              <>
+                <button
+                  className="rail-rearchive-btn"
+                  onClick={handleRearchive}
+                  disabled={rearchiveState === 'running'}
+                >
+                  {rearchiveState === 'running' ? 'Re-archiving\u2026' : 'Re-archive'}
+                </button>
+                {rearchiveState === 'done' && (
+                  <p className="form-msg form-msg--ok" style={{ marginTop: '6px' }}>Re-archived successfully.</p>
+                )}
+                {rearchiveState === 'error' && (
+                  <p className="form-msg form-msg--err" style={{ marginTop: '6px' }}>{rearchiveError}</p>
+                )}
+                {detail.summary.entity_kind === 'tweet_thread' && (
+                  <>
+                    <button
+                      className="rail-rearchive-btn"
+                      style={{ marginTop: '8px' }}
+                      onClick={handleGenerateThreadTitle}
+                      disabled={titleGenState === 'running'}
+                      title={`Names this thread with a small model via ${PROVIDER_LABEL[summaryProvider] || summaryProvider} (the Summary provider)`}
+                    >
+                      {titleGenState === 'running' ? 'Generating title\u2026' : 'Generate title'}
+                    </button>
+                    {titleGenState === 'done' && (
+                      <p className="form-msg form-msg--ok" style={{ marginTop: '6px' }}>Title updated.</p>
+                    )}
+                    {titleGenState === 'error' && (
+                      <p className="form-msg form-msg--err" style={{ marginTop: '6px' }}>{titleGenError}</p>
+                    )}
+                  </>
+                )}
+              </>
+            )}
+            <button
+              className="rail-rearchive-btn"
+              style={{ marginTop: detail && (detail.summary.entity_kind === 'tweet' || detail.summary.entity_kind === 'tweet_thread') ? '8px' : undefined }}
+              onClick={() => setExportOpen(true)}
+            >
+              {'Export\u2026'}
+            </button>
+          </div>
 
           <div className="rail-delete-zone">
             <button className="rail-delete-btn" onClick={handleDeleteEntry}>
@@ -1058,6 +1097,16 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
           </div>
         </>
       )}
+      <ExportDialog
+        open={exportOpen && !isPublicSession}
+        archiveId={archiveId}
+        entryUids={(() => {
+          if (!isBulk) return detail ? [detail.summary.entry_uid] : []
+          const rows = Array.from(document.querySelectorAll('#entries-body [data-entry-uid]')).map(el => el.dataset.entryUid)
+          return orderedSelection(rows, selectedUids)
+        })()}
+        onClose={() => setExportOpen(false)}
+      />
     </aside>
   )
 }

@@ -68,10 +68,11 @@ async fn list_capture_jobs_handler(
 ) -> Result<Json<Vec<archive::CaptureJobSummary>>, ApiError> {
     auth.require_role(ROLE_USER)?;
     if let Some(status) = q.status.as_deref()
+        && status != "active"
         && !capture_jobs::JOB_STATUSES.contains(&status)
     {
         return Err(ApiError::bad_request(
-            "invalid status: must be pending, running, completed, or failed",
+            "invalid status: must be pending, running, completed, failed, or active",
         ));
     }
     let limit = parse_int_param("limit", q.limit.as_deref())?
@@ -96,6 +97,12 @@ async fn list_capture_jobs_handler(
     };
 
     let conn = database::open_or_initialize(&mounted.archive_path)?;
+    if q.status.as_deref() == Some("active") {
+        return Ok(Json(capture_jobs::list_active_capture_jobs(
+            &conn,
+            owner.as_deref(),
+        )?));
+    }
     Ok(Json(capture_jobs::list_capture_jobs(
         &conn,
         q.status.as_deref(),
@@ -724,5 +731,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body_json(resp).await[0]["archive_path"], expected.as_str());
+    }
+
+    #[tokio::test]
+    async fn active_status_keeps_job_metadata_scoped_to_creator() {
+        let f = fixture();
+        let alice = make_role_session(&f.auth_path, "alice", &["user"]);
+        let bob = make_role_session(&f.auth_path, "bob", &["user"]);
+        let admin = admin_session(&f.auth_path);
+        let alice_uid = user_uid(&f.auth_path, "alice");
+        let bob_uid = user_uid(&f.auth_path, "bob");
+        let base = "/api/archives/test/capture_jobs";
+
+        // Create active jobs for both users and a legacy job without a creator.
+        let (alice_pending, bob_running, alice_completed, legacy_pending) = {
+            let conn = database::open_or_initialize(&f.archive_path).unwrap();
+            let a = database::create_capture_job_as(&conn, "test", Some(&alice_uid)).unwrap();
+            let b = database::create_capture_job_as(&conn, "test", Some(&bob_uid)).unwrap();
+            let c = database::create_capture_job_as(&conn, "test", Some(&alice_uid)).unwrap();
+            let legacy = database::create_capture_job(&conn, "test").unwrap();
+            database::update_capture_job_status(&conn, &b, "running", None, None, None).unwrap();
+            database::update_capture_job_status(&conn, &c, "completed", Some("run-x"), None, None).unwrap();
+            database::update_capture_job_notes(
+                &conn,
+                &b,
+                r#"{"locator":"https://private.example/?token=hidden"}"#,
+            )
+            .unwrap();
+            (a, b, c, legacy)
+        };
+
+        // Alice cannot see Bob's locator or even his active job's existence.
+        let (s, list) = get(&f.router, &format!("{base}?status=active"), Some(&alice)).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(uids(&list), vec![alice_pending.clone()]);
+        assert!(!list.to_string().contains("private.example"));
+
+        // Bob sees his own active job and its notes.
+        let (_, list) = get(&f.router, &format!("{base}?status=active"), Some(&bob)).await;
+        assert_eq!(uids(&list), vec![bob_running.clone()]);
+        assert!(list.to_string().contains("private.example"));
+
+        // Explicit filters obey the same rule; admins can see all active jobs.
+        let (s, _) = get(
+            &f.router,
+            &format!("{base}?status=active&created_by={bob_uid}"),
+            Some(&alice),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (_, list) = get(&f.router, &format!("{base}?status=active&created_by=all"), Some(&alice)).await;
+        assert_eq!(uids(&list), vec![alice_pending.clone()]);
+        let (_, list) = get(&f.router, &format!("{base}?status=active"), Some(&admin)).await;
+        let visible = uids(&list);
+        assert!(visible.contains(&alice_pending));
+        assert!(visible.contains(&bob_running));
+        assert!(visible.contains(&legacy_pending));
+        assert!(!visible.contains(&alice_completed));
+
+        // Regular (non-active) status=pending still scopes to own jobs only.
+        let (_, list) = get(&f.router, &format!("{base}?status=pending"), Some(&alice)).await;
+        assert_eq!(uids(&list), vec![alice_pending]);
+
+        // Regular listing without status filter still scopes to own jobs only.
+        let (_, list) = get(&f.router, base, Some(&bob)).await;
+        assert_eq!(uids(&list), vec![bob_running]);
     }
 }

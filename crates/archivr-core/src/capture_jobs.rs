@@ -53,6 +53,38 @@ pub fn list_capture_jobs(
     Ok(rows)
 }
 
+/// Lists `pending` and `running` capture jobs, ordered oldest-first.
+/// `created_by = Some(uid)` limits the result to that user's jobs.
+pub fn list_active_capture_jobs(
+    conn: &Connection,
+    created_by: Option<&str>,
+) -> Result<Vec<CaptureJobSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT job_uid, archive_id, run_uid, status, error_text, notes_json,
+                created_at, updated_at, created_by
+         FROM capture_jobs
+         WHERE status IN ('pending', 'running')
+           AND (?1 IS NULL OR created_by = ?1)
+         ORDER BY created_at ASC, id ASC",
+    )?;
+    let rows = stmt
+        .query_map([created_by], |row| {
+            Ok(CaptureJobSummary {
+                job_uid: row.get(0)?,
+                archive_id: row.get(1)?,
+                run_uid: row.get(2)?,
+                status: row.get(3)?,
+                error_text: row.get(4)?,
+                notes_json: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+                created_by: row.get(8)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// One `archive_run_items` row of a job's run.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct JobItem {

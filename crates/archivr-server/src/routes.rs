@@ -436,6 +436,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .merge(crate::admin_users::routes())
         .merge(crate::credentials::routes())
         .merge(crate::jobs::routes())
+        .merge(crate::exports::routes())
         .merge(crate::effective_config::routes())
         .fallback_service(ServeDir::new(&static_dir).not_found_service(ServeFile::new(static_dir.join("index.html"))))
         .layer(axum::middleware::from_fn_with_state(
@@ -1720,6 +1721,8 @@ async fn capture_handler(
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let created_by = jobs::caller_user_uid(&state, &auth_user)?;
     let job_uid = database::create_capture_job_as(&conn, &archive_id, created_by.as_deref())?;
+    let locator_notes = serde_json::json!({"locator": locator}).to_string();
+    database::update_capture_job_notes(&conn, &job_uid, &locator_notes).ok();
     drop(conn);
     // Load cookie rules and global uBlock / cookie-ext settings from the auth DB.
     let (cookie_rules, global_ublock, global_cookie_ext, global_modal_closer) = {
@@ -1887,6 +1890,8 @@ async fn capture_text_handler(
     let conn = database::open_or_initialize(&mounted.archive_path)?;
     let created_by = jobs::caller_user_uid(&state, &auth_user)?;
     let job_uid = database::create_capture_job_as(&conn, &archive_id, created_by.as_deref())?;
+    let text_notes = serde_json::json!({"locator": format!("text:{}", body.title.trim())}).to_string();
+    database::update_capture_job_notes(&conn, &job_uid, &text_notes).ok();
     drop(conn);
 
     // Spawn background text capture.
