@@ -1960,6 +1960,10 @@ pub fn entry_source_info(conn: &Connection, entry_uid: &str) -> Result<Option<En
     .map_err(Into::into)
 }
 
+fn new_summary_uid() -> String {
+    format!("sum_{}", &Uuid::new_v4().simple().to_string()[..10])
+}
+
 /// Creates a fresh pending summary attempt for one cache key.
 ///
 /// Attempts are intentionally not unique by cache key: a forced regeneration
@@ -1972,7 +1976,7 @@ pub fn upsert_pending_entry_summary(
     prompt_version: &str,
     input_sha256: &str,
 ) -> Result<String> {
-    let summary_uid = format!("sum_{}", &Uuid::new_v4().simple().to_string()[..10]);
+    let summary_uid = new_summary_uid();
     let now = now_timestamp();
     let model = provider_model.unwrap_or("");
     conn.execute(
@@ -2011,6 +2015,41 @@ pub fn update_entry_summary_completed(
     )?;
     Ok(())
 }
+
+/// Inserts an already-completed summary written outside the provider pipeline
+/// (an agent via the API, or a hand edit). Returns the new `summary_uid`.
+pub fn insert_completed_entry_summary(
+    conn: &Connection,
+    entry_id: i64,
+    provider_kind: &str,
+    model: Option<&str>,
+    prompt_version: &str,
+    input_sha256: &str,
+    summary_text: &str,
+) -> Result<String> {
+    let summary_uid = new_summary_uid();
+    let now = now_timestamp();
+    conn.execute(
+        "INSERT INTO entry_summaries
+             (summary_uid, entry_id, provider_kind, provider_model, prompt_version,
+              input_sha256, status, summary_text, resolved_model, error_text,
+              created_at, updated_at, completed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'completed', ?7, ?8, NULL, ?9, ?9, ?9)",
+        rusqlite::params![
+            summary_uid,
+            entry_id,
+            provider_kind,
+            model.unwrap_or(""),
+            prompt_version,
+            input_sha256,
+            summary_text,
+            model,
+            now
+        ],
+    )?;
+    Ok(summary_uid)
+}
+
 
 /// Moves a summary row through `running` → `completed` / `failed`.
 /// `completed_at` is stamped only on the terminal `completed` transition.

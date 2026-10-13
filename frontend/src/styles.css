@@ -3526,6 +3526,48 @@ body.has-audio-bar { padding-bottom: 56px; }
   .rail-summary-spinner { animation: none; }
 }
 .rail-summary-controls { display: flex; flex-direction: column; gap: 6px; }
+.rail-summary-edit-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--muted);
+  align-self: flex-start;
+  margin-top: 4px;
+}
+.rail-summary-edit-btn:hover { color: var(--ink); }
+.rail-summary-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.rail-summary-editor__label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.rail-summary-editor__input,
+.rail-summary-editor__textarea {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  font-size: 12.5px;
+  padding: 5px 8px;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+.rail-summary-editor__textarea { resize: vertical; }
+.rail-summary-editor__actions {
+  display: flex;
+  flex-direction: row;
+  gap: 6px;
+}
 .rail-summary-select {
   width: 100%;
   padding: 5px 8px;

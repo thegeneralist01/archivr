@@ -291,7 +291,7 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route(
             "/api/archives/:archive_id/entries/:entry_uid/summary",
-            get(entry_summary_handler).post(request_entry_summary_handler),
+            get(entry_summary_handler).post(request_entry_summary_handler).put(put_entry_summary_handler),
         )
         .route(
             "/api/summary/transcription-engines",
@@ -844,6 +844,68 @@ fn summary_failure_error_text(error: &anyhow::Error) -> String {
         format!("{error:#}")
     }
 }
+
+/// `PUT /api/archives/:id/entries/:uid/summary`
+///
+/// Inserts a new completed summary row written by an agent (`kind:"agent"`)
+/// or by a human editing an existing summary (`kind:"manual"`).
+///
+/// The newest completed row is displayed; earlier rows are retained. A
+/// provider attempt running concurrently will supersede this row when it
+/// completes — that is the existing regeneration semantics.
+#[derive(Debug, serde::Deserialize)]
+struct ExternalSummaryBody {
+    kind: String,
+    #[serde(default)]
+    tldr: String,
+    summary: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+async fn put_entry_summary_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path((archive_id, entry_uid)): Path<(String, String)>,
+    Json(body): Json<ExternalSummaryBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    auth_user.require_role(ROLE_USER)?;
+    let mounted = mounted_archive(&state, &archive_id)?;
+    let conn = database::open_or_initialize(&mounted.archive_path)?;
+    ensure_entry_visible(&conn, &auth_user, &entry_uid)?;
+    let entry_id = database::entry_id_for_uid(&conn, &entry_uid)?
+        .ok_or(ApiError::not_found("entry not found"))?;
+    if !summarizer::EXTERNAL_SUMMARY_KINDS.contains(&body.kind.as_str()) {
+        return Err(ApiError::bad_request("kind must be 'agent' or 'manual'"));
+    }
+    let model = summarizer::normalize_external_model(body.model.as_deref())
+        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+    if body.kind == "manual" && model.is_some() {
+        return Err(ApiError::bad_request("model is only accepted for kind 'agent'"));
+    }
+    let text = summarizer::external_summary_text(&body.tldr, &body.summary, &body.tags)
+        .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
+    if body.kind == "manual"
+        && database::latest_completed_entry_summary(&conn, entry_id)?.is_none()
+    {
+        return Err(ApiError::conflict("no summary to edit"));
+    }
+    let summary_uid = database::insert_completed_entry_summary(
+        &conn,
+        entry_id,
+        &body.kind,
+        model.as_deref(),
+        summarizer::EXTERNAL_SUMMARY_PROMPT_VERSION,
+        summarizer::EXTERNAL_SUMMARY_INPUT_SHA256,
+        &text,
+    )?;
+    let record = database::get_entry_summary_by_uid(&conn, &summary_uid)?
+        .ok_or_else(|| anyhow::anyhow!("inserted summary not found"))?;
+    Ok((StatusCode::CREATED, Json(serde_json::to_value(record)?)))
+}
+
 
 /// `GET /api/summary/transcription-engines`
 ///
@@ -5170,6 +5232,261 @@ mod tests {
             .unwrap();
         assert_eq!(input_hashes.len(), 2);
         assert_ne!(input_hashes[0], input_hashes[1]);
+    }
+
+    async fn put_summary(
+        registry: ServerRegistry,
+        auth_path: std::path::PathBuf,
+        entry_uid: &str,
+        cookie: Option<&str>,
+        token: Option<&str>,
+        payload: serde_json::Value,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder()
+            .method("PUT")
+            .uri(format!("/api/archives/test/entries/{entry_uid}/summary"))
+            .header("content-type", "application/json");
+        if let Some(c) = cookie {
+            builder = builder.header("cookie", c);
+        }
+        if let Some(t) = token {
+            builder = builder.header("authorization", format!("Bearer {t}"));
+        }
+        app(registry, auth_path)
+            .oneshot(builder.body(json_body(&payload)).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn put_agent_summary_creates_completed_row_that_becomes_latest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        let session = make_test_session(&auth_path);
+
+        // Seed a pre-existing codex_cli completed row.
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let old_uid = database::upsert_pending_entry_summary(
+            &conn,
+            entry.id,
+            "codex_cli",
+            None,
+            summarizer::PROMPT_VERSION,
+            "prior-sha",
+        )
+        .unwrap();
+        database::update_entry_summary_status(&conn, &old_uid, "completed", Some("old summary"), None)
+            .unwrap();
+        drop(conn);
+
+        let resp = put_summary(
+            registry.clone(),
+            auth_path.clone(),
+            &entry.entry_uid,
+            Some(&session),
+            None,
+            serde_json::json!({
+                "kind": "agent",
+                "tldr": "T",
+                "summary": " S ",
+                "tags": ["Rust", "rust", " cli "],
+                "model": " claude-x "
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp).await;
+        assert_eq!(body["provider_kind"], "agent");
+        assert_eq!(body["provider_model"], "claude-x");
+        assert_eq!(body["resolved_model"], "claude-x");
+        assert_eq!(body["prompt_version"], "external");
+        assert_eq!(body["status"], "completed");
+        let text: serde_json::Value = serde_json::from_str(body["summary_text"].as_str().unwrap()).unwrap();
+        assert_eq!(text, serde_json::json!({"tldr": "T", "summary": "S", "tags": ["rust", "cli"]}));
+
+        // GET /summary now returns this uid as summary and attempt null.
+        let new_uid = body["summary_uid"].as_str().unwrap().to_string();
+        let get_resp = app(registry.clone(), auth_path.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/archives/test/entries/{}/summary", entry.entry_uid))
+                    .header("cookie", &session)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let get_body = body_json(get_resp).await;
+        assert_eq!(get_body["summary"]["summary_uid"], new_uid);
+        assert!(get_body["attempt"].is_null());
+
+        // Both rows retained.
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entry_summaries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn put_manual_summary_requires_existing_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        let session = make_test_session(&auth_path);
+
+        // 409 on a fresh entry.
+        let resp = put_summary(
+            registry.clone(),
+            auth_path.clone(),
+            &entry.entry_uid,
+            Some(&session),
+            None,
+            serde_json::json!({"kind": "manual", "summary": "S"}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(resp).await["error"], "no summary to edit");
+
+        // No row was created.
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entry_summaries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        drop(conn);
+
+        // After an agent PUT the manual PUT succeeds.
+        put_summary(
+            registry.clone(),
+            auth_path.clone(),
+            &entry.entry_uid,
+            Some(&session),
+            None,
+            serde_json::json!({"kind": "agent", "summary": "Agent S", "tldr": ""}),
+        )
+        .await;
+        let resp2 = put_summary(
+            registry.clone(),
+            auth_path.clone(),
+            &entry.entry_uid,
+            Some(&session),
+            None,
+            serde_json::json!({"kind": "manual", "summary": "S"}),
+        )
+        .await;
+        assert_eq!(resp2.status(), StatusCode::CREATED);
+        let b2 = body_json(resp2).await;
+        assert_eq!(b2["provider_kind"], "manual");
+        assert!(b2["resolved_model"].is_null());
+
+        // model with kind=manual → 400.
+        let resp3 = put_summary(
+            registry.clone(),
+            auth_path.clone(),
+            &entry.entry_uid,
+            Some(&session),
+            None,
+            serde_json::json!({"kind": "manual", "summary": "S", "model": "m"}),
+        )
+        .await;
+        assert_eq!(resp3.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp3).await["error"], "model is only accepted for kind 'agent'");
+    }
+
+    #[tokio::test]
+    async fn put_summary_validates_body_and_role() {
+        use crate::test_support::{guest_session, make_api_token};
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        let session = make_test_session(&auth_path);
+
+        // Bad kind.
+        let r1 = put_summary(
+            registry.clone(),
+            auth_path.clone(),
+            &entry.entry_uid,
+            Some(&session),
+            None,
+            serde_json::json!({"kind": "anthropic_http", "summary": "S"}),
+        )
+        .await;
+        assert_eq!(r1.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(r1).await["error"], "kind must be 'agent' or 'manual'");
+
+        // Empty summary.
+        let r2 = put_summary(
+            registry.clone(),
+            auth_path.clone(),
+            &entry.entry_uid,
+            Some(&session),
+            None,
+            serde_json::json!({"kind": "agent", "summary": ""}),
+        )
+        .await;
+        assert_eq!(r2.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(r2).await["error"], "summary must not be empty");
+
+        // Too many tags.
+        let tags: Vec<String> = (0..11_u8).map(|i| format!("tag{i}")).collect();
+        let r3 = put_summary(
+            registry.clone(),
+            auth_path.clone(),
+            &entry.entry_uid,
+            Some(&session),
+            None,
+            serde_json::json!({"kind": "agent", "summary": "S", "tags": tags}),
+        )
+        .await;
+        assert_eq!(r3.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(r3).await["error"], "at most 10 tags are allowed");
+
+        // Guest → 403.
+        let guest = guest_session(&auth_path);
+        let r4 = put_summary(
+            registry.clone(),
+            auth_path.clone(),
+            &entry.entry_uid,
+            Some(&guest),
+            None,
+            serde_json::json!({"kind": "agent", "summary": "S"}),
+        )
+        .await;
+        assert_eq!(r4.status(), StatusCode::FORBIDDEN);
+
+        // No cookie → 401.
+        let r5 = put_summary(
+            registry.clone(),
+            auth_path.clone(),
+            &entry.entry_uid,
+            None,
+            None,
+            serde_json::json!({"kind": "agent", "summary": "S"}),
+        )
+        .await;
+        assert_eq!(r5.status(), StatusCode::UNAUTHORIZED);
+
+        // Read-scope token → 403.
+        let read_token = make_api_token(&auth_path, "testowner", None, "read");
+        let r6 = put_summary(
+            registry.clone(),
+            auth_path.clone(),
+            &entry.entry_uid,
+            None,
+            Some(&read_token),
+            serde_json::json!({"kind": "agent", "summary": "S"}),
+        )
+        .await;
+        assert_eq!(r6.status(), StatusCode::FORBIDDEN);
+
+        // No rows created by any of the above.
+        let conn = database::open_or_initialize(&archive_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entry_summaries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]

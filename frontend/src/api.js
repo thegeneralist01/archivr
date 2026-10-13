@@ -77,6 +77,28 @@ export async function requestEntrySummary(archiveId, entryUid, { provider, force
   return resp.json();
 }
 
+// Saves a hand-edited summary as a new completed row (kind "manual"). The
+// server refuses (409) when the entry has no summary yet: edit-only by design.
+export async function saveEntrySummary(archiveId, entryUid, { tldr, summary, tags, signal } = {}) {
+  const resp = await fetch(
+    `/api/archives/${archiveId}/entries/${entryUid}/summary`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: 'manual', tldr, summary, tags }),
+      signal,
+    }
+  );
+  if (!resp.ok) {
+    const detail = await resp.text();
+    let message = detail.trim();
+    try { message = JSON.parse(detail).error || message } catch { /* non-JSON body */ }
+    throw new Error(message || `Summary save failed (${resp.status})`);
+  }
+  return resp.json();
+}
+
+
 // Text artifacts are served by the same entry-artifact endpoint as previews.
 // Keep credentials explicit because this helper is also used by public/private
 // archive views, and preserve the previous concise HTTP error contract.

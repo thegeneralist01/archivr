@@ -1,5 +1,5 @@
 import { useState, useEffect, useLayoutEffect, useRef } from 'react'
-import { fetchEntryTags, assignTag, removeTag, listEntryCollections, listCollections, addEntryToCollection, updateEntryTitle, generateThreadTitle, deleteEntry, rearchiveEntry, pollCaptureJob, fetchEntrySummary, requestEntrySummary, fetchTranscriptionEngines } from '../api'
+import { fetchEntryTags, assignTag, removeTag, listEntryCollections, listCollections, addEntryToCollection, updateEntryTitle, generateThreadTitle, deleteEntry, rearchiveEntry, pollCaptureJob, fetchEntrySummary, requestEntrySummary, saveEntrySummary, fetchTranscriptionEngines } from '../api'
 import ExportDialog from './ExportDialog'
 import { formatTimestamp, formatBytes, valueText, sourceIconSvg, displayPath } from '../utils'
 
@@ -14,6 +14,7 @@ const SUMMARY_PROVIDERS = [
   { value: 'codex_cli', label: 'Codex CLI' },
 ]
 const PROVIDER_LABEL = Object.fromEntries(SUMMARY_PROVIDERS.map(p => [p.value, p.label]))
+const SUMMARY_SOURCE_LABEL = { ...PROVIDER_LABEL, agent: 'Agent', manual: 'Edited by hand' }
 const SUMMARY_PROVIDER_KEY = 'archivr:summary:provider'
 const SUMMARY_TRANSCRIBE_ENGINE_KEY = 'archivr:summary:transcribe-engine'
 const SUMMARY_POLL_MS = 1500
@@ -103,6 +104,9 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
       return sessionStorage.getItem(SUMMARY_TRANSCRIBE_ENGINE_KEY) || ''
     } catch { return '' }
   })
+  const [editingSummary, setEditingSummary] = useState(false)
+  const [summaryDraft, setSummaryDraft] = useState({ tldr: '', summary: '', tags: '' })
+  const [summarySaving, setSummarySaving] = useState(false)
   const summaryPollRef = useRef(null)
   const summaryPollAbortRef = useRef(null)
   const summaryGenerateAbortRef = useRef(null)
@@ -206,6 +210,8 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
     setSummaryError('')
     setSummaryBusy(false)
     setIncludeSummaryImages(false)
+    setEditingSummary(false)
+    setSummarySaving(false)
   }, [archiveId, selectedEntry?.entry_uid, detail?.summary?.entry_uid])
 
   // Poll only while a replacement attempt is non-terminal. Anchoring the effect
@@ -322,6 +328,34 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
       if (summaryGenerateAbortRef.current === controller) summaryGenerateAbortRef.current = null
     }
   }
+
+  async function handleSaveSummary() {
+    if (!archiveId || !detail?.summary?.entry_uid || summarySaving) return
+    const entryUid = detail.summary.entry_uid
+    const selectionKey = `${archiveId}:${entryUid}`
+    if (summarySelectionRef.current !== selectionKey) return
+    setSummarySaving(true)
+    setSummaryError('')
+    try {
+      const tags = summaryDraft.tags.split(',').map(t => t.trim()).filter(Boolean)
+      const res = await saveEntrySummary(archiveId, entryUid, {
+        tldr: summaryDraft.tldr,
+        summary: summaryDraft.summary,
+        tags,
+      })
+      if (summarySelectionRef.current !== selectionKey) return
+      setSummary(res)
+      setSummaryAttempt(null)
+      setEditingSummary(false)
+      onDetailRefresh?.()
+    } catch (e) {
+      if (summarySelectionRef.current !== selectionKey) return
+      setSummaryError(e.message || 'Summary save failed')
+    } finally {
+      setSummarySaving(false)
+    }
+  }
+
 
   function handleProviderChange(value) {
     setSummaryProvider(value)
@@ -810,15 +844,77 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
                       </div>
                     )}
                     <p className="rail-summary-provider">
-                      {PROVIDER_LABEL[summary.provider_kind] || summary.provider_kind}
+                      {SUMMARY_SOURCE_LABEL[summary.provider_kind] || summary.provider_kind}
                       {summary.resolved_model || summary.provider_model
                         ? ` \u00b7 ${summary.resolved_model || summary.provider_model}`
                         : ''}
                     </p>
+                    {!isPublicSession && !running && !editingSummary && (
+                      <button
+                        className="rail-summary-edit-btn"
+                        onClick={() => {
+                          setSummaryDraft({
+                            tldr: parsed.tldr || '',
+                            summary: parsed.summary || '',
+                            tags: parsed.tags.join(', '),
+                          })
+                          setEditingSummary(true)
+                        }}
+                      >
+                        Edit
+                      </button>
+                    )}
                   </div>
                 )}
 
-                {running && (
+                {editingSummary && (
+                  <div className="rail-summary-editor">
+                    <label className="rail-summary-editor__label">
+                      TL;DR
+                      <input
+                        className="rail-summary-editor__input"
+                        value={summaryDraft.tldr}
+                        maxLength={300}
+                        onChange={e => setSummaryDraft(d => ({ ...d, tldr: e.target.value }))}
+                      />
+                    </label>
+                    <label className="rail-summary-editor__label">
+                      Summary
+                      <textarea
+                        className="rail-summary-editor__textarea"
+                        rows={8}
+                        value={summaryDraft.summary}
+                        onChange={e => setSummaryDraft(d => ({ ...d, summary: e.target.value }))}
+                      />
+                    </label>
+                    <label className="rail-summary-editor__label">
+                      Tags (comma-separated)
+                      <input
+                        className="rail-summary-editor__input"
+                        value={summaryDraft.tags}
+                        onChange={e => setSummaryDraft(d => ({ ...d, tags: e.target.value }))}
+                      />
+                    </label>
+                    <div className="rail-summary-editor__actions">
+                      <button
+                        className="rail-rearchive-btn"
+                        onClick={handleSaveSummary}
+                        disabled={summarySaving || !summaryDraft.summary.trim()}
+                      >
+                        {summarySaving ? '\u2026' : 'Save'}
+                      </button>
+                      <button
+                        className="rail-rearchive-btn"
+                        onClick={() => { setEditingSummary(false); setSummaryError('') }}
+                        disabled={summarySaving}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {!editingSummary && running && (
                   <p className="rail-summary-status">
                     <span className="rail-summary-spinner" aria-hidden="true" />
                     {'Generating\u2026'}
@@ -842,7 +938,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
                   </p>
                 )}
 
-                {!isPublicSession && !running && (
+                {!isPublicSession && !running && !editingSummary && (
                   <div className="rail-summary-controls">
                     <select
                       className="rail-summary-select"
