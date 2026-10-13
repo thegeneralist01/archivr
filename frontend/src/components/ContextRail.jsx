@@ -1098,7 +1098,7 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
         </>
       )}
       <ExportDialog
-        open={exportOpen}
+        open={exportOpen && !isPublicSession}
         archiveId={archiveId}
         entryUids={(() => {
           if (!isBulk) return detail ? [detail.summary.entry_uid] : []
