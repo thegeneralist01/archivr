@@ -15,6 +15,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
+use regex::Regex;
+use std::sync::LazyLock;
 use tempfile::TempDir;
 
 use crate::archive::{self, ArchivePaths, EntrySummary};
@@ -184,10 +186,13 @@ pub fn export_entries(
     let wpath = work_dir.path().to_path_buf();
 
     // 5. Load all entries.
-    let entries: Vec<model::ExportEntry> = summaries
+    let mut entries: Vec<model::ExportEntry> = summaries
         .into_iter()
         .map(|s| model::load_entry(&conn, &paths.store_path, s, options.caller_bits, 0))
         .collect::<Result<Vec<_>>>()?;
+    for entry in &mut entries {
+        localize_page_fonts(entry, &wpath)?;
+    }
 
     // 6. Generate posters when format requires them.
     let posters: HashMap<String, PathBuf> = if options.format != ExportFormat::Markdown {
@@ -207,6 +212,58 @@ pub fn export_entries(
         content_type,
         work_dir,
     })
+}
+
+/// Rewrite extracted-font API URLs in an export copy of each captured page.
+/// The page and its fonts are both placed directly under `assets/` in the ZIP.
+fn localize_page_fonts(entry: &mut model::ExportEntry, work_dir: &Path) -> Result<()> {
+    static FONT_URL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"url\(/api/archives/[^/)\s]+/blobs/([0-9a-f]{64})\)").unwrap()
+    });
+
+    match &mut entry.body {
+        model::ExportBody::Page(page) if !entry.fonts.is_empty() => {
+            let font_names: HashMap<String, String> = entry
+                .fonts
+                .iter()
+                .filter_map(|font| {
+                    let (hash, _) = font.name.rsplit_once('.')?;
+                    (hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+                        .then(|| (hash.to_ascii_lowercase(), font.name.clone()))
+                })
+                .collect();
+            let original = fs::read_to_string(&page.source)
+                .with_context(|| format!("failed to read page: {}", page.source.display()))?;
+            let rewritten = FONT_URL.replace_all(&original, |caps: &regex::Captures| {
+                font_names
+                    .get(&caps[1])
+                    .map_or_else(|| caps[0].to_string(), |name| format!("url(./{name})"))
+            });
+            if rewritten != original {
+                let localized_name = format!(
+                    "{}.{}",
+                    crate::hash::hash_bytes(rewritten.as_bytes()),
+                    model::ext_of_s(&page.name),
+                );
+                let page_dir = work_dir
+                    .join("localized-pages")
+                    .join(crate::hash::hash_bytes(entry.summary.entry_uid.as_bytes()));
+                fs::create_dir_all(&page_dir)?;
+                let localized_path = page_dir.join(&localized_name);
+                fs::write(&localized_path, rewritten.as_bytes())?;
+                page.source = localized_path;
+                page.name = localized_name;
+                page.byte_size = rewritten.len() as u64;
+            }
+        }
+        model::ExportBody::Container(children) => {
+            for child in children {
+                localize_page_fonts(child, work_dir)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -529,6 +586,9 @@ fn collect_entry_assets(
     for sub in &entry.subtitles {
         out.push(sub.clone());
     }
+    for font in &entry.fonts {
+        out.push(font.clone());
+    }
     out
 }
 
@@ -617,6 +677,9 @@ fn collect_entry_assets_into(
     collect_body_assets(&entry.body, posters, out);
     for sub in &entry.subtitles {
         out.push(sub.clone());
+    }
+    for font in &entry.fonts {
+        out.push(font.clone());
     }
 }
 
@@ -772,6 +835,67 @@ mod tests {
                 },
             ).unwrap();
             entry.entry_uid
+        }
+
+        fn add_page_with_extracted_font(&self) -> (String, String, String, String) {
+            let conn = self.conn();
+            let n = self.si_counter.get();
+            self.si_counter.set(n + 1);
+            let si_id = database::upsert_source_identity(
+                &conn, "web", "page", Some(&format!("page-{n}")), None,
+                &format!("https://example.com/{n}"),
+            ).unwrap();
+            let entry = database::create_archived_entry(
+                &conn,
+                &database::NewEntry {
+                    source_identity_id: si_id,
+                    archive_run_id: self.run_id,
+                    parent_entry_id: None,
+                    root_entry_id: None,
+                    created_by_user_id: self.user_id,
+                    owned_by_user_id: self.user_id,
+                    source_kind: "web".to_string(),
+                    entity_kind: "page".to_string(),
+                    title: Some("Page with font".to_string()),
+                    visibility: "public".to_string(),
+                    representation_kind: "html".to_string(),
+                    source_metadata_json: "{}".to_string(),
+                    display_metadata_json: None,
+                },
+            ).unwrap();
+            let html = "<style>@font-face{src:url(data:font/woff2;base64,V09GRjJGQUtFREFUQQ==)}</style><p>Page</p>";
+            let (captured, fonts) = crate::downloader::font_extractor::extract_and_rewrite(
+                html, &self.paths.store_path, "test-archive",
+            ).unwrap();
+            let page_name = format!("{}.html", crate::hash::hash_bytes(captured.as_bytes()));
+            let page_path = self.paths.store_path.join("raw").join(&page_name);
+            std::fs::write(&page_path, &captured).unwrap();
+            database::add_entry_artifact(
+                &conn,
+                &database::NewArtifact {
+                    entry_id: entry.id,
+                    artifact_role: "primary_media".to_string(),
+                    storage_area: "raw".to_string(),
+                    relpath: format!("raw/{page_name}"),
+                    blob_id: None,
+                    logical_path: None,
+                    metadata_json: None,
+                },
+            ).unwrap();
+            let font = &fonts[0];
+            database::add_entry_artifact(
+                &conn,
+                &database::NewArtifact {
+                    entry_id: entry.id,
+                    artifact_role: "font".to_string(),
+                    storage_area: "raw".to_string(),
+                    relpath: font.raw_relpath.clone(),
+                    blob_id: None,
+                    logical_path: None,
+                    metadata_json: None,
+                },
+            ).unwrap();
+            (entry.entry_uid, page_name, format!("{}{}", font.sha256, font.ext), captured)
         }
 
         /// Create a parent + child entry pair. Returns (parent_uid, child_uid).
@@ -993,6 +1117,47 @@ mod tests {
             let (file, _, _, _) = export.open().unwrap();
             assert_eq!(read_zip_entry(file, "assets/captions.srt"), srt);
         }
+    }
+
+    #[test]
+    fn extracted_fonts_are_localized_in_page_exports() {
+        let ctx = TestCtx::new();
+        let (uid, page_name, font_name, captured) = ctx.add_page_with_extracted_font();
+        let other_uid = ctx.add_text_entry("Other", "text");
+        assert!(captured.contains("/api/archives/test-archive/blobs/"));
+        let localized = captured.replace(
+            &format!("/api/archives/test-archive/blobs/{}", font_name.trim_end_matches(".woff2")),
+            &format!("./{font_name}"),
+        );
+        let localized_name = format!("{}.html", crate::hash::hash_bytes(localized.as_bytes()));
+
+        for format in [ExportFormat::Html, ExportFormat::Markdown] {
+            for layout in [ExportLayout::Together, ExportLayout::Separate] {
+                let opts = ExportOptions {
+                    format,
+                    layout,
+                    include_credit: false,
+                    caller_bits: u32::MAX,
+                };
+                let uids = if layout == ExportLayout::Separate {
+                    vec![uid.clone(), other_uid.clone()]
+                } else {
+                    vec![uid.clone()]
+                };
+                let export = export_entries(&ctx.paths, &uids, &opts).unwrap();
+                let (file, _, _, _) = export.open().unwrap();
+                let page = read_zip_entry(file.try_clone().unwrap(), &format!("assets/{localized_name}"));
+                assert!(page.contains(&format!("url(./{font_name})")));
+                assert!(!page.contains("/api/archives/test-archive/blobs/"));
+                assert_eq!(
+                    read_zip_entry(file, &format!("assets/{font_name}")),
+                    "WOFF2FAKEDATA",
+                );
+            }
+        }
+
+        let archived_page = std::fs::read_to_string(ctx.paths.store_path.join("raw").join(page_name)).unwrap();
+        assert_eq!(archived_page, captured);
     }
 
     #[test]

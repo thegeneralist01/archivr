@@ -74,6 +74,8 @@ pub(crate) struct ExportEntry {
     pub summary: EntrySummary,
     /// Subtitle `.vtt` and `.srt` assets in track order.
     pub subtitles: Vec<Asset>,
+    /// Fonts extracted from a captured page.
+    pub fonts: Vec<Asset>,
     pub body: ExportBody,
 }
 
@@ -127,6 +129,7 @@ pub(crate) fn load_entry(
             return Ok(ExportEntry {
                 summary,
                 subtitles: vec![],
+                fonts: vec![],
                 body: ExportBody::Empty,
             });
         }
@@ -136,6 +139,7 @@ pub(crate) fn load_entry(
     let mut asset_map: HashMap<String, Asset> = HashMap::new();
     let mut primary_media_artifact: Option<EntryArtifactSummary> = None;
     let mut subtitle_artifacts: Vec<EntryArtifactSummary> = Vec::new();
+    let mut font_artifacts: Vec<EntryArtifactSummary> = Vec::new();
     let mut raw_json_artifacts: Vec<EntryArtifactSummary> = Vec::new();
 
     for artifact in &detail.artifacts {
@@ -188,7 +192,8 @@ pub(crate) fn load_entry(
                 }
             }
             "subtitle" => subtitle_artifacts.push(artifact.clone()),
-            _ => {} // favicon, font, etc.
+            "font" => font_artifacts.push(artifact.clone()),
+            _ => {} // favicon, etc.
         }
     }
 
@@ -205,6 +210,23 @@ pub(crate) fn load_entry(
                 })
                 .map_err(|e| {
                     eprintln!("warn: export: subtitle not found: {e:#}");
+                    e
+                })
+                .ok()
+        })
+        .collect();
+
+    let fonts: Vec<Asset> = font_artifacts
+        .iter()
+        .filter_map(|a| {
+            archive::resolve_artifact_path(store_path, a)
+                .map(|p| Asset {
+                    byte_size: a.byte_size.unwrap_or(0) as u64,
+                    source: p,
+                    name: file_name_of(&a.relpath),
+                })
+                .map_err(|e| {
+                    eprintln!("warn: export: font not found: {e:#}");
                     e
                 })
                 .ok()
@@ -251,6 +273,7 @@ pub(crate) fn load_entry(
     Ok(ExportEntry {
         summary,
         subtitles,
+        fonts,
         body,
     })
 }
