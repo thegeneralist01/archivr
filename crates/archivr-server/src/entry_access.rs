@@ -125,6 +125,12 @@ async fn hidden_entry_is_not_found_on_every_by_uid_endpoint() {
         ("DELETE", "", None, StatusCode::NO_CONTENT),
         ("POST", "/tags", Some(json!({"tag_path": "/secret"})), StatusCode::CREATED),
         ("POST", "/rearchive", None, StatusCode::ACCEPTED),
+        (
+            "PUT",
+            "/summary",
+            Some(json!({"kind": "agent", "summary": "x"})),
+            StatusCode::CREATED,
+        ),
     ]);
     for (method, suffix, body, _) in &cases {
         let uri = entry_path(hidden, suffix);
@@ -149,6 +155,10 @@ async fn hidden_entry_is_not_found_on_every_by_uid_endpoint() {
         .query_row("SELECT COUNT(*) FROM capture_jobs", [], |r| r.get(0))
         .unwrap();
     assert_eq!(jobs, 2, "rearchive of a hidden entry must not create a job");
+    let summaries: i64 = conn
+        .query_row("SELECT COUNT(*) FROM entry_summaries", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(summaries, 0, "PUT summary on hidden entry must not create a row");
 
     // The tag-removal route is gated too (the tag need not exist for the gate to answer).
     let (status, json) = send_json(

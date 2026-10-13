@@ -1270,6 +1270,81 @@ pub fn normalize_summary_json(raw: &str) -> String {
     .to_string()
 }
 
+// ── External (agent / hand-edited) summary constants ────────────────────────
+
+pub const EXTERNAL_SUMMARY_KINDS: [&str; 2] = ["agent", "manual"];
+pub const EXTERNAL_SUMMARY_PROMPT_VERSION: &str = "external";
+pub const EXTERNAL_SUMMARY_INPUT_SHA256: &str = "external";
+pub const MAX_EXTERNAL_TLDR_CHARS: usize = 300;
+pub const MAX_EXTERNAL_SUMMARY_CHARS: usize = 20_000;
+pub const MAX_EXTERNAL_SUMMARY_TAGS: usize = 10;
+pub const MAX_EXTERNAL_TAG_CHARS: usize = 50;
+pub const MAX_EXTERNAL_MODEL_CHARS: usize = 100;
+
+/// Validates and normalizes a caller-written summary into the persisted
+/// `{"tldr","summary","tags"}` JSON (same shape as provider output).
+///
+/// Counts Unicode scalar values (`.chars().count()`), runs every check on the
+/// trimmed value, normalises tags to lowercase, and dedupes in first-seen
+/// order.
+pub fn external_summary_text(tldr: &str, summary: &str, tags: &[String]) -> Result<String> {
+    // tldr
+    let t = tldr.trim();
+    if t.chars().any(|c| c.is_control()) {
+        bail!("tldr must be a single line without control characters");
+    }
+    if t.chars().count() > MAX_EXTERNAL_TLDR_CHARS {
+        bail!("tldr is longer than 300 characters");
+    }
+
+    // summary
+    let s = summary.trim();
+    if s.is_empty() {
+        bail!("summary must not be empty");
+    }
+    if s.chars().any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t') {
+        bail!("summary contains control characters");
+    }
+    if s.chars().count() > MAX_EXTERNAL_SUMMARY_CHARS {
+        bail!("summary is longer than 20000 characters");
+    }
+
+    // tags: trim, lowercase, dedupe, validate
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for raw in tags {
+        let tag = raw.trim().to_lowercase();
+        if tag.is_empty() {
+            continue;
+        }
+        if tag.chars().any(|c| c.is_control()) || tag.chars().count() > MAX_EXTERNAL_TAG_CHARS {
+            bail!("tags must be 1-50 characters without control characters");
+        }
+        if seen.insert(tag.clone()) {
+            out.push(tag);
+        }
+    }
+    if out.len() > MAX_EXTERNAL_SUMMARY_TAGS {
+        bail!("at most 10 tags are allowed");
+    }
+
+    Ok(serde_json::json!({"tldr": t, "summary": s, "tags": out}).to_string())
+}
+
+/// Trims a self-reported model label.  Returns `None` when absent or empty.
+pub fn normalize_external_model(model: Option<&str>) -> Result<Option<String>> {
+    let Some(raw) = model else { return Ok(None) };
+    let m = raw.trim();
+    if m.is_empty() {
+        return Ok(None);
+    }
+    if m.chars().any(|c| c.is_control()) || m.chars().count() > MAX_EXTERNAL_MODEL_CHARS {
+        bail!("model is longer than 100 characters or contains control characters");
+    }
+    Ok(Some(m.to_string()))
+}
+
+
 /// Full manual summarization pass for one entry, persisting the result.
 ///
 /// Owns the whole row lifecycle (`pending` → `running` → `completed`/`failed`)
@@ -2765,5 +2840,116 @@ mod tests {
             Some(NO_SUBTITLES_AFTER_TRANSCRIPTION_MESSAGE)
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // ── external_summary_text / normalize_external_model tests ──────────────
+
+    #[test]
+    fn external_summary_tag_normalization() {
+        let tags: Vec<String> = vec![
+            " Rust ".to_string(),
+            "rust".to_string(),
+            "".to_string(),
+            "CLI".to_string(),
+        ];
+        let json_str = external_summary_text("T", "Some summary.", &tags).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(v["tags"], serde_json::json!(["rust", "cli"]));
+    }
+
+    #[test]
+    fn external_summary_empty_tldr_is_accepted() {
+        let result = external_summary_text("", "Some summary.", &[]);
+        assert!(result.is_ok(), "empty tldr should be accepted: {result:?}");
+    }
+
+    #[test]
+    fn external_summary_tldr_control_char_rejected() {
+        let err = external_summary_text("line1\nline2", "S.", &[]).unwrap_err();
+        assert_eq!(format!("{err}"), "tldr must be a single line without control characters");
+    }
+
+    #[test]
+    fn external_summary_tldr_too_long_rejected() {
+        let long = "x".repeat(301);
+        let err = external_summary_text(&long, "S.", &[]).unwrap_err();
+        assert_eq!(format!("{err}"), "tldr is longer than 300 characters");
+    }
+
+    #[test]
+    fn external_summary_empty_summary_rejected() {
+        let err = external_summary_text("T", "   ", &[]).unwrap_err();
+        assert_eq!(format!("{err}"), "summary must not be empty");
+    }
+
+    #[test]
+    fn external_summary_control_char_in_summary_rejected() {
+        let s = "hello\x01world";
+        let err = external_summary_text("T", s, &[]).unwrap_err();
+        assert_eq!(format!("{err}"), "summary contains control characters");
+    }
+
+    #[test]
+    fn external_summary_summary_too_long_rejected() {
+        let long = "x".repeat(20_001);
+        let err = external_summary_text("T", &long, &[]).unwrap_err();
+        assert_eq!(format!("{err}"), "summary is longer than 20000 characters");
+    }
+
+    #[test]
+    fn external_summary_tag_control_char_rejected() {
+        let tags = vec!["bad\x01tag".to_string()];
+        let err = external_summary_text("T", "S.", &tags).unwrap_err();
+        assert_eq!(format!("{err}"), "tags must be 1-50 characters without control characters");
+    }
+
+    #[test]
+    fn external_summary_tag_too_long_rejected() {
+        let tags = vec!["x".repeat(51)];
+        let err = external_summary_text("T", "S.", &tags).unwrap_err();
+        assert_eq!(format!("{err}"), "tags must be 1-50 characters without control characters");
+    }
+
+    #[test]
+    fn external_summary_too_many_tags_rejected() {
+        let tags: Vec<String> = (0..11).map(|i| format!("tag{i}")).collect();
+        let err = external_summary_text("T", "S.", &tags).unwrap_err();
+        assert_eq!(format!("{err}"), "at most 10 tags are allowed");
+    }
+
+    #[test]
+    fn external_summary_output_has_exactly_three_keys() {
+        let json_str = external_summary_text("TL;DR", "A full summary.", &["rust".to_string()])
+            .unwrap();
+        let v: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&json_str).unwrap();
+        assert_eq!(v.len(), 3);
+        assert!(v.contains_key("tldr"));
+        assert!(v.contains_key("summary"));
+        assert!(v.contains_key("tags"));
+    }
+
+    #[test]
+    fn normalize_external_model_trims_and_returns_none_for_empty() {
+        assert_eq!(normalize_external_model(None).unwrap(), None);
+        assert_eq!(normalize_external_model(Some("")).unwrap(), None);
+        assert_eq!(normalize_external_model(Some("  ")).unwrap(), None);
+        assert_eq!(
+            normalize_external_model(Some(" claude-opus-4-5 ")).unwrap(),
+            Some("claude-opus-4-5".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_external_model_control_char_rejected() {
+        let err = normalize_external_model(Some("bad\x01model")).unwrap_err();
+        assert_eq!(format!("{err}"), "model is longer than 100 characters or contains control characters");
+    }
+
+    #[test]
+    fn normalize_external_model_too_long_rejected() {
+        let long = "x".repeat(101);
+        let err = normalize_external_model(Some(&long)).unwrap_err();
+        assert_eq!(format!("{err}"), "model is longer than 100 characters or contains control characters");
     }
 }
