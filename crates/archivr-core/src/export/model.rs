@@ -453,7 +453,9 @@ fn dfs(
         Some(s) => s,
         None => return,
     };
-    conversation_ids.insert(id.to_string());
+    if !conversation_ids.insert(id.to_string()) {
+        return;
+    }
     let post = parse_post(status, asset_map, Some(conversation_ids));
     out.push(post);
     if let Some(children) = children_map.get(id) {
@@ -717,4 +719,31 @@ fn decode_html_entities(s: &str) -> String {
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn thread_export_visits_each_post_once_when_replies_cycle() {
+        for statuses in [
+            vec![json!({"id_str": "1", "in_reply_to_status_id_str": "1"})],
+            vec![
+                json!({"id_str": "1", "in_reply_to_status_id_str": "2"}),
+                json!({"id_str": "2", "in_reply_to_status_id_str": "1"}),
+            ],
+        ] {
+            let status_map: HashMap<String, serde_json::Value> = statuses
+                .iter()
+                .map(|status| (tweet_id(status).unwrap(), status.clone()))
+                .collect();
+            let posts = build_thread(&statuses, &status_map, Some("1"), &HashMap::new());
+            let unique_ids: HashSet<&str> = posts.iter().map(|post| post._id.as_str()).collect();
+
+            assert_eq!(posts.len(), statuses.len());
+            assert_eq!(unique_ids.len(), statuses.len());
+        }
+    }
 }
