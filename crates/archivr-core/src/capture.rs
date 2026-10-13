@@ -113,6 +113,10 @@ pub struct CaptureConfig {
     /// `capture_jobs` row to link to the run as soon as the run exists, so the job's creator
     /// can see the in-progress run (the job otherwise learns its `run_uid` only when it ends).
     pub job_uid: Option<String>,
+    /// Browser session forwarded from the extension's in-page capture dialog.
+    /// Contains the user's cookies and localStorage for the captured page.
+    /// Never persisted or logged.
+    pub browser_session: Option<crate::browser_session::BrowserSession>,
 }
 
 impl Default for CaptureConfig {
@@ -128,6 +132,7 @@ impl Default for CaptureConfig {
             sync: false,
             download_subtitles: true,
             job_uid: None,
+            browser_session: None,
         }
     }
 }
@@ -324,7 +329,7 @@ fn is_youtube_video_id(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-fn expand_shorthand_to_url(path: &str, source: &Source) -> String {
+pub(crate) fn expand_shorthand_to_url(path: &str, source: &Source) -> String {
     // YouTube shorthands: yt:video/ID, yt:playlist/ID, yt:@handle, yt:channel/ID, etc.
     if matches!(
         source,
@@ -432,7 +437,7 @@ pub fn locator_is_local_path(locator: &str) -> bool {
 
 // INFO: yt-dlp supports a lot of sites; so, when archiving (for example) a website, the user
 // -> should be asked whether they want to archive the whole website or just the video(s) on it.
-fn determine_source(path: &str) -> Source {
+pub(crate) fn determine_source(path: &str) -> Source {
     // INFO: Extractor URLs can be found here:
     // -> https://github.com/yt-dlp/yt-dlp/tree/dfc0a84c192a7357dd1768cc345d590253a14fe5/yt_dlp/extractor
     // TEST: X posts can have multiple videos.
@@ -1254,7 +1259,16 @@ pub fn perform_capture(
 
     // Expand shorthands to the canonical URL for cookie matching.
     let canonical_url = expand_shorthand_to_url(locator, &source);
-    let cookies = resolve_cookies_for_url(&config.cookie_rules, &canonical_url);
+    // Filter the browser session to this locator (defensive re-check even though
+    // the server validates applicability before creating the job).
+    let session = config
+        .browser_session
+        .as_ref()
+        .filter(|s| s.applies_to(locator));
+    let cookies = crate::browser_session::merge_cookies(
+        resolve_cookies_for_url(&config.cookie_rules, &canonical_url),
+        session,
+    );
 
     // Create the run record before probing so every attempt — including
     // probe failures — is visible in /runs with a proper status and error.
@@ -1720,6 +1734,19 @@ pub fn perform_capture(
         // Key cleanup/title-stripping off the actual fetch host so that
         // user-supplied freedium-mirror.cfd URLs are also handled correctly.
         let is_freedium_fetch = fetch_url.starts_with("https://freedium-mirror.cfd/");
+        // Build localStorage seed when we have a session with storage items and
+        // this is NOT a Freedium fetch (Freedium gets an empty cookie jar and no seed).
+        let storage_seed_origin = if !is_freedium_fetch {
+            session.and_then(|s| s.storage_origin())
+        } else {
+            None
+        };
+        let storage_seed = storage_seed_origin.as_deref().and_then(|origin| {
+            session.map(|s| downloader::singlefile::LocalStorageSeed {
+                origin,
+                items: &s.local_storage,
+            })
+        });
         match downloader::singlefile::save(
             &fetch_url,
             store_path,
@@ -1730,6 +1757,7 @@ pub fn perform_capture(
             config.reader_mode,
             config.modal_closer_enabled,
             is_freedium_fetch,
+            storage_seed,
         ) {
             Ok(result) => {
                 let file_extension = ".html".to_string();
@@ -1910,7 +1938,10 @@ pub fn perform_capture(
         // Tweet shorthands (tweet:ID) don't expand to a URL, so `canonical_url`
         // won't match x.com patterns. Always resolve cookies against x.com so
         // that wildcard/global rules containing `ct0`+`auth_token` are picked up.
-        let tweet_cookies = resolve_cookies_for_url(&config.cookie_rules, "https://x.com/");
+        let tweet_cookies = crate::browser_session::merge_cookies(
+            resolve_cookies_for_url(&config.cookie_rules, "https://x.com/"),
+            session,
+        );
         match downloader::tweets::archive(
             locator,
             source == Source::TweetThread,

@@ -195,3 +195,65 @@ describe('manual title controls', () => {
     expect(markup).toContain('New body')
   })
 })
+
+describe('browser session', () => {
+  // (a) Without browserSession prop, dashboard-invariant: no browser data controls
+  test('without browserSession the markup contains no browser data controls', () => {
+    const markup = renderToStaticMarkup(
+      <CaptureDialog
+        open
+        archiveId="personal"
+        initialItems={[{ locator: 'https://www.example.com/a' }]}
+      />
+    )
+    expect(markup).not.toContain('Use my cookies')
+    expect(markup).not.toContain('Include localStorage')
+  })
+
+  // (b) With browserSession whose appliesTo returns true: toggle visible, unchecked
+  test('with matching browserSession the checkbox appears unchecked when defaults.cookies=false', () => {
+    const browserSession = {
+      pageUrl: 'https://www.example.com/a',
+      host: 'www.example.com',
+      defaults: { cookies: false, localStorage: false },
+      appliesTo: () => true,
+      load: () => new Promise(() => {}),
+      requestAccess: () => {},
+    }
+    const markup = renderToStaticMarkup(
+      <CaptureDialog
+        open
+        archiveId="personal"
+        initialItems={[{ locator: 'https://www.example.com/a' }]}
+        browserSession={browserSession}
+      />
+    )
+    expect(markup).toContain('Use my cookies')
+    // checkbox should not be checked (defaults.cookies = false)
+    expect(markup).not.toContain('checked="" class="capture-browser-session-row"')
+    // the checkbox input itself should not have checked
+    const checkboxMatch = markup.match(/type="checkbox"[^>]*/)
+    expect(checkboxMatch?.[0] ?? '').not.toContain('checked')
+  })
+
+  // (c) With browserSession whose appliesTo returns false: no toggle
+  test('with non-matching browserSession (appliesTo false) the toggle is not shown', () => {
+    const browserSession = {
+      pageUrl: 'https://other.example.com/',
+      host: 'other.example.com',
+      defaults: { cookies: true, localStorage: true },
+      appliesTo: () => false,
+      load: () => new Promise(() => {}),
+      requestAccess: () => {},
+    }
+    const markup = renderToStaticMarkup(
+      <CaptureDialog
+        open
+        archiveId="personal"
+        initialItems={[{ locator: 'https://www.example.com/a' }]}
+        browserSession={browserSession}
+      />
+    )
+    expect(markup).not.toContain('Use my cookies')
+  })
+})

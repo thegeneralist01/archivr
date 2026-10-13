@@ -1,6 +1,8 @@
 import { useRef, useEffect, useState } from 'react'
 import * as defaultApi from '../api'
 import { capturePersistenceKey, captureDraftItems, applyGeneratedTitle, applyTitleGenerationError } from '../captureRequests'
+import { toRows, validateBrowserData, buildBrowserSessionPayload } from '../browserData.js'
+import { BrowserSessionToggle, BrowserDataSection } from './CaptureBrowserData.jsx'
 
 let nextItemId = 1
 
@@ -234,8 +236,7 @@ function applyPlaylistQuality(newQ, currentItems) {
 function hasConflict(item) {
   return Array.isArray(item.playlistItems) && item.playlistItems.some(pi => pi.quality === null)
 }
-
-export default function CaptureDialog({ open, archiveId, onClose, onCaptured, onToast, onJobStarted, onJobSettled, activeJobs = [], api = defaultApi, initialItems, persistenceKey = 'captureItems', requestKey, allowFileUpload = true }) {
+export default function CaptureDialog({ open, archiveId, onClose, onCaptured, onToast, onJobStarted, onJobSettled, activeJobs = [], api = defaultApi, initialItems, persistenceKey = 'captureItems', requestKey, allowFileUpload = true, browserSession = null }) {
   const draftKey = capturePersistenceKey(persistenceKey, initialItems, requestKey)
   const apiRef = useRef(api)
   apiRef.current = api
@@ -355,6 +356,50 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
 
   // Reader mode: off by default, per-session only
   const [readerMode, setReaderMode] = useState(false)
+
+  // ── Browser session (extension-only; null in dashboard) ─────────────────────
+  // NEVER write cookie or localStorage data to sessionStorage — in the extension
+  // content script, that is the *page's* sessionStorage.
+  const [browserData, setBrowserData] = useState({
+    status: 'idle', cookieAccess: null, cookieRows: [], storageRows: [],
+  })
+  const [useCookies, setUseCookies] = useState(browserSession?.defaults?.cookies ?? false)
+  const [includeStorage, setIncludeStorage] = useState(browserSession?.defaults?.localStorage ?? false)
+
+  useEffect(() => {
+    if (!browserSession) return
+    let cancelled = false
+    async function load() {
+      setBrowserData(prev => ({ ...prev, status: 'loading' }))
+      try {
+        const result = await browserSession.load()
+        if (cancelled) return
+        setBrowserData({
+          status: 'ready',
+          cookieAccess: result.cookieAccess,
+          cookieRows: toRows(result.cookies || [], 'name'),
+          storageRows: toRows(result.localStorage || [], 'key'),
+        })
+        if (result.cookieAccess === 'granted') {
+          setUseCookies(browserSession.defaults.cookies)
+        }
+      } catch {
+        if (!cancelled) setBrowserData({ status: 'error', cookieAccess: null, cookieRows: [], storageRows: [] })
+      }
+    }
+    load()
+    // Re-check when tab regains focus (user may have granted access in the settings tab)
+    function onVisibility() {
+      if (document.visibilityState === 'visible' && browserData.cookieAccess === 'missing') {
+        load()
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      cancelled = true
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [browserSession]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // On mount: clean up old single-locator sessionStorage keys; reconnect running bg jobs
   useEffect(() => {
@@ -574,6 +619,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
 
   function handleArchive() {
     if (!archiveIdRef.current) return
+    if (browserDataError) return
     // Guard against the Enter-key shortcut in CaptureRow bypassing the
     // disabled button — uploads must be complete before archiving starts.
     if (items.some(it => it.kind === 'file' && it.uploadStatus === 'uploading')) return
@@ -595,6 +641,10 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     if (batchId) {
       batchRef.current.set(batchId, { total: toSubmit.length, archived: 0, warnings: 0, failed: 0, failedLocators: [], warningLocators: [] })
     }
+    // Build browser session payload before state changes (snapshot current state).
+    const sessionPayload = browserApplicable
+      ? buildBrowserSessionPayload({ pageUrl: browserSession.pageUrl, useCookies: effectiveUseCookies, includeStorage, cookieRows: browserData.cookieRows, storageRows: browserData.storageRows })
+      : null
     // Capture all submission data before any state changes
     const submissions = toSubmit.map(it => {
       if (it.kind === 'file') {
@@ -603,13 +653,20 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
       if (it.kind === 'text') {
         return { type: 'text', title: it.title.trim(), body: it.body, mime: it.mime }
       }
+      const locator = it.locator.trim()
+      const browserSessionExt = (sessionPayload && browserSession?.appliesTo(locator))
+        ? { browser_session: sessionPayload }
+        : {}
       return {
         type: 'url',
-        locator: it.locator.trim(),
+        locator,
         quality: it.playlistItems !== null ? null : (it.quality || 'best'),
-        extraExtensions: it.playlistItems !== null
-          ? { per_item_quality: Object.fromEntries(it.playlistItems.map(pi => [pi.id, pi.quality])), sync: it.syncEnabled }
-          : {},
+        extraExtensions: {
+          ...(it.playlistItems !== null
+            ? { per_item_quality: Object.fromEntries(it.playlistItems.map(pi => [pi.id, pi.quality])), sync: it.syncEnabled }
+            : {}),
+          ...browserSessionExt,
+        },
       }
     })
     // Reset form and close dialog immediately.
@@ -861,6 +918,15 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     )
   )
 
+  // ── Browser session computed values ─────────────────────────────────────────
+  const browserApplicable = !!browserSession && items.some(
+    it => it.kind !== 'text' && it.kind !== 'file' && it.locator.trim() && browserSession.appliesTo(it.locator.trim())
+  )
+  const effectiveUseCookies = useCookies && browserData.cookieAccess === 'granted'
+  const browserDataError = browserApplicable
+    ? validateBrowserData({ useCookies: effectiveUseCookies, includeStorage, cookieRows: browserData.cookieRows, storageRows: browserData.storageRows })
+    : null
+
   return (
     <dialog
       ref={dialogRef}
@@ -960,6 +1026,16 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
             Add text
           </button>
         </div>
+
+        {/* ── Use my cookies toggle ────────────────────────── */}
+        {browserApplicable && (
+          <BrowserSessionToggle
+            browserSession={browserSession}
+            browserData={browserData}
+            useCookies={useCookies}
+            setUseCookies={setUseCookies}
+          />
+        )}
 
         {/* ── Advanced options ────────────────────────────── */}
         <div className="capture-advanced">
@@ -1079,6 +1155,17 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
                   <span className="ext-toggle-knob" />
                 </button>
               </label>
+              {browserApplicable && (
+                <BrowserDataSection
+                  browserSession={browserSession}
+                  browserData={browserData}
+                  setBrowserData={setBrowserData}
+                  effectiveUseCookies={effectiveUseCookies}
+                  includeStorage={includeStorage}
+                  setIncludeStorage={setIncludeStorage}
+                  browserDataError={browserDataError}
+                />
+              )}
             </div>
           )}
         </div>
@@ -1089,7 +1176,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
             type="button"
             className="capture-submit"
             onClick={handleArchive}
-            disabled={!archiveId || pendingCount === 0 || anyConflict || anyProbing || anyEmptyPlaylist || anyUploading}
+            disabled={!archiveId || pendingCount === 0 || anyConflict || anyProbing || anyEmptyPlaylist || anyUploading || !!browserDataError}
           >
             {pendingCount > 1 ? `Archive ${pendingCount}` : 'Archive'}
           </button>
