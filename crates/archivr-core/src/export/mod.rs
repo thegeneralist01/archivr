@@ -718,6 +718,15 @@ mod tests {
 
         /// Create a text entry with a .txt primary_media artifact. Returns entry_uid.
         fn add_text_entry(&self, title: &str, content: &str) -> String {
+            self.add_text_entry_with_extension(title, content, "txt")
+        }
+
+        fn add_text_entry_with_extension(
+            &self,
+            title: &str,
+            content: &str,
+            extension: &str,
+        ) -> String {
             let conn = self.conn();
             let n = self.si_counter.get();
             self.si_counter.set(n + 1);
@@ -746,7 +755,7 @@ mod tests {
             let hash = format!("{n:064x}");
             let sub1 = &hash[0..1];
             let sub2 = &hash[1..2];
-            let relpath = format!("raw/{sub1}/{sub2}/{hash}.txt");
+            let relpath = format!("raw/{sub1}/{sub2}/{hash}.{extension}");
             let file_path = self.paths.store_path.join(&relpath);
             std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
             std::fs::write(&file_path, content).unwrap();
@@ -902,6 +911,31 @@ mod tests {
         let md = read_zip_entry(file, "index.md");
         assert!(md.starts_with("# My Note"), "heading: {md}");
         assert!(md.contains("# heading\n\nbody text"), "body verbatim");
+    }
+
+    #[test]
+    fn markdown_export_fences_plain_text_but_keeps_markdown_source_raw() {
+        let ctx = TestCtx::new();
+        let source = "# heading\n[link](https://example.com)\n<script>alert(1)</script>\n```\ninner\n```";
+        let plain_uid = ctx.add_text_entry("Plain text", source);
+        let markdown_uid = ctx.add_text_entry_with_extension("Markdown", source, "md");
+        let opts = ExportOptions {
+            format: ExportFormat::Markdown,
+            layout: ExportLayout::Together,
+            include_credit: false,
+            caller_bits: u32::MAX,
+        };
+
+        let plain = export_entries(&ctx.paths, &[plain_uid], &opts).unwrap();
+        let (file, _, _, _) = plain.open().unwrap();
+        let plain_md = read_zip_entry(file, "index.md");
+        assert!(plain_md.contains(&format!("````\n{source}\n````")));
+
+        let markdown = export_entries(&ctx.paths, &[markdown_uid], &opts).unwrap();
+        let (file, _, _, _) = markdown.open().unwrap();
+        let markdown_md = read_zip_entry(file, "index.md");
+        assert!(markdown_md.contains(&format!("\n\n{source}\n")));
+        assert!(!markdown_md.contains("````\n"));
     }
 
     #[test]

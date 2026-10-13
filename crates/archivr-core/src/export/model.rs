@@ -59,7 +59,7 @@ pub(crate) enum ExportBody {
     Pdf(Asset),
     /// An HTML/HTM snapshot (SingleFile page).
     Page(Asset),
-    Text { _mime_markdown: bool, text: String },
+    Text { mime_markdown: bool, text: String },
     /// Text file > 5 MiB: offer a download link only.
     TextTooLarge(Asset),
     File(Asset),
@@ -287,8 +287,8 @@ fn body_from_primary_media(
             match std::fs::read(&asset.source) {
                 Ok(bytes) => {
                     let text = String::from_utf8_lossy(&bytes).into_owned();
-                    let _mime_markdown = ext == "md" || ext == "markdown";
-                    ExportBody::Text { _mime_markdown, text }
+                    let mime_markdown = ext == "md" || ext == "markdown";
+                    ExportBody::Text { mime_markdown, text }
                 }
                 Err(e) => {
                     eprintln!("warn: export: failed to read text artifact: {e:#}");

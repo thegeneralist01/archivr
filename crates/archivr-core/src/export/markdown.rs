@@ -55,6 +55,22 @@ fn poster_ref(poster: &std::path::Path) -> String {
         .unwrap_or_default()
 }
 
+fn fenced_plain_text(text: &str) -> String {
+    let mut longest_run = 0;
+    let mut run = 0;
+    for byte in text.bytes() {
+        if byte == b'`' {
+            run += 1;
+            longest_run = longest_run.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    let fence = "`".repeat((longest_run + 1).max(3));
+    let trailing_newline = if text.ends_with('\n') { "" } else { "\n" };
+    format!("{fence}\n{text}{trailing_newline}{fence}\n")
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -155,9 +171,12 @@ fn render_body_md(
         }
         ExportBody::Pdf(asset) => format!("[PDF document]({})\n", asset_ref(asset)),
         ExportBody::Page(asset) => format!("[Archived page snapshot]({})\n", asset_ref(asset)),
-        ExportBody::Text { text, .. } => {
-            // Verbatim text.
-            format!("{}\n", text)
+        ExportBody::Text { mime_markdown, text } => {
+            if *mime_markdown {
+                format!("{text}\n")
+            } else {
+                fenced_plain_text(text)
+            }
         }
         ExportBody::TextTooLarge(asset) | ExportBody::File(asset) => {
             let ext = ext_of_s(&asset.name).to_uppercase();
