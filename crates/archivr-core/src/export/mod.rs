@@ -923,6 +923,45 @@ mod tests {
     }
 
     #[test]
+    fn srt_subtitle_of_child_is_preserved_in_html_and_markdown_bundles() {
+        let ctx = TestCtx::new();
+        let (parent_uid, child_uid) = ctx.add_container_entry("Playlist", "Video");
+        let conn = ctx.conn();
+        let entry_id = database::entry_id_for_uid(&conn, &child_uid)
+            .unwrap()
+            .unwrap();
+        let relpath = "raw/captions.srt";
+        let srt = "1\n00:00:00,000 --> 00:00:02,000\nCaption text.\n";
+        std::fs::write(ctx.paths.store_path.join(relpath), srt).unwrap();
+        database::add_entry_artifact(
+            &conn,
+            &database::NewArtifact {
+                entry_id,
+                artifact_role: "subtitle".to_string(),
+                storage_area: "raw".to_string(),
+                relpath: relpath.to_string(),
+                blob_id: None,
+                logical_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+
+        for format in [ExportFormat::Html, ExportFormat::Markdown] {
+            let opts = ExportOptions {
+                format,
+                layout: ExportLayout::Together,
+                include_credit: false,
+                caller_bits: u32::MAX,
+            };
+            let export =
+                export_entries(&ctx.paths, std::slice::from_ref(&parent_uid), &opts).unwrap();
+            let (file, _, _, _) = export.open().unwrap();
+            assert_eq!(read_zip_entry(file, "assets/captions.srt"), srt);
+        }
+    }
+
+    #[test]
     fn test_validation_empty() {
         let ctx = TestCtx::new();
         let opts = ExportOptions {

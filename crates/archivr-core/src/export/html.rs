@@ -335,6 +335,8 @@ fn render_video(
         .unwrap_or_default();
     let tracks: String = subtitles
         .iter()
+        // SRT files stay in the ZIP, but HTML video tracks require WebVTT.
+        .filter(|sub| ext_of_s(&sub.name) == "vtt")
         .enumerate()
         .map(|(i, sub)| {
             let sub_src = asset_src(mode, sub);
@@ -559,4 +561,29 @@ fn render_container(
     }
     s.push_str("</ol>");
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn video_tracks_use_vtt_only_even_when_srt_precedes_it() {
+        let asset = |name: &str| Asset {
+            source: PathBuf::new(),
+            name: name.to_string(),
+            byte_size: 0,
+        };
+        let html = render_video(
+            &asset("video.mp4"),
+            AssetMode::Bundle,
+            &std::collections::HashMap::new(),
+            &[asset("captions.srt"), asset("captions.vtt")],
+        );
+
+        assert_eq!(html.matches("<track ").count(), 1);
+        assert!(html.contains("src=\"assets/captions.vtt\""));
+        assert!(html.contains(" default>"));
+        assert!(!html.contains("captions.srt"));
+    }
 }

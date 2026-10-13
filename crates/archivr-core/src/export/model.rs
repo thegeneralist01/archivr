@@ -72,7 +72,7 @@ pub(crate) enum ExportBody {
 #[derive(Debug)]
 pub(crate) struct ExportEntry {
     pub summary: EntrySummary,
-    /// Subtitle `.vtt` assets in track order.
+    /// Subtitle `.vtt` and `.srt` assets in track order.
     pub subtitles: Vec<Asset>,
     pub body: ExportBody,
 }
@@ -192,10 +192,10 @@ pub(crate) fn load_entry(
         }
     }
 
-    // ----- subtitles (VTT only) -----
+    // ----- subtitles -----
     let subtitles: Vec<Asset> = subtitle_artifacts
         .iter()
-        .filter(|a| a.relpath.to_lowercase().ends_with(".vtt"))
+        .filter(|a| matches!(ext_of_s(&a.relpath).as_str(), "vtt" | "srt"))
         .filter_map(|a| {
             archive::resolve_artifact_path(store_path, a)
                 .map(|p| Asset {
