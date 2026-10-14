@@ -59,6 +59,8 @@ const MAX_TEXT_CAPTURE_BODY_BYTES: usize = 2 * 1024 * 1024;
 // JSON can expand each body byte into a six-byte `\\u00XX` escape sequence,
 // plus a small request envelope.
 const MAX_TEXT_CAPTURE_REQUEST_BYTES: usize = MAX_TEXT_CAPTURE_BODY_BYTES * 6 + 64 * 1024;
+// 1 MiB localStorage + 64 KiB cookies, with up to 6× JSON escape expansion.
+const MAX_CAPTURE_REQUEST_BYTES: usize = (1_048_576 + 65_536) * 6 + 64 * 1024;
 
 // Short-lived token granting unauthenticated access to one specific artifact.
 // Used so Cast / AirPlay devices (which carry no session cookie) can fetch media.
@@ -304,7 +306,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/api/archives/:archive_id/blobs/:sha256", get(serve_blob))
         .route("/api/archives/:archive_id/runs", get(list_runs))
         .route("/api/captures/options", get(capture_options_handler))
-        .route("/api/archives/:archive_id/captures", post(capture_handler))
+        .route("/api/archives/:archive_id/captures", post(capture_handler).layer(DefaultBodyLimit::max(MAX_CAPTURE_REQUEST_BYTES)))
         .route(
             "/api/archives/:archive_id/captures/text/title",
             post(generate_text_title_handler)
@@ -1610,6 +1612,10 @@ struct CaptureBody {
     /// When true, skip playlist items already archived under an existing container.
     #[serde(default)]
     sync: bool,
+    /// Browser session forwarded from the extension's in-page capture dialog.
+    /// Contains the user's cookies and localStorage for the captured page.
+    /// Never persisted, logged, or echoed in error messages.
+    browser_session: Option<archivr_core::browser_session::BrowserSession>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1733,6 +1739,20 @@ async fn capture_handler(
             )));
         }
     }
+    // Validate browser_session if provided.
+    if let Some(session) = &body.browser_session {
+        session.validate().map_err(|e| ApiError::bad_request(&e))?;
+        if !session.applies_to(body.locator.trim()) {
+            return Err(ApiError::bad_request(
+                "browser_session.url must be on the same site as the locator",
+            ));
+        }
+        if !session.local_storage.is_empty() && !session.storage_applies_to(body.locator.trim()) {
+            return Err(ApiError::bad_request(
+                "browser_session.local_storage requires the same origin as the locator",
+            ));
+        }
+    }
     // per_item_quality semantics (enforced in capture.rs):
     // - Absent or empty map: all playlist items are downloaded; quality is the
     //   global `quality` field applied as a yt-dlp cap with graceful fallback.
@@ -1819,6 +1839,7 @@ async fn capture_handler(
         per_item_quality: body.per_item_quality.clone(),
         sync: body.sync,
         job_uid: Some(job_uid.clone()),
+        browser_session: body.browser_session.clone(),
     };
 
     // Spawn background capture.
@@ -2224,6 +2245,8 @@ async fn rearchive_handler(
         sync: false,
         // Rearchive replaces an entry's artifacts in place and creates no run to link.
         job_uid: None,
+        // Rearchive has no browser session; browser data is only supplied for new captures.
+        browser_session: None,
     };
 
     let job_uid_bg = job_uid.clone();
@@ -6438,6 +6461,201 @@ mod tests {
             json["error"]
                 .as_str()
                 .is_some_and(|e| e.contains("invalid quality"))
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_browser_session_wrong_site_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let body = serde_json::json!({
+            "locator": "https://example.com/a",
+            "browser_session": {
+                "url": "https://other.example.com/",
+                "cookies": {},
+                "local_storage": {}
+            }
+        });
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let resp_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("same site")),
+            "expected same-site error, got: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_browser_session_storage_requires_same_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let body = serde_json::json!({
+            "locator": "https://example.com:8443/a",
+            "browser_session": {
+                "url": "https://example.com/a",
+                "cookies": { "session": "abc" },
+                "local_storage": { "pref": "dark" }
+            }
+        });
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let resp_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+        assert!(json["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("same origin")));
+    }
+
+    #[tokio::test]
+    async fn capture_browser_session_invalid_cookie_name_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let body = serde_json::json!({
+            "locator": "https://example.com/a",
+            "browser_session": {
+                "url": "https://example.com/",
+                "cookies": { "a b": "secret_value_must_not_appear" },
+                "local_storage": {}
+            }
+        });
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let resp_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&resp_bytes);
+        assert!(
+            text.contains("invalid name"),
+            "expected invalid-name error, got: {text}"
+        );
+        assert!(
+            !text.contains("secret_value_must_not_appear"),
+            "cookie value must not appear in error: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_browser_session_valid_returns_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let body = serde_json::json!({
+            "locator": "https://example.com/a",
+            "browser_session": {
+                "url": "https://example.com/page",
+                "cookies": { "session": "abc123" },
+                "local_storage": { "pref": "dark" }
+            }
+        });
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let resp_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+        assert!(
+            json["job_uid"].as_str().is_some(),
+            "expected job_uid, got: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_browser_session_oversized_storage_returns_400_not_413() {
+        // Body ≈ 3 MiB (1.5 MiB of '"' chars, each escaped to '\\"' → 6 bytes);
+        // exceeds axum's 2 MB default. Proves the route's raised body limit.
+        // The value also exceeds our 1 MiB storage limit, so validation gives 400.
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let large_value = "\"".repeat(1_572_864); // 1.5 MiB of '"'
+        let body = serde_json::json!({
+            "locator": "https://example.com/a",
+            "browser_session": {
+                "url": "https://example.com/page",
+                "cookies": {},
+                "local_storage": { "k": large_value }
+            }
+        });
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Must be 400 (validation error) not 413 (body too large).
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "expected 400, got {}",
+            response.status()
+        );
+        let resp_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&resp_bytes);
+        assert!(
+            text.contains("localStorage exceeds 1 MiB"),
+            "expected storage limit error, got: {text}"
         );
     }
 

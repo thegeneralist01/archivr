@@ -1,4 +1,5 @@
 pub mod capture;
+pub mod browser_session;
 pub mod archive;
 pub mod auth_credentials;
 pub mod auth_users;

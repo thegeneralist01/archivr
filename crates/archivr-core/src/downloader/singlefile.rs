@@ -273,6 +273,32 @@ pub struct SaveResult {
     pub cookie_ext_skipped: bool,
 }
 
+/// Carries localStorage seed data for a SingleFile page capture.
+/// The items are written to a `--browser-script` that runs before page scripts.
+pub struct LocalStorageSeed<'a> {
+    /// ASCII origin of the page (e.g. `"https://www.example.com"`).
+    pub origin: &'a str,
+    /// key → value pairs to seed into `localStorage` on page load.
+    pub items: &'a HashMap<String, String>,
+}
+
+/// Generates a self-contained IIFE script that seeds localStorage with the given
+/// items, gated on the page's origin matching `seed.origin`.
+///
+/// Both the origin and the data are JSON-encoded (valid JS literals), so no
+/// manual quoting or escaping is needed.  The IIFE catches any errors silently so
+/// the page always loads, even if storage is blocked.
+fn local_storage_seed_script(seed: &LocalStorageSeed) -> String {
+    let origin_json = serde_json::to_string(seed.origin).unwrap_or_else(|_| "\"\"".to_string());
+    let data_json = serde_json::to_string(seed.items).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        ";(function(){{try{{if(location.origin!=={origin_json})return;\
+         var d={data_json};\
+         for(var k in d){{if(Object.prototype.hasOwnProperty.call(d,k))localStorage.setItem(k,d[k]);}}\
+         }}catch(e){{}}}})()"
+    )
+}
+
 /// Archives `url` as a self-contained HTML snapshot.
 ///
 /// Env vars:
@@ -291,6 +317,7 @@ pub fn save(
     reader_mode: bool,
     modal_closer_enabled: Option<bool>,
     freedium_cleanup: bool,
+    local_storage: Option<LocalStorageSeed<'_>>,
 ) -> Result<SaveResult> {
     let single_file =
         env::var("ARCHIVR_SINGLE_FILE").unwrap_or_else(|_| "single-file".to_string());
@@ -310,6 +337,7 @@ pub fn save(
         reader_mode,
         modal_closer,
         freedium_cleanup,
+        local_storage,
     )?;
     result.ublock_skipped = ublock_skipped;
     result.cookie_ext_skipped = cookie_ext_skipped;
@@ -435,6 +463,7 @@ fn save_with(
     reader_mode: bool,
     modal_closer: bool,
     freedium_cleanup: bool,
+    local_storage: Option<LocalStorageSeed<'_>>,
 ) -> Result<SaveResult> {
     let temp_dir = store_path.join("temp").join(timestamp);
     std::fs::create_dir_all(&temp_dir).context("failed to create temp dir")?;
@@ -609,36 +638,66 @@ fn save_with(
         .collect();
     let browser_args = format!("[{}]", quoted.join(","));
 
-    // Write cookie file (secrets must never appear in process args).
-    let cookie_file: Option<PathBuf> = if !cookies.is_empty() {
-        let cf = temp_dir.join("cookies.json");
-        let domain = domain_from_url(url);
-        write_json_cookie_file(cookies, &domain, url, &cf)
-            .context("failed to write single-file cookie file")?;
-        Some(cf)
-    } else {
-        None
-    };
+    // Construct both secret paths before writing either one. Every fallible
+    // write and the subprocess run stay inside this scope so cleanup also runs
+    // when the second write fails after the first file has been created.
+    let cookie_file = (!cookies.is_empty()).then(|| temp_dir.join("cookies.json"));
+    let storage_script_file = local_storage
+        .as_ref()
+        .filter(|seed| !seed.items.is_empty())
+        .map(|_| temp_dir.join("sf-local-storage.js"));
+    let sf_result = (|| -> Result<std::process::Output> {
+        if let Some(cf) = &cookie_file {
+            let domain = domain_from_url(url);
+            write_json_cookie_file(cookies, &domain, url, cf)
+                .context("failed to write single-file cookie file")?;
+        }
+        if let (Some(sf), Some(seed)) = (&storage_script_file, &local_storage) {
+            let script = local_storage_seed_script(seed);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(sf)
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        f.write_all(script.as_bytes())
+                    })
+                    .context("failed to write localStorage seed script")?;
+            }
+            #[cfg(not(unix))]
+            std::fs::write(sf, &script).context("failed to write localStorage seed script")?;
+        }
 
-    let mut scripts: Vec<&Path> = vec![strip_scripts_path.as_path()];
-    scripts.extend(extra_browser_scripts.iter().map(|p| p.as_path()));
-
-    let sf_output = run_single_file_standalone(
-        url,
-        &out_file,
-        single_file,
-        chrome,
-        &browser_args,
-        &scripts,
-        cookie_file.as_deref(),
-    )
-    .with_context(|| format!("failed to spawn single-file ({single_file})"))?;
-
-    // Delete cookie file unconditionally — including on failure — so secrets
-    // are never left in store/temp when the capture fails.
-    if let Some(cf) = &cookie_file {
-        let _ = std::fs::remove_file(cf);
+        // localStorage seed runs FIRST so it executes before any page scripts.
+        let mut scripts: Vec<&Path> = Vec::new();
+        if let Some(sf) = &storage_script_file {
+            scripts.push(sf.as_path());
+        }
+        scripts.push(strip_scripts_path.as_path());
+        scripts.extend(extra_browser_scripts.iter().map(|p| p.as_path()));
+        run_single_file_standalone(
+            url,
+            &out_file,
+            single_file,
+            chrome,
+            &browser_args,
+            &scripts,
+            cookie_file.as_deref(),
+        )
+        .with_context(|| format!("failed to spawn single-file ({single_file})"))
+    })();
+    for path in [cookie_file.as_ref(), storage_script_file.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        let _ = std::fs::remove_file(path);
     }
+    let sf_output = sf_result?;
 
     if !sf_output.status.success() {
         let stderr = String::from_utf8_lossy(&sf_output.stderr);
@@ -1080,6 +1139,7 @@ mod tests {
             false, // reader mode off
             false, // modal closer off
             false, // freedium cleanup off
+            None,  // no localStorage seed
         );
         let err = result.unwrap_err();
         let msg = format!("{err:#}");
@@ -1087,6 +1147,70 @@ mod tests {
             msg.contains("spawn") || msg.contains("nonexistent") || msg.contains("No such"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn save_with_spawn_failure_removes_secret_files() {
+        // Verifies that cookies.json and sf-local-storage.js are deleted even
+        // when spawning the single-file binary fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cookies = HashMap::new();
+        cookies.insert("session".to_string(), "secret".to_string());
+        let mut items = HashMap::new();
+        items.insert("pref".to_string(), "dark".to_string());
+        let seed = LocalStorageSeed {
+            origin: "https://example.com",
+            items: &items,
+        };
+        let result = save_with(
+            "https://example.com",
+            tmp.path(),
+            "test-ts",
+            "/nonexistent/single-file",
+            "chromium",
+            &cookies,
+            None,  // no ublock ext
+            None,  // no cookie ext
+            false, // reader mode off
+            false, // modal closer off
+            false, // freedium cleanup off
+            Some(seed),
+        );
+        assert!(result.is_err(), "expected error from missing binary");
+        let cookie_path = tmp.path().join("temp/test-ts/cookies.json");
+        let storage_path = tmp.path().join("temp/test-ts/sf-local-storage.js");
+        assert!(!cookie_path.exists(), "cookies.json was not deleted: {}", cookie_path.display());
+        assert!(!storage_path.exists(), "sf-local-storage.js was not deleted: {}", storage_path.display());
+    }
+
+    #[test]
+    fn save_with_storage_write_failure_removes_cookie_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let temp_dir = tmp.path().join("temp/test-ts");
+        std::fs::create_dir_all(temp_dir.join("sf-local-storage.js")).unwrap();
+        let mut cookies = HashMap::new();
+        cookies.insert("session".to_string(), "secret".to_string());
+        let mut items = HashMap::new();
+        items.insert("pref".to_string(), "dark".to_string());
+        let result = save_with(
+            "https://example.com",
+            tmp.path(),
+            "test-ts",
+            "/nonexistent/single-file",
+            "chromium",
+            &cookies,
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some(LocalStorageSeed {
+                origin: "https://example.com",
+                items: &items,
+            }),
+        );
+        assert!(result.unwrap_err().to_string().contains("localStorage seed script"));
+        assert!(!temp_dir.join("cookies.json").exists());
     }
 
     #[test]
