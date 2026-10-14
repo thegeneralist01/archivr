@@ -1783,8 +1783,7 @@ pub fn perform_capture(
                     let (rewritten, fonts) =
                         downloader::font_extractor::extract_and_rewrite(&content, store_path, aid)
                             .unwrap_or_else(|_| (content.clone(), vec![])); // non-fatal
-                                                                            // Extract title after font-stripping so the title tag is not buried
-                                                                            // behind multi-MB embedded font data that would exceed the 256 KiB window.
+                    // Extract from the rewritten snapshot that will be stored.
                     let title = downloader::singlefile::extract_html_title_str(&rewritten);
                     fs::write(&temp_html, rewritten.as_bytes())
                         .with_context(|| "failed to write rewritten HTML")?;

@@ -803,39 +803,191 @@ fn base_single_file_cmd(
 
 // ── HTML helpers ──────────────────────────────────────────────────────────────
 
-/// Reads up to 256 KiB of `path` and extracts the content of the first
-/// `<title>…</title>` element. Returns `None` if absent or empty.
-///
-/// Uses `to_ascii_lowercase` for case-insensitive tag matching. ASCII-only
-/// lowercasing is byte-length-preserving, so byte offsets derived from the
-/// lowercased buffer are valid indices into the original buffer.
-///
-/// Uses `take().read_to_end()` rather than a single `read()` call so the
-/// full 256 KiB is always consumed even when the OS short-reads.
+/// Extracts the first HTML title from a saved page without holding the whole
+/// (potentially very large) SingleFile snapshot in memory.
 fn extract_html_title(path: &Path) -> Option<String> {
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut buf = Vec::new();
-    f.take(256 * 1024).read_to_end(&mut buf).ok()?;
-    extract_html_title_from_buf(&buf)
+    extract_html_title_from_reader(std::fs::File::open(path).ok()?)
 }
 
 /// Extracts the `<title>` content from an HTML string.
 ///
 /// Used in the server capture path where the font-extracted HTML is already
-/// in memory — avoids a re-read and operates on the smaller post-extraction
-/// content where the title is guaranteed to be within range.
+/// in memory, so both paths use the same title scanner.
 pub fn extract_html_title_str(html: &str) -> Option<String> {
-    extract_html_title_from_buf(html.as_bytes())
+    extract_html_title_from_reader(html.as_bytes())
 }
 
-fn extract_html_title_from_buf(buf: &[u8]) -> Option<String> {
-    let lower = String::from_utf8_lossy(buf).to_ascii_lowercase();
-    let start = lower.find("<title>")? + "<title>".len();
-    let end = lower[start..].find("</title>")? + start;
-    let title = String::from_utf8_lossy(&buf[start..end])
-        .trim()
-        .to_string();
-    if title.is_empty() { None } else { Some(title) }
+/// A small read-ahead buffer keeps tag boundaries intact even when they cross
+/// a read boundary. Only the title text itself is accumulated.
+struct HtmlBytes<R: Read> {
+    reader: R,
+    buf: [u8; 8192],
+    pos: usize,
+    len: usize,
+    unread: Vec<u8>,
+}
+
+impl<R: Read> HtmlBytes<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buf: [0; 8192],
+            pos: 0,
+            len: 0,
+            unread: Vec::new(),
+        }
+    }
+
+    fn next(&mut self) -> Option<u8> {
+        if let Some(byte) = self.unread.pop() {
+            return Some(byte);
+        }
+        if self.pos == self.len {
+            self.len = self.reader.read(&mut self.buf).ok()?;
+            self.pos = 0;
+            if self.len == 0 {
+                return None;
+            }
+        }
+        let byte = self.buf[self.pos];
+        self.pos += 1;
+        Some(byte)
+    }
+
+    fn put_back(&mut self, bytes: &[u8]) {
+        self.unread.extend(bytes.iter().rev());
+    }
+
+    /// Skip to the end of a tag, including `>` inside quoted attributes.
+    fn skip_tag(&mut self) -> bool {
+        let mut quote = None;
+        while let Some(byte) = self.next() {
+            match quote {
+                Some(q) if byte == q => quote = None,
+                None if byte == b'\'' || byte == b'"' => quote = Some(byte),
+                None if byte == b'>' => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn skip_comment(&mut self) {
+        let (mut prev2, mut prev1) = (0, 0);
+        while let Some(byte) = self.next() {
+            if (prev2, prev1, byte) == (b'-', b'-', b'>') {
+                break;
+            }
+            (prev2, prev1) = (prev1, byte);
+        }
+    }
+
+    /// Called after `<`. Rewind a failed match so a later `<` is still seen.
+    fn closing_tag(&mut self, name: &[u8]) -> bool {
+        let mut consumed = Vec::with_capacity(name.len() + 2);
+        for expected in std::iter::once(b'/').chain(name.iter().copied()) {
+            let Some(byte) = self.next() else {
+                self.put_back(&consumed);
+                return false;
+            };
+            consumed.push(byte);
+            if !byte.eq_ignore_ascii_case(&expected) {
+                self.put_back(&consumed);
+                return false;
+            }
+        }
+        loop {
+            let Some(byte) = self.next() else {
+                self.put_back(&consumed);
+                return false;
+            };
+            consumed.push(byte);
+            if byte == b'>' {
+                return true;
+            }
+            if !byte.is_ascii_whitespace() {
+                self.put_back(&consumed);
+                return false;
+            }
+        }
+    }
+
+    fn skip_raw_text(&mut self, name: &[u8]) {
+        while let Some(byte) = self.next() {
+            if byte == b'<' && self.closing_tag(name) {
+                break;
+            }
+        }
+    }
+
+    fn title_text(&mut self) -> Option<String> {
+        let mut text = Vec::new();
+        while let Some(byte) = self.next() {
+            if byte == b'<' {
+                if self.closing_tag(b"title") {
+                    let title = String::from_utf8_lossy(&text).trim().to_string();
+                    return if title.is_empty() { None } else { Some(title) };
+                }
+            }
+            text.push(byte);
+        }
+        None
+    }
+}
+
+fn extract_html_title_from_reader(reader: impl Read) -> Option<String> {
+    let mut html = HtmlBytes::new(reader);
+    while let Some(byte) = html.next() {
+        if byte != b'<' {
+            continue;
+        }
+        let Some(first) = html.next() else { break };
+        if first == b'!' {
+            let second = html.next();
+            let third = html.next();
+            if second == Some(b'-') && third == Some(b'-') {
+                html.skip_comment();
+            } else {
+                if let Some(third) = third {
+                    html.put_back(&[third]);
+                }
+                if let Some(second) = second {
+                    html.put_back(&[second]);
+                }
+                html.skip_tag();
+            }
+            continue;
+        }
+        if !first.is_ascii_alphabetic() {
+            if first == b'/' || first == b'?' {
+                html.skip_tag();
+            } else {
+                html.put_back(&[first]);
+            }
+            continue;
+        }
+
+        let mut name = vec![first.to_ascii_lowercase()];
+        while let Some(next) = html.next() {
+            if next.is_ascii_alphanumeric() || next == b'-' || next == b':' {
+                if name.len() < 32 {
+                    name.push(next.to_ascii_lowercase());
+                }
+            } else {
+                html.put_back(&[next]);
+                break;
+            }
+        }
+        if !html.skip_tag() {
+            break;
+        }
+        match name.as_slice() {
+            b"title" => return html.title_text(),
+            b"script" | b"style" => html.skip_raw_text(&name),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Extracts the favicon embedded in a single-file HTML archive.
@@ -1113,13 +1265,65 @@ mod tests {
     #[test]
     fn extract_html_title_after_100kb_preamble() {
         // Freedium / SingleFile pages can embed large CSS blocks before <title>.
-        // Verify take().read_to_end() reads the full 256 KiB window.
         let mut f = NamedTempFile::new().unwrap();
         let padding = " ".repeat(100 * 1024); // 100 KiB of whitespace
-        write!(f, "{}<html><head><title>Deep Title</title></head></html>", padding).unwrap();
+        write!(
+            f,
+            "{}<html><head><title>Deep Title</title></head></html>",
+            padding
+        )
+        .unwrap();
+        assert_eq!(extract_html_title(f.path()), Some("Deep Title".to_string()));
+    }
+
+    #[test]
+    fn extract_html_title_after_large_style_with_attributes() {
+        let mut f = NamedTempFile::new().unwrap();
+        let style = "x".repeat(300 * 1024);
+        write!(f, "<html><head><style>{style}</style><TiTlE class=\"sf-hidden\">The Map Is Not The Territory — LessWrong</tItLe></head></html>").unwrap();
         assert_eq!(
             extract_html_title(f.path()),
-            Some("Deep Title".to_string())
+            Some("The Map Is Not The Territory — LessWrong".to_string())
+        );
+        let html = std::fs::read_to_string(f.path()).unwrap();
+        assert_eq!(
+            extract_html_title_str(&html),
+            Some("The Map Is Not The Territory — LessWrong".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_html_title_ignores_comments_scripts_and_styles() {
+        let html = "<head><!-- <title>Comment</title> -->\
+                    <script>const fake = '<title>Script</title>';</script>\
+                    <style>/* <title>Style</title> */</style>\
+                    <title data-label='a > b'>Real Title</title></head>";
+        assert_eq!(extract_html_title_str(html), Some("Real Title".to_string()));
+    }
+
+    #[test]
+    fn extract_html_title_handles_short_reads_and_split_tags() {
+        struct ShortReads<'a>(&'a [u8]);
+        impl Read for ShortReads<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let len = self.0.len().min(buf.len()).min(2);
+                buf[..len].copy_from_slice(&self.0[..len]);
+                self.0 = &self.0[len..];
+                Ok(len)
+            }
+        }
+        let html = b"<HEAD><TITLE class='hidden'>Split Title</TITLE></HEAD>";
+        assert_eq!(
+            extract_html_title_from_reader(ShortReads(html)),
+            Some("Split Title".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_html_title_blank_attributed_tag_returns_none() {
+        assert_eq!(
+            extract_html_title_str("<title class='hidden'>  </title>"),
+            None
         );
     }
 
