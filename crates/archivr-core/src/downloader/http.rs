@@ -12,7 +12,8 @@ pub enum UrlKind {
 }
 
 /// Probes `url` with a HEAD request and inspects the `Content-Type` header.
-/// Falls back to a GET request (body not read) if the server returns 405.
+/// Falls back to a GET request (body not read) if the server returns 405 or
+/// omits the header on HEAD. Some sites provide a type only for GET.
 ///
 /// Returns `Err` if the probe fails (network error, non-2xx/405 status).
 /// Redirects (3xx) are followed automatically by reqwest; only the final
@@ -35,40 +36,42 @@ pub fn probe_url_kind(url: &str, cookies: &HashMap<String, String>) -> Result<Ur
         req.send().with_context(|| format!("failed to probe {url}"))?
     };
 
-    if head.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
-        // Server rejected HEAD — do a GET but only inspect headers.
-        let get = {
-            let mut req = client.get(url);
-            if !cookie_header.is_empty() {
-                req = req.header(reqwest::header::COOKIE, &cookie_header);
-            }
-            req.send().with_context(|| format!("failed to probe {url}"))?
-        };
-        if !get.status().is_success() {
-            bail!("HTTP {} probing {url}", get.status());
-        }
-        let ct = get
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        return Ok(if content_type_is_html(ct) {
+    if head.status() != reqwest::StatusCode::METHOD_NOT_ALLOWED && !head.status().is_success() {
+        bail!("HTTP {} probing {url}", head.status());
+    }
+
+    let head_content_type = head
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if head.status().is_success() && !head_content_type.trim().is_empty() {
+        return Ok(if content_type_is_html(head_content_type) {
             UrlKind::Html
         } else {
             UrlKind::File
         });
     }
 
-    if !head.status().is_success() {
-        bail!("HTTP {} probing {url}", head.status());
+    // HEAD without a Content-Type is ambiguous: LessWrong, for example,
+    // returns no type for HEAD and text/html for GET. Inspect GET headers
+    // before choosing the raw-file downloader.
+    let get = {
+        let mut req = client.get(url);
+        if !cookie_header.is_empty() {
+            req = req.header(reqwest::header::COOKIE, &cookie_header);
+        }
+        req.send().with_context(|| format!("failed to probe {url}"))?
+    };
+    if !get.status().is_success() {
+        bail!("HTTP {} probing {url}", get.status());
     }
-
-    let ct = head
+    let get_content_type = get
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    Ok(if content_type_is_html(ct) {
+    Ok(if content_type_is_html(get_content_type) {
         UrlKind::Html
     } else {
         UrlKind::File
@@ -412,5 +415,54 @@ mod tests {
             msg.contains("probe") || msg.contains("connect") || msg.contains("refused"),
             "unexpected error message: {msg}"
         );
+    }
+
+    #[test]
+    fn probe_uses_get_type_when_head_omits_it() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            for (method, content_type) in [
+                ("HEAD", ""),
+                ("GET", "Content-Type: text/html; charset=utf-8\r\n"),
+            ] {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(e) => panic!("expected {method} request: {e}"),
+                    }
+                };
+                let mut request_line = String::new();
+                BufReader::new(&stream).read_line(&mut request_line).unwrap();
+                assert!(
+                    request_line.starts_with(method),
+                    "unexpected request: {request_line}"
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\n{content_type}Content-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            }
+        });
+
+        let kind = probe_url_kind(
+            &format!("http://{addr}/w/the-map-is-not-the-territory"),
+            &HashMap::new(),
+        );
+        server.join().unwrap();
+        assert_eq!(kind.unwrap(), UrlKind::Html);
     }
 }
