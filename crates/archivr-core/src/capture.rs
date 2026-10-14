@@ -1277,10 +1277,11 @@ pub fn perform_capture(
 
     // For generic http/https URLs, probe Content-Type to decide whether to
     // treat the URL as a raw file download or an HTML page for SingleFile.
+    let mut probed_file_response = None;
     if source == Source::Url {
-        match downloader::http::probe_url_kind(locator, &cookies) {
-            Ok(downloader::http::UrlKind::Html) => source = Source::WebPage,
-            Ok(downloader::http::UrlKind::File) => {}
+        match downloader::http::probe_url(locator, &cookies) {
+            Ok(probe) if probe.kind == downloader::http::UrlKind::Html => source = Source::WebPage,
+            Ok(probe) => probed_file_response = probe.file_response,
             Err(e) => {
                 // Probe failed (e.g. Cloudflare JS challenge, 403, network
                 // issue). Fall back to treating the URL as an HTML page so
@@ -1651,7 +1652,12 @@ pub fn perform_capture(
 
     // Source: generic HTTP/S file URL
     if source == Source::Url {
-        match downloader::http::download(locator, store_path, &timestamp, &cookies) {
+        let download = if let Some(response) = probed_file_response {
+            downloader::http::download_response(response, locator, store_path, &timestamp)
+        } else {
+            downloader::http::download(locator, store_path, &timestamp, &cookies)
+        };
+        match download {
             Ok((hash, file_extension, title_hint)) => {
                 let temp_file = store_path
                     .join("temp")

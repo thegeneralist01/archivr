@@ -5,10 +5,17 @@ use crate::downloader::cookies::cookies_to_header;
 use crate::hash::hash_file;
 
 /// Whether a URL resolves to an HTML document or a downloadable file.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UrlKind {
     Html,
     File,
+}
+
+/// A GET used to classify a file can also supply its body to the downloader.
+/// Keeping that response matters for URLs that allow only one GET.
+pub(crate) struct UrlProbe {
+    pub kind: UrlKind,
+    pub file_response: Option<reqwest::blocking::Response>,
 }
 
 /// Probes `url` with a HEAD request and inspects the `Content-Type` header.
@@ -19,6 +26,10 @@ pub enum UrlKind {
 /// Redirects (3xx) are followed automatically by reqwest; only the final
 /// response status is checked.
 pub fn probe_url_kind(url: &str, cookies: &HashMap<String, String>) -> Result<UrlKind> {
+    Ok(probe_url(url, cookies)?.kind)
+}
+
+pub(crate) fn probe_url(url: &str, cookies: &HashMap<String, String>) -> Result<UrlProbe> {
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
         .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 archivr/0.1")
@@ -46,10 +57,13 @@ pub fn probe_url_kind(url: &str, cookies: &HashMap<String, String>) -> Result<Ur
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if head.status().is_success() && !head_content_type.trim().is_empty() {
-        return Ok(if content_type_is_html(head_content_type) {
-            UrlKind::Html
-        } else {
-            UrlKind::File
+        return Ok(UrlProbe {
+            kind: if content_type_is_html(head_content_type) {
+                UrlKind::Html
+            } else {
+                UrlKind::File
+            },
+            file_response: None,
         });
     }
 
@@ -72,9 +86,15 @@ pub fn probe_url_kind(url: &str, cookies: &HashMap<String, String>) -> Result<Ur
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     Ok(if content_type_is_html(get_content_type) {
-        UrlKind::Html
+        UrlProbe {
+            kind: UrlKind::Html,
+            file_response: None,
+        }
     } else {
-        UrlKind::File
+        UrlProbe {
+            kind: UrlKind::File,
+            file_response: Some(get),
+        }
     })
 }
 
@@ -102,6 +122,15 @@ pub fn download(url: &str, store_path: &Path, timestamp: &str, cookies: &HashMap
         req.send().with_context(|| format!("failed to fetch {url}"))?
     };
 
+    download_response(response, url, store_path, timestamp)
+}
+
+pub(crate) fn download_response(
+    response: reqwest::blocking::Response,
+    url: &str,
+    store_path: &Path,
+    timestamp: &str,
+) -> Result<(String, String, Option<String>)> {
     if !response.status().is_success() {
         bail!("HTTP {} fetching {url}", response.status());
     }
@@ -464,5 +493,66 @@ mod tests {
         );
         server.join().unwrap();
         assert_eq!(kind.unwrap(), UrlKind::Html);
+    }
+
+    #[test]
+    fn capture_reuses_probe_get_for_single_use_file() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let get_count = Arc::new(AtomicUsize::new(0));
+        let server_stop = Arc::clone(&stop);
+        let server_get_count = Arc::clone(&get_count);
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !server_stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                };
+                let mut request_line = String::new();
+                BufReader::new(&stream).read_line(&mut request_line).unwrap();
+                if request_line.starts_with("HEAD ") {
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                } else if request_line.starts_with("GET ") {
+                    if server_get_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Length: 9\r\nConnection: close\r\n\r\n%PDF-1.7\n").unwrap();
+                    } else {
+                        write!(stream, "HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    }
+                } else {
+                    panic!("unexpected request: {request_line}");
+                }
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = crate::archive::initialize_archive(
+            temp.path(),
+            &temp.path().join("store"),
+            "single-use-file",
+            false,
+        ).unwrap();
+        let result = crate::capture::perform_capture(
+            &paths,
+            &format!("http://{addr}/one-time.pdf"),
+            None,
+            None,
+            &crate::capture::CaptureConfig::default(),
+        );
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert_eq!(result.unwrap().status, "completed");
+        assert_eq!(get_count.load(Ordering::SeqCst), 1);
     }
 }
