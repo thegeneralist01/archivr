@@ -76,6 +76,7 @@ export function BrowserDataSection({
   setBrowserData,
   effectiveUseCookies,
   includeStorage,
+  storageApplicable,
   setIncludeStorage,
   browserDataError,
 }) {
@@ -131,12 +132,17 @@ export function BrowserDataSection({
       <label className="capture-ext-row" style={{ marginTop: 8 }}>
         <span className="capture-ext-label">
           <span className="capture-ext-name">Include localStorage</span>
-          <span className="capture-ext-desc">Seed this site&apos;s localStorage in the archiving browser (page captures only)</span>
+          <span className="capture-ext-desc">
+            {storageApplicable
+              ? 'Seed this site\'s localStorage in the archiving browser (page captures only)'
+              : 'Available only for URLs on this page\'s exact origin (scheme, host, and port)'}
+          </span>
         </span>
         <button
           type="button"
           role="switch"
           aria-checked={includeStorage}
+          disabled={!storageApplicable}
           className={`ext-toggle ext-toggle--sm${includeStorage ? ' ext-toggle--on' : ''}`}
           onClick={() => setIncludeStorage(v => !v)}
           aria-label="Toggle localStorage for this capture"

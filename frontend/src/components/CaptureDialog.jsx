@@ -363,6 +363,8 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   const [browserData, setBrowserData] = useState({
     status: 'idle', cookieAccess: null, cookieRows: [], storageRows: [],
   })
+  const cookieAccessRef = useRef(browserData.cookieAccess)
+  cookieAccessRef.current = browserData.cookieAccess
   const [useCookies, setUseCookies] = useState(browserSession?.defaults?.cookies ?? false)
   const [includeStorage, setIncludeStorage] = useState(browserSession?.defaults?.localStorage ?? false)
 
@@ -390,7 +392,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     load()
     // Re-check when tab regains focus (user may have granted access in the settings tab)
     function onVisibility() {
-      if (document.visibilityState === 'visible' && browserData.cookieAccess === 'missing') {
+      if (document.visibilityState === 'visible' && cookieAccessRef.current === 'missing') {
         load()
       }
     }
@@ -619,7 +621,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
 
   function handleArchive() {
     if (!archiveIdRef.current) return
-    if (browserDataError) return
+    if (browserDataError || browserDataLoading) return
     // Guard against the Enter-key shortcut in CaptureRow bypassing the
     // disabled button — uploads must be complete before archiving starts.
     if (items.some(it => it.kind === 'file' && it.uploadStatus === 'uploading')) return
@@ -641,10 +643,6 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
     if (batchId) {
       batchRef.current.set(batchId, { total: toSubmit.length, archived: 0, warnings: 0, failed: 0, failedLocators: [], warningLocators: [] })
     }
-    // Build browser session payload before state changes (snapshot current state).
-    const sessionPayload = browserApplicable
-      ? buildBrowserSessionPayload({ pageUrl: browserSession.pageUrl, useCookies: effectiveUseCookies, includeStorage, cookieRows: browserData.cookieRows, storageRows: browserData.storageRows })
-      : null
     // Capture all submission data before any state changes
     const submissions = toSubmit.map(it => {
       if (it.kind === 'file') {
@@ -654,9 +652,17 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
         return { type: 'text', title: it.title.trim(), body: it.body, mime: it.mime }
       }
       const locator = it.locator.trim()
-      const browserSessionExt = (sessionPayload && browserSession?.appliesTo(locator))
-        ? { browser_session: sessionPayload }
-        : {}
+      // Cookies are host-scoped; localStorage is scoped to the exact origin.
+      const sessionPayload = browserSession?.appliesTo(locator)
+        ? buildBrowserSessionPayload({
+            pageUrl: browserSession.pageUrl,
+            useCookies: effectiveUseCookies,
+            includeStorage: effectiveIncludeStorage && !!browserSession.storageAppliesTo?.(locator),
+            cookieRows: browserData.cookieRows,
+            storageRows: browserData.storageRows,
+          })
+        : null
+      const browserSessionExt = sessionPayload ? { browser_session: sessionPayload } : {}
       return {
         type: 'url',
         locator,
@@ -922,10 +928,15 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
   const browserApplicable = !!browserSession && items.some(
     it => it.kind !== 'text' && it.kind !== 'file' && it.locator.trim() && browserSession.appliesTo(it.locator.trim())
   )
+  const storageApplicable = !!browserSession && items.some(
+    it => it.kind !== 'text' && it.kind !== 'file' && it.locator.trim() && browserSession.storageAppliesTo?.(it.locator.trim())
+  )
+  const effectiveIncludeStorage = includeStorage && storageApplicable
   const effectiveUseCookies = useCookies && browserData.cookieAccess === 'granted'
   const browserDataError = browserApplicable
-    ? validateBrowserData({ useCookies: effectiveUseCookies, includeStorage, cookieRows: browserData.cookieRows, storageRows: browserData.storageRows })
+    ? validateBrowserData({ useCookies: effectiveUseCookies, includeStorage: effectiveIncludeStorage, cookieRows: browserData.cookieRows, storageRows: browserData.storageRows })
     : null
+  const browserDataLoading = browserApplicable && (browserData.status === 'idle' || browserData.status === 'loading')
 
   return (
     <dialog
@@ -1161,7 +1172,8 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
                   browserData={browserData}
                   setBrowserData={setBrowserData}
                   effectiveUseCookies={effectiveUseCookies}
-                  includeStorage={includeStorage}
+                  includeStorage={effectiveIncludeStorage}
+                  storageApplicable={storageApplicable}
                   setIncludeStorage={setIncludeStorage}
                   browserDataError={browserDataError}
                 />
@@ -1176,7 +1188,7 @@ export default function CaptureDialog({ open, archiveId, onClose, onCaptured, on
             type="button"
             className="capture-submit"
             onClick={handleArchive}
-            disabled={!archiveId || pendingCount === 0 || anyConflict || anyProbing || anyEmptyPlaylist || anyUploading || !!browserDataError}
+            disabled={!archiveId || pendingCount === 0 || anyConflict || anyProbing || anyEmptyPlaylist || anyUploading || browserDataLoading || !!browserDataError}
           >
             {pendingCount > 1 ? `Archive ${pendingCount}` : 'Archive'}
           </button>

@@ -1747,6 +1747,11 @@ async fn capture_handler(
                 "browser_session.url must be on the same site as the locator",
             ));
         }
+        if !session.local_storage.is_empty() && !session.storage_applies_to(body.locator.trim()) {
+            return Err(ApiError::bad_request(
+                "browser_session.local_storage requires the same origin as the locator",
+            ));
+        }
     }
     // per_item_quality semantics (enforced in capture.rs):
     // - Absent or empty map: all playlist items are downloaded; quality is the
@@ -6495,6 +6500,41 @@ mod tests {
                 .is_some_and(|e| e.contains("same site")),
             "expected same-site error, got: {json}"
         );
+    }
+
+    #[tokio::test]
+    async fn capture_browser_session_storage_requires_same_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session_cookie = make_test_session(&auth_path);
+        let body = serde_json::json!({
+            "locator": "https://example.com:8443/a",
+            "browser_session": {
+                "url": "https://example.com/a",
+                "cookies": { "session": "abc" },
+                "local_storage": { "pref": "dark" }
+            }
+        });
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archives/test/captures")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let resp_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+        assert!(json["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("same origin")));
     }
 
     #[tokio::test]

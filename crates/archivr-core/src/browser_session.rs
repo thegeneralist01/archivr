@@ -143,6 +143,19 @@ impl BrowserSession {
         }
     }
 
+    /// localStorage belongs to an exact origin, including scheme and port.
+    /// Media shorthands have no page origin to seed.
+    pub fn storage_applies_to(&self, locator: &str) -> bool {
+        let Ok(session_url) = reqwest::Url::parse(&self.url) else {
+            return false;
+        };
+        let Ok(target_url) = reqwest::Url::parse(locator) else {
+            return false;
+        };
+        matches!(target_url.scheme(), "http" | "https")
+            && session_url.origin() == target_url.origin()
+    }
+
     /// Returns the ASCII-serialized origin of `url`, e.g. `"https://www.example.com"`.
     pub fn storage_origin(&self) -> Option<String> {
         reqwest::Url::parse(&self.url)
@@ -205,6 +218,15 @@ mod tests {
     fn applies_to_same_host() {
         let s = make_session("https://www.example.com/a");
         assert!(s.applies_to("https://www.example.com/b"));
+    }
+
+    #[test]
+    fn storage_requires_the_same_origin_not_just_host() {
+        let s = make_session("https://example.com:8443/a");
+        assert!(s.storage_applies_to("https://example.com:8443/b"));
+        assert!(!s.storage_applies_to("https://example.com/b"));
+        assert!(!s.storage_applies_to("http://example.com:8443/b"));
+        assert!(!s.storage_applies_to("tweet:123456789012345678"));
     }
 
     #[test]

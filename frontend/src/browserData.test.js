@@ -31,6 +31,12 @@ describe('rowsToMap', () => {
     expect(Object.keys(map)).toEqual(['a'])
     expect(map.a).toBe('x')
   })
+
+  test('preserves a localStorage key named __proto__', () => {
+    const map = rowsToMap([{ id: 1, name: '__proto__', value: 'saved', included: true }])
+    expect(Object.keys(map)).toEqual(['__proto__'])
+    expect(map.__proto__).toBe('saved')
+  })
 })
 
 describe('validateBrowserData', () => {

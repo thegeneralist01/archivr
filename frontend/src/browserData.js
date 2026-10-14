@@ -44,13 +44,11 @@ export function toRows(list, keyField) {
  * @returns {Object<string,string>}
  */
 export function rowsToMap(rows) {
-  const map = {}
-  for (const row of rows) {
-    if (row.included && row.name !== '') {
-      map[row.name] = row.value
-    }
-  }
-  return map
+  // Object.fromEntries creates an own property for names such as "__proto__".
+  // Assignment into {} silently drops that valid cookie/localStorage key.
+  return Object.fromEntries(rows
+    .filter(row => row.included && row.name !== '')
+    .map(row => [row.name, row.value]))
 }
 
 /** @param {string} s */

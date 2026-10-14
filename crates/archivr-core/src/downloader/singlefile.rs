@@ -638,23 +638,21 @@ fn save_with(
         .collect();
     let browser_args = format!("[{}]", quoted.join(","));
 
-    // Write cookie file (secrets must never appear in process args).
-    let cookie_file: Option<PathBuf> = if !cookies.is_empty() {
-        let cf = temp_dir.join("cookies.json");
-        let domain = domain_from_url(url);
-        write_json_cookie_file(cookies, &domain, url, &cf)
-            .context("failed to write single-file cookie file")?;
-        Some(cf)
-    } else {
-        None
-    };
-
-    // Write localStorage seed script (secrets must never appear in process args).
-    // It runs as the first --browser-script so localStorage is set before page
-    // scripts execute.
-    let storage_script_file: Option<PathBuf> = match &local_storage {
-        Some(seed) if !seed.items.is_empty() => {
-            let sf = temp_dir.join("sf-local-storage.js");
+    // Construct both secret paths before writing either one. Every fallible
+    // write and the subprocess run stay inside this scope so cleanup also runs
+    // when the second write fails after the first file has been created.
+    let cookie_file = (!cookies.is_empty()).then(|| temp_dir.join("cookies.json"));
+    let storage_script_file = local_storage
+        .as_ref()
+        .filter(|seed| !seed.items.is_empty())
+        .map(|_| temp_dir.join("sf-local-storage.js"));
+    let sf_result = (|| -> Result<std::process::Output> {
+        if let Some(cf) = &cookie_file {
+            let domain = domain_from_url(url);
+            write_json_cookie_file(cookies, &domain, url, cf)
+                .context("failed to write single-file cookie file")?;
+        }
+        if let (Some(sf), Some(seed)) = (&storage_script_file, &local_storage) {
             let script = local_storage_seed_script(seed);
             #[cfg(unix)]
             {
@@ -664,45 +662,42 @@ fn save_with(
                     .create(true)
                     .truncate(true)
                     .mode(0o600)
-                    .open(&sf)
-                    .and_then(|mut f| { use std::io::Write; f.write_all(script.as_bytes()) })
+                    .open(sf)
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        f.write_all(script.as_bytes())
+                    })
                     .context("failed to write localStorage seed script")?;
             }
             #[cfg(not(unix))]
-            std::fs::write(&sf, &script).context("failed to write localStorage seed script")?;
-            Some(sf)
+            std::fs::write(sf, &script).context("failed to write localStorage seed script")?;
         }
-        _ => None,
-    };
 
-    // localStorage seed runs FIRST so it executes before any page scripts.
-    let mut scripts: Vec<&Path> = Vec::new();
-    if let Some(sf) = &storage_script_file {
-        scripts.push(sf.as_path());
+        // localStorage seed runs FIRST so it executes before any page scripts.
+        let mut scripts: Vec<&Path> = Vec::new();
+        if let Some(sf) = &storage_script_file {
+            scripts.push(sf.as_path());
+        }
+        scripts.push(strip_scripts_path.as_path());
+        scripts.extend(extra_browser_scripts.iter().map(|p| p.as_path()));
+        run_single_file_standalone(
+            url,
+            &out_file,
+            single_file,
+            chrome,
+            &browser_args,
+            &scripts,
+            cookie_file.as_deref(),
+        )
+        .with_context(|| format!("failed to spawn single-file ({single_file})"))
+    })();
+    for path in [cookie_file.as_ref(), storage_script_file.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        let _ = std::fs::remove_file(path);
     }
-    scripts.push(strip_scripts_path.as_path());
-    scripts.extend(extra_browser_scripts.iter().map(|p| p.as_path()));
-
-    // Run single-file; always delete secret files afterwards, even on spawn failure.
-    let sf_result = run_single_file_standalone(
-        url,
-        &out_file,
-        single_file,
-        chrome,
-        &browser_args,
-        &scripts,
-        cookie_file.as_deref(),
-    );
-    // Delete cookie file and localStorage seed unconditionally — including on
-    // failure — so secrets are never left in store/temp when the capture fails.
-    if let Some(cf) = &cookie_file {
-        let _ = std::fs::remove_file(cf);
-    }
-    if let Some(sf) = &storage_script_file {
-        let _ = std::fs::remove_file(sf);
-    }
-    let sf_output = sf_result
-        .with_context(|| format!("failed to spawn single-file ({single_file})"))?;
+    let sf_output = sf_result?;
 
     if !sf_output.status.success() {
         let stderr = String::from_utf8_lossy(&sf_output.stderr);
@@ -1186,6 +1181,36 @@ mod tests {
         let storage_path = tmp.path().join("temp/test-ts/sf-local-storage.js");
         assert!(!cookie_path.exists(), "cookies.json was not deleted: {}", cookie_path.display());
         assert!(!storage_path.exists(), "sf-local-storage.js was not deleted: {}", storage_path.display());
+    }
+
+    #[test]
+    fn save_with_storage_write_failure_removes_cookie_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let temp_dir = tmp.path().join("temp/test-ts");
+        std::fs::create_dir_all(temp_dir.join("sf-local-storage.js")).unwrap();
+        let mut cookies = HashMap::new();
+        cookies.insert("session".to_string(), "secret".to_string());
+        let mut items = HashMap::new();
+        items.insert("pref".to_string(), "dark".to_string());
+        let result = save_with(
+            "https://example.com",
+            tmp.path(),
+            "test-ts",
+            "/nonexistent/single-file",
+            "chromium",
+            &cookies,
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some(LocalStorageSeed {
+                origin: "https://example.com",
+                items: &items,
+            }),
+        );
+        assert!(result.unwrap_err().to_string().contains("localStorage seed script"));
+        assert!(!temp_dir.join("cookies.json").exists());
     }
 
     #[test]
