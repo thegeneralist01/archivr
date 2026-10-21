@@ -10,14 +10,105 @@ import argparse
 import json
 import os
 import sys
+sys.dont_write_bytecode = True
 import time
 import urllib.parse
 import urllib.request
 from datetime import datetime
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from twitter.scraper import Scraper
+_last_request_time = 0.0
+
+def _rate_limit(delay: float):
+    global _last_request_time
+    if delay > 0 and _last_request_time > 0:
+        elapsed = time.time() - _last_request_time
+        if elapsed < delay:
+            time.sleep(delay - elapsed)
+    _last_request_time = time.time()
+import httpx
+
+class SimpleTwitterScraper:
+    def __init__(self, cookies: dict):
+        self.cookies = cookies
+        headers = {
+            "authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
+            "referer": "https://twitter.com/",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36",
+            "x-csrf-token": cookies.get("ct0", ""),
+            "x-twitter-active-user": "yes",
+            "x-twitter-auth-type": "OAuth2Session" if cookies.get("auth_token") else "",
+            "x-twitter-client-language": "en",
+        }
+        self.session = httpx.Client(cookies=cookies, headers=headers, follow_redirects=True, timeout=30.0)
+        self._full_scraper = None
+
+    def tweets_details(self, tweet_ids):
+        if self._full_scraper is None:
+            from twitter.scraper import Scraper
+            self._full_scraper = Scraper(cookies=self.cookies, save=False)
+        return self._full_scraper.tweets_details(tweet_ids)
+try:
+    import orjson
+    def dump_json_file(path: str, data: Any):
+        with open(path, "wb") as f:
+            f.write(orjson.dumps(data, option=orjson.OPT_INDENT_2))
+    def parse_json_bytes(content: bytes) -> Any:
+        return orjson.loads(content)
+except ImportError:
+    def dump_json_file(path: str, data: Any):
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+    def parse_json_bytes(content: bytes) -> Any:
+        return json.loads(content.decode("utf-8"))
+DEFAULT_FEATURES_JSON = json.dumps({
+    "rweb_video_screen_enabled": False,
+    "profile_label_improvements_pcf_label_in_post_enabled": True,
+    "responsive_web_profile_redirect_enabled": False,
+    "rweb_tipjar_consumption_enabled": False,
+    "verified_phone_label_enabled": False,
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "premium_content_api_read_enabled": False,
+    "communities_web_enable_tweet_community_results_fetch": True,
+    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+    "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
+    "responsive_web_grok_analyze_post_followups_enabled": True,
+    "responsive_web_jetfuel_frame": True,
+    "responsive_web_grok_share_attachment_enabled": True,
+    "responsive_web_grok_annotations_enabled": True,
+    "articles_preview_enabled": True,
+    "responsive_web_edit_tweet_api_enabled": True,
+    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+    "view_counts_everywhere_api_enabled": True,
+    "longform_notetweets_consumption_enabled": True,
+    "responsive_web_twitter_article_tweet_consumption_enabled": True,
+    "content_disclosure_indicator_enabled": True,
+    "content_disclosure_ai_generated_indicator_enabled": True,
+    "responsive_web_grok_show_grok_translated_post": False,
+    "responsive_web_grok_analysis_button_from_backend": True,
+    "post_ctas_fetch_enabled": True,
+    "freedom_of_speech_not_reach_fetch_enabled": True,
+    "standardized_nudges_misinfo": True,
+    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+    "longform_notetweets_rich_text_read_enabled": True,
+    "longform_notetweets_inline_media_enabled": False,
+    "responsive_web_grok_image_annotation_enabled": True,
+    "responsive_web_grok_imagine_annotation_enabled": True,
+    "responsive_web_grok_community_note_auto_translation_is_enabled": False,
+    "responsive_web_enhance_cards_enabled": False,
+})
+
+DEFAULT_FIELD_TOGGLES_JSON = json.dumps({
+    "withArticleRichContentState": True,
+    "withArticlePlainText": True,
+    "withArticleSummaryText": True,
+    "withArticleVoiceOver": True,
+    "withGrokAnalyze": False,
+    "withDisallowedReplyControls": False,
+})
 
 
 def print_json(data):
@@ -165,127 +256,111 @@ def parse_tweet_ids_from_file(file_path: str) -> List[str]:
     return tweet_ids
 
 
-def extract_tweet_from_response(response_data: Any, tweet_id: str) -> Optional[Dict]:
+def extract_all_tweets_from_response(response_data: Any) -> Dict[str, Dict]:
     """
-    Extract tweet data from API response.
-
-    Args:
-        response_data: Response data from scraper
-        tweet_id: The tweet ID we're looking for
-
-    Returns:
-        Tweet data dictionary or None if not found
+    Extract all tweet results present anywhere in an API response.
+    Maps str(tweet_id) -> tweet_result dictionary.
     """
+    tweets: Dict[str, Dict] = {}
     try:
-        # Handle list response
         if isinstance(response_data, list):
             if len(response_data) == 0:
-                return None
+                return tweets
             data = response_data[0]
         elif isinstance(response_data, dict):
             data = response_data
         else:
-            return None
+            return tweets
 
-        # Navigate through the nested structure
-        # Try different possible paths
-        tweet_result = None
+        def add_result(res):
+            if not isinstance(res, dict):
+                return
+            if res.get("__typename") == "TweetWithVisibilityResults" and "tweet" in res:
+                res = res["tweet"]
+            rest_id = res.get("rest_id") or res.get("legacy", {}).get("id_str")
+            if rest_id and (res.get("__typename") == "Tweet" or "legacy" in res):
+                tweets[str(rest_id)] = res
 
-        # Path 1: TweetDetail GraphQL response structure
-        # Check for threaded_conversation_with_injections_v2 structure
-        if "data" in data:
-            threaded_conversation = data.get("data", {}).get(
-                "threaded_conversation_with_injections_v2", {}
-            )
-            instructions = threaded_conversation.get("instructions", [])
+        # Path 1: Threaded conversation
+        tc = data.get("data", {}).get("threaded_conversation_with_injections_v2", {})
+        for instruction in tc.get("instructions", []):
+            if instruction.get("type") == "TimelineAddEntries":
+                for entry in instruction.get("entries", []):
+                    content = entry.get("content", {})
+                    entry_type = content.get("entryType")
+                    if entry_type == "TimelineTimelineItem":
+                        res = content.get("itemContent", {}).get("tweet_results", {}).get("result", {})
+                        add_result(res)
+                    elif entry_type == "TimelineTimelineModule":
+                        for item in content.get("items", []):
+                            res = item.get("item", {}).get("itemContent", {}).get("tweet_results", {}).get("result", {})
+                            add_result(res)
 
-            for instruction in instructions:
-                if instruction.get("type") == "TimelineAddEntries":
-                    entries = instruction.get("entries", [])
-                    for entry in entries:
-                        content = entry.get("content", {})
-                        if content.get("entryType") == "TimelineTimelineItem":
-                            item_content = content.get("itemContent", {})
-                            if item_content.get("itemType") == "TimelineTweet":
-                                result = item_content.get("tweet_results", {}).get(
-                                    "result", {}
-                                )
-                                if result.get("rest_id") == tweet_id:
-                                    tweet_result = result
-                                    break
-                        if tweet_result:
-                            break
-                    if tweet_result:
-                        break
+        # Path 2: User timeline
+        timeline = data.get("data", {}).get("user", {}).get("result", {}).get("timeline_v2", {}).get("timeline", {})
+        for instruction in timeline.get("instructions", []):
+            if instruction.get("type") == "TimelineAddEntries":
+                for entry in instruction.get("entries", []):
+                    content = entry.get("content", {})
+                    entry_type = content.get("entryType")
+                    if entry_type == "TimelineTimelineItem":
+                        res = content.get("itemContent", {}).get("tweet_results", {}).get("result", {})
+                        add_result(res)
+                    elif entry_type == "TimelineTimelineModule":
+                        for item in content.get("items", []):
+                            res = item.get("item", {}).get("itemContent", {}).get("tweet_results", {}).get("result", {})
+                            add_result(res)
 
-        # Path 2: Timeline structure (for user tweets)
-        if not tweet_result and "data" in data:
-            timeline = (
-                data.get("data", {})
-                .get("user", {})
-                .get("result", {})
-                .get("timeline_v2", {})
-                .get("timeline", {})
-            )
-            instructions = timeline.get("instructions", [])
-
-            for instruction in instructions:
-                if instruction.get("type") == "TimelineAddEntries":
-                    entries = instruction.get("entries", [])
-                    for entry in entries:
-                        content = entry.get("content", {})
-                        if content.get("entryType") == "TimelineTimelineItem":
-                            item_content = content.get("itemContent", {})
-                            if item_content.get("itemType") == "TimelineTweet":
-                                result = item_content.get("tweet_results", {}).get(
-                                    "result", {}
-                                )
-                                if result.get("rest_id") == tweet_id:
-                                    tweet_result = result
-                                    break
-                        if tweet_result:
-                            break
-                    if tweet_result:
-                        break
-
-        # Path 3: Direct tweet lookup (recursive search)
-        if not tweet_result:
-
-            def find_tweet_recursive(obj, target_id):
+        # Path 3: Recursive scan fallback if none extracted yet
+        if not tweets:
+            def find_all_recursive(obj):
                 if isinstance(obj, dict):
-                    # Check if this is a tweet result with matching ID
-                    if (
-                        obj.get("rest_id") == target_id
-                        and obj.get("__typename") == "Tweet"
-                    ):
-                        return obj
-                    # Also check legacy.id_str for older format
-                    legacy = obj.get("legacy", {})
-                    if legacy and legacy.get("id_str") == target_id:
-                        return obj
-                    # Recursively search
-                    for value in obj.values():
-                        result = find_tweet_recursive(value, target_id)
-                        if result:
-                            return result
+                    if obj.get("__typename") == "Tweet" and ("rest_id" in obj or "legacy" in obj):
+                        add_result(obj)
+                    for v in obj.values():
+                        find_all_recursive(v)
                 elif isinstance(obj, list):
                     for item in obj:
-                        result = find_tweet_recursive(item, target_id)
-                        if result:
-                            return result
-                return None
-
-            tweet_result = find_tweet_recursive(data, tweet_id)
-
-        return tweet_result
+                        find_all_recursive(item)
+            find_all_recursive(data)
 
     except Exception as e:
-        print(f"  ⚠ Warning: Error extracting tweet {tweet_id}: {e}")
-        import traceback
+        print(f"  ⚠ Warning: Error extracting tweets from response: {e}")
 
-        traceback.print_exc()
+    return tweets
+
+
+def extract_tweet_from_response(response_data: Any, tweet_id: str) -> Optional[Dict]:
+    """
+    Extract tweet data from API response for a specific tweet ID.
+    """
+    tweets = extract_all_tweets_from_response(response_data)
+    if tweet_id in tweets:
+        return tweets[tweet_id]
+
+    # Deep fallback search if exact structure match didn't find it
+    try:
+        data = response_data[0] if isinstance(response_data, list) and response_data else response_data
+        def find_tweet_recursive(obj, target_id):
+            if isinstance(obj, dict):
+                if obj.get("rest_id") == target_id and obj.get("__typename") == "Tweet":
+                    return obj
+                legacy = obj.get("legacy", {})
+                if legacy and legacy.get("id_str") == target_id:
+                    return obj
+                for value in obj.values():
+                    result = find_tweet_recursive(value, target_id)
+                    if result:
+                        return result
+            elif isinstance(obj, list):
+                for item in obj:
+                    result = find_tweet_recursive(item, target_id)
+                    if result:
+                        return result
+            return None
+        return find_tweet_recursive(data, tweet_id)
+    except Exception:
         return None
-
 
 from typing import Any, Dict, List, Optional
 
@@ -630,20 +705,27 @@ def extract_tweet_data(
     return tweet_data
 
 
-def download_file(url: str, output_path: str, retry_count: int = 0) -> bool:
+def download_file(
+    url: str, output_path: str, retry_count: int = 0, session: Optional[Any] = None
+) -> bool:
     """
-    Download a file from URL to output path.
-
-    Args:
-        url: URL to download from
-        output_path: Path to save the file
-        retry_count: Number of retries attempted
-
-    Returns:
-        True if successful, False otherwise
+    Download a file from URL to output path, reusing session keep-alive connections when available.
     """
     try:
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return True
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        mock_server = os.environ.get("ARCHIVR_TWITTER_MOCK_SERVER")
+        if mock_server and ("twimg.com" in url or "twitter.com" in url or "x.com" in url):
+            parsed_u = urllib.parse.urlparse(url)
+            url = f"{mock_server}{parsed_u.path}"
+
+        if session is not None and hasattr(session, "get"):
+            resp = session.get(url, timeout=30)
+            if resp.status_code == 200:
+                with open(output_path, "wb") as f:
+                    f.write(resp.content)
+                return True
 
         # Create request with user agent
         req = urllib.request.Request(url)
@@ -658,13 +740,15 @@ def download_file(url: str, output_path: str, retry_count: int = 0) -> bool:
         return True
     except Exception as e:
         if retry_count < 2:
-            time.sleep(2)
-            return download_file(url, output_path, retry_count + 1)
+            time.sleep(1)
+            return download_file(url, output_path, retry_count + 1, session=session)
         print(f"  ⚠ Warning: Failed to download {url}: {e}")
         return False
 
 
-def download_tweet_media(tweet_data: Dict, tweet_id: str, media_dir: str) -> List[str]:
+def download_tweet_media(
+    tweet_data: Dict, tweet_id: str, media_dir: str, session: Optional[Any] = None
+) -> List[str]:
     """
     Download media files for a tweet.
 
@@ -684,6 +768,7 @@ def download_tweet_media(tweet_data: Dict, tweet_id: str, media_dir: str) -> Lis
 
     tweet_media_dir = os.path.join(media_dir, tweet_id)
 
+    tasks = []
     for idx, media_item in enumerate(media_list):
         media_url = media_item.get("media_url_https") or media_item.get("media_url")
         if not media_url:
@@ -713,19 +798,33 @@ def download_tweet_media(tweet_data: Dict, tweet_id: str, media_dir: str) -> Lis
 
         filename = f"media_{idx + 1}.{ext}"
         output_path = os.path.join(tweet_media_dir, filename)
+        tasks.append((media_url, output_path, media_item))
 
-        if download_file(media_url, output_path):
+    if len(tasks) == 1:
+        media_url, output_path, media_item = tasks[0]
+        if download_file(media_url, output_path, session=session):
             media_paths.append(output_path)
-            # Update tweet data with local path
             media_item["local_path"] = os.path.relpath(
                 output_path, os.path.dirname(media_dir)
             )
+    elif len(tasks) > 1:
+        def _fetch_media(task):
+            m_url, out_p, m_item = task
+            ok = download_file(m_url, out_p, session=session)
+            return (ok, out_p, m_item)
 
+        with ThreadPoolExecutor(max_workers=min(4, len(tasks))) as pool:
+            for ok, out_p, m_item in pool.map(_fetch_media, tasks):
+                if ok:
+                    media_paths.append(out_p)
+                    m_item["local_path"] = os.path.relpath(
+                        out_p, os.path.dirname(media_dir)
+                    )
     return media_paths
 
 
 def download_article_media(
-    article_data: Dict, tweet_id: str, media_dir: str, output_dir: str
+    article_data: Dict, tweet_id: str, media_dir: str, output_dir: str, session: Optional[Any] = None
 ) -> None:
     """
     Download images embedded in an article: the cover image and any inline
@@ -755,7 +854,7 @@ def download_article_media(
     if cover_url and not cover.get("local_path"):
         ext = _ext_from_url(cover_url)
         output_path = os.path.join(article_media_dir, f"cover.{ext}")
-        if download_file(cover_url, output_path):
+        if download_file(cover_url, output_path, session=session):
             cover["local_path"] = os.path.relpath(output_path, rel_base)
 
     # --- Inline block images ---
@@ -770,11 +869,13 @@ def download_article_media(
             ext = _ext_from_url(url)
             filename = f"article_{media_id}.{ext}" if media_id else f"article_img.{ext}"
             output_path = os.path.join(article_media_dir, filename)
-            if download_file(url, output_path):
+            if download_file(url, output_path, session=session):
                 entity["local_path"] = os.path.relpath(output_path, rel_base)
 
 
-def download_avatar(avatar_url: str, author_id: str, avatars_dir: str) -> Optional[str]:
+def download_avatar(
+    avatar_url: str, author_id: str, avatars_dir: str, session: Optional[Any] = None
+) -> Optional[str]:
     """
     Download avatar image for an author.
 
@@ -801,21 +902,23 @@ def download_avatar(avatar_url: str, author_id: str, avatars_dir: str) -> Option
 
     filename = f"{author_id}.{ext}"
     output_path = os.path.join(avatars_dir, filename)
-
-    # Try high quality first, fallback to normal
-    if download_file(avatar_url_hq, output_path):
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
         return output_path
-    elif download_file(avatar_url, output_path):
+    # Try high quality first, fallback to normal
+    if download_file(avatar_url_hq, output_path, session=session):
+        return output_path
+    elif download_file(avatar_url, output_path, session=session):
         return output_path
 
     return None
 
 
 def fetch_tweet_by_id(
-    scraper: Scraper,
+    scraper: Any,
     tweet_id: str,
     retry_count: int = 0,
     delay_between_requests: float = 2.0,
+    discovered_tweets: Optional[Dict[str, Dict]] = None,
 ) -> Optional[Dict]:
     """
     Fetch a single tweet by ID with rate limit handling.
@@ -828,10 +931,13 @@ def fetch_tweet_by_id(
         tweet_id: Tweet ID to fetch
         retry_count: Current retry count
         delay_between_requests: Delay between requests
+        discovered_tweets: In-memory cache of already parsed tweet results
 
     Returns:
         Tweet result dictionary or None if not found
     """
+    if discovered_tweets is not None and tweet_id in discovered_tweets:
+        return discovered_tweets[tweet_id]
     try:
         response_data = None
         last_error = None
@@ -841,7 +947,11 @@ def fetch_tweet_by_id(
             try:
                 # Use the TweetDetail GraphQL endpoint
                 # The endpoint hash might vary, but this is a common one
-                url = "https://twitter.com/i/api/graphql/rU08O-YiXdr0IZfE7qaUMg/TweetDetail"
+                mock_server = os.environ.get("ARCHIVR_TWITTER_MOCK_SERVER")
+                if mock_server:
+                    url = f"{mock_server}/i/api/graphql/rU08O-YiXdr0IZfE7qaUMg/TweetDetail"
+                else:
+                    url = "https://twitter.com/i/api/graphql/rU08O-YiXdr0IZfE7qaUMg/TweetDetail"
                 variables = {
                     "focalTweetId": tweet_id,
                     "with_rux_injections": False,
@@ -853,61 +963,15 @@ def fetch_tweet_by_id(
                     "withVoice": True,
                 }
 
-                features = {
-                    "rweb_video_screen_enabled": False,
-                    "profile_label_improvements_pcf_label_in_post_enabled": True,
-                    "responsive_web_profile_redirect_enabled": False,
-                    "rweb_tipjar_consumption_enabled": False,
-                    "verified_phone_label_enabled": False,
-                    "creator_subscriptions_tweet_preview_api_enabled": True,
-                    "responsive_web_graphql_timeline_navigation_enabled": True,
-                    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
-                    "premium_content_api_read_enabled": False,
-                    "communities_web_enable_tweet_community_results_fetch": True,
-                    "c9s_tweet_anatomy_moderator_badge_enabled": True,
-                    "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
-                    "responsive_web_grok_analyze_post_followups_enabled": True,
-                    "responsive_web_jetfuel_frame": True,
-                    "responsive_web_grok_share_attachment_enabled": True,
-                    "responsive_web_grok_annotations_enabled": True,
-                    "articles_preview_enabled": True,
-                    "responsive_web_edit_tweet_api_enabled": True,
-                    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
-                    "view_counts_everywhere_api_enabled": True,
-                    "longform_notetweets_consumption_enabled": True,
-                    "responsive_web_twitter_article_tweet_consumption_enabled": True,
-                    "content_disclosure_indicator_enabled": True,
-                    "content_disclosure_ai_generated_indicator_enabled": True,
-                    "responsive_web_grok_show_grok_translated_post": False,
-                    "responsive_web_grok_analysis_button_from_backend": True,
-                    "post_ctas_fetch_enabled": True,
-                    "freedom_of_speech_not_reach_fetch_enabled": True,
-                    "standardized_nudges_misinfo": True,
-                    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
-                    "longform_notetweets_rich_text_read_enabled": True,
-                    "longform_notetweets_inline_media_enabled": False,
-                    "responsive_web_grok_image_annotation_enabled": True,
-                    "responsive_web_grok_imagine_annotation_enabled": True,
-                    "responsive_web_grok_community_note_auto_translation_is_enabled": False,
-                    "responsive_web_enhance_cards_enabled": False,
-                }
-
-                field_toggles = {
-                    "withArticleRichContentState": True,
-                    "withArticlePlainText": True,
-                    "withArticleSummaryText": True,
-                    "withArticleVoiceOver": True,
-                    "withGrokAnalyze": False,
-                    "withDisallowedReplyControls": False,
-                }
                 params = {
                     "variables": json.dumps(variables),
-                    "features": json.dumps(features),
-                    "fieldToggles": json.dumps(field_toggles),
+                    "features": DEFAULT_FEATURES_JSON,
+                    "fieldToggles": DEFAULT_FIELD_TOGGLES_JSON,
                 }
+                _rate_limit(delay_between_requests)
                 response = scraper.session.get(url, params=params)
                 if response.status_code == 200:
-                    response_data = response.json()
+                    response_data = parse_json_bytes(response.content)
                     if response_data:
                         print(f"  ✓ Fetched using direct GraphQL request")
                 else:
@@ -929,6 +993,7 @@ def fetch_tweet_by_id(
         # Method 1: Try tweets_details() if available (note: plural "tweets")
         if response_data is None and hasattr(scraper, "tweets_details"):
             try:
+                _rate_limit(delay_between_requests)
                 response_data = scraper.tweets_details([tweet_id])
                 if response_data:
                     print(f"  ✓ Fetched using tweets_details()")
@@ -958,10 +1023,18 @@ def fetch_tweet_by_id(
                 error_msg += f"Last error: {last_error}"
             raise Exception(error_msg)
 
-        # Extract tweet from response
-        tweet_result = extract_tweet_from_response(response_data, tweet_id)
+        # Extract tweets from response and cache in discovered_tweets
+        if response_data:
+            found_tweets = extract_all_tweets_from_response(response_data)
+            if discovered_tweets is not None:
+                discovered_tweets.update(found_tweets)
+            if tweet_id in found_tweets:
+                return found_tweets[tweet_id]
 
+        tweet_result = extract_tweet_from_response(response_data, tweet_id)
         if tweet_result:
+            if discovered_tweets is not None:
+                discovered_tweets[tweet_id] = tweet_result
             return tweet_result
         else:
             # Debug: print response structure
@@ -984,7 +1057,11 @@ def fetch_tweet_by_id(
             time.sleep(wait_time)
             if retry_count < 5:  # Max 5 retries for rate limits
                 return fetch_tweet_by_id(
-                    scraper, tweet_id, retry_count + 1, delay_between_requests
+                    scraper,
+                    tweet_id,
+                    retry_count + 1,
+                    delay_between_requests,
+                    discovered_tweets=discovered_tweets,
                 )
             else:
                 print(f"  ❌ Max retries reached for tweet {tweet_id}")
@@ -994,7 +1071,11 @@ def fetch_tweet_by_id(
             if retry_count < 1:
                 time.sleep(delay_between_requests * 3)
                 return fetch_tweet_by_id(
-                    scraper, tweet_id, retry_count + 1, delay_between_requests
+                    scraper,
+                    tweet_id,
+                    retry_count + 1,
+                    delay_between_requests,
+                    discovered_tweets=discovered_tweets,
                 )
             else:
                 print(f"  ⚠ Warning: Error fetching tweet {tweet_id}: {error_msg}")
@@ -1034,7 +1115,7 @@ def extract_related_tweet_ids(tweet_data: Dict) -> List[str]:
 
 
 def scrape_tweets_recursive(
-    scraper: Scraper,
+    scraper: Any,
     tweet_id: str,
     scraped_tweets: Dict[str, Dict],
     output_dir: str,
@@ -1054,6 +1135,7 @@ def scrape_tweets_recursive(
     max_replied_to_tweets_recursion_depth: int,
     delay_between_requests: float,
     replied_to_depth: int = 0,
+    discovered_tweets: Optional[Dict[str, Dict]] = None,
 ) -> None:
     """
     Recursively scrape tweets (quoted, retweeted, replied-to).
@@ -1094,7 +1176,10 @@ def scrape_tweets_recursive(
     # Fetch tweet
     print(f"  {'  ' * depth}→ Fetching tweet {tweet_id}...")
     tweet_result = fetch_tweet_by_id(
-        scraper, tweet_id, delay_between_requests=delay_between_requests
+        scraper,
+        tweet_id,
+        delay_between_requests=delay_between_requests,
+        discovered_tweets=discovered_tweets,
     )
 
     if not tweet_result:
@@ -1113,13 +1198,14 @@ def scrape_tweets_recursive(
         bare_scrape=current_bare_scrape,
         advanced_info=current_advanced_info,
     )
+    session = getattr(scraper, "session", None)
 
     # Download avatar if enabled
     if download_avatars and not is_replied_to_tweet:
         author_id = tweet_data.get("author", {}).get("id")
         avatar_url = tweet_data.get("author", {}).get("avatar_url", "")
         if author_id and avatar_url:
-            avatar_path = download_avatar(avatar_url, author_id, avatars_dir)
+            avatar_path = download_avatar(avatar_url, author_id, avatars_dir, session=session)
             if avatar_path:
                 tweet_data["author"]["avatar_local_path"] = os.path.relpath(
                     avatar_path, output_dir
@@ -1131,15 +1217,13 @@ def scrape_tweets_recursive(
         should_download_media = download_replied_to_tweets_media
 
     if should_download_media:
-        download_tweet_media(tweet_data, tweet_id, media_dir)
+        download_tweet_media(tweet_data, tweet_id, media_dir, session=session)
         if tweet_data.get("is_article") and tweet_data.get("article"):
-            download_article_media(tweet_data["article"], tweet_id, media_dir, output_dir)
-
+            download_article_media(tweet_data["article"], tweet_id, media_dir, output_dir, session=session)
     # Save tweet to JSON file
     json_file = os.path.join(output_dir, f"tweet-{tweet_id}.json")
     try:
-        with open(json_file, "w") as f:
-            json.dump(tweet_data, f, indent=2)
+        dump_json_file(json_file, tweet_data)
     except Exception as e:
         print(
             f"  {'  ' * depth}⚠ Warning: Failed to save JSON file for tweet {tweet_id}: {e}"
@@ -1149,10 +1233,7 @@ def scrape_tweets_recursive(
     # Mark as scraped
     scraped_tweets[tweet_id] = tweet_data
 
-    # Rate limiting
-    if delay_between_requests > 0:
-        time.sleep(delay_between_requests)
-
+    # Rate limiting is handled prior to outgoing requests in _rate_limit()
     # Recursively scrape related tweets
     if recursive and depth < max_depth - 1:
         related_ids = extract_related_tweet_ids(tweet_data)
@@ -1180,8 +1261,8 @@ def scrape_tweets_recursive(
                     max_replied_to_tweets_recursion_depth,
                     delay_between_requests,
                     replied_to_depth,
+                    discovered_tweets,
                 )
-
     # Handle replied-to tweets
     if scrape_replied_to_tweet or recursive_replied_to_tweets:
         in_reply_to_status_id = tweet_data.get("in_reply_to_status_id")
@@ -1219,6 +1300,7 @@ def scrape_tweets_recursive(
                 max_replied_to_tweets_recursion_depth,
                 delay_between_requests,
                 new_replied_to_depth,
+                discovered_tweets,
             )
 
 
@@ -1442,7 +1524,7 @@ def main():
     cookie_dict = dict(item.split("=", 1) for item in cookie_str.split(";"))
 
     # Initialize scraper
-    scraper = Scraper(cookies=cookie_dict, save=False)
+    scraper = SimpleTwitterScraper(cookies=cookie_dict)
 
     # Load already scraped tweets (for resume)
     scraped_tweets = load_scraped_tweets(output_dir)
@@ -1471,6 +1553,7 @@ def main():
     }
 
     # Scrape tweets
+    discovered_tweets: Dict[str, Dict] = {}
     for idx, tweet_id in enumerate(remaining_tweet_ids, 1):
         print(f"\n[{idx}/{len(remaining_tweet_ids)}] Processing tweet {tweet_id}...")
 
@@ -1495,6 +1578,7 @@ def main():
                 download_replied_to_tweets_media=args.download_replied_to_tweets_media,
                 max_replied_to_tweets_recursion_depth=args.max_replied_to_tweets_recursion_depth,
                 delay_between_requests=args.delay_between_requests,
+                discovered_tweets=discovered_tweets,
             )
             stats["newly_scraped"] += 1
         except Exception as e:
@@ -1534,9 +1618,10 @@ def main():
     }
 
     summary_file = os.path.join(output_dir, "scraping_summary.json")
-    with open(summary_file, "w") as f:
-        json.dump(summary, f, indent=2)
-
+    try:
+        dump_json_file(summary_file, summary)
+    except Exception as e:
+        print(f"⚠ Warning: Failed to save summary file: {e}")
     # Print final summary
     print(f"\n{'=' * 80}")
     print("Scraping complete!")

@@ -966,28 +966,47 @@ fn record_container_entry(
 /// Extracts PlatformMetadata from a tweet JSON string.
 /// `title` is the X Article title when the status is an Article.
 /// Returns Default on any parse failure.
+#[derive(serde::Deserialize)]
+struct TweetJsonMetadata<'a> {
+    #[serde(borrow)]
+    author: Option<TweetAuthorMetadata<'a>>,
+    #[serde(borrow)]
+    full_text: Option<&'a str>,
+    #[serde(borrow)]
+    article: Option<TweetArticleMetadata<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct TweetAuthorMetadata<'a> {
+    #[serde(borrow)]
+    screen_name: Option<&'a str>,
+}
+
+#[derive(serde::Deserialize)]
+struct TweetArticleMetadata<'a> {
+    #[serde(borrow)]
+    title: Option<&'a str>,
+}
+
 fn tweet_metadata_from_json(json_str: &str) -> PlatformMetadata {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) else {
+    let Ok(v) = serde_json::from_str::<TweetJsonMetadata>(json_str) else {
         return PlatformMetadata::default();
     };
 
     let screen_name = v
-        .get("author")
-        .and_then(|a| a.get("screen_name"))
-        .and_then(|s| s.as_str())
+        .author
+        .and_then(|a| a.screen_name)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
     let full_text = v
-        .get("full_text")
-        .and_then(|t| t.as_str())
+        .full_text
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
     let article_title = v
-        .get("article")
-        .and_then(|a| a.get("title"))
-        .and_then(|t| t.as_str())
+        .article
+        .and_then(|a| a.title)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
@@ -1007,7 +1026,9 @@ fn register_tweet_artifacts(
     store_path: &Path,
     entry_id: i64,
     tweet_json_relpaths: &[String],
+    primary_json: Option<(&str, &str)>,
 ) -> Result<()> {
+    let mut blob_cache: HashMap<String, i64> = HashMap::new();
     for relpath in tweet_json_relpaths {
         database::add_entry_artifact(
             conn,
@@ -1021,20 +1042,40 @@ fn register_tweet_artifacts(
                 metadata_json: None,
             },
         )?;
-        let json_path = store_path.join(relpath);
-        let json_str = fs::read_to_string(&json_path).with_context(|| {
-            format!(
-                "failed to read tweet JSON for artifact registration: {}",
-                json_path.display()
-            )
-        })?;
-        for (role, raw_relpath) in tweet_raw_artifacts(&json_str)? {
-            let raw_path = PathBuf::from(&raw_relpath);
-            let mut blob = blob_record_for_raw_relpath(store_path, &raw_path)?;
-            if role == "media" {
-                blob.mime_type = tweet_media_image_mime(blob.extension.as_deref());
+        let json_str = if let Some((p_rel, p_str)) = primary_json {
+            if p_rel == relpath {
+                std::borrow::Cow::Borrowed(p_str)
+            } else {
+                let json_path = store_path.join(relpath);
+                std::borrow::Cow::Owned(fs::read_to_string(&json_path).with_context(|| {
+                    format!(
+                        "failed to read tweet JSON for artifact registration: {}",
+                        json_path.display()
+                    )
+                })?)
             }
-            let blob_id = database::upsert_blob(conn, &blob)?;
+        } else {
+            let json_path = store_path.join(relpath);
+            std::borrow::Cow::Owned(fs::read_to_string(&json_path).with_context(|| {
+                format!(
+                    "failed to read tweet JSON for artifact registration: {}",
+                    json_path.display()
+                )
+            })?)
+        };
+        for (role, raw_relpath) in tweet_raw_artifacts(&json_str)? {
+            let blob_id = if let Some(&id) = blob_cache.get(&raw_relpath) {
+                id
+            } else {
+                let raw_path = PathBuf::from(&raw_relpath);
+                let mut blob = blob_record_for_raw_relpath(store_path, &raw_path)?;
+                if role == "media" {
+                    blob.mime_type = tweet_media_image_mime(blob.extension.as_deref());
+                }
+                let id = database::upsert_blob(conn, &blob)?;
+                blob_cache.insert(raw_relpath.clone(), id);
+                id
+            };
             database::add_entry_artifact(
                 conn,
                 &database::NewArtifact {
@@ -1076,7 +1117,7 @@ fn record_tweet_entry(
         &canonical_locator,
     )?;
     // Read the primary tweet JSON to extract title before entry creation.
-    let tweet_json_relpath = PathBuf::from("raw_tweets").join(format!("tweet-{tweet_id}.json"));
+    let tweet_json_relpath = format!("raw_tweets/tweet-{tweet_id}.json");
     let tweet_json = fs::read_to_string(store_path.join(&tweet_json_relpath))?;
     let tweet_meta = tweet_metadata_from_json(&tweet_json);
     let tweet_title = generate_entry_title(source, &tweet_meta);
@@ -1106,7 +1147,13 @@ fn record_tweet_entry(
     create_structured_root(store_path, &entry)?;
 
     // Register all tweet JSONs and their blobs.
-    register_tweet_artifacts(conn, store_path, entry.id, tweet_json_relpaths)?;
+    register_tweet_artifacts(
+        conn,
+        store_path,
+        entry.id,
+        tweet_json_relpaths,
+        Some((&tweet_json_relpath, &tweet_json)),
+    )?;
 
     database::complete_archive_run_item(conn, item.id, entry.id)?;
     Ok(entry)
@@ -1192,11 +1239,16 @@ fn tweet_media_image_mime(extension: Option<&str>) -> Option<String> {
 }
 
 fn tweet_raw_artifacts(tweet_json: &str) -> Result<Vec<(String, String)>> {
-    let regex = regex::Regex::new(r#""(avatar_local_path|local_path)": "([^"\n]+)""#)?;
+    if !tweet_json.contains("\"raw/") {
+        return Ok(Vec::new());
+    }
+    static REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#""(avatar_local_path|local_path)": "([^"\n]+)""#).unwrap()
+    });
     let mut seen = HashSet::new();
     let mut artifacts = Vec::new();
 
-    for captures in regex.captures_iter(tweet_json) {
+    for captures in REGEX.captures_iter(tweet_json) {
         let relpath = captures[2].to_string();
         if !relpath.starts_with("raw/") || !seen.insert(relpath.clone()) {
             continue;
@@ -1252,7 +1304,7 @@ pub fn perform_capture(
     );
     let store_path = &archive_paths.store_path;
 
-    let conn = database::open_or_initialize(&archive_paths.archive_path)?;
+    let mut conn = database::open_or_initialize(&archive_paths.archive_path)?;
     let user_id = database::ensure_default_user(&conn)?;
 
     let mut source = determine_source(locator);
@@ -1955,8 +2007,9 @@ pub fn perform_capture(
             &tweet_cookies,
         ) {
             Ok(tweet_json_relpaths) => {
+                let tx = conn.transaction()?;
                 let tweet_entry = record_tweet_entry(
-                    &conn,
+                    &tx,
                     store_path,
                     user_id,
                     &run,
@@ -1966,8 +2019,9 @@ pub fn perform_capture(
                     &tweet_id,
                     &tweet_json_relpaths,
                 )?;
-                database::refresh_entry_cached_bytes(&conn, tweet_entry.id)?;
-                database::finish_archive_run(&conn, run.id)?;
+                database::refresh_entry_cached_bytes(&tx, tweet_entry.id)?;
+                database::finish_archive_run(&tx, run.id)?;
+                tx.commit()?;
                 return Ok(CaptureResult {
                     run_uid: run.run_uid.clone(),
                     status: "completed".to_string(),
@@ -2426,7 +2480,7 @@ pub fn perform_rearchive(
     {
         let tx = conn.transaction()?;
         database::delete_entry_artifacts(&tx, entry.id)?;
-        register_tweet_artifacts(&tx, store_path, entry.id, &tweet_json_relpaths)?;
+        register_tweet_artifacts(&tx, store_path, entry.id, &tweet_json_relpaths, None)?;
         tx.commit()?;
     }
 

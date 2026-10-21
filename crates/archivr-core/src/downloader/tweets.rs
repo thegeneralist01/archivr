@@ -7,7 +7,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::OnceLock,
+    sync::LazyLock,
 };
 
 use crate::{downloader::store, twitter::parse_tweet_id};
@@ -163,6 +163,7 @@ fn run_scraper_staged(
     }
 
     let mut cmd = Command::new(&python);
+    cmd.env("PYTHONDONTWRITEBYTECODE", "1");
     // Run the scraper from staging_dir so relative paths in JSON resolve correctly.
     cmd.current_dir(&staging_dir).arg(&scraper_path);
     for arg in build_scraper_args(tweet_id, thread, &staging_tweets_dir, &staging_dir, &credentials_file) {
@@ -215,25 +216,36 @@ fn run_scraper_staged(
         .collect();
     staged_jsons.sort();
 
-    // Rewrite asset paths in staged JSONs (moves media blobs from staging into raw/).
-    // staging_tweets_dir is base for avatar_local_path; staging_dir is base for local_path.
-    rewrite_tweet_outputs(&staged_jsons, &staging_tweets_dir, &staging_dir, store_path)?;
-
-    // Move each staged JSON to its final destination, collecting store-relative relpaths.
+    // Rewrite asset paths and move staged JSONs to final destination raw_tweets/.
     let mut relpaths = Vec::with_capacity(staged_jsons.len());
+    let mut archived_assets = HashMap::new();
     for staged_path in &staged_jsons {
         let filename = staged_path.file_name().context("tweet JSON path has no filename")?;
         let dest = output_dir.join(filename);
-        fs::rename(staged_path, &dest)
-            .or_else(|_| {
-                fs::copy(staged_path, &dest).map(|_| ())?;
-                fs::remove_file(staged_path)
-            })
-            .with_context(|| format!("failed to move staged tweet JSON to {}", dest.display()))?;
-        let rel = dest
-            .strip_prefix(store_path)
-            .context("dest tweet JSON is not under store_path")?;
-        relpaths.push(rel.to_string_lossy().replace('\\', "/"));
+        let contents = fs::read_to_string(staged_path)?;
+        let rewritten = rewrite_json_asset_paths(
+            &contents,
+            &staging_tweets_dir,
+            &staging_dir,
+            store_path,
+            &mut archived_assets,
+        )?;
+
+        if rewritten != contents {
+            fs::write(&dest, rewritten)
+                .with_context(|| format!("failed to write rewritten tweet JSON to {}", dest.display()))?;
+            let _ = fs::remove_file(staged_path);
+        } else {
+            fs::rename(staged_path, &dest)
+                .or_else(|_| {
+                    fs::copy(staged_path, &dest).map(|_| ())?;
+                    fs::remove_file(staged_path)
+                })
+                .with_context(|| format!("failed to move staged tweet JSON to {}", dest.display()))?;
+        }
+
+        let filename_str = filename.to_string_lossy();
+        relpaths.push(format!("raw_tweets/{filename_str}"));
     }
 
     // Clean up the staging directory (media already moved to raw/ by rewrite_tweet_outputs).
@@ -290,42 +302,16 @@ fn cleanup_summary(output_dir: &Path) -> Result<()> {
 
 /// Returns a lazily-compiled regex matching `"avatar_local_path": "..."` in JSON.
 fn avatar_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r#""avatar_local_path": "([^"\n]+)""#).unwrap())
+    static REGEX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#""avatar_local_path": "([^"\n]+)""#).unwrap());
+    &REGEX
 }
 
 /// Returns a lazily-compiled regex matching `"local_path": "..."` in JSON.
 fn media_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r#"(?m)"local_path": "([^"\n]+)""#).unwrap())
-}
-
-/// Rewrites asset paths in each newly-created JSON file, moving assets into
-/// the content-addressed store. Files are written back only if content changed.
-fn rewrite_tweet_outputs(
-    tweet_jsons: &[PathBuf],
-    output_dir: &Path,
-    temp_dir: &Path,
-    store_path: &Path,
-) -> Result<()> {
-    let mut archived_assets = HashMap::new();
-
-    for path in tweet_jsons {
-        let contents = fs::read_to_string(path)?;
-        let rewritten = rewrite_json_asset_paths(
-            &contents,
-            output_dir,
-            temp_dir,
-            store_path,
-            &mut archived_assets,
-        )?;
-
-        if rewritten != contents {
-            fs::write(path, rewritten)?;
-        }
-    }
-
-    Ok(())
+    static REGEX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"(?m)"local_path": "([^"\n]+)""#).unwrap());
+    &REGEX
 }
 
 /// Rewrites all `avatar_local_path` and `local_path` references in `contents`,
@@ -339,28 +325,41 @@ fn rewrite_json_asset_paths(
     store_path: &Path,
     archived_assets: &mut HashMap<String, String>,
 ) -> Result<String> {
+    let has_avatar = contents.contains("\"avatar_local_path\"");
+    let has_media = contents.contains("\"local_path\"");
+    if !has_avatar && !has_media {
+        return Ok(contents.to_string());
+    }
+
     let mut rewritten = contents.to_string();
 
-    for captures in avatar_regex().captures_iter(contents) {
-        let old_path = captures[1].to_string();
-        let new_path =
-            archive_asset_reference(&old_path, output_dir, store_path, "avatar", archived_assets)?;
-        rewritten = rewritten.replace(
-            &format!(r#""avatar_local_path": "{old_path}""#),
-            &format!(r#""avatar_local_path": "{new_path}""#),
-        );
+    if has_avatar {
+        for captures in avatar_regex().captures_iter(contents) {
+            let old_path = &captures[1];
+            let new_path =
+                archive_asset_reference(old_path, output_dir, store_path, "avatar", archived_assets)?;
+            if old_path != new_path {
+                rewritten = rewritten.replace(
+                    &format!(r#""avatar_local_path": "{old_path}""#),
+                    &format!(r#""avatar_local_path": "{new_path}""#),
+                );
+            }
+        }
     }
 
-    for captures in media_regex().captures_iter(contents) {
-        let old_path = captures[1].to_string();
-        let new_path =
-            archive_asset_reference(&old_path, temp_dir, store_path, "media", archived_assets)?;
-        rewritten = rewritten.replace(
-            &format!(r#""local_path": "{old_path}""#),
-            &format!(r#""local_path": "{new_path}""#),
-        );
+    if has_media {
+        for captures in media_regex().captures_iter(contents) {
+            let old_path = &captures[1];
+            let new_path =
+                archive_asset_reference(old_path, temp_dir, store_path, "media", archived_assets)?;
+            if old_path != new_path {
+                rewritten = rewritten.replace(
+                    &format!(r#""local_path": "{old_path}""#),
+                    &format!(r#""local_path": "{new_path}""#),
+                );
+            }
+        }
     }
-
     Ok(rewritten)
 }
 
@@ -408,8 +407,8 @@ mod tests {
     };
 
     fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+        LOCK.lock().unwrap()
     }
 
     fn unique_path(prefix: &str) -> PathBuf {

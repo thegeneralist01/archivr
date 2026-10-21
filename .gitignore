@@ -23,6 +23,9 @@ crates/archivr-server/static/**
 
 !vendor
 !vendor/**
+vendor/**/__pycache__/
+vendor/**/__pycache__/**
+vendor/**/*.pyc
 
 !flake.nix
 !flake.lock
@@ -52,4 +55,8 @@ frontend/result
 frontend/result/**
 frontend/dist/
 frontend/dist/**
+
+!autoresearch.sh
+!benches/
+!benches/**
 .DS_Store
