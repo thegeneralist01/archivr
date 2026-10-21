@@ -971,7 +971,7 @@ struct TweetJsonMetadata<'a> {
     #[serde(borrow)]
     author: Option<TweetAuthorMetadata<'a>>,
     #[serde(borrow)]
-    full_text: Option<&'a str>,
+    full_text: Option<std::borrow::Cow<'a, str>>,
     #[serde(borrow)]
     article: Option<TweetArticleMetadata<'a>>,
 }
@@ -979,13 +979,13 @@ struct TweetJsonMetadata<'a> {
 #[derive(serde::Deserialize)]
 struct TweetAuthorMetadata<'a> {
     #[serde(borrow)]
-    screen_name: Option<&'a str>,
+    screen_name: Option<std::borrow::Cow<'a, str>>,
 }
 
 #[derive(serde::Deserialize)]
 struct TweetArticleMetadata<'a> {
     #[serde(borrow)]
-    title: Option<&'a str>,
+    title: Option<std::borrow::Cow<'a, str>>,
 }
 
 fn tweet_metadata_from_json(json_str: &str) -> PlatformMetadata {
@@ -3773,6 +3773,20 @@ mod tests {
             assert_eq!(
                 meta.caption,
                 Some("Hello Rust world, this is a test tweet".to_string())
+            );
+            assert_eq!(meta.title, None);
+        }
+        #[test]
+        fn tweet_title_extracted_from_json_with_escapes() {
+            let json = r#"{
+                "full_text": "First line\n\nSecond line with \"quotes\"",
+                "author": { "screen_name": "rustacean", "name": "The Rustacean" }
+            }"#;
+            let meta = tweet_metadata_from_json(json);
+            assert_eq!(meta.author, Some("rustacean".to_string()));
+            assert_eq!(
+                meta.caption,
+                Some("First line\n\nSecond line with \"quotes\"".to_string())
             );
             assert_eq!(meta.title, None);
         }
