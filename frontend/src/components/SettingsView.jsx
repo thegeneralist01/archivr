@@ -8,7 +8,7 @@ import {
   scanOrphanBlobs, deleteOrphanBlobs,
   listCookieRules, createCookieRule, updateCookieRule, deleteCookieRule,
   listRoles, fetchMe,
-  getYtDlpStatus, updateYtDlp,
+  getYtDlpStatus, updateYtDlp, fetchOpenAiModels,
 } from '../api.js'
 import { describeExpiry, formatTimestamp } from '../utils.js'
 import { useTheme } from '../useTheme.js'
@@ -136,6 +136,32 @@ function ProfileTab({ currentUser, setCurrentUser }) {
         <p className="muted" style={{ fontSize: 13, margin: '4px 0 0' }}>
           When on, tag paths show as "X / Articles" instead of "x/articles".
         </p>
+        <div className="form-field" style={{ marginTop: 16 }}>
+          <label className="form-label" htmlFor="summary-provider-select">Preferred summary provider</label>
+          <select
+            id="summary-provider-select"
+            className="field-input"
+            value={currentUser?.summary_provider ?? ''}
+            onChange={async e => {
+              const val = e.target.value;
+              try {
+                await patchMe({ summary_provider: val });
+                setCurrentUser(prev => ({ ...prev, summary_provider: val || null }));
+              } catch {
+                // silently revert
+              }
+            }}
+          >
+            <option value="">Default (Anthropic API)</option>
+            <option value="anthropic_http">Anthropic API</option>
+            <option value="openai_compatible">OpenAI-compatible API</option>
+            <option value="claude_cli">Claude CLI</option>
+            <option value="codex_cli">Codex CLI</option>
+          </select>
+          <p className="muted" style={{ fontSize: 13, margin: '4px 0 0' }}>
+            Default provider used for summaries and thread title generation across all your devices.
+          </p>
+        </div>
         <div className="form-field" style={{ marginTop: 16 }}>
           <label className="form-label" htmlFor="theme-select">Theme</label>
           <select
@@ -398,6 +424,36 @@ function InstanceTab({ isOwner, setCurrentUser }) {
   const [permSaving, setPermSaving] = useState(false)
   const [permMsg, setPermMsg] = useState(null)
 
+  const [fetchingModels, setFetchingModels] = useState(false)
+  const [modelFetchMsg, setModelFetchMsg] = useState(null)
+  const [fetchedModels, setFetchedModels] = useState([])
+  const [apiKeyInput, setApiKeyInput] = useState('')
+  const [clearingKey, setClearingKey] = useState(false)
+
+  async function handleFetchModels() {
+    setFetchingModels(true)
+    setModelFetchMsg(null)
+    try {
+      const res = await fetchOpenAiModels({
+        baseUrl: settings.openai_base_url,
+        apiKey: apiKeyInput || undefined,
+      })
+      const list = res.models || []
+      setFetchedModels(list)
+      if (list.length > 0) {
+        setModelFetchMsg({ ok: true, text: `Fetched ${list.length} model${list.length === 1 ? '' : 's'}.` })
+        if (!settings.openai_model) {
+          setSettings(s => ({ ...s, openai_model: list[0] }))
+        }
+      } else {
+        setModelFetchMsg({ ok: true, text: 'No models returned from endpoint.' })
+      }
+    } catch (e) {
+      setModelFetchMsg({ ok: false, text: e.message || 'Failed to fetch models' })
+    } finally {
+      setFetchingModels(false)
+    }
+  }
   useEffect(() => {
     (async () => {
       try {
@@ -435,8 +491,23 @@ function InstanceTab({ isOwner, setCurrentUser }) {
     e.preventDefault()
     setSaving(true); setSaveMsg(null)
     try {
-      const { reorder_children_role_bits: _mask, title_models: _models, ...rest } = settings
-      await updateInstanceSettings(rest)
+      const {
+        reorder_children_role_bits: _mask,
+        title_models: _models,
+        openai_api_key_set: _ks,
+        ublock_ext_available: _ub,
+        cookie_ext_available: _ck,
+        ...rest
+      } = settings
+      const payload = { ...rest }
+      if (apiKeyInput.trim()) {
+        payload.openai_api_key = apiKeyInput.trim()
+      } else if (clearingKey) {
+        payload.openai_api_key = ''
+      }
+      await updateInstanceSettings(payload)
+      setApiKeyInput('')
+      setClearingKey(false)
       setSettings(await getInstanceSettings()) // server-trimmed models + effective sources
       setSaveMsg({ ok: true, text: 'Saved.' })
     } catch (err) {
@@ -480,17 +551,115 @@ function InstanceTab({ isOwner, setCurrentUser }) {
             {TITLE_MODEL_PROVIDERS.map(([kind, label]) => {
               const key = `title_model_${kind}`
               const info = settings.title_models?.[kind]
-              const placeholder = info ? `${info.fallback_model} (${info.fallback_source})` : ''
+              const isOai = kind === 'openai_compatible'
+              const sourceLabel = info?.fallback_source === 'instance' && isOai
+                ? 'endpoint model'
+                : info?.fallback_source
+              const placeholder = info ? `${info.fallback_model} (${sourceLabel})` : ''
               return (
                 <div key={kind} className="form-field">
                   <label className="form-label" htmlFor={key}>{label}</label>
                   <input id={key} className="field-input" type="text" maxLength={100}
+                    list={isOai ? 'openai-models-datalist' : undefined}
                     value={settings[key] ?? ''} placeholder={placeholder}
                     onChange={e => setSettings(s => ({ ...s, [key]: e.target.value }))} />
                 </div>
               )
             })}
             <p className="form-hint">Cheap model used for Generate title. Leave blank to use the default.</p>
+          </div>
+          <div className="form-field" style={{ marginTop: 16 }}>
+            <label className="form-label">OpenAI-compatible endpoint</label>
+            <div className="form-field">
+              <label className="form-label" htmlFor="openai-base-url" style={{ fontSize: 12 }}>Base URL</label>
+              <input
+                id="openai-base-url"
+                className="field-input"
+                type="text"
+                placeholder="http://localhost:8318/v1 or https://api.openai.com/v1"
+                value={settings.openai_base_url ?? ''}
+                onChange={e => setSettings(s => ({ ...s, openai_base_url: e.target.value }))}
+              />
+              <p className="form-hint">Endpoint for OpenAI-compatible LLMs (e.g. Handy STT post-processing, Ollama, LocalAI).</p>
+            </div>
+
+            <div className="form-field">
+              <label className="form-label" htmlFor="openai-api-key" style={{ fontSize: 12 }}>API Key</label>
+              <input
+                id="openai-api-key"
+                className="field-input"
+                type="password"
+                autoComplete="off"
+                placeholder={
+                  clearingKey
+                    ? 'Will be cleared on save'
+                    : settings.openai_api_key_set
+                    ? '••••••••  (saved — enter new key to replace)'
+                    : 'Optional (leave blank if server requires no auth)'
+                }
+                value={apiKeyInput}
+                onChange={e => {
+                  setApiKeyInput(e.target.value)
+                  if (clearingKey) setClearingKey(false)
+                }}
+              />
+              {settings.openai_api_key_set && !clearingKey && !apiKeyInput && (
+                <button
+                  type="button"
+                  style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 12, marginTop: 4, padding: 0, textDecoration: 'underline' }}
+                  onClick={() => setClearingKey(true)}
+                >
+                  Clear saved API key
+                </button>
+              )}
+              {clearingKey && (
+                <span className="muted" style={{ fontSize: 12, marginTop: 4, display: 'inline-block' }}>
+                  Key will be removed on save.{' '}
+                  <button
+                    type="button"
+                    style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 12, padding: 0, textDecoration: 'underline' }}
+                    onClick={() => setClearingKey(false)}
+                  >
+                    Cancel
+                  </button>
+                </span>
+              )}
+            </div>
+
+            <div className="form-field">
+              <label className="form-label" htmlFor="openai-model" style={{ fontSize: 12 }}>Model</label>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <input
+                  id="openai-model"
+                  className="field-input"
+                  type="text"
+                  list="openai-models-datalist"
+                  placeholder="e.g. gpt-4o-mini, llama3, or local model"
+                  value={settings.openai_model ?? ''}
+                  onChange={e => setSettings(s => ({ ...s, openai_model: e.target.value }))}
+                  style={{ flex: 1 }}
+                />
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  onClick={handleFetchModels}
+                  disabled={fetchingModels}
+                  style={{ whiteSpace: 'nowrap' }}
+                >
+                  {fetchingModels ? 'Fetching\u2026' : 'Fetch models'}
+                </button>
+              </div>
+              <datalist id="openai-models-datalist">
+                {fetchedModels.map(m => (
+                  <option key={m} value={m} />
+                ))}
+              </datalist>
+              {modelFetchMsg && (
+                <div className={`form-msg form-msg--${modelFetchMsg.ok ? 'ok' : 'err'}`} style={{ marginTop: 6 }}>
+                  {modelFetchMsg.text}
+                </div>
+              )}
+            </div>
           </div>
           {saveMsg && <div className={`form-msg form-msg--${saveMsg.ok ? 'ok' : 'err'}`}>{saveMsg.text}</div>}
           <button className="btn-primary" type="submit" disabled={saving}>

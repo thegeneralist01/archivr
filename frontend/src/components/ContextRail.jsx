@@ -1,5 +1,6 @@
-import { useState, useEffect, useLayoutEffect, useRef } from 'react'
-import { fetchEntryTags, assignTag, removeTag, listEntryCollections, listCollections, addEntryToCollection, updateEntryTitle, generateThreadTitle, deleteEntry, rearchiveEntry, pollCaptureJob, fetchEntrySummary, requestEntrySummary, saveEntrySummary, fetchTranscriptionEngines } from '../api'
+import { useState, useEffect, useLayoutEffect, useRef, useContext } from 'react'
+import { fetchEntryTags, assignTag, removeTag, listEntryCollections, listCollections, addEntryToCollection, updateEntryTitle, generateThreadTitle, deleteEntry, rearchiveEntry, pollCaptureJob, fetchEntrySummary, requestEntrySummary, saveEntrySummary, fetchTranscriptionEngines, patchMe } from '../api'
+import { AuthContext } from '../App.jsx'
 import ExportDialog from './ExportDialog'
 import { formatTimestamp, formatBytes, valueText, sourceIconSvg, displayPath } from '../utils'
 
@@ -66,6 +67,7 @@ function orderedSelection(rows, selectedUids) {
 }
 
 export default function ContextRail({ archiveId, selectedEntry, selectedUids, selectedEntries, detail, onTagFilterSet, tagNodes, onTagsRefresh, onEntryTitleChange, onEntryDeleted, onBulkDeleted, humanizeTags, onDetailRefresh, onOpenPreview, onPlay, isPublicSession }) {
+  const { currentUser, setCurrentUser } = useContext(AuthContext) ?? {}
   const [tags, setTags] = useState([])
   const [exportOpen, setExportOpen] = useState(false)
   const [assignInput, setAssignInput] = useState('')
@@ -91,10 +93,18 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
   const [summaryError, setSummaryError] = useState('')
   const [summaryBusy, setSummaryBusy] = useState(false)
   const [summaryProvider, setSummaryProvider] = useState(() => {
+    if (currentUser?.summary_provider) return currentUser.summary_provider
     try {
       return sessionStorage.getItem(SUMMARY_PROVIDER_KEY) || SUMMARY_PROVIDERS[0].value
     } catch { return SUMMARY_PROVIDERS[0].value }
   })
+
+  useEffect(() => {
+    if (currentUser?.summary_provider) {
+      setSummaryProvider(currentUser.summary_provider)
+      try { sessionStorage.setItem(SUMMARY_PROVIDER_KEY, currentUser.summary_provider) } catch {}
+    }
+  }, [currentUser?.summary_provider])
   const [includeSummaryImages, setIncludeSummaryImages] = useState(false)
   // Local transcription engines offered by the server ([] = feature off) and
   // the one picked for YouTube videos without subtitles ('' = none).
@@ -361,6 +371,13 @@ export default function ContextRail({ archiveId, selectedEntry, selectedUids, se
     setSummaryProvider(value)
     if (value === 'claude_cli') setIncludeSummaryImages(false)
     try { sessionStorage.setItem(SUMMARY_PROVIDER_KEY, value) } catch { /* private mode */ }
+    if (currentUser && currentUser.summary_provider !== value) {
+      patchMe({ summary_provider: value })
+        .then(() => {
+          setCurrentUser?.(prev => prev ? { ...prev, summary_provider: value } : prev)
+        })
+        .catch(() => {})
+    }
   }
 
   function handleTranscribeEngineChange(value) {

@@ -203,6 +203,31 @@ pub struct CliProviderConfig {
     pub timeout_secs: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenAiCompatibleOverrides {
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub model: Option<String>,
+}
+
+pub fn normalize_openai_chat_url(base_or_chat: &str) -> String {
+    let trimmed = base_or_chat.trim().trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/chat/completions")
+    }
+}
+
+pub fn normalize_openai_models_url(base_or_chat: &str) -> String {
+    let trimmed = base_or_chat.trim().trim_end_matches('/');
+    if let Some(stripped) = trimmed.strip_suffix("/chat/completions") {
+        format!("{}/models", stripped.trim_end_matches('/'))
+    } else {
+        format!("{trimmed}/models")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderConfig {
     AnthropicHttp(HttpProviderConfig),
@@ -237,6 +262,14 @@ pub(crate) fn summary_cli_timeout() -> std::time::Duration {
 
 /// Builds a provider configuration for `kind` purely from the environment.
 pub fn provider_from_env(kind: &str) -> Result<ProviderConfig> {
+    provider_from_env_with_openai_overrides(kind, None)
+}
+
+/// Builds a provider configuration with optional instance-level overrides for OpenAI-compatible.
+pub fn provider_from_env_with_openai_overrides(
+    kind: &str,
+    overrides: Option<&OpenAiCompatibleOverrides>,
+) -> Result<ProviderConfig> {
     match kind {
         "anthropic_http" => Ok(ProviderConfig::AnthropicHttp(HttpProviderConfig {
             endpoint: env_or(
@@ -247,15 +280,50 @@ pub fn provider_from_env(kind: &str) -> Result<ProviderConfig> {
             model: env_or("ARCHIVR_ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
             timeout_secs: env_timeout("ARCHIVR_SUMMARY_HTTP_TIMEOUT", DEFAULT_HTTP_TIMEOUT_SECS),
         })),
-        "openai_compatible" => Ok(ProviderConfig::OpenAiCompatible(HttpProviderConfig {
-            endpoint: env_or(
-                "ARCHIVR_OPENAI_URL",
-                "https://api.openai.com/v1/chat/completions",
-            ),
-            api_key: required_env("ARCHIVR_OPENAI_API_KEY")?,
-            model: env_or("ARCHIVR_OPENAI_MODEL", "gpt-4o-mini"),
-            timeout_secs: env_timeout("ARCHIVR_SUMMARY_HTTP_TIMEOUT", DEFAULT_HTTP_TIMEOUT_SECS),
-        })),
+        "openai_compatible" => {
+            let instance_base = overrides
+                .and_then(|o| o.base_url.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let instance_key = overrides
+                .and_then(|o| o.api_key.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let instance_model = overrides
+                .and_then(|o| o.model.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
+            let endpoint = if let Some(base) = instance_base {
+                normalize_openai_chat_url(base)
+            } else {
+                env_or(
+                    "ARCHIVR_OPENAI_URL",
+                    "https://api.openai.com/v1/chat/completions",
+                )
+            };
+
+            let api_key = if let Some(key) = instance_key {
+                key.to_string()
+            } else if instance_base.is_some() {
+                optional_env("ARCHIVR_OPENAI_API_KEY").unwrap_or_default()
+            } else {
+                required_env("ARCHIVR_OPENAI_API_KEY")?
+            };
+
+            let model = if let Some(m) = instance_model {
+                m.to_string()
+            } else {
+                env_or("ARCHIVR_OPENAI_MODEL", "gpt-4o-mini")
+            };
+
+            Ok(ProviderConfig::OpenAiCompatible(HttpProviderConfig {
+                endpoint,
+                api_key,
+                model,
+                timeout_secs: env_timeout("ARCHIVR_SUMMARY_HTTP_TIMEOUT", DEFAULT_HTTP_TIMEOUT_SECS),
+            }))
+        }
         "claude_cli" => Ok(ProviderConfig::ClaudeCli(CliProviderConfig {
             executable: resolve_cli(
                 "ARCHIVR_CLAUDE_CLI",
@@ -480,10 +548,13 @@ impl SummaryProvider for OpenAiCompatibleProvider {
 }
 
 fn send_openai(cfg: &HttpProviderConfig, body: &serde_json::Value) -> Result<SummaryOutput> {
-    let resp = http_client(cfg.timeout_secs)?
+    let mut req = http_client(cfg.timeout_secs)?
         .post(&cfg.endpoint)
-        .header("authorization", format!("Bearer {}", cfg.api_key))
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+    if !cfg.api_key.trim().is_empty() {
+        req = req.header("authorization", format!("Bearer {}", cfg.api_key));
+    }
+    let resp = req
         .body(body.to_string())
         .send()
         .with_context(|| format!("request to {} failed", cfg.endpoint))?;
@@ -508,6 +579,62 @@ pub fn parse_openai_response(body: &str) -> Result<SummaryOutput> {
         text: text.to_string(),
         model: json["model"].as_str().map(str::to_string),
     })
+}
+
+pub fn parse_openai_models_response(body: &str) -> Result<Vec<String>> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).context("openai-compatible models response was not JSON")?;
+    let mut models = Vec::new();
+    if let Some(arr) = json["data"].as_array() {
+        for item in arr {
+            if let Some(id) = item["id"].as_str() {
+                models.push(id.to_string());
+            }
+        }
+    } else if let Some(arr) = json["models"].as_array() {
+        for item in arr {
+            if let Some(id) = item["id"].as_str().or_else(|| item["name"].as_str()) {
+                models.push(id.to_string());
+            } else if let Some(s) = item.as_str() {
+                models.push(s.to_string());
+            }
+        }
+    } else if let Some(arr) = json.as_array() {
+        for item in arr {
+            if let Some(id) = item["id"].as_str() {
+                models.push(id.to_string());
+            } else if let Some(s) = item.as_str() {
+                models.push(s.to_string());
+            }
+        }
+    }
+    models.sort();
+    models.dedup();
+    Ok(models)
+}
+
+pub fn list_openai_compatible_models(
+    base_url: &str,
+    api_key: Option<&str>,
+    timeout_secs: u64,
+) -> Result<Vec<String>> {
+    let url = normalize_openai_models_url(base_url);
+    let mut req = http_client(timeout_secs)?.get(&url);
+    if let Some(key) = api_key.map(str::trim).filter(|k| !k.is_empty()) {
+        req = req.header("authorization", format!("Bearer {key}"));
+    }
+    let resp = req
+        .send()
+        .with_context(|| format!("request to {url} failed"))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "openai-compatible models endpoint returned {status}: {}",
+            truncate_for_error(&text)
+        );
+    }
+    parse_openai_models_response(&text)
 }
 
 fn truncate_for_error(s: &str) -> String {
@@ -580,13 +707,17 @@ impl SummaryProvider for ClaudeCliProvider {
 /// Codex invocation lives in its own module because its one-shot interface is
 /// the least stable of the four.
 ///
-/// Primary form is `codex exec --output-last-message <file> -`, which reads the
-/// prompt from stdin and writes ONLY the final assistant message to `<file>`.
+/// Primary form is `codex exec --skip-git-repo-check --sandbox read-only
+/// --output-last-message <file> -`, which reads the prompt from stdin and
+/// writes ONLY the final assistant message to `<file>`.
 /// Without `--output-last-message`, stdout is polluted with a header
 /// (`OpenAI Codex vX`, session id, model, sandbox, …) and a footer
 /// (`tokens used`, message replay), and the JSON extractor can pick up the
-/// echoed user prompt instead of the real answer. Older builds that reject
-/// `-` as stdin marker fall back to a positional prompt.
+/// echoed user prompt instead of the real answer. `--skip-git-repo-check` is
+/// required because the server's working directory is rarely a trusted git
+/// repo (codex refuses to start otherwise); `--sandbox read-only` keeps a
+/// prompt-injected archived page from writing anywhere. Older builds that
+/// reject `-` as stdin marker fall back to a positional prompt.
 mod codex {
     use super::*;
 
@@ -604,12 +735,18 @@ mod codex {
         ))
     }
 
-    fn missing_binary_hint(cfg: &CliProviderConfig) -> &'static str {
-        // Only nudge users about the env var when we're running the default
-        // bare "codex" and it failed — an explicit ARCHIVR_CODEX_CLI path
-        // failure is their configuration, not a discovery gap.
-        if cfg.executable == Path::new("codex") {
-            " (hint: set ARCHIVR_CODEX_CLI to your codex binary; on macOS the              ChatGPT desktop app installs it at              /Applications/ChatGPT.app/Contents/Resources/codex)"
+    pub(crate) fn missing_binary_hint(cfg: &CliProviderConfig, err: &anyhow::Error) -> &'static str {
+        // Only nudge users about the env var when the default bare "codex"
+        // could not be spawned at all. A codex that ran and exited non-zero is
+        // not a discovery gap, and an explicit ARCHIVR_CODEX_CLI path failure
+        // is their configuration.
+        let not_found = err.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        });
+        if not_found && cfg.executable == Path::new("codex") {
+            " (hint: set ARCHIVR_CODEX_CLI to your codex binary; on macOS the ChatGPT desktop app installs it at /Applications/ChatGPT.app/Contents/Resources/codex)"
         } else {
             ""
         }
@@ -631,7 +768,12 @@ mod codex {
         out_path: &Path,
         model: Option<&str>,
     ) -> Vec<String> {
-        let mut args = vec!["exec".into()];
+        let mut args: Vec<String> = vec![
+            "exec".into(),
+            "--skip-git-repo-check".into(),
+            "--sandbox".into(),
+            "read-only".into(),
+        ];
         for image in images {
             args.push("--image".into());
             args.push(image.archive_file.to_string_lossy().into_owned());
@@ -684,13 +826,16 @@ mod codex {
         // Fallback: positional prompt, no stdin, same --output-last-message.
         let fb = positional_args(images, &out_path, cfg.model.as_deref(), prompt);
         let fb_refs: Vec<&str> = fb.iter().map(String::as_str).collect();
-        let out = run_cli(&cfg.executable, &fb_refs, "", cfg.timeout_secs).with_context(|| {
-            let _ = std::fs::remove_file(&out_path);
-            format!(
-                "codex `exec -` failed ({primary_err:#}); positional fallback failed{}",
-                missing_binary_hint(cfg)
-            )
-        })?;
+        let out = match run_cli(&cfg.executable, &fb_refs, "", cfg.timeout_secs) {
+            Ok(out) => out,
+            Err(e) => {
+                let _ = std::fs::remove_file(&out_path);
+                let hint = missing_binary_hint(cfg, &e);
+                return Err(e.context(format!(
+                    "codex `exec -` failed ({primary_err:#}); positional fallback failed{hint}"
+                )));
+            }
+        };
         if let Some(text) = read_and_cleanup(&out_path) {
             return Ok(text);
         }
@@ -1524,6 +1669,87 @@ mod tests {
     }
 
     #[test]
+    fn normalize_openai_urls_works_for_various_formats() {
+        assert_eq!(
+            normalize_openai_chat_url("http://localhost:8318/v1"),
+            "http://localhost:8318/v1/chat/completions"
+        );
+        assert_eq!(
+            normalize_openai_chat_url("http://localhost:8318/v1/"),
+            "http://localhost:8318/v1/chat/completions"
+        );
+        assert_eq!(
+            normalize_openai_chat_url("http://localhost:8318/v1/chat/completions"),
+            "http://localhost:8318/v1/chat/completions"
+        );
+
+        assert_eq!(
+            normalize_openai_models_url("http://localhost:8318/v1"),
+            "http://localhost:8318/v1/models"
+        );
+        assert_eq!(
+            normalize_openai_models_url("http://localhost:8318/v1/chat/completions"),
+            "http://localhost:8318/v1/models"
+        );
+        assert_eq!(
+            normalize_openai_models_url("http://localhost:8318/v1/"),
+            "http://localhost:8318/v1/models"
+        );
+    }
+
+    #[test]
+    fn provider_with_openai_overrides_honours_instance_settings() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_provider_env();
+        let overrides = OpenAiCompatibleOverrides {
+            base_url: Some("http://localhost:8318/v1".into()),
+            api_key: Some("custom-key".into()),
+            model: Some("qwen2.5:3b".into()),
+        };
+        let ProviderConfig::OpenAiCompatible(c) =
+            provider_from_env_with_openai_overrides("openai_compatible", Some(&overrides)).unwrap()
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(c.endpoint, "http://localhost:8318/v1/chat/completions");
+        assert_eq!(c.api_key, "custom-key");
+        assert_eq!(c.model, "qwen2.5:3b");
+    }
+
+    #[test]
+    fn provider_with_openai_overrides_allows_no_key_for_custom_base() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_provider_env();
+        let overrides = OpenAiCompatibleOverrides {
+            base_url: Some("http://localhost:8318/v1".into()),
+            api_key: None,
+            model: None,
+        };
+        let ProviderConfig::OpenAiCompatible(c) =
+            provider_from_env_with_openai_overrides("openai_compatible", Some(&overrides)).unwrap()
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(c.endpoint, "http://localhost:8318/v1/chat/completions");
+        assert_eq!(c.api_key, "");
+        assert_eq!(c.model, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn parse_openai_models_response_extracts_and_sorts_ids() {
+        let json = r#"{
+            "object": "list",
+            "data": [
+                {"id": "qwen2.5:3b", "object": "model"},
+                {"id": "llama3.2:1b", "object": "model"},
+                {"id": "deepseek-r1:8b", "object": "model"}
+            ]
+        }"#;
+        let models = parse_openai_models_response(json).unwrap();
+        assert_eq!(models, vec!["deepseek-r1:8b", "llama3.2:1b", "qwen2.5:3b"]);
+    }
+
+    #[test]
     fn provider_from_env_clis_default_to_bare_binary_names() {
         let _g = ENV_LOCK.lock().unwrap();
         clear_provider_env();
@@ -1672,6 +1898,11 @@ mod tests {
             request.images[0].archive_file.to_string_lossy()
         );
         assert_eq!(args.last().unwrap(), "-");
+        // Without these codex refuses to run outside a trusted git repo, which
+        // is where the server usually lives.
+        assert!(args.iter().any(|a| a == "--skip-git-repo-check"));
+        let sandbox_at = args.iter().position(|a| a == "--sandbox").unwrap();
+        assert_eq!(args[sandbox_at + 1], "read-only");
     }
 
     #[test]
@@ -1690,6 +1921,9 @@ mod tests {
             request.images[0].archive_file.to_string_lossy()
         );
         assert_eq!(args.last().unwrap(), "prompt");
+        assert!(args.iter().any(|a| a == "--skip-git-repo-check"));
+        let sandbox_at = args.iter().position(|a| a == "--sandbox").unwrap();
+        assert_eq!(args[sandbox_at + 1], "read-only");
     }
 
     #[cfg(unix)]
@@ -1716,6 +1950,30 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(err.contains("timed out after 1s"), "got: {err}");
+    }
+
+    #[test]
+    fn codex_missing_binary_hint_only_fires_on_not_found_with_bare_command() {
+        let bare_cfg = CliProviderConfig {
+            executable: PathBuf::from("codex"),
+            model: None,
+            timeout_secs: 10,
+        };
+        let explicit_cfg = CliProviderConfig {
+            executable: PathBuf::from("/usr/bin/codex"),
+            model: None,
+            timeout_secs: 10,
+        };
+
+        let not_found_err = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No such file",
+        ));
+        let exit_err = anyhow::anyhow!("codex exited with 1: Not inside a trusted directory");
+
+        assert!(codex::missing_binary_hint(&bare_cfg, &not_found_err).contains("ARCHIVR_CODEX_CLI"));
+        assert_eq!(codex::missing_binary_hint(&bare_cfg, &exit_err), "");
+        assert_eq!(codex::missing_binary_hint(&explicit_cfg, &not_found_err), "");
     }
 
     #[test]

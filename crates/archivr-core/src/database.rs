@@ -187,6 +187,13 @@ pub struct InstanceSettings {
     pub title_model_openai_compatible: Option<String>,
     pub title_model_claude_cli: Option<String>,
     pub title_model_codex_cli: Option<String>,
+    /// Optional base URL for an OpenAI-compatible endpoint (e.g. `http://localhost:8318/v1`).
+    pub openai_base_url: Option<String>,
+    /// Optional API key for the OpenAI-compatible endpoint. Never serialized in API responses.
+    #[serde(skip_serializing)]
+    pub openai_api_key: Option<String>,
+    /// Optional default model for the OpenAI-compatible endpoint.
+    pub openai_model: Option<String>,
 }
 
 impl InstanceSettings {
@@ -220,6 +227,29 @@ impl InstanceSettings {
             "claude_cli" => Some(&self.title_model_claude_cli),
             "codex_cli" => Some(&self.title_model_codex_cli),
             _ => None,
+        }
+    }
+    /// Returns instance-level overrides for the OpenAI-compatible provider, if any are set.
+    pub fn openai_compatible_overrides(&self) -> crate::summarizer::OpenAiCompatibleOverrides {
+        crate::summarizer::OpenAiCompatibleOverrides {
+            base_url: self
+                .openai_base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+            api_key: self
+                .openai_api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+            model: self
+                .openai_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from),
         }
     }
 }
@@ -719,7 +749,10 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
             title_model_anthropic_http         TEXT,
             title_model_openai_compatible      TEXT,
             title_model_claude_cli             TEXT,
-            title_model_codex_cli              TEXT
+            title_model_codex_cli              TEXT,
+            openai_base_url                    TEXT,
+            openai_api_key                     TEXT,
+            openai_model                       TEXT
         );
 
         INSERT OR IGNORE INTO instance_settings
@@ -737,7 +770,8 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
             status        TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
             role          TEXT NOT NULL CHECK (role IN ('admin', 'user')),
             created_at    TEXT NOT NULL,
-            last_login_at TEXT
+            last_login_at TEXT,
+            summary_provider TEXT
         );
 
         CREATE TABLE IF NOT EXISTS cookie_rules (
@@ -769,6 +803,9 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
         "ALTER TABLE users ADD COLUMN humanize_slugs INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    // Add summary_provider column to users if not present (idempotent migration)
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN summary_provider TEXT", []);
+
 
     // Add scope column to api_tokens if not present ('full' | 'read'; idempotent migration)
     let _ = conn.execute(
@@ -808,6 +845,18 @@ pub fn initialize_auth_schema(conn: &Connection) -> Result<()> {
             [],
         );
     }
+    // Add OpenAI-compatible configuration to instance_settings if not present (idempotent migration)
+    for column in [
+        "openai_base_url",
+        "openai_api_key",
+        "openai_model",
+    ] {
+        let _ = conn.execute(
+            &format!("ALTER TABLE instance_settings ADD COLUMN {column} TEXT"),
+            [],
+        );
+    }
+
 
     // Backfill allocations for custom roles created before role_bit_allocations existed.
     // Roles deleted before this migration left no record here, so their bits cannot be
@@ -1068,7 +1117,8 @@ pub fn get_instance_settings(conn: &Connection) -> Result<InstanceSettings> {
                 COALESCE(modal_closer_enabled, 1),
                 COALESCE(reorder_children_role_bits, 12),
                 title_model_anthropic_http, title_model_openai_compatible,
-                title_model_claude_cli, title_model_codex_cli
+                title_model_claude_cli, title_model_codex_cli,
+                openai_base_url, openai_api_key, openai_model
          FROM instance_settings WHERE id = 1",
         [],
         |row| {
@@ -1085,6 +1135,9 @@ pub fn get_instance_settings(conn: &Connection) -> Result<InstanceSettings> {
                 title_model_openai_compatible: row.get(9)?,
                 title_model_claude_cli: row.get(10)?,
                 title_model_codex_cli: row.get(11)?,
+                openai_base_url: row.get(12)?,
+                openai_api_key: row.get(13)?,
+                openai_model: row.get(14)?,
             })
         },
     )
@@ -1105,7 +1158,10 @@ pub fn update_instance_settings(conn: &Connection, settings: &InstanceSettings) 
              title_model_anthropic_http = ?9,
              title_model_openai_compatible = ?10,
              title_model_claude_cli = ?11,
-             title_model_codex_cli = ?12
+             title_model_codex_cli = ?12,
+             openai_base_url = ?13,
+             openai_api_key = ?14,
+             openai_model = ?15
          WHERE id = 1",
         params![
             settings.public_index_enabled as i64,
@@ -1120,6 +1176,9 @@ pub fn update_instance_settings(conn: &Connection, settings: &InstanceSettings) 
             settings.title_model_openai_compatible,
             settings.title_model_claude_cli,
             settings.title_model_codex_cli,
+            settings.openai_base_url,
+            settings.openai_api_key,
+            settings.openai_model,
         ],
     )?;
     Ok(())
@@ -1237,6 +1296,27 @@ pub fn update_user_humanize_slugs(conn: &Connection, user_id: i64, value: bool) 
         params![value as i64, user_id],
     )?;
     Ok(())
+}
+
+pub fn update_user_summary_provider(
+    conn: &Connection,
+    user_id: i64,
+    provider: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE users SET summary_provider = ?1 WHERE id = ?2",
+        params![provider, user_id],
+    )?;
+    Ok(())
+}
+
+pub fn get_user_summary_provider(conn: &Connection, user_id: i64) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT summary_provider FROM users WHERE id = ?1",
+        [user_id],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 /// Updates the user-visible title of an archived entry.
@@ -4716,6 +4796,54 @@ mod tests {
         assert_eq!(s.title_model_override("codex_cli"), None);
         assert_eq!(s.title_model_override("gemini"), None);
         assert_eq!(s.title_model_anthropic_http, None);
+    }
+
+    #[test]
+    fn instance_settings_openai_compatible_migrates_and_round_trips() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE instance_settings (id INTEGER PRIMARY KEY CHECK (id = 1), public_index_enabled INTEGER NOT NULL DEFAULT 0, public_entry_content_enabled INTEGER NOT NULL DEFAULT 0, public_archive_submission_enabled INTEGER NOT NULL DEFAULT 0, default_entry_visibility INTEGER NOT NULL DEFAULT 2);
+             INSERT INTO instance_settings (id) VALUES (1);",
+        )
+        .unwrap();
+        initialize_auth_schema(&conn).unwrap();
+        initialize_auth_schema(&conn).unwrap();
+        let mut s = get_instance_settings(&conn).unwrap();
+        assert_eq!(s.openai_base_url, None);
+        assert_eq!(s.openai_api_key, None);
+        assert_eq!(s.openai_model, None);
+
+        s.openai_base_url = Some("http://localhost:8318/v1".into());
+        s.openai_api_key = Some("test-key".into());
+        s.openai_model = Some("llama3.2".into());
+        update_instance_settings(&conn, &s).unwrap();
+
+        let s2 = get_instance_settings(&conn).unwrap();
+        assert_eq!(s2.openai_base_url.as_deref(), Some("http://localhost:8318/v1"));
+        assert_eq!(s2.openai_api_key.as_deref(), Some("test-key"));
+        assert_eq!(s2.openai_model.as_deref(), Some("llama3.2"));
+
+        let overrides = s2.openai_compatible_overrides();
+        assert_eq!(overrides.base_url.as_deref(), Some("http://localhost:8318/v1"));
+        assert_eq!(overrides.api_key.as_deref(), Some("test-key"));
+        assert_eq!(overrides.model.as_deref(), Some("llama3.2"));
+    }
+
+    #[test]
+    fn user_summary_provider_migrates_and_round_trips() {
+        let conn = make_auth_conn_for_mgmt();
+        let uid = create_user(&conn, "providertester", None, "hash", 1).unwrap();
+        let user_id = get_user_id_by_uid(&conn, &uid).unwrap().unwrap();
+        assert_eq!(get_user_summary_provider(&conn, user_id).unwrap(), None);
+
+        update_user_summary_provider(&conn, user_id, Some("openai_compatible")).unwrap();
+        assert_eq!(
+            get_user_summary_provider(&conn, user_id).unwrap().as_deref(),
+            Some("openai_compatible")
+        );
+
+        update_user_summary_provider(&conn, user_id, None).unwrap();
+        assert_eq!(get_user_summary_provider(&conn, user_id).unwrap(), None);
     }
 
     #[test]

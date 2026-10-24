@@ -484,6 +484,22 @@ export async function updateInstanceSettings(patch) {
   if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.error || `HTTP ${res.status}`); }
 }
 
+export async function fetchOpenAiModels(options = {}) {
+  const res = await fetch('/api/admin/openai-models', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      base_url: options.baseUrl || undefined,
+      api_key: options.apiKey || undefined,
+    }),
+  });
+  if (!res.ok) {
+    const b = await res.json().catch(() => ({}));
+    throw new Error(b.error || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
 export async function getYtDlpStatus({ signal } = {}) {
   return getJson('/api/admin/yt-dlp', { signal });
 }

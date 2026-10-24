@@ -395,11 +395,13 @@ replacement succeeds, and public readers receive completed content only—never 
 | `ARCHIVR_CODEX_MODEL` | *(the CLI's own default)* | Optional model override for the local Codex CLI |
 | `ARCHIVR_SUMMARY_HTTP_TIMEOUT` | `120` | Seconds before an HTTP-provider summary is killed |
 | `ARCHIVR_SUMMARY_CLI_TIMEOUT` | `300` | Seconds before a CLI-provider summary is killed; also bounds each summary-time yt-dlp subtitle fetch call |
+OpenAI-compatible endpoints can also be configured directly in the web UI under **Settings › Instance › OpenAI-compatible endpoint** (Base URL, optional API key, and model, with a **Fetch models** helper). Instance settings take precedence over the `ARCHIVR_OPENAI_*` environment variables.
+
+Users can also choose and save their preferred summary provider across sessions and devices in **Settings › Profile › Preferred summary provider** or directly via the Summary section in the sidebar.
 
 Thread-title generation uses the same provider but never its summary model (`ARCHIVR_*_MODEL`); it uses a cheap title
 model instead. Admins can set a per-provider title model in **Settings › Instance › Thread title models**. Precedence:
 that instance setting (blank = unset) > the env var below > the built-in default.
-
 | Variable | Default | Description |
 |---|---|---|
 | `ARCHIVR_ANTHROPIC_TITLE_MODEL` | `claude-haiku-4-5` | Model used only for thread-title generation |
