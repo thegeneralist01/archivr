@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { login } from '../api.js';
+import ThemeToggle from './ThemeToggle.jsx';
 
 export default function LoginPage({ onLogin }) {
   const [username, setUsername] = useState('');
@@ -23,6 +24,7 @@ export default function LoginPage({ onLogin }) {
 
   return (
     <div className="login-page">
+      <ThemeToggle className="auth-page-theme-toggle" />
       <div className="login-card">
         <h1 className="login-brand">Archivr</h1>
         <p className="login-tagline">Sign in to your archive</p>
