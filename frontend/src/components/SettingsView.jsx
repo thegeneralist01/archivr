@@ -12,6 +12,7 @@ import {
 } from '../api.js'
 import { describeExpiry, formatTimestamp } from '../utils.js'
 import { useTheme } from '../useTheme.js'
+import { normalizeCookiesInput, pasteCookies } from '../cookieImport.js'
 
 const ROLE_ADMIN = 4
 const ROLE_OWNER = 8
@@ -683,9 +684,9 @@ function CookiesTab() {
 
   async function handleAdd(e) {
     e.preventDefault()
-    // Validate JSON
-    try { JSON.parse(cookiesInput) } catch {
-      setAddMsg({ ok: false, text: 'cookies must be valid JSON, e.g. {"session": "abc"}' })
+    const normalized = normalizeCookiesInput(cookiesInput)
+    if (!normalized.ok) {
+      setAddMsg({ ok: false, text: normalized.error })
       return
     }
     setAdding(true); setAddMsg(null)
@@ -693,7 +694,7 @@ function CookiesTab() {
       await createCookieRule(
         patternKind === 'global' ? null : urlPattern.trim(),
         patternKind,
-        cookiesInput,
+        normalized.json,
       )
       setUrlPattern('')
       setCookiesInput('{}')
@@ -704,6 +705,44 @@ function CookiesTab() {
       setAddMsg({ ok: false, text: err.message })
     } finally {
       setAdding(false)
+    }
+  }
+
+  function handlePasteAdd(e) {
+    const clip = e.clipboardData?.getData('text')
+    if (!clip) return
+    const start = e.target.selectionStart ?? 0
+    const end = e.target.selectionEnd ?? 0
+    const action = pasteCookies(cookiesInput, start, end, clip)
+    if (!action) return
+    e.preventDefault()
+    if (action.error) {
+      setAddMsg({ ok: false, text: action.error })
+    } else {
+      setCookiesInput(action.text)
+      setAddMsg({ ok: true, text: action.message })
+    }
+  }
+
+  function handlePasteEdit(ruleUid, e) {
+    const clip = e.clipboardData?.getData('text')
+    if (!clip) return
+    const current = edits[ruleUid]?.cookiesInput ?? ''
+    const start = e.target.selectionStart ?? 0
+    const end = e.target.selectionEnd ?? 0
+    const action = pasteCookies(current, start, end, clip)
+    if (!action) return
+    e.preventDefault()
+    if (action.error) {
+      setEdits(prev => ({
+        ...prev,
+        [ruleUid]: { ...prev[ruleUid], msg: { ok: false, text: action.error } },
+      }))
+    } else {
+      setEdits(prev => ({
+        ...prev,
+        [ruleUid]: { ...prev[ruleUid], cookiesInput: action.text, msg: { ok: true, text: action.message } },
+      }))
     }
   }
 
@@ -733,13 +772,14 @@ function CookiesTab() {
 
   async function saveEdit(rule) {
     const edit = edits[rule.rule_uid]
-    try { JSON.parse(edit.cookiesInput) } catch {
-      setEdits(prev => ({ ...prev, [rule.rule_uid]: { ...prev[rule.rule_uid], msg: { ok: false, text: 'Invalid JSON' } } }))
+    const normalized = normalizeCookiesInput(edit.cookiesInput)
+    if (!normalized.ok) {
+      setEdits(prev => ({ ...prev, [rule.rule_uid]: { ...prev[rule.rule_uid], msg: { ok: false, text: normalized.error } } }))
       return
     }
     setEdits(prev => ({ ...prev, [rule.rule_uid]: { ...prev[rule.rule_uid], saving: true, msg: null } }))
     try {
-      await updateCookieRule(rule.rule_uid, { cookies_json: edit.cookiesInput })
+      await updateCookieRule(rule.rule_uid, { cookies_json: normalized.json })
       cancelEdit(rule.rule_uid)
       await load()
     } catch (err) {
@@ -785,6 +825,7 @@ function CookiesTab() {
                             style={{ fontFamily: 'monospace', fontSize: 12, width: '100%', minHeight: 60 }}
                             value={edit.cookiesInput}
                             onChange={ev => setEdits(prev => ({ ...prev, [rule.rule_uid]: { ...prev[rule.rule_uid], cookiesInput: ev.target.value } }))}
+                            onPaste={ev => handlePasteEdit(rule.rule_uid, ev)}
                           />
                           {edit.msg && <div className={`form-msg form-msg--${edit.msg.ok ? 'ok' : 'err'}`}>{edit.msg.text}</div>}
                           <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
@@ -847,9 +888,13 @@ function CookiesTab() {
               style={{ fontFamily: 'monospace', fontSize: 13, minHeight: 70 }}
               value={cookiesInput}
               onChange={e => setCookiesInput(e.target.value)}
+              onPaste={handlePasteAdd}
               placeholder='{"SESSION": "abc123", "token": "xyz"}'
               required
             />
+            <span className="muted" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>
+              Paste JSON object, extension export, Netscape cookies.txt, or header string.
+            </span>
           </div>
           {addMsg && <div className={`form-msg form-msg--${addMsg.ok ? 'ok' : 'err'}`}>{addMsg.text}</div>}
           <button className="btn-primary" type="submit" disabled={adding}>
