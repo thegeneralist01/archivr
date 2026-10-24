@@ -57,6 +57,7 @@ Contributing? See the [contributor guide](../CONTRIBUTING.md) and its ecosystem 
 - **Text notes** — capture a plain-text or Markdown note with a title and no URL; the byte-preserving note is stored as a normal deduplicated blob and opens in the usual entry-rail preview
 - **In-progress capture indicator** — running captures appear as a compact spinner row in the entries list until they finish, replacing the earlier grey skeleton block
 - **Dark mode** — toggle light/dark from the topbar or auth screen, or configure System/Light/Dark under **Settings › Profile**
+- **Cookie rules** — global, wildcard, or regex rules under **Settings › Cookies** inject custom cookies into capture network requests (yt-dlp, HTTP downloads, web snapshots). The input accepts native JSON, browser extension exports (Cookie-Editor, EditThisCookie), Netscape `cookies.txt`, or `Cookie:` header strings with automatic formatting and collision-safe merge on paste
 
 ## Quick Start
 
