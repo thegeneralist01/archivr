@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { doSetup } from '../api.js';
+import ThemeToggle from './ThemeToggle.jsx';
 
 export default function SetupPage({ onComplete }) {
   const [username, setUsername] = useState('');
@@ -32,6 +33,7 @@ export default function SetupPage({ onComplete }) {
 
   return (
     <div className="setup-page">
+      <ThemeToggle className="auth-page-theme-toggle" />
       <div className="setup-card">
         <h1 className="setup-brand">Archivr</h1>
         <p className="setup-tagline">Create your owner account to get started.</p>

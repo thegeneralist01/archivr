@@ -11,6 +11,7 @@ import {
   getYtDlpStatus, updateYtDlp,
 } from '../api.js'
 import { describeExpiry, formatTimestamp } from '../utils.js'
+import { useTheme } from '../useTheme.js'
 
 const ROLE_ADMIN = 4
 const ROLE_OWNER = 8
@@ -54,6 +55,7 @@ export default function SettingsView({ tab, onTabChange, archiveId }) {
 
 function ProfileTab({ currentUser, setCurrentUser }) {
   const [displayName, setDisplayName] = useState(currentUser?.display_name ?? '')
+  const { preference, resolved, setPreference } = useTheme()
   const [saving, setSaving] = useState(false)
   const [saveMsg, setSaveMsg] = useState(null)
 
@@ -133,6 +135,22 @@ function ProfileTab({ currentUser, setCurrentUser }) {
         <p className="muted" style={{ fontSize: 13, margin: '4px 0 0' }}>
           When on, tag paths show as "X / Articles" instead of "x/articles".
         </p>
+        <div className="form-field" style={{ marginTop: 16 }}>
+          <label className="form-label" htmlFor="theme-select">Theme</label>
+          <select
+            id="theme-select"
+            className="field-input"
+            value={preference}
+            onChange={e => setPreference(e.target.value)}
+          >
+            <option value="system">System ({resolved})</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+          <p className="muted" style={{ fontSize: 13, margin: '4px 0 0' }}>
+            Choose light, dark, or follow your operating system settings.
+          </p>
+        </div>
       </div>
 
       <div className="form-section">

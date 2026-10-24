@@ -95,6 +95,9 @@ async fn setup_guard(State(state): State<AppState>, req: Request, next: Next) ->
     let exempt = path.starts_with("/api/auth/")
         || path.starts_with("/assets")
         || path == "/"
+        || path == "/theme-init.js"
+        || path == "/favicon.ico"
+        || path == "/favicon.svg"
         || path == "/health";
     if !exempt {
         if let Ok(conn) = database::open_auth_db(&state.auth_db_path) {
@@ -6251,6 +6254,21 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["setup_required"], true);
+    }
+
+    #[tokio::test]
+    async fn theme_init_exempt_from_setup_guard() {
+        let (test_app, _dir) = make_setup_test_app();
+        let response = test_app
+            .oneshot(
+                Request::builder()
+                    .uri("/theme-init.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

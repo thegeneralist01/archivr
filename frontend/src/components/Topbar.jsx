@@ -1,6 +1,7 @@
 import { useContext, useState } from 'react';
 import { AuthContext } from '../App.jsx';
 import { logout as apiLogout } from '../api.js';
+import ThemeToggle from './ThemeToggle.jsx';
 
 export default function Topbar({ archives, archiveId, onArchiveChange, view, onViewChange, onCaptureClick, collections, selectedCollectionUid, onCollectionChange, isPublicSession, onSignInClick }) {
   const { currentUser, setCurrentUser } = useContext(AuthContext) ?? {};
@@ -51,6 +52,9 @@ export default function Topbar({ archives, archiveId, onArchiveChange, view, onV
         <>
           <span style={{ flex: 1 }} />
           <button className="logout-btn" onClick={onSignInClick}>Sign in</button>
+          <div className="user-menu">
+            <ThemeToggle />
+          </div>
         </>
       ) : (
         <>
@@ -63,14 +67,17 @@ export default function Topbar({ archives, archiveId, onArchiveChange, view, onV
             ))}
           </nav>
           <button className="capture-button" onClick={onCaptureClick}>Capture</button>
-          {currentUser && (
-            <div className="user-menu">
-              <span className="user-name">{currentUser.display_name || currentUser.username}</span>
-              <button className="logout-btn" onClick={handleLogout} disabled={loggingOut}>
-                {loggingOut ? 'Logging out\u2026' : 'Log out'}
-              </button>
-            </div>
-          )}
+          <div className="user-menu">
+            <ThemeToggle />
+            {currentUser && (
+              <>
+                <span className="user-name">{currentUser.display_name || currentUser.username}</span>
+                <button className="logout-btn" onClick={handleLogout} disabled={loggingOut}>
+                  {loggingOut ? 'Logging out\u2026' : 'Log out'}
+                </button>
+              </>
+            )}
+          </div>
         </>
       )}
     </header>

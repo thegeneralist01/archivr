@@ -56,6 +56,7 @@ Contributing? See the [contributor guide](../CONTRIBUTING.md) and its ecosystem 
 - **LLM summaries** — regenerable per-entry summary via the Anthropic HTTP API, an OpenAI-compatible HTTP API, a local `claude` CLI, or a local `codex` CLI; triggered manually from the entry rail, never automatically on capture; text-only by default, with an explicit `Include attached images` option; YouTube videos are summarized from their subtitles
 - **Text notes** — capture a plain-text or Markdown note with a title and no URL; the byte-preserving note is stored as a normal deduplicated blob and opens in the usual entry-rail preview
 - **In-progress capture indicator** — running captures appear as a compact spinner row in the entries list until they finish, replacing the earlier grey skeleton block
+- **Dark mode** — toggle light/dark from the topbar or auth screen, or configure System/Light/Dark under **Settings › Profile**
 
 ## Quick Start
 
