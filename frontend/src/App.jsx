@@ -207,7 +207,7 @@ export default function App() {
     poll()
     const timer = setInterval(poll, 3000)
     return () => { clearInterval(timer); setForeignCaptures([]) }
-  }, [archiveId, currentUser])
+  }, [archiveId, !currentUser])
 
   const [ublockWarningIgnored, setUblockWarningIgnored] = useState(
     () => sessionStorage.getItem('ublockWarningIgnored') === 'true'
@@ -317,7 +317,7 @@ export default function App() {
       tasks.push(fetchTags(archiveId).then(setTagNodes))
     }
     Promise.all(tasks)
-  }, [archiveId, currentUser]) // currentUser distinguishes guest vs authenticated
+  }, [archiveId, !currentUser]) // distinguishes guest vs authenticated without firing on preference changes
 
   // Debounced search — scoped to active collection
   useEffect(() => {

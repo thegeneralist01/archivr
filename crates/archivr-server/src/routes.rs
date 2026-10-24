@@ -399,6 +399,7 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route("/api/admin/yt-dlp", get(get_yt_dlp_status_handler))
         .route("/api/admin/yt-dlp/update", post(update_yt_dlp_handler))
+        .route("/api/admin/openai-models", post(fetch_openai_models_handler))
         .route(
             "/api/admin/cookie-rules",
             get(list_cookie_rules_handler).post(create_cookie_rule_handler),
@@ -604,7 +605,8 @@ async fn entry_detail(
 
 #[derive(Debug, serde::Deserialize)]
 struct SummaryRequestBody {
-    provider: String,
+    #[serde(default)]
+    provider: Option<String>,
     #[serde(default)]
     force: bool,
     #[serde(default)]
@@ -676,6 +678,7 @@ async fn request_entry_summary_handler(
     Path((archive_id, entry_uid)): Path<(String, String)>,
     Json(body): Json<SummaryRequestBody>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let (caller_id, _) = auth_user.require_auth()?;
     auth_user.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
     // A hidden entry is not found: it must not be summarized, nor probe provider config.
@@ -687,9 +690,19 @@ async fn request_entry_summary_handler(
     let archive_paths =
         archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;
 
-    // 1. Provider config from the environment. The error text carries the exact
+    let auth_conn = database::open_auth_db(&state.auth_db_path)?;
+    let settings = database::get_instance_settings(&auth_conn)?;
+    let openai_overrides = settings.openai_compatible_overrides();
+
+    let provider_kind = match body.provider.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => p.to_string(),
+        None => database::get_user_summary_provider(&auth_conn, caller_id)?
+            .unwrap_or_else(|| "anthropic_http".to_string()),
+    };
+
+    // 1. Provider config from the environment / instance overrides. The error text carries the exact
     //    variable name, which is the whole point of returning it as a 400.
-    let provider_cfg = summarizer::provider_from_env(&body.provider)
+    let provider_cfg = summarizer::provider_from_env_with_openai_overrides(&provider_kind, Some(&openai_overrides))
         .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     if body.include_images && matches!(provider_cfg, summarizer::ProviderConfig::ClaudeCli(_)) {
         return Err(ApiError::bad_request(
@@ -1455,7 +1468,8 @@ async fn capture_options_handler(
 #[derive(Debug, serde::Deserialize)]
 struct TextTitleBody {
     body: String,
-    provider: String,
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 async fn generate_text_title_handler(
@@ -1464,6 +1478,7 @@ async fn generate_text_title_handler(
     Path(archive_id): Path<String>,
     Json(body): Json<TextTitleBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let (caller_id, _) = auth_user.require_auth()?;
     auth_user.require_role(ROLE_USER)?;
     if body.body.trim().is_empty() {
         return Err(ApiError::bad_request("body must not be empty"));
@@ -1472,10 +1487,18 @@ async fn generate_text_title_handler(
         return Err(ApiError::bad_request("body must not exceed 2 MiB"));
     }
     mounted_archive(&state, &archive_id)?;
-    let settings = database::get_instance_settings(&database::open_auth_db(&state.auth_db_path)?)?;
-    let cfg = thread_title::title_provider_from_env(
-        &body.provider,
-        settings.title_model_override(&body.provider),
+    let auth_conn = database::open_auth_db(&state.auth_db_path)?;
+    let settings = database::get_instance_settings(&auth_conn)?;
+    let openai_overrides = settings.openai_compatible_overrides();
+    let provider_kind = match body.provider.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => p.to_string(),
+        None => database::get_user_summary_provider(&auth_conn, caller_id)?
+            .unwrap_or_else(|| "anthropic_http".to_string()),
+    };
+    let cfg = thread_title::title_provider_from_env_with_openai_overrides(
+        &provider_kind,
+        settings.title_model_override(&provider_kind),
+        Some(&openai_overrides),
     )
     .map_err(|error| ApiError::bad_request(&format!("{error:#}")))?;
     let title = tokio::task::spawn_blocking(move || {
@@ -1494,7 +1517,8 @@ async fn generate_text_title_handler(
 
 #[derive(Debug, serde::Deserialize)]
 struct ThreadTitleBody {
-    provider: String,
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 /// `POST /api/archives/:id/entries/:uid/thread-title` — names an X thread with a
@@ -1506,6 +1530,7 @@ async fn generate_thread_title_handler(
     Path((archive_id, entry_uid)): Path<(String, String)>,
     Json(body): Json<ThreadTitleBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let (caller_id, _) = auth_user.require_auth()?;
     auth_user.require_role(ROLE_USER)?;
     let mounted = mounted_archive(&state, &archive_id)?;
     ensure_entry_visible(
@@ -1514,10 +1539,18 @@ async fn generate_thread_title_handler(
         &entry_uid,
     )?;
     let paths = archive::read_archive_paths(&mounted.archive_path).map_err(ApiError::from)?;
-    let settings = database::get_instance_settings(&database::open_auth_db(&state.auth_db_path)?)?;
-    let cfg = thread_title::title_provider_from_env(
-        &body.provider,
-        settings.title_model_override(&body.provider),
+    let auth_conn = database::open_auth_db(&state.auth_db_path)?;
+    let settings = database::get_instance_settings(&auth_conn)?;
+    let openai_overrides = settings.openai_compatible_overrides();
+    let provider_kind = match body.provider.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => p.to_string(),
+        None => database::get_user_summary_provider(&auth_conn, caller_id)?
+            .unwrap_or_else(|| "anthropic_http".to_string()),
+    };
+    let cfg = thread_title::title_provider_from_env_with_openai_overrides(
+        &provider_kind,
+        settings.title_model_override(&provider_kind),
+        Some(&openai_overrides),
     )
     .map_err(|e| ApiError::bad_request(&format!("{e:#}")))?;
     let uid = entry_uid.clone();
@@ -2525,11 +2558,16 @@ async fn auth_me(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (user_id, role_bits) = auth_user.require_auth()?;
     let conn = database::open_auth_db(&state.auth_db_path)?;
-    let (username, display_name, humanize_slugs_int): (String, Option<String>, i64) = conn
+    let (username, display_name, humanize_slugs_int, summary_provider): (
+        String,
+        Option<String>,
+        i64,
+        Option<String>,
+    ) = conn
         .query_row(
-            "SELECT username, display_name, COALESCE(humanize_slugs, 0) FROM users WHERE id = ?1",
+            "SELECT username, display_name, COALESCE(humanize_slugs, 0), summary_provider FROM users WHERE id = ?1",
             [user_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .map_err(|e| ApiError::from(anyhow::anyhow!("db error: {e}")))?;
     let humanize_slugs = humanize_slugs_int != 0;
@@ -2543,6 +2581,7 @@ async fn auth_me(
         "username": username,
         "display_name": display_name,
         "humanize_slugs": humanize_slugs,
+        "summary_provider": summary_provider,
         "can_reorder_children": settings.can_reorder_children(role_bits),
     })))
 }
@@ -2594,6 +2633,21 @@ async fn patch_me(
         database::update_user_humanize_slugs(&conn, user_id, hs)?;
     }
 
+    if let Some(sp) = &body.summary_provider {
+        let trimmed = sp.trim();
+        if trimmed.is_empty() {
+            database::update_user_summary_provider(&conn, user_id, None)?;
+        } else {
+            if !summarizer::PROVIDER_KINDS.contains(&trimmed) {
+                return Err(ApiError::bad_request(&format!(
+                    "unknown summary provider: {trimmed} (expected one of {})",
+                    summarizer::PROVIDER_KINDS.join(", ")
+                )));
+            }
+            database::update_user_summary_provider(&conn, user_id, Some(trimmed))?;
+        }
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2624,13 +2678,24 @@ async fn get_instance_settings_handler(
             "cookie_ext_available".into(),
             serde_json::Value::Bool(cookie_ext_available),
         );
+        obj.insert(
+            "openai_api_key_set".into(),
+            serde_json::Value::Bool(
+                settings
+                    .openai_api_key
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|k| !k.is_empty()),
+            ),
+        );
         let title_models: serde_json::Map<String, serde_json::Value> = summarizer::PROVIDER_KINDS
             .iter()
             .filter_map(|kind| {
                 let instance = settings.title_model_override(kind);
-                let (model, source) = thread_title::resolve_title_model(kind, instance)?;
+                let openai_overrides = settings.openai_compatible_overrides();
+                let (model, source) = thread_title::resolve_title_model_with_openai_overrides(kind, instance, Some(&openai_overrides))?;
                 // Fallback = what applies if the instance value is cleared (placeholder).
-                let (fallback, fallback_source) = thread_title::resolve_title_model(kind, None)?;
+                let (fallback, fallback_source) = thread_title::resolve_title_model_with_openai_overrides(kind, None, Some(&openai_overrides))?;
                 Some((
                     kind.to_string(),
                     serde_json::json!({
@@ -2714,9 +2779,101 @@ async fn update_instance_settings_handler(
             }
         }
     }
+    if let Some(raw) = body.openai_base_url {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            settings.openai_base_url = None;
+        } else {
+            if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+                return Err(ApiError::bad_request(
+                    "openai_base_url must start with http:// or https://",
+                ));
+            }
+            if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err(ApiError::bad_request(
+                    "openai_base_url must not contain whitespace or control characters",
+                ));
+            }
+            settings.openai_base_url = Some(trimmed.to_string());
+        }
+    }
+    if let Some(raw) = body.openai_api_key {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            settings.openai_api_key = None;
+        } else {
+            settings.openai_api_key = Some(trimmed.to_string());
+        }
+    }
+    if let Some(raw) = body.openai_model {
+        let trimmed = raw.trim();
+        settings.openai_model = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
     database::update_instance_settings(&tx, &settings)?;
     tx.commit()?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FetchOpenAiModelsBody {
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+async fn fetch_openai_models_handler(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Json(body): Json<FetchOpenAiModelsBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    auth_user.require_role(ROLE_ADMIN)?;
+    let conn = database::open_auth_db(&state.auth_db_path)?;
+    let settings = database::get_instance_settings(&conn)?;
+
+    let base_url = body
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(settings.openai_base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+        .map(String::from)
+        .or_else(|| std::env::var("ARCHIVR_OPENAI_URL").ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        return Err(ApiError::bad_request("base_url must start with http:// or https://"));
+    }
+    if base_url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(ApiError::bad_request("base_url must not contain whitespace or control characters"));
+    }
+
+    let api_key = body
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(settings.openai_api_key.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+        .map(String::from)
+        .or_else(|| std::env::var("ARCHIVR_OPENAI_API_KEY").ok().filter(|s| !s.trim().is_empty()));
+
+    let timeout_secs = std::env::var("ARCHIVR_SUMMARY_HTTP_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+
+    let models = tokio::task::spawn_blocking(move || {
+        summarizer::list_openai_compatible_models(&base_url, api_key.as_deref(), timeout_secs)
+    })
+    .await
+    .map_err(|e| ApiError::internal(&format!("task failed: {e}")))?
+    .map_err(|e| ApiError::bad_request(&format!("failed to fetch models: {e:#}")))?;
+
+    Ok(Json(serde_json::json!({ "models": models })))
 }
 
 const MAX_TITLE_MODEL_CHARS: usize = 100;
@@ -3222,6 +3379,7 @@ struct UpdateProfileBody {
     current_password: Option<String>,
     new_password: Option<String>,
     humanize_slugs: Option<bool>,
+    summary_provider: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -3238,6 +3396,9 @@ struct UpdateInstanceSettingsBody {
     title_model_openai_compatible: Option<String>,
     title_model_claude_cli: Option<String>,
     title_model_codex_cli: Option<String>,
+    openai_base_url: Option<String>,
+    openai_api_key: Option<String>,
+    openai_model: Option<String>,
 }
 
 async fn admin_list_users(
@@ -4848,6 +5009,51 @@ mod tests {
         );
         let conn = database::open_or_initialize(&archive_path).unwrap();
         assert!(database::latest_entry_summary(&conn, entry.id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn summary_request_uses_saved_provider_when_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, archive_path, auth_path) = make_test_registry(&dir);
+        let entry = make_test_entry(&archive_path);
+        let session_cookie = make_test_session(&auth_path);
+
+        // Save claude_cli as user's preferred summary provider
+        let patch_resp = app(registry.clone(), auth_path.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/auth/me")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(Body::from(r#"{"summary_provider":"claude_cli"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(patch_resp.status(), StatusCode::NO_CONTENT);
+
+        // Post summary with omitted provider but include_images: true
+        let response = app(registry, auth_path)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/archives/test/entries/{}/summary", entry.entry_uid))
+                    .header("content-type", "application/json")
+                    .header("cookie", &session_cookie)
+                    .body(json_body(&serde_json::json!({
+                        "include_images": true,
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await["error"],
+            "Claude CLI cannot attach local images; choose an HTTP provider or Codex CLI"
+        );
     }
 
     #[tokio::test]
@@ -9258,6 +9464,180 @@ mod tests {
             json["humanize_slugs"], true,
             "humanize_slugs must be true after PATCH"
         );
+    }
+
+    #[tokio::test]
+    async fn auth_me_returns_summary_provider_null_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+        let me = me_json(registry, auth_path, &session).await;
+        assert!(me["summary_provider"].is_null());
+    }
+
+    #[tokio::test]
+    async fn patch_me_summary_provider_persists_and_validates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let session = make_test_session(&auth_path);
+
+        // Rejects unknown provider
+        let bad_resp = app(registry.clone(), auth_path.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/auth/me")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session)
+                    .body(Body::from(r#"{"summary_provider":"invalid_provider"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_resp.status(), StatusCode::BAD_REQUEST);
+
+        // Accepts valid provider
+        let patch_resp = app(registry.clone(), auth_path.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/auth/me")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session)
+                    .body(Body::from(r#"{"summary_provider":"openai_compatible"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(patch_resp.status(), StatusCode::NO_CONTENT);
+
+        let me = me_json(registry.clone(), auth_path.clone(), &session).await;
+        assert_eq!(me["summary_provider"], "openai_compatible");
+
+        // Clears provider on blank
+        let clear_resp = app(registry.clone(), auth_path.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/auth/me")
+                    .header("content-type", "application/json")
+                    .header("cookie", &session)
+                    .body(Body::from(r#"{"summary_provider":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(clear_resp.status(), StatusCode::NO_CONTENT);
+
+        let me2 = me_json(registry, auth_path, &session).await;
+        assert!(me2["summary_provider"].is_null());
+    }
+
+    #[tokio::test]
+    async fn instance_settings_openai_compatible_round_trips_and_validates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let owner = make_test_session(&auth_path);
+
+        // Initial state: api_key_set false, never returns key
+        let json = get_settings_json(registry.clone(), auth_path.clone(), &owner).await;
+        assert_eq!(json["openai_api_key_set"], false);
+        assert!(json.get("openai_api_key").is_none());
+        assert!(json["openai_base_url"].is_null());
+        assert!(json["openai_model"].is_null());
+
+        // Rejects bad URL (not http/https)
+        let bad_resp = app(registry.clone(), auth_path.clone())
+            .oneshot(patch_settings_request(
+                serde_json::json!({ "openai_base_url": "ftp://example.com" }),
+                &owner,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bad_resp.status(), StatusCode::BAD_REQUEST);
+
+        // Rejects whitespace in URL
+        let bad_resp2 = app(registry.clone(), auth_path.clone())
+            .oneshot(patch_settings_request(
+                serde_json::json!({ "openai_base_url": "http://localhost:8318 /v1" }),
+                &owner,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bad_resp2.status(), StatusCode::BAD_REQUEST);
+
+        // Sets valid base_url, key, and model
+        let patch_resp = app(registry.clone(), auth_path.clone())
+            .oneshot(patch_settings_request(
+                serde_json::json!({
+                    "openai_base_url": "http://localhost:8318/v1",
+                    "openai_api_key": "secret-token-123",
+                    "openai_model": "qwen2.5:3b"
+                }),
+                &owner,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(patch_resp.status(), StatusCode::NO_CONTENT);
+
+        // GET verifies: base_url set, model set, key set is true, key itself is NOT returned
+        let json2 = get_settings_json(registry.clone(), auth_path.clone(), &owner).await;
+        assert_eq!(json2["openai_base_url"], "http://localhost:8318/v1");
+        assert_eq!(json2["openai_model"], "qwen2.5:3b");
+        assert_eq!(json2["openai_api_key_set"], true);
+        assert!(json2.get("openai_api_key").is_none());
+
+        // Blank key clears the stored key
+        let clear_key_resp = app(registry.clone(), auth_path.clone())
+            .oneshot(patch_settings_request(
+                serde_json::json!({ "openai_api_key": "" }),
+                &owner,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(clear_key_resp.status(), StatusCode::NO_CONTENT);
+
+        let json3 = get_settings_json(registry, auth_path, &owner).await;
+        assert_eq!(json3["openai_api_key_set"], false);
+        assert_eq!(json3["openai_base_url"], "http://localhost:8318/v1");
+    }
+
+    #[tokio::test]
+    async fn fetch_openai_models_enforces_admin_and_validates_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _, auth_path) = make_test_registry(&dir);
+        let owner = make_test_session(&auth_path);
+        let user = make_role_session(&auth_path, "regularuser", &["user"]);
+
+        // Non-admin is forbidden
+        let forbidden_resp = app(registry.clone(), auth_path.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/openai-models")
+                    .header("content-type", "application/json")
+                    .header("cookie", &user)
+                    .body(Body::from(r#"{"base_url":"http://localhost:8318/v1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden_resp.status(), StatusCode::FORBIDDEN);
+
+        // Admin with invalid scheme gets 400
+        let bad_resp = app(registry.clone(), auth_path.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/openai-models")
+                    .header("content-type", "application/json")
+                    .header("cookie", &owner)
+                    .body(Body::from(r#"{"base_url":"ftp://localhost:8318"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

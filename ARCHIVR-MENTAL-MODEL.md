@@ -249,7 +249,7 @@ CLI-only installs never backfill. Rearchive still does not change titles.
 `tweet_thread` entries calls `POST .../entries/:entry_uid/thread-title` (user role, the same gate as rename). It reuses
 the selected provider's transport (`summarizer::complete_plain`) with a cheap title model — admin instance setting
 `instance_settings.title_model_<kind>`, else `ARCHIVR_*_TITLE_MODEL`, else a per-provider default, never the summary
-model; the server passes the instance value to core as an `Option<&str>` override (core never reads the auth DB) — and
+model; OpenAI-compatible endpoints can also be configured via instance settings (`instance_settings.openai_{base_url,api_key,model}`); the server passes instance values to core as overrides (core never reads the auth DB) — and
 never touches `entry_summaries`. The model returns only the topic; the server sanitizes it and owns the
 `Thread about <topic> — @author` format, saved via `update_entry_title`. The bulk panel's **Generate titles** (≥2
 selected, ≥1 thread) loops the same endpoint client-side over the selected threads, 2 at a time, with the rail's

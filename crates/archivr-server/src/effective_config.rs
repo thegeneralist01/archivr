@@ -169,10 +169,11 @@ fn env_var_json(spec: &EnvSpec) -> Value {
 
 // ── Derived state ───────────────────────────────────────────────────────────
 
-fn summary_providers_json() -> Vec<Value> {
+fn summary_providers_json(settings: &database::InstanceSettings) -> Vec<Value> {
+    let openai_overrides = settings.openai_compatible_overrides();
     summarizer::PROVIDER_KINDS
         .iter()
-        .map(|kind| match summarizer::provider_from_env(kind) {
+        .map(|kind| match summarizer::provider_from_env_with_openai_overrides(kind, Some(&openai_overrides)) {
             Ok(summarizer::ProviderConfig::AnthropicHttp(c))
             | Ok(summarizer::ProviderConfig::OpenAiCompatible(c)) => json!({
                 "kind": kind, "configured": true, "model": c.model,
@@ -196,7 +197,13 @@ fn summary_providers_json() -> Vec<Value> {
             Err(error) => {
                 let key_var = match *kind {
                     "anthropic_http" => Some("ARCHIVR_ANTHROPIC_API_KEY"),
-                    "openai_compatible" => Some("ARCHIVR_OPENAI_API_KEY"),
+                    "openai_compatible" => {
+                        if openai_overrides.base_url.is_some() {
+                            None
+                        } else {
+                            Some("ARCHIVR_OPENAI_API_KEY")
+                        }
+                    }
                     _ => None,
                 };
                 let missing: Vec<&str> = key_var.filter(|v| env_value(v).is_none()).into_iter().collect();
@@ -296,7 +303,7 @@ async fn effective_config_handler(
             "archives": archives,
         },
         "env_vars": ENV_VARS.iter().map(env_var_json).collect::<Vec<_>>(),
-        "summary_providers": summary_providers_json(),
+        "summary_providers": summary_providers_json(&settings),
         "title_models": title_models_json(&settings),
         "transcription_engines": transcription_engines_json(),
         "extensions": {

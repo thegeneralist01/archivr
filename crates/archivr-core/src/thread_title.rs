@@ -107,9 +107,28 @@ pub fn resolve_title_model(
     kind: &str,
     instance_override: Option<&str>,
 ) -> Option<(String, TitleModelSource)> {
+    resolve_title_model_with_openai_overrides(kind, instance_override, None)
+}
+
+/// Effective title model for `kind`: non-empty trimmed `instance_override` >
+/// OpenAI endpoint model (for `openai_compatible`) > non-empty title env var > built-in default.
+pub fn resolve_title_model_with_openai_overrides(
+    kind: &str,
+    instance_override: Option<&str>,
+    openai_overrides: Option<&summarizer::OpenAiCompatibleOverrides>,
+) -> Option<(String, TitleModelSource)> {
     let (var, default) = (title_model_env(kind)?, default_title_model(kind)?);
     if let Some(m) = instance_override.map(str::trim).filter(|m| !m.is_empty()) {
         return Some((m.to_string(), TitleModelSource::Instance));
+    }
+    if kind == "openai_compatible" {
+        if let Some(m) = openai_overrides
+            .and_then(|o| o.model.as_deref())
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            return Some((m.to_string(), TitleModelSource::Instance));
+        }
     }
     if let Some(m) = optional_env(var).map(|m| m.trim().to_string()).filter(|m| !m.is_empty()) {
         return Some((m, TitleModelSource::Env));
@@ -123,9 +142,19 @@ pub fn title_provider_from_env(
     kind: &str,
     instance_override: Option<&str>,
 ) -> Result<ProviderConfig> {
+    title_provider_from_env_with_openai_overrides(kind, instance_override, None)
+}
+
+/// Provider config for title generation with optional instance OpenAI overrides:
+/// transport settings from env / overrides, model from [`resolve_title_model_with_openai_overrides`].
+pub fn title_provider_from_env_with_openai_overrides(
+    kind: &str,
+    instance_override: Option<&str>,
+    openai_overrides: Option<&summarizer::OpenAiCompatibleOverrides>,
+) -> Result<ProviderConfig> {
     // Validates `kind` and keeps the summary path's missing-key messages.
-    let cfg = summarizer::provider_from_env(kind)?;
-    let Some((model, _)) = resolve_title_model(kind, instance_override) else {
+    let cfg = summarizer::provider_from_env_with_openai_overrides(kind, openai_overrides)?;
+    let Some((model, _)) = resolve_title_model_with_openai_overrides(kind, instance_override, openai_overrides) else {
         bail!("unknown summary provider: {kind}");
     };
     Ok(with_title_model(cfg, model))
@@ -441,6 +470,35 @@ mod tests {
             ProviderConfig::CodexCli(c) => assert_eq!(c.model.as_deref(), Some("small")),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_title_model_inherits_openai_endpoint_model() {
+        let overrides = summarizer::OpenAiCompatibleOverrides {
+            base_url: Some("http://localhost:8318/v1".into()),
+            api_key: None,
+            model: Some("qwen2.5:3b".into()),
+        };
+
+        // Without explicit title override, inherits endpoint model
+        let (model, source) = resolve_title_model_with_openai_overrides(
+            "openai_compatible",
+            None,
+            Some(&overrides),
+        )
+        .unwrap();
+        assert_eq!(model, "qwen2.5:3b");
+        assert_eq!(source, TitleModelSource::Instance);
+
+        // Explicit title override wins over endpoint model
+        let (model2, source2) = resolve_title_model_with_openai_overrides(
+            "openai_compatible",
+            Some("gpt-4o-mini"),
+            Some(&overrides),
+        )
+        .unwrap();
+        assert_eq!(model2, "gpt-4o-mini");
+        assert_eq!(source2, TitleModelSource::Instance);
     }
 
     /// Archive with one entry of `entity_kind` and the given raw tweet JSON files.
