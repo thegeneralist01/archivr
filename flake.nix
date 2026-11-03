@@ -131,7 +131,7 @@
           frontendDepsHash =
             {
               "aarch64-darwin" = "sha256-QYmiCaORbrWPVaM9xXViCZChSxwObRCjlrM03zukjQ0=";
-              "x86_64-linux" = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+              "x86_64-linux" = "sha256-kY+8fLNZmQcQswFvhnNBAydZEiiGYyLHyYCZ1YNJge8=";
               "aarch64-linux" = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
             }
             .${system} or "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
