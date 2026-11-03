@@ -107,10 +107,10 @@
           # new zipapp URL and paste the sri output into `hash`.
           ytDlp = pkgs.stdenv.mkDerivation {
             pname = "yt-dlp";
-            version = "2026.10.21";
+            version = "2026.10.26";
             src = pkgs.fetchurl {
-              url = "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.21/yt-dlp";
-              hash = "sha256-t6939obpX3hFzo0J0hlXcY/ruLSLMFVa253SKSrXvxQ=";
+              url = "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp";
+              hash = "sha256-5R5p6JSJ8ZlTDxPTKkNC2j3bLPNIQvNkYDoGbbBa+/M=";
             };
             dontUnpack = true;
             nativeBuildInputs = [ pkgs.makeWrapper ];
